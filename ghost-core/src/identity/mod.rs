@@ -1,3 +1,4 @@
+pub mod export;
 pub mod keyring_store;
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -6,6 +7,15 @@ use x25519_dalek::{PublicKey as X25519Public, StaticSecret};
 
 use crate::crypto::keys::derive_x25519_secret;
 use crate::error::Result;
+
+impl std::fmt::Debug for Identity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Identity")
+            .field("fingerprint", &self.fingerprint_short())
+            .field("display_name", &self.display_name)
+            .finish()
+    }
+}
 
 pub struct Identity {
     seed: [u8; 32],
