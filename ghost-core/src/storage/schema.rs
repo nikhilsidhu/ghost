@@ -78,11 +78,12 @@ fn create_tables(conn: &Connection) -> Result<()> {
             sender_fp    BLOB    NOT NULL,
             message_type INTEGER NOT NULL,
             timestamp    INTEGER NOT NULL,
+            received_at  INTEGER NOT NULL,
             content      BLOB    NOT NULL,
             expires_at   INTEGER
         );
 
-        CREATE INDEX idx_messages_channel_ts ON messages(channel_id, timestamp DESC);
+        CREATE INDEX idx_messages_channel_recv ON messages(channel_id, received_at DESC);
         CREATE INDEX idx_messages_expires ON messages(expires_at) WHERE expires_at IS NOT NULL;
 
         CREATE TABLE message_references (

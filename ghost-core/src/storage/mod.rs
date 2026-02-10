@@ -1,8 +1,8 @@
-mod schema;
-pub mod groups;
 pub mod channels;
+pub mod groups;
 pub mod members;
 pub mod messages;
+mod schema;
 
 use std::path::Path;
 
@@ -31,8 +31,8 @@ impl GhostStore {
     pub fn open(seed: &[u8; 32], path: &Path) -> Result<Self> {
         let db_key = derive_key(seed, DB_KEY_DERIVE_LABEL)?;
 
-        let conn = Connection::open(path)
-            .map_err(|e| GhostError::Database(format!("open: {e}")))?;
+        let conn =
+            Connection::open(path).map_err(|e| GhostError::Database(format!("open: {e}")))?;
 
         // Unlock the encrypted database
         conn.pragma_update(None, "key", format!("x'{}'", hex::encode(db_key)))
@@ -98,7 +98,9 @@ impl ChannelKind {
         match s {
             "text" => Ok(ChannelKind::Text),
             "voice" => Ok(ChannelKind::Voice),
-            other => Err(GhostError::Database(format!("unknown channel kind: {other}"))),
+            other => Err(GhostError::Database(format!(
+                "unknown channel kind: {other}"
+            ))),
         }
     }
 }
@@ -151,6 +153,7 @@ pub struct StoredMessage {
     pub sender_fp: [u8; 32],
     pub message_type: u8,
     pub timestamp: u64,
+    pub received_at: u64,
     pub content: Vec<u8>,
     pub expires_at: Option<u64>,
     pub references: Vec<[u8; 32]>,
@@ -209,6 +212,7 @@ mod tests {
             sender_fp: rand_id(),
             message_type: MessageType::Text as u8,
             timestamp: ts,
+            received_at: ts,
             content: text.as_bytes().to_vec(),
             expires_at: None,
             references: vec![],
@@ -312,11 +316,11 @@ mod tests {
         // Get newest 3
         let page1 = store.get_messages(&c.channel_id, None, 3).unwrap();
         assert_eq!(page1.len(), 3);
-        assert_eq!(page1[0].timestamp, 1004); // newest first
+        assert_eq!(page1[0].received_at, 1004); // newest first
 
         // Paginate: before the oldest in page1
         let page2 = store
-            .get_messages(&c.channel_id, Some(page1[2].timestamp), 3)
+            .get_messages(&c.channel_id, Some(page1[2].received_at), 3)
             .unwrap();
         assert_eq!(page2.len(), 2);
     }
@@ -391,14 +395,29 @@ mod tests {
         store.insert_message(&m1).unwrap();
         store.insert_message(&m2).unwrap();
 
-        assert_eq!(store.search_messages(&c.channel_id, "sensitive").unwrap().len(), 1);
+        assert_eq!(
+            store
+                .search_messages(&c.channel_id, "sensitive")
+                .unwrap()
+                .len(),
+            1
+        );
 
         store.delete_message(&m1.message_id).unwrap();
 
         // Tombstoned message must not appear in search results
-        assert_eq!(store.search_messages(&c.channel_id, "sensitive").unwrap().len(), 0);
+        assert_eq!(
+            store
+                .search_messages(&c.channel_id, "sensitive")
+                .unwrap()
+                .len(),
+            0
+        );
         // Other messages still searchable
-        assert_eq!(store.search_messages(&c.channel_id, "keep").unwrap().len(), 1);
+        assert_eq!(
+            store.search_messages(&c.channel_id, "keep").unwrap().len(),
+            1
+        );
     }
 
     // -- Cascade delete tests --
