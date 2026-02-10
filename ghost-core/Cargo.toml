@@ -7,7 +7,7 @@ license = "AGPL-3.0"
 [dependencies]
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
-keyring = "3"
+keyring = { version = "3", features = ["apple-native", "windows-native", "linux-native"] }
 blake3 = "1"
 hkdf = "0.12"
 sha2 = "0.10"

@@ -1,3 +1,5 @@
+pub mod keyring_store;
+
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 use x25519_dalek::{PublicKey as X25519Public, StaticSecret};
