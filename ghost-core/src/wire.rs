@@ -1,4 +1,5 @@
 use openmls::prelude::ProcessedMessageContent;
+use openmls::prelude::BasicCredential;
 
 use crate::crypto::{
     DEFAULT_CHANNEL_TAG, GhostProvider, MessageType, MAILBOX_ID_TAG, MLS_GROUP_ID_TAG,
@@ -230,9 +231,20 @@ pub fn open(
     blob: &[u8],
 ) -> Result<ApplicationMessage> {
     let processed = group.process_message_bytes(provider, blob)?;
+
+    // Extract the MLS-authenticated sender fingerprint before consuming the message
+    let mls_credential = processed.credential().clone();
+    let mls_basic = BasicCredential::try_from(mls_credential)
+        .map_err(|_| GhostError::Mls("sender has non-basic credential".into()))?;
+    let mls_fp = mls_basic.identity();
+
     match processed.into_content() {
         ProcessedMessageContent::ApplicationMessage(app_msg) => {
-            ApplicationMessage::from_bytes(&app_msg.into_bytes())
+            let msg = ApplicationMessage::from_bytes(&app_msg.into_bytes())?;
+            if msg.sender_fp != mls_fp {
+                return Err(GhostError::Format("sender_fp does not match MLS credential".into()));
+            }
+            Ok(msg)
         }
         _ => Err(GhostError::Mls("expected application message".into())),
     }
@@ -550,5 +562,36 @@ mod tests {
         assert_eq!(decrypted.references.len(), 1);
         assert_eq!(decrypted.references[0], target);
         assert_eq!(decrypted.content, b"replying");
+    }
+
+    #[test]
+    fn reject_spoofed_sender_fp() {
+        let alice_provider = GhostProvider::new();
+        let bob_provider = GhostProvider::new();
+        let alice = Identity::from_seed([0x01; 32]).unwrap();
+        let bob = Identity::from_seed([0x02; 32]).unwrap();
+
+        let app_group_id = [0x42; 32];
+        let mut alice_group =
+            GhostGroup::create_with_id(&alice_provider, &alice, &app_group_id).unwrap();
+        let bob_kp = generate_key_package(&bob_provider, &bob).unwrap();
+        let (_commit, welcome) = alice_group.add_member(&alice_provider, bob_kp).unwrap();
+        let mut bob_group =
+            GhostGroup::join(&bob_provider, &bob, &welcome.to_bytes().unwrap()).unwrap();
+
+        // Alice crafts a message claiming to be Bob
+        let msg = ApplicationMessage::new(
+            MessageType::Text,
+            test_channel(),
+            bob.fingerprint, // lying about sender
+            1000,
+            vec![],
+            b"forged".to_vec(),
+        )
+        .unwrap();
+
+        let blob = seal(&mut alice_group, &alice_provider, &msg).unwrap();
+        let result = open(&mut bob_group, &bob_provider, &blob);
+        assert!(result.is_err());
     }
 }
