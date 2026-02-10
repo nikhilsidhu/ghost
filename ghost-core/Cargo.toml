@@ -16,6 +16,7 @@ aes-gcm = "0.10"
 openmls = "0.8"
 openmls_rust_crypto = "0.5"
 openmls_basic_credential = "0.5"
+rusqlite = { version = "0.32", features = ["bundled-sqlcipher"] }
 rand = "0.8"
 thiserror = "1"
 hex = "0.4"

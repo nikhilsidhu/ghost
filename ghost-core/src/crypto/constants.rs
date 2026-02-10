@@ -12,3 +12,11 @@ pub const X25519_DERIVE_LABEL: &[u8] = b"ghost-x25519";
 
 /// How many bytes of a fingerprint to use for short display names (produces 2x hex chars).
 pub const FINGERPRINT_SHORT_BYTES: usize = 8;
+
+/// HKDF domain-separation label for deriving the SQLCipher database encryption key from the identity seed.
+pub const DB_KEY_DERIVE_LABEL: &[u8] = b"ghost-db-key";
+
+// Wire message types
+pub const MSG_TYPE_TEXT: u8 = 1;
+pub const MSG_TYPE_REPLY: u8 = 4;
+pub const MSG_TYPE_DELETE: u8 = 6;

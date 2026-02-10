@@ -23,6 +23,9 @@ pub enum GhostError {
     #[error("MLS: {0}")]
     Mls(String),
 
+    #[error("database: {0}")]
+    Database(String),
+
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }
