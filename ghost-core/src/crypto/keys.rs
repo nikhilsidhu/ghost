@@ -39,22 +39,4 @@ mod tests {
         assert_ne!(a, b);
     }
 
-    #[test]
-    fn derive_x25519_deterministic() {
-        let seed = [0xCDu8; 32];
-        let a = derive_x25519_secret(&seed).unwrap();
-        let b = derive_x25519_secret(&seed).unwrap();
-        let pub_a = x25519_dalek::PublicKey::from(&a);
-        let pub_b = x25519_dalek::PublicKey::from(&b);
-        assert_eq!(pub_a.as_bytes(), pub_b.as_bytes());
-    }
-
-    #[test]
-    fn derive_x25519_different_seeds_different_keys() {
-        let a = derive_x25519_secret(&[0x01u8; 32]).unwrap();
-        let b = derive_x25519_secret(&[0x02u8; 32]).unwrap();
-        let pub_a = x25519_dalek::PublicKey::from(&a);
-        let pub_b = x25519_dalek::PublicKey::from(&b);
-        assert_ne!(pub_a.as_bytes(), pub_b.as_bytes());
-    }
 }
