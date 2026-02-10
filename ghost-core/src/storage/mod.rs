@@ -538,7 +538,7 @@ mod tests {
     // -- Transaction tests --
 
     #[test]
-    fn duplicate_reference_rolls_back_message() {
+    fn duplicate_references_deduped() {
         let store = test_store();
         let g = make_group("grp");
         store.insert_group(&g).unwrap();
@@ -546,12 +546,29 @@ mod tests {
         store.insert_channel(&c).unwrap();
 
         let target = rand_id();
-        let mut msg = make_message(c.channel_id, 1000, "bad refs");
-        msg.references = vec![target, target]; // duplicate PK → second insert fails
+        let mut msg = make_message(c.channel_id, 1000, "dup refs");
+        msg.references = vec![target, target];
 
-        assert!(store.insert_message(&msg).is_err());
-        // Transaction rolled back — message row should not exist
-        assert!(store.get_message(&msg.message_id).is_err());
+        store.insert_message(&msg).unwrap();
+        let got = store.get_message(&msg.message_id).unwrap();
+        assert_eq!(got.references.len(), 1);
+    }
+
+    #[test]
+    fn duplicate_message_id_is_idempotent() {
+        let store = test_store();
+        let g = make_group("grp");
+        store.insert_group(&g).unwrap();
+        let c = make_channel(g.group_id, "general", 0);
+        store.insert_channel(&c).unwrap();
+
+        let msg = make_message(c.channel_id, 1000, "hello");
+        store.insert_message(&msg).unwrap();
+        // Re-inserting the same message_id succeeds silently
+        store.insert_message(&msg).unwrap();
+
+        let got = store.get_message(&msg.message_id).unwrap();
+        assert_eq!(got.content, b"hello");
     }
 
     // -- FTS edge cases --

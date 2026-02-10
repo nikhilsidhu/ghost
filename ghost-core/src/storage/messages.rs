@@ -18,13 +18,14 @@ fn row_to_raw_message(row: &rusqlite::Row) -> rusqlite::Result<RawMessage> {
 }
 
 impl GhostStore {
-    /// Insert a message and its references atomically. FTS index is updated via trigger.
+    /// Insert a message and its references atomically. Duplicate message_ids are silently
+    /// ignored (idempotent) so relay re-deliveries don't cause errors.
     pub fn insert_message(&self, msg: &StoredMessage) -> Result<()> {
         let tx = self.conn.unchecked_transaction()
             .map_err(|e| GhostError::Database(format!("begin transaction: {e}")))?;
 
-        tx.execute(
-            "INSERT INTO messages (message_id, channel_id, sender_fp, message_type, timestamp, received_at, content, expires_at)
+        let inserted = tx.execute(
+            "INSERT OR IGNORE INTO messages (message_id, channel_id, sender_fp, message_type, timestamp, received_at, content, expires_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             rusqlite::params![
                 msg.message_id.as_slice(),
@@ -39,12 +40,15 @@ impl GhostStore {
         )
         .map_err(|e| GhostError::Database(format!("insert message: {e}")))?;
 
-        for ref_id in &msg.references {
-            tx.execute(
-                "INSERT INTO message_references (message_id, referenced_id) VALUES (?1, ?2)",
-                rusqlite::params![msg.message_id.as_slice(), ref_id.as_slice()],
-            )
-            .map_err(|e| GhostError::Database(format!("insert reference: {e}")))?;
+        // Skip references if message already existed
+        if inserted > 0 {
+            for ref_id in &msg.references {
+                tx.execute(
+                    "INSERT OR IGNORE INTO message_references (message_id, referenced_id) VALUES (?1, ?2)",
+                    rusqlite::params![msg.message_id.as_slice(), ref_id.as_slice()],
+                )
+                .map_err(|e| GhostError::Database(format!("insert reference: {e}")))?;
+            }
         }
 
         tx.commit()
