@@ -1,0 +1,35 @@
+.claude
+
+# Rust
+target/
+**/*.rs.bk
+
+# Node / Frontend
+node_modules/
+dist/
+.vite/
+
+# Tauri
+src-tauri/target/
+src-tauri/WixTools/
+
+# Environment
+.env
+.env.*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Build artifacts
+*.app
+*.dmg
+*.msi
+*.deb
+*.AppImage
