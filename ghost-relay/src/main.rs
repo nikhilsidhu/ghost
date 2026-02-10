@@ -1,15 +1,8 @@
-mod config;
-mod constants;
-mod error;
-mod mailbox;
-mod routes;
-mod state;
-mod worker;
-mod util;
-
 use std::net::SocketAddr;
 
 use tracing_subscriber::EnvFilter;
+
+use ghost_relay::{config, routes, state, worker};
 
 #[tokio::main]
 async fn main() {
