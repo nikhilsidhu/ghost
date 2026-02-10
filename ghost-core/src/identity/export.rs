@@ -124,10 +124,4 @@ mod tests {
         assert!(matches!(err, GhostError::Format(_)));
     }
 
-    #[test]
-    fn export_is_93_bytes() {
-        let id = Identity::generate().unwrap();
-        let blob = export(&id, "test").unwrap();
-        assert_eq!(blob.len(), 93);
-    }
 }

@@ -347,7 +347,7 @@ mod tests {
     }
 
     #[test]
-    fn message_tombstone_delete() {
+    fn delete_message_clears_content() {
         let store = test_store();
         let g = make_group("grp");
         store.insert_group(&g).unwrap();
@@ -383,7 +383,7 @@ mod tests {
     }
 
     #[test]
-    fn tombstone_removes_from_search() {
+    fn deleted_message_excluded_from_search() {
         let store = test_store();
         let g = make_group("grp");
         store.insert_group(&g).unwrap();
@@ -405,7 +405,7 @@ mod tests {
 
         store.delete_message(&m1.message_id).unwrap();
 
-        // Tombstoned message must not appear in search results
+        // Deleted message must not appear in search results
         assert_eq!(
             store
                 .search_messages(&c.channel_id, "sensitive")

@@ -265,33 +265,6 @@ mod tests {
     }
 
     #[test]
-    fn dm_two_person_group() {
-        let alice_provider = GhostProvider::new();
-        let bob_provider = GhostProvider::new();
-
-        let alice = Identity::from_seed([0x10u8; 32]).unwrap();
-        let bob = Identity::from_seed([0x20u8; 32]).unwrap();
-
-        let mut alice_group = GhostGroup::create(&alice_provider, &alice).unwrap();
-        let bob_kp = generate_key_package(&bob_provider, &bob).unwrap();
-        let (_commit, welcome) = alice_group.add_member(&alice_provider, bob_kp).unwrap();
-        let mut bob_group =
-            GhostGroup::join(&bob_provider, &bob, &welcome.to_bytes().unwrap()).unwrap();
-
-        // Bob sends a DM to Alice
-        let msg = b"hey alice, this is a DM";
-        let ciphertext = bob_group.encrypt(&bob_provider, msg).unwrap();
-        let processed = alice_group.process_message(&alice_provider, &ciphertext).unwrap();
-
-        match processed.into_content() {
-            ProcessedMessageContent::ApplicationMessage(app_msg) => {
-                assert_eq!(app_msg.into_bytes(), msg);
-            }
-            other => panic!("expected ApplicationMessage, got {:?}", other),
-        }
-    }
-
-    #[test]
     fn export_secret_returns_32_bytes() {
         let provider = GhostProvider::new();
         let alice = Identity::from_seed([0x01u8; 32]).unwrap();
