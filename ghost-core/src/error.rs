@@ -20,6 +20,9 @@ pub enum GhostError {
     #[error("invalid format: {0}")]
     Format(String),
 
+    #[error("MLS: {0}")]
+    Mls(String),
+
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }
