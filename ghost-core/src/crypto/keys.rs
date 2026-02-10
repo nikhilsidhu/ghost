@@ -13,6 +13,11 @@ pub fn derive_key(ikm: &[u8], info: &[u8]) -> Result<[u8; 32]> {
     Ok(out)
 }
 
+/// Seed -> Ed25519 signing key bytes via HKDF
+pub fn derive_ed25519_seed(seed: &[u8; 32]) -> Result<[u8; 32]> {
+    derive_key(seed, super::ED25519_DERIVE_LABEL)
+}
+
 /// Seed -> X25519 static secret via HKDF
 pub fn derive_x25519_secret(seed: &[u8; 32]) -> Result<StaticSecret> {
     let bytes = derive_key(seed, super::X25519_DERIVE_LABEL)?;

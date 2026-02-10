@@ -5,7 +5,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 use x25519_dalek::{PublicKey as X25519Public, StaticSecret};
 
-use crate::crypto::keys::derive_x25519_secret;
+use crate::crypto::keys::{derive_ed25519_seed, derive_x25519_secret};
 use crate::crypto::FINGERPRINT_SHORT_BYTES;
 use crate::error::Result;
 
@@ -37,7 +37,8 @@ impl Identity {
 
     /// All keys derived deterministically from seed
     pub fn from_seed(seed: [u8; 32]) -> Result<Self> {
-        let signing_key = SigningKey::from_bytes(&seed);
+        let ed25519_bytes = derive_ed25519_seed(&seed)?;
+        let signing_key = SigningKey::from_bytes(&ed25519_bytes);
         let verifying_key = signing_key.verifying_key();
         let x25519_secret = derive_x25519_secret(&seed)?;
         let x25519_public = X25519Public::from(&x25519_secret);
