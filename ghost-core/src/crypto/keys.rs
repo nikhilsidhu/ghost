@@ -15,7 +15,7 @@ pub fn derive_key(ikm: &[u8], info: &[u8]) -> Result<[u8; 32]> {
 
 /// Seed -> X25519 static secret via HKDF
 pub fn derive_x25519_secret(seed: &[u8; 32]) -> Result<StaticSecret> {
-    let bytes = derive_key(seed, b"ghost-x25519")?;
+    let bytes = derive_key(seed, super::X25519_DERIVE_LABEL)?;
     Ok(StaticSecret::from(bytes))
 }
 

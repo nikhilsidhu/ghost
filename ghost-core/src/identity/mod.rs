@@ -6,6 +6,7 @@ use rand::rngs::OsRng;
 use x25519_dalek::{PublicKey as X25519Public, StaticSecret};
 
 use crate::crypto::keys::derive_x25519_secret;
+use crate::crypto::FINGERPRINT_SHORT_BYTES;
 use crate::error::Result;
 
 impl std::fmt::Debug for Identity {
@@ -42,7 +43,7 @@ impl Identity {
         let x25519_public = X25519Public::from(&x25519_secret);
         let fingerprint: [u8; 32] = blake3::hash(verifying_key.as_bytes()).into();
 
-        let fp_hex = hex::encode(&fingerprint[..8]);
+        let fp_hex = hex::encode(&fingerprint[..FINGERPRINT_SHORT_BYTES]);
         let display_name = format!("ghost-{fp_hex}");
 
         Ok(Self {
@@ -62,7 +63,7 @@ impl Identity {
 
     /// First 16 hex chars of fingerprint.
     pub fn fingerprint_short(&self) -> String {
-        hex::encode(&self.fingerprint[..8])
+        hex::encode(&self.fingerprint[..FINGERPRINT_SHORT_BYTES])
     }
 }
 

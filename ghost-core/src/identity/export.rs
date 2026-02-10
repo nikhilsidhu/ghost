@@ -9,6 +9,10 @@ use crate::error::{GhostError, Result};
 const VERSION: u8 = 1;
 const EXPORT_LEN: usize = 1 + 32 + 12 + 48; // 93 bytes
 
+const ARGON2_MEMORY_KIB: u32 = 19 * 1024; // 19 MiB
+const ARGON2_ITERATIONS: u32 = 2;
+const ARGON2_PARALLELISM: u32 = 1;
+
 /// Encrypt identity seed with a passphrase. Returns 93 bytes.
 pub fn export(identity: &Identity, passphrase: &str) -> Result<Vec<u8>> {
     let mut salt = [0u8; 32];
@@ -67,9 +71,9 @@ pub fn import(data: &[u8], passphrase: &str) -> Result<Identity> {
     Identity::from_seed(seed)
 }
 
-/// Argon2id: memory-hard password KDF (19 MiB, 2 iterations, 1 thread).
+// Derive an AES-256 key from a user passphrase using Argon2id, so brute-forcing exported seeds is expensive.
 fn derive_export_key(passphrase: &[u8], salt: &[u8]) -> Result<[u8; 32]> {
-    let params = argon2::Params::new(19 * 1024, 2, 1, Some(32))
+    let params = argon2::Params::new(ARGON2_MEMORY_KIB, ARGON2_ITERATIONS, ARGON2_PARALLELISM, Some(32))
         .map_err(|e| GhostError::Crypto(format!("argon2 params: {e}")))?;
     let argon2 = Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
     let mut key = [0u8; 32];
