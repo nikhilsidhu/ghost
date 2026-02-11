@@ -11,8 +11,9 @@ dist/
 .vite/
 
 # Tauri
-src-tauri/target/
-src-tauri/WixTools/
+**/src-tauri/target/
+**/src-tauri/gen/
+**/src-tauri/WixTools/
 
 # Environment
 .env
