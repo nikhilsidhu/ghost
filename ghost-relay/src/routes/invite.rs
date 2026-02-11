@@ -24,6 +24,11 @@ pub async fn register(
     let (join_notify, _) = broadcast::channel(NOTIFY_CAPACITY);
     let (accept_notify, _) = broadcast::channel(NOTIFY_CAPACITY);
 
+    // Clamp expiry so clients can't keep invites alive forever
+    let now = now_millis();
+    let max_expires = now + state.config.ttl.as_millis() as u64;
+    let expires_at = body.expires_at.min(max_expires);
+
     let mut invites = state.invites.write().await;
     if invites.contains_key(&body.token) {
         return Err(RelayError::BadRequest("token already registered".into()));
@@ -31,7 +36,7 @@ pub async fn register(
     invites.insert(
         body.token,
         Invite {
-            expires_at: body.expires_at,
+            expires_at,
             join: None,
             accept: None,
             join_notify,
