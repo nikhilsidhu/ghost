@@ -1,3 +1,5 @@
+mod commands;
+mod dto;
 mod setup;
 mod state;
 
@@ -7,6 +9,13 @@ fn main() {
 
     tauri::Builder::default()
         .manage(app_state)
+        .invoke_handler(tauri::generate_handler![
+            commands::get_identity,
+            commands::list_groups,
+            commands::create_group,
+            commands::list_channels,
+            commands::list_members,
+        ])
         .run(tauri::generate_context!())
         .expect("error while running ghost");
 }
