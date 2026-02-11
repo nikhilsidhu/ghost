@@ -61,3 +61,4 @@ impl TryFrom<u8> for MessageType {
 // BLAKE3 domain-separation tags for ID derivation
 pub const MLS_GROUP_ID_TAG: &[u8] = b"ghost-mls";
 pub const MAILBOX_ID_TAG: &[u8] = b"ghost-mailbox";
+pub const DEFAULT_CHANNEL_TAG: &[u8] = b"ghost-default-channel";

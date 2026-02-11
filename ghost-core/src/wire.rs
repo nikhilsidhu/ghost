@@ -1,6 +1,9 @@
 use openmls::prelude::ProcessedMessageContent;
 
-use crate::crypto::{GhostProvider, MessageType, MAILBOX_ID_TAG, MLS_GROUP_ID_TAG, PROTOCOL_VERSION};
+use crate::crypto::{
+    DEFAULT_CHANNEL_TAG, GhostProvider, MessageType, MAILBOX_ID_TAG, MLS_GROUP_ID_TAG,
+    PROTOCOL_VERSION,
+};
 use crate::error::{GhostError, Result};
 use crate::mls::group::GhostGroup;
 
@@ -194,6 +197,19 @@ pub fn group_mailbox_id(mls_group_id: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+pub fn derive_default_channel_id(group_id: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(group_id);
+    hasher.update(DEFAULT_CHANNEL_TAG);
+    hasher.finalize().into()
+}
+
+/// Encrypted blob addressed to a relay mailbox.
+pub struct Outbound {
+    pub mailbox_id: [u8; 32],
+    pub blob: Vec<u8>,
+}
+
 /// Serialize an ApplicationMessage and MLS-encrypt it into transport bytes.
 pub fn seal(
     group: &mut GhostGroup,
@@ -364,6 +380,20 @@ mod tests {
 
         let different = derive_mls_group_id(&[0x22; 32]);
         assert_ne!(a, different);
+    }
+
+    #[test]
+    fn default_channel_id_deterministic() {
+        let gid = [0x11; 32];
+        let a = derive_default_channel_id(&gid);
+        let b = derive_default_channel_id(&gid);
+        assert_eq!(a, b);
+
+        let different = derive_default_channel_id(&[0x22; 32]);
+        assert_ne!(a, different);
+
+        // Must differ from MLS group ID derivation for same input
+        assert_ne!(a, derive_mls_group_id(&gid));
     }
 
     #[test]

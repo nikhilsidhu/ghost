@@ -26,6 +26,9 @@ pub enum GhostError {
     #[error("database: {0}")]
     Database(String),
 
+    #[error("group not loaded: {0}")]
+    GroupNotLoaded(String),
+
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }

@@ -49,8 +49,7 @@ impl GhostStore {
         Ok(Self { conn })
     }
 
-    /// Open an in-memory encrypted database for testing.
-    #[cfg(test)]
+    /// Open an in-memory encrypted database (useful for testing).
     pub fn open_in_memory(seed: &[u8; 32]) -> Result<Self> {
         let db_key = derive_key(seed, DB_KEY_DERIVE_LABEL)?;
 
