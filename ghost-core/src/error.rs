@@ -29,6 +29,9 @@ pub enum GhostError {
     #[error("group not loaded: {0}")]
     GroupNotLoaded(String),
 
+    #[error("network: {0}")]
+    Network(String),
+
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }

@@ -745,8 +745,12 @@ version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "argon2",
+ "axum",
+ "base64",
  "blake3",
  "ed25519-dalek",
+ "futures-util",
+ "ghost-relay",
  "hex",
  "hkdf",
  "keyring",
@@ -754,10 +758,14 @@ dependencies = [
  "openmls_basic_credential",
  "openmls_rust_crypto",
  "rand 0.8.5",
+ "reqwest",
  "rusqlite",
+ "serde_json",
  "sha2",
  "tempfile",
  "thiserror 1.0.69",
+ "tokio",
+ "tokio-tungstenite 0.26.2",
  "x25519-dalek",
 ]
 
