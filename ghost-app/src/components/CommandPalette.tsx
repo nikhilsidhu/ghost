@@ -33,16 +33,35 @@ export function CommandPalette(props: Props) {
     const q = query().toLowerCase().trim();
     let list = props.groups;
     if (q) {
-      list = list.filter((g) => g.name.toLowerCase().includes(q));
+      list = list
+        .filter((g) => g.name.toLowerCase().includes(q))
+        .sort((a, b) => {
+          const aExact = a.name.toLowerCase() === q ? 0 : 1;
+          const bExact = b.name.toLowerCase() === q ? 0 : 1;
+          if (aExact !== bExact) return aExact - bExact;
+          // prefer starts-with over contains
+          const aStarts = a.name.toLowerCase().startsWith(q) ? 0 : 1;
+          const bStarts = b.name.toLowerCase().startsWith(q) ? 0 : 1;
+          return aStarts - bStarts;
+        });
     }
     const pinned = list.filter((g) => props.pinnedGroupIds.has(g.group_id));
     const rest = list.filter((g) => !props.pinnedGroupIds.has(g.group_id));
     return [...pinned, ...rest];
   };
 
+  let listRef!: HTMLDivElement;
+
   createEffect(() => {
     query();
     setFocusedIndex(0);
+  });
+
+  createEffect(() => {
+    const i = focusedIndex();
+    if (!listRef) return;
+    const el = listRef.children[i] as HTMLElement | undefined;
+    el?.scrollIntoView({ block: "nearest" });
   });
 
   const select = (id: string) => {
@@ -73,10 +92,14 @@ export function CommandPalette(props: Props) {
             value={query()}
             onInput={(e: InputEvent) => setQuery((e.currentTarget as HTMLInputElement).value)}
             onKeyDown={handleKeyDown}
+            autocomplete="off"
+            autocorrect="off"
+            autocapitalize="off"
+            spellcheck={false}
             autofocus
           />
         </div>
-        <div class="max-h-64 overflow-y-auto py-1">
+        <div ref={listRef} class="max-h-64 overflow-y-auto py-1">
           <Show
             when={filtered().length > 0}
             fallback={
