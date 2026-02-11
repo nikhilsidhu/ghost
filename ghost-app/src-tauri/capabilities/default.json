@@ -1,0 +1,9 @@
+{
+  "$schema": "https://raw.githubusercontent.com/tauri-apps/tauri/dev/.schema/capabilities.json",
+  "identifier": "default",
+  "description": "Default capabilities for Ghost",
+  "windows": ["main"],
+  "permissions": [
+    "core:default"
+  ]
+}
