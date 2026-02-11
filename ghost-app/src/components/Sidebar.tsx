@@ -1,7 +1,6 @@
 import { createSignal, For, Show, onMount, onCleanup } from "solid-js";
 import type { Identity, Group } from "../lib/types";
 import { ScrollArea } from "./ui/scroll-area";
-import { CreateGroupDialog } from "./CreateGroupDialog";
 import { cn } from "../lib/cn";
 import { Pin, PinOff } from "lucide-solid";
 
@@ -11,7 +10,7 @@ interface SidebarProps {
   pinnedGroupIds: Set<string>;
   selectedGroupId: string | null;
   onSelectGroup: (id: string) => void;
-  onGroupCreated: () => void;
+  onCreateGroup: () => void;
   onTogglePin: (id: string) => void;
 }
 
@@ -107,7 +106,12 @@ export function Sidebar(props: SidebarProps) {
         <span class="text-xs uppercase tracking-wider text-[var(--neutral-500)]">
           groups
         </span>
-        <CreateGroupDialog onCreated={props.onGroupCreated} />
+        <button
+          onClick={() => props.onCreateGroup()}
+          class="w-6 h-6 flex items-center justify-center rounded text-base leading-none text-[var(--neutral-400)] hover:text-[var(--neutral-200)] hover:bg-[var(--neutral-700)] cursor-pointer transition-colors"
+        >
+          +
+        </button>
       </div>
 
       <ScrollArea class="flex-1">

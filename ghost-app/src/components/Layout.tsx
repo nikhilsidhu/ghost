@@ -1,10 +1,15 @@
 import { createSignal, createEffect, on, onMount, Show } from "solid-js";
 import type { Identity, Group, Channel, Member } from "../lib/types";
-import { getIdentity, listGroups, listChannels, listMembers, listPinnedGroups, pinGroup, unpinGroup } from "../lib/api";
+import {
+  getIdentity, listGroups, listChannels, listMembers,
+  listPinnedGroups, pinGroup, unpinGroup,
+  createGroup, createChannel as apiCreateChannel,
+  renameChannel as apiRenameChannel, deleteChannel as apiDeleteChannel,
+} from "../lib/api";
 import { Sidebar } from "./Sidebar";
 import { GroupView } from "./GroupView";
 import { MemberPanel } from "./MemberPanel";
-import { CommandPalette } from "./CommandPalette";
+import { CommandPalette, type CommandDef } from "./CommandPalette";
 
 export function Layout() {
   const [identity, setIdentity] = createSignal<Identity | null>(null);
@@ -14,10 +19,20 @@ export function Layout() {
   const [members, setMembers] = createSignal<Member[]>([]);
   const [pinnedGroupIds, setPinnedGroupIds] = createSignal<Set<string>>(new Set());
   const [selectedChannelId, setSelectedChannelId] = createSignal<string | null>(null);
+  const [openCommandId, setOpenCommandId] = createSignal<string | null>(null);
+
+  // --- Refresh helpers ---
 
   const refreshGroups = async () => {
     const gs = await listGroups();
     setGroups(gs);
+  };
+
+  const refreshChannels = async () => {
+    const gid = selectedGroupId();
+    if (!gid) { setChannels([]); return; }
+    const ch = await listChannels(gid);
+    setChannels(ch);
   };
 
   const refreshPins = async () => {
@@ -51,6 +66,87 @@ export function Layout() {
 
   const selectedGroup = () => groups().find((g) => g.group_id === selectedGroupId());
 
+  // --- Completion providers ---
+
+  const groupCompleter = (q: string) => {
+    const lq = q.toLowerCase();
+    return groups()
+      .filter((g) => !lq || g.name.toLowerCase().includes(lq))
+      .map((g) => ({ label: g.name, value: g.group_id }));
+  };
+
+  const channelCompleter = (q: string) => {
+    const lq = q.toLowerCase();
+    return channels()
+      .filter((ch) => !lq || ch.name.toLowerCase().includes(lq))
+      .map((ch) => ({ label: `${ch.kind === "text" ? "#" : "\u266a"} ${ch.name}`, value: ch.channel_id }));
+  };
+
+  const typeCompleter = () => [
+    { label: "text", value: "text" },
+    { label: "voice", value: "voice" },
+  ];
+
+  // --- Command definitions ---
+
+  const commands: CommandDef[] = [
+    {
+      id: "create-group",
+      command: "create group",
+      args: [{ name: "name", placeholder: "group name" }],
+      execute: async (args) => {
+        await createGroup(args.name);
+        await refreshGroups();
+      },
+    },
+    {
+      id: "create-channel",
+      command: "create channel",
+      args: [
+        {
+          name: "group",
+          placeholder: "group",
+          complete: groupCompleter,
+          defaultValue: () => selectedGroupId(),
+        },
+        { name: "name", placeholder: "channel name" },
+        {
+          name: "type",
+          placeholder: "text or voice",
+          complete: typeCompleter,
+          defaultValue: () => "text",
+        },
+      ],
+      execute: async (args) => {
+        await apiCreateChannel(args.group, args.name, args.type);
+        await refreshChannels();
+      },
+    },
+    {
+      id: "rename-channel",
+      command: "rename channel",
+      args: [
+        { name: "channel", placeholder: "channel", complete: channelCompleter },
+        { name: "name", placeholder: "new name" },
+      ],
+      execute: async (args) => {
+        await apiRenameChannel(args.channel, args.name);
+        await refreshChannels();
+      },
+    },
+    {
+      id: "delete-channel",
+      command: "delete channel",
+      args: [
+        { name: "channel", placeholder: "channel", complete: channelCompleter },
+      ],
+      execute: async (args) => {
+        await apiDeleteChannel(args.channel);
+        await refreshChannels();
+      },
+    },
+  ];
+
   return (
     <div class="h-screen flex relative" style={{ background: "var(--neutral-950)" }}>
       <div class="absolute left-0 right-0 top-[84px] h-px bg-[var(--neutral-800)] z-10" />
@@ -60,7 +156,7 @@ export function Layout() {
         pinnedGroupIds={pinnedGroupIds()}
         selectedGroupId={selectedGroupId()}
         onSelectGroup={setSelectedGroupId}
-        onGroupCreated={refreshGroups}
+        onCreateGroup={() => setOpenCommandId("create-group")}
         onTogglePin={handleTogglePin}
       />
       <main class="flex-1 flex flex-col min-w-0">
@@ -93,7 +189,10 @@ export function Layout() {
       <CommandPalette
         groups={groups()}
         pinnedGroupIds={pinnedGroupIds()}
+        commands={commands}
         onSelectGroup={setSelectedGroupId}
+        openCommandId={openCommandId()}
+        onOpenCommandHandled={() => setOpenCommandId(null)}
       />
     </div>
   );
