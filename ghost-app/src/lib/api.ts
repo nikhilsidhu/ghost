@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Identity, Group, Channel, Member } from "./types";
+import type { Identity, Group, Channel, Member, Message } from "./types";
 
 export const getIdentity = () => invoke<Identity>("get_identity");
 
@@ -22,3 +22,9 @@ export const unpinGroup = (groupId: string) =>
 
 export const listPinnedGroups = () =>
   invoke<string[]>("list_pinned_groups");
+
+export const listMessages = (channelId: string, before?: number, limit?: number) =>
+  invoke<Message[]>("list_messages", { channelId, before, limit });
+
+export const sendMessage = (groupId: string, channelId: string, content: string) =>
+  invoke<Message>("send_message", { groupId, channelId, content });

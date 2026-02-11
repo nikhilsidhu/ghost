@@ -26,3 +26,13 @@ export interface Member {
   role: "creator" | "member";
   joined_at: number;
 }
+
+export interface Message {
+  message_id: string;
+  channel_id: string;
+  sender_fp: string;
+  message_type: number;
+  timestamp: number;
+  received_at: number;
+  content: string;
+}

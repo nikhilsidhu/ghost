@@ -90,7 +90,7 @@ mod tests {
 
     #[test]
     fn derive_voice_key_deterministic() {
-        let provider = GhostProvider::new();
+        let provider = GhostProvider::new_in_memory().unwrap();
         let id = Identity::from_seed([0x01u8; 32]).unwrap();
         let group = super::super::group::GhostGroup::create(&provider, &id).unwrap();
 
@@ -102,7 +102,7 @@ mod tests {
 
     #[test]
     fn different_sender_different_key() {
-        let provider = GhostProvider::new();
+        let provider = GhostProvider::new_in_memory().unwrap();
         let id = Identity::from_seed([0x01u8; 32]).unwrap();
         let group = super::super::group::GhostGroup::create(&provider, &id).unwrap();
 

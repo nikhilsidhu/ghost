@@ -18,6 +18,8 @@ fn main() {
             commands::pin_group,
             commands::unpin_group,
             commands::list_pinned_groups,
+            commands::list_messages,
+            commands::send_message,
         ])
         .run(tauri::generate_context!())
         .expect("error while running ghost");

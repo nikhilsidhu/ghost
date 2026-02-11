@@ -3,8 +3,10 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use openmls::prelude::KeyPackage;
+use rusqlite::Connection;
 
-use crate::crypto::{GhostProvider, MessageType};
+use crate::crypto::{GhostProvider, MLS_DB_KEY_DERIVE_LABEL, MessageType};
+use crate::crypto::keys::derive_key;
 use crate::error::{GhostError, Result};
 use crate::identity::Identity;
 use crate::mls::credential::generate_key_package;
@@ -15,6 +17,23 @@ use crate::storage::{
 use crate::wire::{
     derive_default_channel_id, group_mailbox_id, open, seal, ApplicationMessage, Outbound,
 };
+
+/// Open an encrypted SQLite connection for MLS state, separate from the app DB.
+fn open_mls_connection(seed: &[u8; 32], app_db_path: &Path) -> Result<Connection> {
+    let mls_path = app_db_path.with_extension("mls.db");
+    let mls_key = derive_key(seed, MLS_DB_KEY_DERIVE_LABEL)?;
+
+    let conn = Connection::open(&mls_path)
+        .map_err(|e| GhostError::Database(format!("open mls db: {e}")))?;
+
+    conn.pragma_update(None, "key", format!("x'{}'", hex::encode(mls_key)))
+        .map_err(|e| GhostError::Database(format!("set mls key: {e}")))?;
+
+    conn.pragma_update(None, "journal_mode", "WAL")
+        .map_err(|e| GhostError::Database(format!("set mls WAL: {e}")))?;
+
+    Ok(conn)
+}
 
 /// Session-level orchestration: holds identity, MLS state, and local storage.
 pub struct GhostClient {
@@ -27,19 +46,34 @@ pub struct GhostClient {
 impl GhostClient {
     pub fn open(seed: [u8; 32], db_path: &Path) -> Result<Self> {
         let identity = Identity::from_seed(seed)?;
-        let provider = GhostProvider::new();
         let store = GhostStore::open(&seed, db_path)?;
+
+        let mls_conn = open_mls_connection(&seed, db_path)?;
+        let provider = GhostProvider::new(mls_conn)?;
+
+        // Reload MLS groups that were persisted from previous sessions
+        let mut groups = HashMap::new();
+        if let Ok(stored_groups) = store.list_groups() {
+            for g in &stored_groups {
+                if let Ok(Some(ghost_group)) =
+                    GhostGroup::load(&provider, &identity, &g.group_id)
+                {
+                    groups.insert(g.group_id, ghost_group);
+                }
+            }
+        }
+
         Ok(Self {
             identity,
             provider,
             store,
-            groups: HashMap::new(),
+            groups,
         })
     }
 
     pub fn open_in_memory(seed: [u8; 32]) -> Result<Self> {
         let identity = Identity::from_seed(seed)?;
-        let provider = GhostProvider::new();
+        let provider = GhostProvider::new_in_memory()?;
         let store = GhostStore::open_in_memory(&seed)?;
         Ok(Self {
             identity,

@@ -2,7 +2,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use tauri::State;
 
-use crate::dto::{ChannelDto, GroupDto, IdentityDto, MemberDto};
+use crate::dto::{ChannelDto, GroupDto, IdentityDto, MemberDto, MessageDto};
 use crate::state::AppState;
 
 fn now_millis() -> u64 {
@@ -93,4 +93,40 @@ pub fn list_pinned_groups(state: State<AppState>) -> Result<Vec<String>, String>
         .list_pinned_group_ids()
         .map_err(|e| e.to_string())?;
     Ok(ids.iter().map(hex::encode).collect())
+}
+
+#[tauri::command]
+pub fn list_messages(
+    channel_id: String,
+    before: Option<u64>,
+    limit: Option<u32>,
+    state: State<AppState>,
+) -> Result<Vec<MessageDto>, String> {
+    let cid = parse_id(&channel_id)?;
+    let client = state.client.lock().map_err(|e| e.to_string())?;
+    let msgs = client
+        .store()
+        .get_messages(&cid, before, limit.unwrap_or(50))
+        .map_err(|e| e.to_string())?;
+    Ok(msgs.iter().map(MessageDto::from).collect())
+}
+
+#[tauri::command]
+pub fn send_message(
+    group_id: String,
+    channel_id: String,
+    content: String,
+    state: State<AppState>,
+) -> Result<MessageDto, String> {
+    let gid = parse_id(&group_id)?;
+    let cid = parse_id(&channel_id)?;
+    let mut client = state.client.lock().map_err(|e| e.to_string())?;
+    let (_, msg_id) = client
+        .send_message(&gid, &cid, content.into_bytes(), vec![], now_millis())
+        .map_err(|e| e.to_string())?;
+    let stored = client
+        .store()
+        .get_message(&msg_id)
+        .map_err(|e| e.to_string())?;
+    Ok(MessageDto::from(&stored))
 }

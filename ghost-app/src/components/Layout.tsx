@@ -13,6 +13,7 @@ export function Layout() {
   const [channels, setChannels] = createSignal<Channel[]>([]);
   const [members, setMembers] = createSignal<Member[]>([]);
   const [pinnedGroupIds, setPinnedGroupIds] = createSignal<Set<string>>(new Set());
+  const [selectedChannelId, setSelectedChannelId] = createSignal<string | null>(null);
 
   const refreshGroups = async () => {
     const gs = await listGroups();
@@ -41,6 +42,7 @@ export function Layout() {
   });
 
   createEffect(on(selectedGroupId, async (id) => {
+    setSelectedChannelId(null);
     if (!id) { setChannels([]); setMembers([]); return; }
     const [ch, mem] = await Promise.all([listChannels(id), listMembers(id)]);
     setChannels(ch);
@@ -73,7 +75,16 @@ export function Layout() {
             </div>
           }
         >
-          {(group) => <GroupView group={group()} channels={channels()} />}
+          {(group) => (
+            <GroupView
+              group={group()}
+              channels={channels()}
+              members={members()}
+              identity={identity()}
+              selectedChannelId={selectedChannelId()}
+              onSelectChannel={setSelectedChannelId}
+            />
+          )}
         </Show>
       </main>
       <Show when={selectedGroup()}>

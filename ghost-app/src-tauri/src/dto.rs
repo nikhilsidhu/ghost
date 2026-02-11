@@ -1,7 +1,7 @@
 use serde::Serialize;
 
 use ghost_core::identity::Identity;
-use ghost_core::storage::{Channel, ChannelKind, Group, Member, MemberRole};
+use ghost_core::storage::{Channel, ChannelKind, Group, Member, MemberRole, StoredMessage};
 
 #[derive(Serialize)]
 pub struct IdentityDto {
@@ -69,6 +69,31 @@ impl From<&Channel> for ChannelDto {
             }
             .to_string(),
             position: c.position,
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct MessageDto {
+    pub message_id: String,
+    pub channel_id: String,
+    pub sender_fp: String,
+    pub message_type: u8,
+    pub timestamp: u64,
+    pub received_at: u64,
+    pub content: String,
+}
+
+impl From<&StoredMessage> for MessageDto {
+    fn from(m: &StoredMessage) -> Self {
+        Self {
+            message_id: hex::encode(m.message_id),
+            channel_id: hex::encode(m.channel_id),
+            sender_fp: hex::encode(m.sender_fp),
+            message_type: m.message_type,
+            timestamp: m.timestamp,
+            received_at: m.received_at,
+            content: String::from_utf8_lossy(&m.content).into_owned(),
         }
     }
 }

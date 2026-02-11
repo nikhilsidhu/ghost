@@ -17,6 +17,7 @@ pub const FINGERPRINT_SHORT_BYTES: usize = 8;
 
 /// HKDF domain-separation label for deriving the SQLCipher database encryption key from the identity seed.
 pub const DB_KEY_DERIVE_LABEL: &[u8] = b"ghost-db-key";
+pub const MLS_DB_KEY_DERIVE_LABEL: &[u8] = b"ghost-mls-db-key";
 
 // Wire protocol version
 pub const PROTOCOL_VERSION: u8 = 0x01;

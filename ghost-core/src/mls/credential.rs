@@ -32,7 +32,7 @@ pub fn generate_key_package(
     let credential = credential_from_identity(identity);
 
     let bundle = KeyPackage::builder()
-        .build(MLS_CIPHERSUITE, provider.inner(), &signer, credential)
+        .build(MLS_CIPHERSUITE, provider, &signer, credential)
         .map_err(|e| GhostError::Mls(format!("key package: {e}")))?;
     Ok(bundle.key_package().clone())
 }
@@ -58,7 +58,7 @@ mod tests {
 
     #[test]
     fn generate_key_package_succeeds() {
-        let provider = GhostProvider::new();
+        let provider = GhostProvider::new_in_memory().unwrap();
         let id = Identity::from_seed([0xCCu8; 32]).unwrap();
         let kp = generate_key_package(&provider, &id).unwrap();
         assert_eq!(kp.ciphersuite(), MLS_CIPHERSUITE);

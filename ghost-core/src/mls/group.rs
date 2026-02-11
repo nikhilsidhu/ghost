@@ -1,6 +1,7 @@
 use openmls::prelude::*;
 use openmls::prelude::tls_codec::Deserialize;
 use openmls_basic_credential::SignatureKeyPair;
+use openmls_traits::OpenMlsProvider;
 
 use crate::crypto::GhostProvider;
 use crate::error::{GhostError, Result};
@@ -36,7 +37,7 @@ impl GhostGroup {
             .build();
 
         let mls_group = MlsGroup::new(
-            provider.inner(),
+            provider,
             &signer,
             &config,
             credential,
@@ -61,7 +62,7 @@ impl GhostGroup {
 
         let mls_group_id = derive_mls_group_id(group_id);
         let mls_group = MlsGroup::new_with_group_id(
-            provider.inner(),
+            provider,
             &signer,
             &config,
             GroupId::from_slice(&mls_group_id),
@@ -70,6 +71,25 @@ impl GhostGroup {
         .map_err(|e| GhostError::Mls(format!("create group: {e}")))?;
 
         Ok(Self { mls_group, signer })
+    }
+
+    /// Reload a group from persistent storage.
+    pub fn load(
+        provider: &GhostProvider,
+        identity: &Identity,
+        group_id: &[u8; 32],
+    ) -> Result<Option<Self>> {
+        let mls_group_id = derive_mls_group_id(group_id);
+        let mls_group = MlsGroup::load(
+            provider.storage(),
+            &GroupId::from_slice(&mls_group_id),
+        )
+        .map_err(|e| GhostError::Mls(format!("load group: {e}")))?;
+
+        Ok(mls_group.map(|g| Self {
+            mls_group: g,
+            signer: signer_from_identity(identity),
+        }))
     }
 
     /// Add someone to this group. Returns a commit (broadcast to existing members)
@@ -81,11 +101,11 @@ impl GhostGroup {
     ) -> Result<(MlsMessageOut, MlsMessageOut)> {
         let (commit, welcome, _group_info) = self
             .mls_group
-            .add_members(provider.inner(), &self.signer, &[key_package])
+            .add_members(provider, &self.signer, &[key_package])
             .map_err(|e| GhostError::Mls(format!("add member: {e}")))?;
 
         self.mls_group
-            .merge_pending_commit(provider.inner())
+            .merge_pending_commit(provider)
             .map_err(|e| GhostError::Mls(format!("merge add commit: {e}")))?;
 
         Ok((commit, welcome))
@@ -99,11 +119,11 @@ impl GhostGroup {
     ) -> Result<MlsMessageOut> {
         let (commit, _welcome, _group_info) = self
             .mls_group
-            .remove_members(provider.inner(), &self.signer, &[member])
+            .remove_members(provider, &self.signer, &[member])
             .map_err(|e| GhostError::Mls(format!("remove member: {e}")))?;
 
         self.mls_group
-            .merge_pending_commit(provider.inner())
+            .merge_pending_commit(provider)
             .map_err(|e| GhostError::Mls(format!("merge remove commit: {e}")))?;
 
         Ok(commit)
@@ -116,7 +136,7 @@ impl GhostGroup {
         plaintext: &[u8],
     ) -> Result<MlsMessageOut> {
         self.mls_group
-            .create_message(provider.inner(), &self.signer, plaintext)
+            .create_message(provider, &self.signer, plaintext)
             .map_err(|e| GhostError::Mls(format!("encrypt: {e}")))
     }
 
@@ -131,7 +151,7 @@ impl GhostGroup {
             .try_into_protocol_message()
             .map_err(|_| GhostError::Mls("not a protocol message".into()))?;
         self.mls_group
-            .process_message(provider.inner(), protocol_message)
+            .process_message(provider, protocol_message)
             .map_err(|e| GhostError::Mls(format!("process message: {e}")))
     }
 
@@ -147,7 +167,7 @@ impl GhostGroup {
             .try_into_protocol_message()
             .map_err(|_| GhostError::Mls("not a protocol message".into()))?;
         self.mls_group
-            .process_message(provider.inner(), protocol_message)
+            .process_message(provider, protocol_message)
             .map_err(|e| GhostError::Mls(format!("process message: {e}")))
     }
 
@@ -158,7 +178,7 @@ impl GhostGroup {
         commit: StagedCommit,
     ) -> Result<()> {
         self.mls_group
-            .merge_staged_commit(provider.inner(), commit)
+            .merge_staged_commit(provider, commit)
             .map_err(|e| GhostError::Mls(format!("merge staged commit: {e}")))
     }
 
@@ -177,9 +197,9 @@ impl GhostGroup {
         };
         let join_config = MlsGroupJoinConfig::default();
         let mls_group =
-            StagedWelcome::new_from_welcome(provider.inner(), &join_config, welcome_msg, None)
+            StagedWelcome::new_from_welcome(provider, &join_config, welcome_msg, None)
                 .map_err(|e| GhostError::Mls(format!("staged welcome: {e}")))?
-                .into_group(provider.inner())
+                .into_group(provider)
                 .map_err(|e| GhostError::Mls(format!("join group: {e}")))?;
         Ok(Self { mls_group, signer })
     }
@@ -193,7 +213,7 @@ impl GhostGroup {
         length: usize,
     ) -> Result<Vec<u8>> {
         self.mls_group
-            .export_secret(provider.inner().crypto(), label, context, length)
+            .export_secret(provider.crypto(), label, context, length)
             .map_err(|e| GhostError::Mls(format!("export secret: {e}")))
     }
 
@@ -213,7 +233,7 @@ mod tests {
 
     #[test]
     fn create_group() {
-        let provider = GhostProvider::new();
+        let provider = GhostProvider::new_in_memory().unwrap();
         let id = Identity::from_seed([0x01u8; 32]).unwrap();
         let group = GhostGroup::create(&provider, &id).unwrap();
         assert!(!group.group_id().is_empty());
@@ -221,8 +241,8 @@ mod tests {
 
     #[test]
     fn add_member_and_join() {
-        let provider_a = GhostProvider::new();
-        let provider_b = GhostProvider::new();
+        let provider_a = GhostProvider::new_in_memory().unwrap();
+        let provider_b = GhostProvider::new_in_memory().unwrap();
 
         let id_a = Identity::from_seed([0x01u8; 32]).unwrap();
         let id_b = Identity::from_seed([0x02u8; 32]).unwrap();
@@ -240,8 +260,8 @@ mod tests {
 
     #[test]
     fn encrypt_decrypt_roundtrip() {
-        let provider_a = GhostProvider::new();
-        let provider_b = GhostProvider::new();
+        let provider_a = GhostProvider::new_in_memory().unwrap();
+        let provider_b = GhostProvider::new_in_memory().unwrap();
 
         let id_a = Identity::from_seed([0x01u8; 32]).unwrap();
         let id_b = Identity::from_seed([0x02u8; 32]).unwrap();
@@ -266,7 +286,7 @@ mod tests {
 
     #[test]
     fn export_secret_returns_32_bytes() {
-        let provider = GhostProvider::new();
+        let provider = GhostProvider::new_in_memory().unwrap();
         let id = Identity::from_seed([0x01u8; 32]).unwrap();
         let group = GhostGroup::create(&provider, &id).unwrap();
 
@@ -274,5 +294,21 @@ mod tests {
             .export_secret(&provider, "ghost-voice", b"test-context", 32)
             .unwrap();
         assert_eq!(secret.len(), 32);
+    }
+
+    #[test]
+    fn load_persisted_group() {
+        let provider = GhostProvider::new_in_memory().unwrap();
+        let id = Identity::from_seed([0x01u8; 32]).unwrap();
+        let group_id = [0x42u8; 32];
+
+        let original = GhostGroup::create_with_id(&provider, &id, &group_id).unwrap();
+        let original_mls_id = original.group_id().to_vec();
+
+        // Load from the same provider — state was written automatically
+        let loaded = GhostGroup::load(&provider, &id, &group_id)
+            .unwrap()
+            .expect("group should be loadable");
+        assert_eq!(loaded.group_id(), original_mls_id.as_slice());
     }
 }

@@ -486,7 +486,7 @@ mod tests {
 
     #[test]
     fn create_with_id_uses_derived_group_id() {
-        let provider = GhostProvider::new();
+        let provider = GhostProvider::new_in_memory().unwrap();
         let id = Identity::from_seed([0x01; 32]).unwrap();
         let app_group_id = [0x42; 32];
         let group = GhostGroup::create_with_id(&provider, &id, &app_group_id).unwrap();
@@ -497,8 +497,8 @@ mod tests {
 
     #[test]
     fn seal_open_roundtrip() {
-        let provider_a = GhostProvider::new();
-        let provider_b = GhostProvider::new();
+        let provider_a = GhostProvider::new_in_memory().unwrap();
+        let provider_b = GhostProvider::new_in_memory().unwrap();
         let id_a = Identity::from_seed([0x01; 32]).unwrap();
         let id_b = Identity::from_seed([0x02; 32]).unwrap();
 
@@ -532,8 +532,8 @@ mod tests {
 
     #[test]
     fn seal_open_with_references() {
-        let provider_a = GhostProvider::new();
-        let provider_b = GhostProvider::new();
+        let provider_a = GhostProvider::new_in_memory().unwrap();
+        let provider_b = GhostProvider::new_in_memory().unwrap();
         let id_a = Identity::from_seed([0x01; 32]).unwrap();
         let id_b = Identity::from_seed([0x02; 32]).unwrap();
 
@@ -566,8 +566,8 @@ mod tests {
 
     #[test]
     fn reject_spoofed_sender_fp() {
-        let provider_a = GhostProvider::new();
-        let provider_b = GhostProvider::new();
+        let provider_a = GhostProvider::new_in_memory().unwrap();
+        let provider_b = GhostProvider::new_in_memory().unwrap();
         let id_a = Identity::from_seed([0x01; 32]).unwrap();
         let id_b = Identity::from_seed([0x02; 32]).unwrap();
 
