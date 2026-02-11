@@ -114,13 +114,17 @@
   --font-mono: 'Iosevka', 'SF Mono', 'Fira Code', 'JetBrains Mono', monospace;
 }
 
+* {
+  -webkit-user-select: none;
+  user-select: none;
+}
+
 body {
   margin: 0;
   background: var(--neutral-950);
   color: var(--neutral-100);
   font-family: var(--font-mono);
   -webkit-font-smoothing: antialiased;
-  user-select: none;
 }
 
 input, textarea {

@@ -75,24 +75,32 @@ export function Sidebar(props: SidebarProps) {
       <div class="h-7 flex-shrink-0" />
 
       <Show when={props.identity}>
-        {(id) => (
-          <div class="h-14 flex-shrink-0 flex items-center gap-3 px-3">
-            <div
-              class="w-8 h-8 rounded-full flex items-center justify-center text-sm flex-shrink-0"
-              style={{ background: "var(--purple-700)", color: "var(--purple-200)" }}
-            >
-              {id().display_name[0]}
-            </div>
-            <div class="min-w-0">
-              <div class="text-sm text-[var(--neutral-200)] truncate leading-tight">
-                {id().display_name}
+        {(id) => {
+          const [copied, setCopied] = createSignal(false);
+          const copyFp = () => {
+            navigator.clipboard.writeText(id().fingerprint);
+            setCopied(true);
+            setTimeout(() => setCopied(false), 1200);
+          };
+          return (
+            <div class="h-14 flex-shrink-0 flex items-center gap-3 px-3 cursor-pointer" onClick={copyFp}>
+              <div
+                class="w-8 h-8 rounded-full flex items-center justify-center text-sm flex-shrink-0"
+                style={{ background: "var(--purple-700)", color: "var(--purple-200)" }}
+              >
+                {id().display_name[0]}
               </div>
-              <div class="text-xs text-[var(--neutral-500)] truncate leading-tight">
-                {id().fingerprint_short}
+              <div class="min-w-0">
+                <div class="text-sm text-[var(--neutral-200)] truncate leading-tight">
+                  {id().display_name}
+                </div>
+                <div class="text-xs text-[var(--neutral-500)] truncate leading-tight">
+                  {copied() ? "copied" : id().fingerprint_short}
+                </div>
               </div>
             </div>
-          </div>
-        )}
+          );
+        }}
       </Show>
 
       <div class="px-3 py-2 flex items-center justify-between">
