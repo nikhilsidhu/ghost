@@ -1,0 +1,3 @@
+[workspace]
+members = ["ghost-core", "ghost-relay"]
+resolver = "2"
