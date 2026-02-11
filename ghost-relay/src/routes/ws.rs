@@ -2,7 +2,6 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::response::{IntoResponse, Response};
 use futures_util::{SinkExt, StreamExt};
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -71,7 +70,10 @@ async fn ws_connection(socket: WebSocket, mailbox_id: [u8; 32], state: AppState)
             result = rx.recv() => {
                 let blob_id = match result {
                     Ok(id) => id,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        own_blobs.clear();
+                        continue;
+                    }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 };
                 // Skip blobs this client submitted
@@ -109,17 +111,12 @@ async fn store_blob(
     if payload.len() > state.config.max_blob_size {
         return Err(RelayError::PayloadTooLarge);
     }
-    let current_mem = state.memory_used.load(Ordering::Relaxed);
-    if current_mem + payload.len() > state.config.max_memory {
+    if !state.try_reserve(payload.len()) {
         return Err(RelayError::StorageFull);
     }
 
     let blob_id = Uuid::new_v4();
     let received_at = now_millis();
-
-    state
-        .memory_used
-        .fetch_add(payload.len(), Ordering::Relaxed);
 
     let mut map = state.mailboxes.write().await;
     let mailbox = map.entry(*mailbox_id).or_insert_with(Mailbox::new);
@@ -138,9 +135,7 @@ async fn remove_blob(state: &AppState, mailbox_id: &[u8; 32], blob_uuid: Uuid) {
     if let Some(mailbox) = map.get_mut(mailbox_id) {
         if let Some(pos) = mailbox.blobs.iter().position(|b| b.id == blob_uuid) {
             let removed = mailbox.blobs.remove(pos);
-            state
-                .memory_used
-                .fetch_sub(removed.payload.len(), Ordering::Relaxed);
+            state.release(removed.payload.len());
         }
     }
 }

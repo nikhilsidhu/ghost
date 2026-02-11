@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -24,6 +24,23 @@ pub struct Inner {
     pub config: Config,
     pub start_time: Instant,
     pub memory_used: AtomicUsize,
+}
+
+impl Inner {
+    /// Atomically reserve `size` bytes. Returns false if over limit.
+    pub fn try_reserve(&self, size: usize) -> bool {
+        let prev = self.memory_used.fetch_add(size, Ordering::Relaxed);
+        if prev + size > self.config.max_memory {
+            self.memory_used.fetch_sub(size, Ordering::Relaxed);
+            false
+        } else {
+            true
+        }
+    }
+
+    pub fn release(&self, size: usize) {
+        self.memory_used.fetch_sub(size, Ordering::Relaxed);
+    }
 }
 
 pub type AppState = Arc<Inner>;

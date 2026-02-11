@@ -3,10 +3,10 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use serde::Serialize;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 use uuid::Uuid;
 
+use crate::constants::MAX_LONG_POLL_MS;
 use crate::error::{RelayError, Result};
 use crate::mailbox::{Blob, Mailbox};
 use crate::state::AppState;
@@ -46,18 +46,13 @@ pub async fn post_blob(
         return Err(RelayError::PayloadTooLarge);
     }
 
-    let current_mem = state.memory_used.load(Ordering::Relaxed);
-    if current_mem + body.len() > state.config.max_memory {
-        return Err(RelayError::StorageFull);
-    }
-
     let blob_id = Uuid::new_v4();
     let received_at = now_millis();
     let payload = body.to_vec();
 
-    state
-        .memory_used
-        .fetch_add(payload.len(), Ordering::Relaxed);
+    if !state.try_reserve(payload.len()) {
+        return Err(RelayError::StorageFull);
+    }
 
     let mut map = state.mailboxes.write().await;
     let mailbox = map.entry(id).or_insert_with(Mailbox::new);
@@ -90,7 +85,8 @@ pub async fn get_blobs(
         .get("X-Ghost-Long-Poll")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .min(MAX_LONG_POLL_MS);
 
     // No long-poll: read lock, no mailbox creation
     if timeout_ms == 0 {
@@ -141,9 +137,7 @@ pub async fn delete_blob(
         .ok_or(RelayError::NotFound)?;
 
     let removed = mailbox.blobs.remove(pos);
-    state
-        .memory_used
-        .fetch_sub(removed.payload.len(), Ordering::Relaxed);
+    state.release(removed.payload.len());
 
     Ok(StatusCode::NO_CONTENT)
 }

@@ -1,4 +1,3 @@
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use crate::constants::WORKER_INTERVAL_SECS;
@@ -39,13 +38,26 @@ pub async fn run(state: AppState) {
         }
 
         if freed > 0 {
-            state.memory_used.fetch_sub(freed, Ordering::Relaxed);
+            state.release(freed);
         }
 
         // Sweep expired invites
+        let mut invite_freed = 0usize;
         {
             let mut invites = state.invites.write().await;
-            invites.retain(|_, inv| inv.expires_at > now);
+            invites.retain(|_, inv| {
+                if inv.expires_at > now {
+                    return true;
+                }
+                invite_freed += inv.joins.iter().map(|j| j.len()).sum::<usize>();
+                if let Some(ref a) = inv.accept {
+                    invite_freed += a.len();
+                }
+                false
+            });
+        }
+        if invite_freed > 0 {
+            state.release(invite_freed);
         }
     }
 }

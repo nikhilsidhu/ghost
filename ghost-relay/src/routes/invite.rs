@@ -8,7 +8,7 @@ use serde::Deserialize;
 use std::time::Duration;
 use tokio::sync::broadcast;
 
-use crate::constants::{DEFAULT_LONG_POLL_MS, NOTIFY_CAPACITY};
+use crate::constants::{DEFAULT_LONG_POLL_MS, MAX_LONG_POLL_MS, NOTIFY_CAPACITY};
 use crate::error::{RelayError, Result};
 use crate::state::{AppState, Invite};
 use crate::util::now_millis;
@@ -53,14 +53,27 @@ pub async fn join(
     body: Bytes,
 ) -> Result<StatusCode> {
     let now = now_millis();
+    let payload = body.to_vec();
+
+    if !state.try_reserve(payload.len()) {
+        return Err(RelayError::StorageFull);
+    }
+
     let mut invites = state.invites.write().await;
-    let invite = invites.get_mut(&token).ok_or(RelayError::NotFound)?;
+    let invite = match invites.get_mut(&token) {
+        Some(inv) => inv,
+        None => {
+            state.release(payload.len());
+            return Err(RelayError::NotFound);
+        }
+    };
 
     if invite.expires_at <= now || invite.uses >= invite.max_uses {
+        state.release(payload.len());
         return Err(RelayError::Gone("invite expired or fully used".into()));
     }
 
-    invite.joins.push(body.to_vec());
+    invite.joins.push(payload);
     invite.uses += 1;
     let _ = invite.join_notify.send(());
 
@@ -76,7 +89,8 @@ pub async fn get_joins(
         .get("X-Ghost-Long-Poll")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_LONG_POLL_MS);
+        .unwrap_or(DEFAULT_LONG_POLL_MS)
+        .min(MAX_LONG_POLL_MS);
 
     // Check + subscribe under one lock to avoid race
     let mut rx = {
@@ -105,10 +119,27 @@ pub async fn post_accept(
     Path(token): Path<String>,
     body: Bytes,
 ) -> Result<StatusCode> {
-    let mut invites = state.invites.write().await;
-    let invite = invites.get_mut(&token).ok_or(RelayError::NotFound)?;
+    let payload = body.to_vec();
 
-    invite.accept = Some(body.to_vec());
+    if !state.try_reserve(payload.len()) {
+        return Err(RelayError::StorageFull);
+    }
+
+    let mut invites = state.invites.write().await;
+    let invite = match invites.get_mut(&token) {
+        Some(inv) => inv,
+        None => {
+            state.release(payload.len());
+            return Err(RelayError::NotFound);
+        }
+    };
+
+    if invite.accept.is_some() {
+        state.release(payload.len());
+        return Err(RelayError::BadRequest("accept already posted".into()));
+    }
+
+    invite.accept = Some(payload);
     let _ = invite.accept_notify.send(());
 
     Ok(StatusCode::NO_CONTENT)
@@ -123,7 +154,8 @@ pub async fn get_accept(
         .get("X-Ghost-Long-Poll")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_LONG_POLL_MS);
+        .unwrap_or(DEFAULT_LONG_POLL_MS)
+        .min(MAX_LONG_POLL_MS);
 
     // Check + subscribe under one lock to avoid race
     let mut rx = {
