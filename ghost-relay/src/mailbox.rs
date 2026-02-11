@@ -11,7 +11,7 @@ pub struct Blob {
 
 pub struct Mailbox {
     pub blobs: Vec<Blob>,
-    pub tx: broadcast::Sender<()>,
+    pub tx: broadcast::Sender<Uuid>,
 }
 
 impl Mailbox {

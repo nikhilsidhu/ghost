@@ -63,7 +63,7 @@ pub async fn post_blob(
     let mailbox = map.entry(id).or_insert_with(Mailbox::new);
 
     // Wake any long-poll or WS subscribers; ignore if none connected
-    let _ = mailbox.tx.send(());
+    let _ = mailbox.tx.send(blob_id);
 
     mailbox.blobs.push(Blob {
         id: blob_id,
