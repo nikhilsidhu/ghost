@@ -1,6 +1,9 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use rand::RngCore;
 use tauri::State;
+
+use ghost_core::storage::{Channel, ChannelKind};
 
 use crate::dto::{ChannelDto, GroupDto, IdentityDto, MemberDto, MessageDto};
 use crate::state::AppState;
@@ -129,4 +132,62 @@ pub fn send_message(
         .get_message(&msg_id)
         .map_err(|e| e.to_string())?;
     Ok(MessageDto::from(&stored))
+}
+
+#[tauri::command]
+pub fn create_channel(
+    group_id: String,
+    name: String,
+    kind: String,
+    state: State<AppState>,
+) -> Result<ChannelDto, String> {
+    let gid = parse_id(&group_id)?;
+    let mut channel_id = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut channel_id);
+    let kind = match kind.as_str() {
+        "voice" => ChannelKind::Voice,
+        _ => ChannelKind::Text,
+    };
+    let client = state.client.lock().map_err(|e| e.to_string())?;
+    let position = client
+        .store()
+        .list_channels(&gid)
+        .map_err(|e| e.to_string())?
+        .len() as i32;
+    let channel = Channel {
+        channel_id,
+        group_id: gid,
+        name,
+        kind,
+        position,
+    };
+    client
+        .store()
+        .insert_channel(&channel)
+        .map_err(|e| e.to_string())?;
+    Ok(ChannelDto::from(&channel))
+}
+
+#[tauri::command]
+pub fn rename_channel(
+    channel_id: String,
+    name: String,
+    state: State<AppState>,
+) -> Result<(), String> {
+    let cid = parse_id(&channel_id)?;
+    let client = state.client.lock().map_err(|e| e.to_string())?;
+    client
+        .store()
+        .rename_channel(&cid, &name)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn delete_channel(channel_id: String, state: State<AppState>) -> Result<(), String> {
+    let cid = parse_id(&channel_id)?;
+    let client = state.client.lock().map_err(|e| e.to_string())?;
+    client
+        .store()
+        .delete_channel(&cid)
+        .map_err(|e| e.to_string())
 }

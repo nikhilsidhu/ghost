@@ -20,6 +20,9 @@ fn main() {
             commands::list_pinned_groups,
             commands::list_messages,
             commands::send_message,
+            commands::create_channel,
+            commands::rename_channel,
+            commands::delete_channel,
         ])
         .run(tauri::generate_context!())
         .expect("error while running ghost");

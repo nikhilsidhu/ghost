@@ -28,3 +28,12 @@ export const listMessages = (channelId: string, before?: number, limit?: number)
 
 export const sendMessage = (groupId: string, channelId: string, content: string) =>
   invoke<Message>("send_message", { groupId, channelId, content });
+
+export const createChannel = (groupId: string, name: string, kind: string) =>
+  invoke<Channel>("create_channel", { groupId, name, kind });
+
+export const renameChannel = (channelId: string, name: string) =>
+  invoke<void>("rename_channel", { channelId, name });
+
+export const deleteChannel = (channelId: string) =>
+  invoke<void>("delete_channel", { channelId });
