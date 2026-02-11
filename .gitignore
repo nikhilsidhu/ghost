@@ -15,7 +15,8 @@ dist/
 **/src-tauri/gen/
 **/src-tauri/WixTools/
 
-# Environment
+# Secrets
+*.key
 .env
 .env.*
 
