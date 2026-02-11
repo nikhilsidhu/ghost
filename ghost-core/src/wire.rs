@@ -496,7 +496,7 @@ mod tests {
         let bob_kp = generate_key_package(&bob_provider, &bob).unwrap();
         let (_commit, welcome) = alice_group.add_member(&alice_provider, bob_kp).unwrap();
         let mut bob_group =
-            GhostGroup::join_from_welcome(&bob_provider, &bob, welcome).unwrap();
+            GhostGroup::join(&bob_provider, &bob, &welcome.to_bytes().unwrap()).unwrap();
 
         let msg = ApplicationMessage::new(
             MessageType::Text,
@@ -531,7 +531,7 @@ mod tests {
         let bob_kp = generate_key_package(&bob_provider, &bob).unwrap();
         let (_commit, welcome) = alice_group.add_member(&alice_provider, bob_kp).unwrap();
         let mut bob_group =
-            GhostGroup::join_from_welcome(&bob_provider, &bob, welcome).unwrap();
+            GhostGroup::join(&bob_provider, &bob, &welcome.to_bytes().unwrap()).unwrap();
 
         let target = [0xCC; 32];
         let msg = ApplicationMessage::new(

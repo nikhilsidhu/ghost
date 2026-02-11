@@ -162,12 +162,83 @@ impl GhostClient {
 
         Ok(msg)
     }
+
+    pub fn invite_member(
+        &mut self,
+        group_id: &[u8; 32],
+        key_package: KeyPackage,
+        invitee_fp: [u8; 32],
+        invitee_name: &str,
+        timestamp: u64,
+    ) -> Result<(Outbound, Vec<u8>)> {
+        let group = self.groups.get_mut(group_id).ok_or_else(|| {
+            GhostError::GroupNotLoaded(hex::encode(&group_id[..8]))
+        })?;
+
+        let (commit, welcome) = group.add_member(&self.provider, key_package)?;
+
+        let commit_blob = commit
+            .to_bytes()
+            .map_err(|e| GhostError::Mls(format!("serialize commit: {e}")))?;
+        let welcome_bytes = welcome
+            .to_bytes()
+            .map_err(|e| GhostError::Mls(format!("serialize welcome: {e}")))?;
+
+        let mailbox_id = group_mailbox_id(group.group_id());
+
+        self.store.insert_member(&Member {
+            group_id: *group_id,
+            fingerprint: invitee_fp,
+            display_name: invitee_name.to_string(),
+            role: MemberRole::Member,
+            joined_at: timestamp,
+        })?;
+
+        Ok((Outbound { mailbox_id, blob: commit_blob }, welcome_bytes))
+    }
+
+    pub fn join_group(
+        &mut self,
+        group_id: &[u8; 32],
+        welcome_bytes: &[u8],
+        group_name: &str,
+        timestamp: u64,
+    ) -> Result<()> {
+        let ghost_group =
+            GhostGroup::join(&self.provider, &self.identity, welcome_bytes)?;
+
+        self.store.insert_group(&Group {
+            group_id: *group_id,
+            name: group_name.to_string(),
+            creator_fp: [0u8; 32],
+            created_at: timestamp,
+        })?;
+
+        let channel_id = derive_default_channel_id(group_id);
+        self.store.insert_channel(&Channel {
+            channel_id,
+            group_id: *group_id,
+            name: "general".to_string(),
+            kind: ChannelKind::Text,
+            position: 0,
+        })?;
+
+        self.store.insert_member(&Member {
+            group_id: *group_id,
+            fingerprint: self.identity.fingerprint,
+            display_name: self.identity.display_name.clone(),
+            role: MemberRole::Member,
+            joined_at: timestamp,
+        })?;
+
+        self.groups.insert(*group_id, ghost_group);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mls::credential::generate_key_package;
 
     /// Returns (creator, joiner, group_id) with both clients in a shared MLS group.
     fn setup_two_clients() -> (GhostClient, GhostClient, [u8; 32]) {
@@ -175,41 +246,14 @@ mod tests {
         let mut c2 = GhostClient::open_in_memory([0x02; 32]).unwrap();
 
         let group_id = c1.create_group("test", 1000).unwrap();
-        let channel_id = derive_default_channel_id(&group_id);
 
-        let kp = generate_key_package(&c2.provider, &c2.identity).unwrap();
-        let g1 = c1.groups.get_mut(&group_id).unwrap();
-        let (_commit, welcome) = g1.add_member(&c1.provider, kp).unwrap();
+        let kp = c2.generate_key_package().unwrap();
+        let fp = *c2.fingerprint();
+        let name = c2.identity().display_name.clone();
+        let (_outbound, welcome_bytes) =
+            c1.invite_member(&group_id, kp, fp, &name, 1000).unwrap();
 
-        let g2 = GhostGroup::join_from_welcome(&c2.provider, &c2.identity, welcome).unwrap();
-        c2.groups.insert(group_id, g2);
-
-        c2.store
-            .insert_group(&Group {
-                group_id,
-                name: "test".to_string(),
-                creator_fp: c1.identity.fingerprint,
-                created_at: 1000,
-            })
-            .unwrap();
-        c2.store
-            .insert_channel(&Channel {
-                channel_id,
-                group_id,
-                name: "general".to_string(),
-                kind: ChannelKind::Text,
-                position: 0,
-            })
-            .unwrap();
-        c2.store
-            .insert_member(&Member {
-                group_id,
-                fingerprint: c2.identity.fingerprint,
-                display_name: c2.identity.display_name.clone(),
-                role: MemberRole::Member,
-                joined_at: 1000,
-            })
-            .unwrap();
+        c2.join_group(&group_id, &welcome_bytes, "test", 1000).unwrap();
 
         (c1, c2, group_id)
     }
@@ -294,5 +338,46 @@ mod tests {
 
         let stored = c2.store().get_message(&msg_id).unwrap();
         assert_eq!(stored.content, b"hello");
+    }
+
+    #[test]
+    fn two_client_full_flow() {
+        let mut c1 = GhostClient::open_in_memory([0x01; 32]).unwrap();
+        let mut c2 = GhostClient::open_in_memory([0x02; 32]).unwrap();
+
+        let group_id = c1.create_group("full-flow", 1000).unwrap();
+        let channel_id = derive_default_channel_id(&group_id);
+
+        // c1 invites c2
+        let kp = c2.generate_key_package().unwrap();
+        let fp = *c2.fingerprint();
+        let name = c2.identity().display_name.clone();
+        let (_outbound, welcome) =
+            c1.invite_member(&group_id, kp, fp, &name, 1000).unwrap();
+
+        // c2 joins
+        c2.join_group(&group_id, &welcome, "full-flow", 1000).unwrap();
+
+        // c1 sends, c2 receives
+        let (out1, id1) = c1
+            .send_message(&group_id, &channel_id, b"from c1".to_vec(), vec![], 2000)
+            .unwrap();
+        let recv1 = c2.receive_blob(&group_id, &out1.blob).unwrap();
+        assert_eq!(recv1.content, b"from c1");
+        assert_eq!(recv1.sender_fp, *c1.fingerprint());
+
+        // c2 sends, c1 receives
+        let (out2, id2) = c2
+            .send_message(&group_id, &channel_id, b"from c2".to_vec(), vec![], 3000)
+            .unwrap();
+        let recv2 = c1.receive_blob(&group_id, &out2.blob).unwrap();
+        assert_eq!(recv2.content, b"from c2");
+        assert_eq!(recv2.sender_fp, *c2.fingerprint());
+
+        // Both stores have both messages
+        assert_eq!(c1.store().get_message(&id1).unwrap().content, b"from c1");
+        assert_eq!(c1.store().get_message(&id2).unwrap().content, b"from c2");
+        assert_eq!(c2.store().get_message(&id1).unwrap().content, b"from c1");
+        assert_eq!(c2.store().get_message(&id2).unwrap().content, b"from c2");
     }
 }

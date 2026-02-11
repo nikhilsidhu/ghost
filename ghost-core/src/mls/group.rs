@@ -162,27 +162,25 @@ impl GhostGroup {
             .map_err(|e| GhostError::Mls(format!("merge staged commit: {e}")))
     }
 
-    /// Join an existing group using the Welcome message we received after being added.
-    pub fn join_from_welcome(
+    /// Join an existing group using a serialized Welcome message.
+    pub fn join(
         provider: &GhostProvider,
         identity: &Identity,
-        welcome: MlsMessageOut,
+        bytes: &[u8],
     ) -> Result<Self> {
         let signer = signer_from_identity(identity);
-
-        let msg_in = outbound_to_inbound(&welcome)?;
+        let msg_in = MlsMessageIn::tls_deserialize_exact(bytes)
+            .map_err(|e| GhostError::Mls(format!("deserialize welcome: {e}")))?;
         let welcome_msg = match msg_in.extract() {
             MlsMessageBodyIn::Welcome(w) => w,
             _ => return Err(GhostError::Mls("not a welcome message".into())),
         };
-
         let join_config = MlsGroupJoinConfig::default();
         let mls_group =
             StagedWelcome::new_from_welcome(provider.inner(), &join_config, welcome_msg, None)
                 .map_err(|e| GhostError::Mls(format!("staged welcome: {e}")))?
                 .into_group(provider.inner())
                 .map_err(|e| GhostError::Mls(format!("join group: {e}")))?;
-
         Ok(Self { mls_group, signer })
     }
 
@@ -235,7 +233,7 @@ mod tests {
         let (_commit, welcome) = alice_group.add_member(&alice_provider, bob_kp).unwrap();
 
         let bob_group =
-            GhostGroup::join_from_welcome(&bob_provider, &bob, welcome).unwrap();
+            GhostGroup::join(&bob_provider, &bob, &welcome.to_bytes().unwrap()).unwrap();
 
         assert_eq!(alice_group.group_id(), bob_group.group_id());
     }
@@ -252,7 +250,7 @@ mod tests {
         let bob_kp = generate_key_package(&bob_provider, &bob).unwrap();
         let (_commit, welcome) = alice_group.add_member(&alice_provider, bob_kp).unwrap();
         let mut bob_group =
-            GhostGroup::join_from_welcome(&bob_provider, &bob, welcome).unwrap();
+            GhostGroup::join(&bob_provider, &bob, &welcome.to_bytes().unwrap()).unwrap();
 
         let msg = b"hello from alice";
         let ciphertext = alice_group.encrypt(&alice_provider, msg).unwrap();
@@ -278,7 +276,7 @@ mod tests {
         let bob_kp = generate_key_package(&bob_provider, &bob).unwrap();
         let (_commit, welcome) = alice_group.add_member(&alice_provider, bob_kp).unwrap();
         let mut bob_group =
-            GhostGroup::join_from_welcome(&bob_provider, &bob, welcome).unwrap();
+            GhostGroup::join(&bob_provider, &bob, &welcome.to_bytes().unwrap()).unwrap();
 
         // Bob sends a DM to Alice
         let msg = b"hey alice, this is a DM";
