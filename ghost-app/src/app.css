@@ -1,1 +1,123 @@
 @import "tailwindcss";
+
+@font-face {
+  font-family: 'Iosevka';
+  src: local('Iosevka'), local('Iosevka Term');
+  font-weight: 100 900;
+}
+
+:root {
+  /* Neutral — mauve-tinted greys, cohesive with purple brand */
+  --neutral-50: #eeedf5;
+  --neutral-100: #d8d6e3;
+  --neutral-200: #adabc0;
+  --neutral-300: #83809d;
+  --neutral-400: #5d5a78;
+  --neutral-500: #403d58;
+  --neutral-600: #2b2940;
+  --neutral-700: #1e1c2e;
+  --neutral-800: #141320;
+  --neutral-900: #0a0a14;
+  --neutral-950: #000000;
+
+  /* Purple — amethyst, brand signature */
+  --purple-50: #f3eeff;
+  --purple-100: #e2d5ff;
+  --purple-200: #c4abff;
+  --purple-300: #a680ff;
+  --purple-400: #8f5fe6;
+  --purple-500: #7c52d6;
+  --purple-600: #6642b0;
+  --purple-700: #50338a;
+  --purple-800: #3a2464;
+  --purple-900: #24163e;
+  --purple-950: #120b1f;
+
+  /* Violet — secondary accent, cooler complement */
+  --violet-50: #eeeeff;
+  --violet-100: #d6d6ff;
+  --violet-200: #ababff;
+  --violet-300: #8080e6;
+  --violet-400: #5e5ec4;
+  --violet-500: #4a4aaa;
+  --violet-600: #38388a;
+  --violet-700: #2a2a6a;
+  --violet-800: #1c1c4a;
+  --violet-900: #10102e;
+  --violet-950: #080818;
+
+  /* Red — danger, crimson matte */
+  --red-50: #fff0f0;
+  --red-100: #ffd6d8;
+  --red-200: #ffabb0;
+  --red-300: #f08088;
+  --red-400: #e05560;
+  --red-500: #c43c48;
+  --red-600: #a02838;
+  --red-700: #7c1c2a;
+  --red-800: #58121e;
+  --red-900: #340a12;
+  --red-950: #1a0509;
+
+  /* Amber — warning, warm gold */
+  --amber-50: #fff8ea;
+  --amber-100: #ffeccc;
+  --amber-200: #ffd898;
+  --amber-300: #ffc264;
+  --amber-400: #e6a838;
+  --amber-500: #c48c20;
+  --amber-600: #a07018;
+  --amber-700: #7c5412;
+  --amber-800: #583a0c;
+  --amber-900: #342008;
+  --amber-950: #1a1004;
+
+  /* Emerald — success, matte forest */
+  --emerald-50: #eefff5;
+  --emerald-100: #d0ffe2;
+  --emerald-200: #98ffc2;
+  --emerald-300: #60e098;
+  --emerald-400: #38c078;
+  --emerald-500: #28a060;
+  --emerald-600: #1c8048;
+  --emerald-700: #146038;
+  --emerald-800: #0e4028;
+  --emerald-900: #082418;
+  --emerald-950: #04120c;
+
+  /* Cyan — info, cool teal */
+  --cyan-50: #eafaff;
+  --cyan-100: #ccf0ff;
+  --cyan-200: #98dcff;
+  --cyan-300: #64c4e6;
+  --cyan-400: #38a8c8;
+  --cyan-500: #2890a8;
+  --cyan-600: #1c7488;
+  --cyan-700: #145868;
+  --cyan-800: #0e3c48;
+  --cyan-900: #082228;
+  --cyan-950: #041114;
+
+  /* Rose — attention, notifications */
+  --rose-50: #fff0f5;
+  --rose-100: #ffd6e6;
+  --rose-200: #ffabcc;
+  --rose-300: #f080ae;
+  --rose-400: #e05590;
+  --rose-500: #c43c74;
+  --rose-600: #a0285c;
+  --rose-700: #7c1c44;
+  --rose-800: #58122e;
+  --rose-900: #340a1a;
+  --rose-950: #1a050d;
+
+  --font-mono: 'Iosevka', 'SF Mono', 'Fira Code', 'JetBrains Mono', monospace;
+}
+
+body {
+  margin: 0;
+  background: var(--neutral-950);
+  color: var(--neutral-100);
+  font-family: var(--font-mono);
+  -webkit-font-smoothing: antialiased;
+}

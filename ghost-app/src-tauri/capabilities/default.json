@@ -4,6 +4,7 @@
   "description": "Default capabilities for Ghost",
   "windows": ["main"],
   "permissions": [
-    "core:default"
+    "core:default",
+    "core:window:allow-start-dragging"
   ]
 }
