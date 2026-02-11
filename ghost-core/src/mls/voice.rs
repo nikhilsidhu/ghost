@@ -91,20 +91,20 @@ mod tests {
     #[test]
     fn derive_voice_key_deterministic() {
         let provider = GhostProvider::new();
-        let alice = Identity::from_seed([0x01u8; 32]).unwrap();
-        let group = super::super::group::GhostGroup::create(&provider, &alice).unwrap();
+        let id = Identity::from_seed([0x01u8; 32]).unwrap();
+        let group = super::super::group::GhostGroup::create(&provider, &id).unwrap();
 
         let channel_id = [0xFFu8; 32];
-        let key1 = derive_voice_key(&group, &provider, &channel_id, &alice.fingerprint).unwrap();
-        let key2 = derive_voice_key(&group, &provider, &channel_id, &alice.fingerprint).unwrap();
+        let key1 = derive_voice_key(&group, &provider, &channel_id, &id.fingerprint).unwrap();
+        let key2 = derive_voice_key(&group, &provider, &channel_id, &id.fingerprint).unwrap();
         assert_eq!(key1, key2);
     }
 
     #[test]
     fn different_sender_different_key() {
         let provider = GhostProvider::new();
-        let alice = Identity::from_seed([0x01u8; 32]).unwrap();
-        let group = super::super::group::GhostGroup::create(&provider, &alice).unwrap();
+        let id = Identity::from_seed([0x01u8; 32]).unwrap();
+        let group = super::super::group::GhostGroup::create(&provider, &id).unwrap();
 
         let channel_id = [0xFFu8; 32];
         let fp_a = [0xAAu8; 32];

@@ -487,9 +487,9 @@ mod tests {
     #[test]
     fn create_with_id_uses_derived_group_id() {
         let provider = GhostProvider::new();
-        let alice = Identity::from_seed([0x01; 32]).unwrap();
+        let id = Identity::from_seed([0x01; 32]).unwrap();
         let app_group_id = [0x42; 32];
-        let group = GhostGroup::create_with_id(&provider, &alice, &app_group_id).unwrap();
+        let group = GhostGroup::create_with_id(&provider, &id, &app_group_id).unwrap();
 
         let expected = derive_mls_group_id(&app_group_id);
         assert_eq!(group.group_id(), expected);
@@ -497,67 +497,67 @@ mod tests {
 
     #[test]
     fn seal_open_roundtrip() {
-        let alice_provider = GhostProvider::new();
-        let bob_provider = GhostProvider::new();
-        let alice = Identity::from_seed([0x01; 32]).unwrap();
-        let bob = Identity::from_seed([0x02; 32]).unwrap();
+        let provider_a = GhostProvider::new();
+        let provider_b = GhostProvider::new();
+        let id_a = Identity::from_seed([0x01; 32]).unwrap();
+        let id_b = Identity::from_seed([0x02; 32]).unwrap();
 
         let app_group_id = [0x42; 32];
-        let mut alice_group =
-            GhostGroup::create_with_id(&alice_provider, &alice, &app_group_id).unwrap();
-        let bob_kp = generate_key_package(&bob_provider, &bob).unwrap();
-        let (_commit, welcome) = alice_group.add_member(&alice_provider, bob_kp).unwrap();
-        let mut bob_group =
-            GhostGroup::join(&bob_provider, &bob, &welcome.to_bytes().unwrap()).unwrap();
+        let mut group_a =
+            GhostGroup::create_with_id(&provider_a, &id_a, &app_group_id).unwrap();
+        let kp_b = generate_key_package(&provider_b, &id_b).unwrap();
+        let (_commit, welcome) = group_a.add_member(&provider_a, kp_b).unwrap();
+        let mut group_b =
+            GhostGroup::join(&provider_b, &id_b, &welcome.to_bytes().unwrap()).unwrap();
 
         let msg = ApplicationMessage::new(
             MessageType::Text,
             test_channel(),
-            alice.fingerprint,
+            id_a.fingerprint,
             1000,
             vec![],
-            b"hello from alice".to_vec(),
+            b"hello from sender".to_vec(),
         )
         .unwrap();
 
-        let blob = seal(&mut alice_group, &alice_provider, &msg).unwrap();
-        let decrypted = open(&mut bob_group, &bob_provider, &blob).unwrap();
+        let blob = seal(&mut group_a, &provider_a, &msg).unwrap();
+        let decrypted = open(&mut group_b, &provider_b, &blob).unwrap();
 
         assert_eq!(decrypted.message_type, MessageType::Text);
         assert_eq!(decrypted.channel_id, test_channel());
-        assert_eq!(decrypted.sender_fp, alice.fingerprint);
-        assert_eq!(decrypted.content, b"hello from alice");
+        assert_eq!(decrypted.sender_fp, id_a.fingerprint);
+        assert_eq!(decrypted.content, b"hello from sender");
         assert_eq!(decrypted.message_id, msg.message_id);
     }
 
     #[test]
     fn seal_open_with_references() {
-        let alice_provider = GhostProvider::new();
-        let bob_provider = GhostProvider::new();
-        let alice = Identity::from_seed([0x01; 32]).unwrap();
-        let bob = Identity::from_seed([0x02; 32]).unwrap();
+        let provider_a = GhostProvider::new();
+        let provider_b = GhostProvider::new();
+        let id_a = Identity::from_seed([0x01; 32]).unwrap();
+        let id_b = Identity::from_seed([0x02; 32]).unwrap();
 
         let app_group_id = [0x42; 32];
-        let mut alice_group =
-            GhostGroup::create_with_id(&alice_provider, &alice, &app_group_id).unwrap();
-        let bob_kp = generate_key_package(&bob_provider, &bob).unwrap();
-        let (_commit, welcome) = alice_group.add_member(&alice_provider, bob_kp).unwrap();
-        let mut bob_group =
-            GhostGroup::join(&bob_provider, &bob, &welcome.to_bytes().unwrap()).unwrap();
+        let mut group_a =
+            GhostGroup::create_with_id(&provider_a, &id_a, &app_group_id).unwrap();
+        let kp_b = generate_key_package(&provider_b, &id_b).unwrap();
+        let (_commit, welcome) = group_a.add_member(&provider_a, kp_b).unwrap();
+        let mut group_b =
+            GhostGroup::join(&provider_b, &id_b, &welcome.to_bytes().unwrap()).unwrap();
 
         let target = [0xCC; 32];
         let msg = ApplicationMessage::new(
             MessageType::Text,
             test_channel(),
-            bob.fingerprint,
+            id_b.fingerprint,
             2000,
             vec![target],
             b"replying".to_vec(),
         )
         .unwrap();
 
-        let blob = seal(&mut bob_group, &bob_provider, &msg).unwrap();
-        let decrypted = open(&mut alice_group, &alice_provider, &blob).unwrap();
+        let blob = seal(&mut group_b, &provider_b, &msg).unwrap();
+        let decrypted = open(&mut group_a, &provider_a, &blob).unwrap();
 
         assert_eq!(decrypted.references.len(), 1);
         assert_eq!(decrypted.references[0], target);
@@ -566,32 +566,32 @@ mod tests {
 
     #[test]
     fn reject_spoofed_sender_fp() {
-        let alice_provider = GhostProvider::new();
-        let bob_provider = GhostProvider::new();
-        let alice = Identity::from_seed([0x01; 32]).unwrap();
-        let bob = Identity::from_seed([0x02; 32]).unwrap();
+        let provider_a = GhostProvider::new();
+        let provider_b = GhostProvider::new();
+        let id_a = Identity::from_seed([0x01; 32]).unwrap();
+        let id_b = Identity::from_seed([0x02; 32]).unwrap();
 
         let app_group_id = [0x42; 32];
-        let mut alice_group =
-            GhostGroup::create_with_id(&alice_provider, &alice, &app_group_id).unwrap();
-        let bob_kp = generate_key_package(&bob_provider, &bob).unwrap();
-        let (_commit, welcome) = alice_group.add_member(&alice_provider, bob_kp).unwrap();
-        let mut bob_group =
-            GhostGroup::join(&bob_provider, &bob, &welcome.to_bytes().unwrap()).unwrap();
+        let mut group_a =
+            GhostGroup::create_with_id(&provider_a, &id_a, &app_group_id).unwrap();
+        let kp_b = generate_key_package(&provider_b, &id_b).unwrap();
+        let (_commit, welcome) = group_a.add_member(&provider_a, kp_b).unwrap();
+        let mut group_b =
+            GhostGroup::join(&provider_b, &id_b, &welcome.to_bytes().unwrap()).unwrap();
 
-        // Alice crafts a message claiming to be Bob
+        // Sender crafts a message claiming to be the other member
         let msg = ApplicationMessage::new(
             MessageType::Text,
             test_channel(),
-            bob.fingerprint, // lying about sender
+            id_b.fingerprint, // lying about sender
             1000,
             vec![],
             b"forged".to_vec(),
         )
         .unwrap();
 
-        let blob = seal(&mut alice_group, &alice_provider, &msg).unwrap();
-        let result = open(&mut bob_group, &bob_provider, &blob);
+        let blob = seal(&mut group_a, &provider_a, &msg).unwrap();
+        let result = open(&mut group_b, &provider_b, &blob);
         assert!(result.is_err());
     }
 }

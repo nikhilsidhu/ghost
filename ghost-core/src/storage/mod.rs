@@ -199,7 +199,7 @@ mod tests {
         Member {
             group_id,
             fingerprint: rand_id(),
-            display_name: "alice".to_string(),
+            display_name: "user".to_string(),
             role,
             joined_at: 2000,
         }

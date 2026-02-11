@@ -214,47 +214,47 @@ mod tests {
     #[test]
     fn create_group() {
         let provider = GhostProvider::new();
-        let alice = Identity::from_seed([0x01u8; 32]).unwrap();
-        let group = GhostGroup::create(&provider, &alice).unwrap();
+        let id = Identity::from_seed([0x01u8; 32]).unwrap();
+        let group = GhostGroup::create(&provider, &id).unwrap();
         assert!(!group.group_id().is_empty());
     }
 
     #[test]
     fn add_member_and_join() {
-        let alice_provider = GhostProvider::new();
-        let bob_provider = GhostProvider::new();
+        let provider_a = GhostProvider::new();
+        let provider_b = GhostProvider::new();
 
-        let alice = Identity::from_seed([0x01u8; 32]).unwrap();
-        let bob = Identity::from_seed([0x02u8; 32]).unwrap();
+        let id_a = Identity::from_seed([0x01u8; 32]).unwrap();
+        let id_b = Identity::from_seed([0x02u8; 32]).unwrap();
 
-        let mut alice_group = GhostGroup::create(&alice_provider, &alice).unwrap();
-        let bob_kp = generate_key_package(&bob_provider, &bob).unwrap();
+        let mut group_a = GhostGroup::create(&provider_a, &id_a).unwrap();
+        let kp_b = generate_key_package(&provider_b, &id_b).unwrap();
 
-        let (_commit, welcome) = alice_group.add_member(&alice_provider, bob_kp).unwrap();
+        let (_commit, welcome) = group_a.add_member(&provider_a, kp_b).unwrap();
 
-        let bob_group =
-            GhostGroup::join(&bob_provider, &bob, &welcome.to_bytes().unwrap()).unwrap();
+        let group_b =
+            GhostGroup::join(&provider_b, &id_b, &welcome.to_bytes().unwrap()).unwrap();
 
-        assert_eq!(alice_group.group_id(), bob_group.group_id());
+        assert_eq!(group_a.group_id(), group_b.group_id());
     }
 
     #[test]
     fn encrypt_decrypt_roundtrip() {
-        let alice_provider = GhostProvider::new();
-        let bob_provider = GhostProvider::new();
+        let provider_a = GhostProvider::new();
+        let provider_b = GhostProvider::new();
 
-        let alice = Identity::from_seed([0x01u8; 32]).unwrap();
-        let bob = Identity::from_seed([0x02u8; 32]).unwrap();
+        let id_a = Identity::from_seed([0x01u8; 32]).unwrap();
+        let id_b = Identity::from_seed([0x02u8; 32]).unwrap();
 
-        let mut alice_group = GhostGroup::create(&alice_provider, &alice).unwrap();
-        let bob_kp = generate_key_package(&bob_provider, &bob).unwrap();
-        let (_commit, welcome) = alice_group.add_member(&alice_provider, bob_kp).unwrap();
-        let mut bob_group =
-            GhostGroup::join(&bob_provider, &bob, &welcome.to_bytes().unwrap()).unwrap();
+        let mut group_a = GhostGroup::create(&provider_a, &id_a).unwrap();
+        let kp_b = generate_key_package(&provider_b, &id_b).unwrap();
+        let (_commit, welcome) = group_a.add_member(&provider_a, kp_b).unwrap();
+        let mut group_b =
+            GhostGroup::join(&provider_b, &id_b, &welcome.to_bytes().unwrap()).unwrap();
 
-        let msg = b"hello from alice";
-        let ciphertext = alice_group.encrypt(&alice_provider, msg).unwrap();
-        let processed = bob_group.process_message(&bob_provider, &ciphertext).unwrap();
+        let msg = b"hello from sender";
+        let ciphertext = group_a.encrypt(&provider_a, msg).unwrap();
+        let processed = group_b.process_message(&provider_b, &ciphertext).unwrap();
 
         match processed.into_content() {
             ProcessedMessageContent::ApplicationMessage(app_msg) => {
@@ -267,8 +267,8 @@ mod tests {
     #[test]
     fn export_secret_returns_32_bytes() {
         let provider = GhostProvider::new();
-        let alice = Identity::from_seed([0x01u8; 32]).unwrap();
-        let group = GhostGroup::create(&provider, &alice).unwrap();
+        let id = Identity::from_seed([0x01u8; 32]).unwrap();
+        let group = GhostGroup::create(&provider, &id).unwrap();
 
         let secret = group
             .export_secret(&provider, "ghost-voice", b"test-context", 32)
