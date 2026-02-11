@@ -4,6 +4,7 @@ mod error;
 mod mailbox;
 mod routes;
 mod state;
+mod worker;
 mod util;
 
 use std::net::SocketAddr;
@@ -19,6 +20,8 @@ async fn main() {
     let config = config::Config::from_env();
     let port = config.port;
     let state = state::new_state(config);
+
+    tokio::spawn(worker::run(state.clone()));
 
     let app = routes::router(state);
 

@@ -92,25 +92,22 @@ pub async fn get_blobs(
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
 
-    // Check for existing blobs first
-    {
-        let map = state.mailboxes.read().await;
-        if let Some(mailbox) = map.get(&id) {
-            if !mailbox.blobs.is_empty() {
-                return Ok(Json(to_entries(&mailbox.blobs)));
-            }
-        }
-    }
-
-    // No blobs — if no long-poll requested, return empty
+    // No long-poll: read lock, no mailbox creation
     if timeout_ms == 0 {
-        return Ok(Json(Vec::new()));
+        let map = state.mailboxes.read().await;
+        return match map.get(&id) {
+            Some(mailbox) => Ok(Json(to_entries(&mailbox.blobs))),
+            None => Ok(Json(Vec::new())),
+        };
     }
 
-    // Subscribe and wait for a notification or timeout
+    // Long-poll: write lock to ensure mailbox exists, check + subscribe atomically
     let mut rx = {
         let mut map = state.mailboxes.write().await;
         let mailbox = map.entry(id).or_insert_with(Mailbox::new);
+        if !mailbox.blobs.is_empty() {
+            return Ok(Json(to_entries(&mailbox.blobs)));
+        }
         mailbox.tx.subscribe()
     };
 
