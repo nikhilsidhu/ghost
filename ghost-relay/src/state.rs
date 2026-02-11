@@ -9,10 +9,8 @@ use crate::config::Config;
 use crate::mailbox::Mailbox;
 
 pub struct Invite {
-    pub max_uses: u32,
-    pub uses: u32,
     pub expires_at: u64,
-    pub joins: Vec<Vec<u8>>,
+    pub join: Option<Vec<u8>>,
     pub accept: Option<Vec<u8>>,
     pub join_notify: broadcast::Sender<()>,
     pub accept_notify: broadcast::Sender<()>,

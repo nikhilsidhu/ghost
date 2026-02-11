@@ -22,7 +22,7 @@ pub fn router(state: AppState) -> Router {
         .route("/invite", post(invite::register))
         .route(
             "/invite/{token}/join",
-            post(invite::join).get(invite::get_joins),
+            post(invite::join).get(invite::get_join),
         )
         .route(
             "/invite/{token}/accept",

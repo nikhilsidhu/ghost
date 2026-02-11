@@ -2,8 +2,6 @@ use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
-use base64::engine::general_purpose::STANDARD;
-use base64::Engine;
 use serde::Deserialize;
 use std::time::Duration;
 use tokio::sync::broadcast;
@@ -16,7 +14,6 @@ use crate::util::now_millis;
 #[derive(Deserialize)]
 pub struct RegisterInvite {
     pub token: String,
-    pub max_uses: u32,
     pub expires_at: u64,
 }
 
@@ -34,10 +31,8 @@ pub async fn register(
     invites.insert(
         body.token,
         Invite {
-            max_uses: body.max_uses,
-            uses: 0,
             expires_at: body.expires_at,
-            joins: Vec::new(),
+            join: None,
             accept: None,
             join_notify,
             accept_notify,
@@ -68,23 +63,27 @@ pub async fn join(
         }
     };
 
-    if invite.expires_at <= now || invite.uses >= invite.max_uses {
+    if invite.expires_at <= now {
         state.release(payload.len());
-        return Err(RelayError::Gone("invite expired or fully used".into()));
+        return Err(RelayError::Gone("invite expired".into()));
     }
 
-    invite.joins.push(payload);
-    invite.uses += 1;
+    if invite.join.is_some() {
+        state.release(payload.len());
+        return Err(RelayError::BadRequest("already joined".into()));
+    }
+
+    invite.join = Some(payload);
     let _ = invite.join_notify.send(());
 
     Ok(StatusCode::ACCEPTED)
 }
 
-pub async fn get_joins(
+pub async fn get_join(
     State(state): State<AppState>,
     Path(token): Path<String>,
     headers: HeaderMap,
-) -> Result<Json<Vec<String>>> {
+) -> Result<(StatusCode, Vec<u8>)> {
     let timeout_ms: u64 = headers
         .get("X-Ghost-Long-Poll")
         .and_then(|v| v.to_str().ok())
@@ -96,8 +95,8 @@ pub async fn get_joins(
     let mut rx = {
         let invites = state.invites.read().await;
         let invite = invites.get(&token).ok_or(RelayError::NotFound)?;
-        if !invite.joins.is_empty() {
-            return Ok(Json(encode_joins(&invite.joins)));
+        if let Some(ref join) = invite.join {
+            return Ok((StatusCode::OK, join.clone()));
         }
         invite.join_notify.subscribe()
     };
@@ -107,11 +106,10 @@ pub async fn get_joins(
 
     let invites = state.invites.read().await;
     let invite = invites.get(&token).ok_or(RelayError::NotFound)?;
-    Ok(Json(encode_joins(&invite.joins)))
-}
-
-fn encode_joins(joins: &[Vec<u8>]) -> Vec<String> {
-    joins.iter().map(|j| STANDARD.encode(j)).collect()
+    match &invite.join {
+        Some(join) => Ok((StatusCode::OK, join.clone())),
+        None => Ok((StatusCode::NO_CONTENT, Vec::new())),
+    }
 }
 
 pub async fn post_accept(

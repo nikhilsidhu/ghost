@@ -49,7 +49,9 @@ pub async fn run(state: AppState) {
                 if inv.expires_at > now {
                     return true;
                 }
-                invite_freed += inv.joins.iter().map(|j| j.len()).sum::<usize>();
+                if let Some(ref j) = inv.join {
+                    invite_freed += j.len();
+                }
                 if let Some(ref a) = inv.accept {
                     invite_freed += a.len();
                 }
