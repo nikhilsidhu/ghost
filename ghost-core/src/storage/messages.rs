@@ -1,6 +1,6 @@
 use crate::error::{GhostError, Result};
 
-use crate::crypto::MSG_TYPE_DELETE;
+use crate::crypto::MessageType;
 
 use super::{blob32, GhostStore, StoredMessage};
 
@@ -154,7 +154,7 @@ impl GhostStore {
             .conn
             .execute(
                 "UPDATE messages SET content = X'', message_type = ?1 WHERE message_id = ?2",
-                rusqlite::params![MSG_TYPE_DELETE, message_id.as_slice()],
+                rusqlite::params![MessageType::Delete as u8, message_id.as_slice()],
             )
             .map_err(|e| GhostError::Database(format!("delete message: {e}")))?;
 

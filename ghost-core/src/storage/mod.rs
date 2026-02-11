@@ -160,7 +160,7 @@ pub struct StoredMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::{MSG_TYPE_DELETE, MSG_TYPE_REPLY, MSG_TYPE_TEXT};
+    use crate::crypto::MessageType;
 
     fn test_store() -> GhostStore {
         let seed = [0xABu8; 32];
@@ -208,7 +208,7 @@ mod tests {
             message_id: rand_id(),
             channel_id,
             sender_fp: rand_id(),
-            message_type: MSG_TYPE_TEXT,
+            message_type: MessageType::Text as u8,
             timestamp: ts,
             content: text.as_bytes().to_vec(),
             expires_at: None,
@@ -334,7 +334,7 @@ mod tests {
         store.insert_message(&original).unwrap();
 
         let mut reply = make_message(c.channel_id, 1001, "reply");
-        reply.message_type = MSG_TYPE_REPLY;
+        reply.message_type = MessageType::Text as u8;
         reply.references = vec![original.message_id];
         store.insert_message(&reply).unwrap();
 
@@ -357,7 +357,7 @@ mod tests {
         store.delete_message(&msg.message_id).unwrap();
         let got = store.get_message(&msg.message_id).unwrap();
         assert_eq!(got.content, b"");
-        assert_eq!(got.message_type, MSG_TYPE_DELETE);
+        assert_eq!(got.message_type, MessageType::Delete as u8);
     }
 
     #[test]

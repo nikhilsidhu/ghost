@@ -1,6 +1,6 @@
 use rusqlite::Connection;
 
-use crate::crypto::{MSG_TYPE_REPLY, MSG_TYPE_TEXT};
+use crate::crypto::MessageType;
 use crate::error::{GhostError, Result};
 
 const CURRENT_VERSION: u32 = 1;
@@ -44,8 +44,7 @@ fn set_version(conn: &Connection, version: u32) -> Result<()> {
 }
 
 fn create_tables(conn: &Connection) -> Result<()> {
-    let text = MSG_TYPE_TEXT;
-    let reply = MSG_TYPE_REPLY;
+    let text = MessageType::Text as u8;
 
     conn.execute_batch(&format!(
         "
@@ -98,29 +97,27 @@ fn create_tables(conn: &Connection) -> Result<()> {
             content_rowid='rowid'
         );
 
-        -- Keep FTS index in sync for searchable message types
+        -- FTS index for text messages
         CREATE TRIGGER messages_fts_insert AFTER INSERT ON messages
-        WHEN NEW.message_type IN ({text}, {reply})
+        WHEN NEW.message_type = {text}
         BEGIN
             INSERT INTO messages_fts(rowid, content) VALUES (NEW.rowid, NEW.content);
         END;
 
         CREATE TRIGGER messages_fts_delete AFTER DELETE ON messages
-        WHEN OLD.message_type IN ({text}, {reply})
+        WHEN OLD.message_type = {text}
         BEGIN
             INSERT INTO messages_fts(messages_fts, rowid, content) VALUES ('delete', OLD.rowid, OLD.content);
         END;
 
-        -- On UPDATE, remove old FTS entry if it was searchable
         CREATE TRIGGER messages_fts_update_del BEFORE UPDATE ON messages
-        WHEN OLD.message_type IN ({text}, {reply})
+        WHEN OLD.message_type = {text}
         BEGIN
             INSERT INTO messages_fts(messages_fts, rowid, content) VALUES ('delete', OLD.rowid, OLD.content);
         END;
 
-        -- On UPDATE, add new FTS entry if the new content is searchable
         CREATE TRIGGER messages_fts_update_ins AFTER UPDATE ON messages
-        WHEN NEW.message_type IN ({text}, {reply})
+        WHEN NEW.message_type = {text}
         BEGIN
             INSERT INTO messages_fts(rowid, content) VALUES (NEW.rowid, NEW.content);
         END;
