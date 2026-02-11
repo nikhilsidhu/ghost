@@ -3,7 +3,7 @@ use rusqlite::Connection;
 use crate::crypto::MessageType;
 use crate::error::{GhostError, Result};
 
-const CURRENT_VERSION: u32 = 1;
+const CURRENT_VERSION: u32 = 2;
 
 pub fn initialize(conn: &Connection) -> Result<()> {
     let version = get_version(conn)?;
@@ -122,6 +122,11 @@ fn create_tables(conn: &Connection) -> Result<()> {
         BEGIN
             INSERT INTO messages_fts(rowid, content) VALUES (NEW.rowid, NEW.content);
         END;
+
+        CREATE TABLE pinned_groups (
+            group_id  BLOB PRIMARY KEY REFERENCES groups(group_id) ON DELETE CASCADE,
+            pinned_at INTEGER NOT NULL
+        );
         "
     ))
     .map_err(|e| GhostError::Database(format!("create tables: {e}")))?;
@@ -129,14 +134,27 @@ fn create_tables(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-// Run sequential migrations from `from_version` to CURRENT_VERSION.
-#[allow(unused)]
-fn migrate(_conn: &Connection, from_version: u32) -> Result<()> {
-    // Future migrations go here as match arms:
-    //   1 => { migrate_v1_to_v2(conn)?; }
-    //   2 => { migrate_v2_to_v3(conn)?; }
-    // For now, no migrations exist — any unknown version is an error.
-    Err(GhostError::Database(format!(
-        "no migration from version {from_version}"
-    )))
+fn migrate(conn: &Connection, from_version: u32) -> Result<()> {
+    let mut v = from_version;
+    while v < CURRENT_VERSION {
+        match v {
+            1 => {
+                conn.execute_batch(
+                    "CREATE TABLE pinned_groups (
+                        group_id  BLOB PRIMARY KEY REFERENCES groups(group_id) ON DELETE CASCADE,
+                        pinned_at INTEGER NOT NULL
+                    );"
+                )
+                .map_err(|e| GhostError::Database(format!("migrate v1->v2: {e}")))?;
+            }
+            _ => {
+                return Err(GhostError::Database(format!(
+                    "no migration from version {v}"
+                )));
+            }
+        }
+        v += 1;
+        set_version(conn, v)?;
+    }
+    Ok(())
 }

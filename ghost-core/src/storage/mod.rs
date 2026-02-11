@@ -2,6 +2,7 @@ pub mod channels;
 pub mod groups;
 pub mod members;
 pub mod messages;
+pub mod pins;
 mod schema;
 
 use std::path::Path;
@@ -479,6 +480,36 @@ mod tests {
         // Message still exists after member removal
         let got = store.get_message(&msg.message_id).unwrap();
         assert_eq!(got.sender_fp, m.fingerprint);
+    }
+
+    // -- Pin tests --
+
+    #[test]
+    fn pin_unpin_group() {
+        let store = test_store();
+        let g = make_group("pinnable");
+        store.insert_group(&g).unwrap();
+
+        store.pin_group(&g.group_id, 5000).unwrap();
+        assert!(store.is_pinned(&g.group_id).unwrap());
+
+        let pins = store.list_pinned_group_ids().unwrap();
+        assert_eq!(pins.len(), 1);
+        assert_eq!(pins[0], g.group_id);
+
+        store.unpin_group(&g.group_id).unwrap();
+        assert!(!store.is_pinned(&g.group_id).unwrap());
+        assert!(store.list_pinned_group_ids().unwrap().is_empty());
+    }
+
+    #[test]
+    fn pin_cascades_on_group_delete() {
+        let store = test_store();
+        let g = make_group("temp");
+        store.insert_group(&g).unwrap();
+        store.pin_group(&g.group_id, 5000).unwrap();
+        store.delete_group(&g.group_id).unwrap();
+        assert!(store.list_pinned_group_ids().unwrap().is_empty());
     }
 
     // -- Encrypted DB tests --
