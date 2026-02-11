@@ -1,12 +1,13 @@
-use crate::crypto::{MessageType, MAILBOX_ID_TAG, MLS_GROUP_ID_TAG, PROTOCOL_VERSION};
+use openmls::prelude::ProcessedMessageContent;
+
+use crate::crypto::{GhostProvider, MessageType, MAILBOX_ID_TAG, MLS_GROUP_ID_TAG, PROTOCOL_VERSION};
 use crate::error::{GhostError, Result};
+use crate::mls::group::GhostGroup;
 
 const MAX_REFERENCES: usize = 255;
 
 /// version + type + channel_id + sender_fp + timestamp + message_id + ref_count + content_len
 const FIXED_HEADER_LEN: usize = 1 + 1 + 32 + 32 + 8 + 32 + 1 + 4;
-
-const MESSAGE_ID_OFFSET: usize = 1 + 1 + 32 + 32 + 8;
 
 /// Application-layer message — the plaintext unit before MLS encryption.
 pub struct ApplicationMessage {
@@ -193,9 +194,41 @@ pub fn group_mailbox_id(mls_group_id: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+/// Serialize an ApplicationMessage and MLS-encrypt it into transport bytes.
+pub fn seal(
+    group: &mut GhostGroup,
+    provider: &GhostProvider,
+    msg: &ApplicationMessage,
+) -> Result<Vec<u8>> {
+    let plaintext = msg.to_bytes();
+    let mls_out = group.encrypt(provider, &plaintext)?;
+    mls_out
+        .to_bytes()
+        .map_err(|e| GhostError::Mls(format!("serialize ciphertext: {e}")))
+}
+
+/// MLS-decrypt transport bytes and deserialize into an ApplicationMessage.
+pub fn open(
+    group: &mut GhostGroup,
+    provider: &GhostProvider,
+    blob: &[u8],
+) -> Result<ApplicationMessage> {
+    let processed = group.process_message_bytes(provider, blob)?;
+    match processed.into_content() {
+        ProcessedMessageContent::ApplicationMessage(app_msg) => {
+            ApplicationMessage::from_bytes(&app_msg.into_bytes())
+        }
+        _ => Err(GhostError::Mls("expected application message".into())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::identity::Identity;
+    use crate::mls::credential::generate_key_package;
+
+    const MESSAGE_ID_OFFSET: usize = 1 + 1 + 32 + 32 + 8;
 
     fn test_channel() -> [u8; 32] {
         [0xAA; 32]
@@ -379,7 +412,6 @@ mod tests {
     fn reject_tampered_message_id() {
         let msg = make_text(b"hello");
         let mut bytes = msg.to_bytes();
-        const MESSAGE_ID_OFFSET: usize = 1 + 1 + 32 + 32 + 8;
         bytes[MESSAGE_ID_OFFSET] ^= 0xFF;
         assert!(ApplicationMessage::from_bytes(&bytes).is_err());
     }
@@ -405,8 +437,88 @@ mod tests {
     fn reject_content_len_overflow() {
         let msg = make_text(b"hello");
         let mut bytes = msg.to_bytes();
-        let content_len_pos = FIXED_HEADER_LEN - 4; // content_len is last 4 bytes of fixed header
+        let content_len_pos = FIXED_HEADER_LEN - 4;
         bytes[content_len_pos..content_len_pos + 4].copy_from_slice(&9999u32.to_be_bytes());
         assert!(ApplicationMessage::from_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn create_with_id_uses_derived_group_id() {
+        let provider = GhostProvider::new();
+        let alice = Identity::from_seed([0x01; 32]).unwrap();
+        let app_group_id = [0x42; 32];
+        let group = GhostGroup::create_with_id(&provider, &alice, &app_group_id).unwrap();
+
+        let expected = derive_mls_group_id(&app_group_id);
+        assert_eq!(group.group_id(), expected);
+    }
+
+    #[test]
+    fn seal_open_roundtrip() {
+        let alice_provider = GhostProvider::new();
+        let bob_provider = GhostProvider::new();
+        let alice = Identity::from_seed([0x01; 32]).unwrap();
+        let bob = Identity::from_seed([0x02; 32]).unwrap();
+
+        let app_group_id = [0x42; 32];
+        let mut alice_group =
+            GhostGroup::create_with_id(&alice_provider, &alice, &app_group_id).unwrap();
+        let bob_kp = generate_key_package(&bob_provider, &bob).unwrap();
+        let (_commit, welcome) = alice_group.add_member(&alice_provider, bob_kp).unwrap();
+        let mut bob_group =
+            GhostGroup::join_from_welcome(&bob_provider, &bob, welcome).unwrap();
+
+        let msg = ApplicationMessage::new(
+            MessageType::Text,
+            test_channel(),
+            alice.fingerprint,
+            1000,
+            vec![],
+            b"hello from alice".to_vec(),
+        )
+        .unwrap();
+
+        let blob = seal(&mut alice_group, &alice_provider, &msg).unwrap();
+        let decrypted = open(&mut bob_group, &bob_provider, &blob).unwrap();
+
+        assert_eq!(decrypted.message_type, MessageType::Text);
+        assert_eq!(decrypted.channel_id, test_channel());
+        assert_eq!(decrypted.sender_fp, alice.fingerprint);
+        assert_eq!(decrypted.content, b"hello from alice");
+        assert_eq!(decrypted.message_id, msg.message_id);
+    }
+
+    #[test]
+    fn seal_open_with_references() {
+        let alice_provider = GhostProvider::new();
+        let bob_provider = GhostProvider::new();
+        let alice = Identity::from_seed([0x01; 32]).unwrap();
+        let bob = Identity::from_seed([0x02; 32]).unwrap();
+
+        let app_group_id = [0x42; 32];
+        let mut alice_group =
+            GhostGroup::create_with_id(&alice_provider, &alice, &app_group_id).unwrap();
+        let bob_kp = generate_key_package(&bob_provider, &bob).unwrap();
+        let (_commit, welcome) = alice_group.add_member(&alice_provider, bob_kp).unwrap();
+        let mut bob_group =
+            GhostGroup::join_from_welcome(&bob_provider, &bob, welcome).unwrap();
+
+        let target = [0xCC; 32];
+        let msg = ApplicationMessage::new(
+            MessageType::Text,
+            test_channel(),
+            bob.fingerprint,
+            2000,
+            vec![target],
+            b"replying".to_vec(),
+        )
+        .unwrap();
+
+        let blob = seal(&mut bob_group, &bob_provider, &msg).unwrap();
+        let decrypted = open(&mut alice_group, &alice_provider, &blob).unwrap();
+
+        assert_eq!(decrypted.references.len(), 1);
+        assert_eq!(decrypted.references[0], target);
+        assert_eq!(decrypted.content, b"replying");
     }
 }

@@ -5,6 +5,7 @@ use openmls_basic_credential::SignatureKeyPair;
 use crate::crypto::GhostProvider;
 use crate::error::{GhostError, Result};
 use crate::identity::Identity;
+use crate::wire::derive_mls_group_id;
 
 use super::credential::{credential_from_identity, signer_from_identity};
 
@@ -38,6 +39,32 @@ impl GhostGroup {
             provider.inner(),
             &signer,
             &config,
+            credential,
+        )
+        .map_err(|e| GhostError::Mls(format!("create group: {e}")))?;
+
+        Ok(Self { mls_group, signer })
+    }
+
+    /// Start a new group with a deterministic MLS group ID derived from the application group_id.
+    pub fn create_with_id(
+        provider: &GhostProvider,
+        identity: &Identity,
+        group_id: &[u8; 32],
+    ) -> Result<Self> {
+        let signer = signer_from_identity(identity);
+        let credential = credential_from_identity(identity);
+
+        let config = MlsGroupCreateConfig::builder()
+            .use_ratchet_tree_extension(true)
+            .build();
+
+        let mls_group_id = derive_mls_group_id(group_id);
+        let mls_group = MlsGroup::new_with_group_id(
+            provider.inner(),
+            &signer,
+            &config,
+            GroupId::from_slice(&mls_group_id),
             credential,
         )
         .map_err(|e| GhostError::Mls(format!("create group: {e}")))?;
@@ -100,6 +127,22 @@ impl GhostGroup {
         message: &MlsMessageOut,
     ) -> Result<ProcessedMessage> {
         let inbound = outbound_to_inbound(message)?;
+        let protocol_message = inbound
+            .try_into_protocol_message()
+            .map_err(|_| GhostError::Mls("not a protocol message".into()))?;
+        self.mls_group
+            .process_message(provider.inner(), protocol_message)
+            .map_err(|e| GhostError::Mls(format!("process message: {e}")))
+    }
+
+    /// Process an inbound MLS message from raw bytes (as received from relay).
+    pub fn process_message_bytes(
+        &mut self,
+        provider: &GhostProvider,
+        bytes: &[u8],
+    ) -> Result<ProcessedMessage> {
+        let inbound = MlsMessageIn::tls_deserialize_exact(bytes)
+            .map_err(|e| GhostError::Mls(format!("deserialize: {e}")))?;
         let protocol_message = inbound
             .try_into_protocol_message()
             .map_err(|_| GhostError::Mls("not a protocol message".into()))?;
