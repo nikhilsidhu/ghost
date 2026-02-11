@@ -13,3 +13,12 @@ export const listChannels = (groupId: string) =>
 
 export const listMembers = (groupId: string) =>
   invoke<Member[]>("list_members", { groupId });
+
+export const pinGroup = (groupId: string) =>
+  invoke<void>("pin_group", { groupId });
+
+export const unpinGroup = (groupId: string) =>
+  invoke<void>("unpin_group", { groupId });
+
+export const listPinnedGroups = () =>
+  invoke<string[]>("list_pinned_groups");

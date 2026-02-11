@@ -64,3 +64,33 @@ pub fn list_members(group_id: String, state: State<AppState>) -> Result<Vec<Memb
         .map_err(|e| e.to_string())?;
     Ok(members.iter().map(MemberDto::from).collect())
 }
+
+#[tauri::command]
+pub fn pin_group(group_id: String, state: State<AppState>) -> Result<(), String> {
+    let gid = parse_id(&group_id)?;
+    let client = state.client.lock().map_err(|e| e.to_string())?;
+    client
+        .store()
+        .pin_group(&gid, now_millis())
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn unpin_group(group_id: String, state: State<AppState>) -> Result<(), String> {
+    let gid = parse_id(&group_id)?;
+    let client = state.client.lock().map_err(|e| e.to_string())?;
+    client
+        .store()
+        .unpin_group(&gid)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn list_pinned_groups(state: State<AppState>) -> Result<Vec<String>, String> {
+    let client = state.client.lock().map_err(|e| e.to_string())?;
+    let ids = client
+        .store()
+        .list_pinned_group_ids()
+        .map_err(|e| e.to_string())?;
+    Ok(ids.iter().map(hex::encode).collect())
+}

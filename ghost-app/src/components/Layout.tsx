@@ -1,9 +1,10 @@
 import { createSignal, createEffect, on, onMount, Show } from "solid-js";
 import type { Identity, Group, Channel, Member } from "../lib/types";
-import { getIdentity, listGroups, listChannels, listMembers } from "../lib/api";
+import { getIdentity, listGroups, listChannels, listMembers, listPinnedGroups, pinGroup, unpinGroup } from "../lib/api";
 import { Sidebar } from "./Sidebar";
 import { GroupView } from "./GroupView";
 import { MemberPanel } from "./MemberPanel";
+import { CommandPalette } from "./CommandPalette";
 
 export function Layout() {
   const [identity, setIdentity] = createSignal<Identity | null>(null);
@@ -11,16 +12,32 @@ export function Layout() {
   const [selectedGroupId, setSelectedGroupId] = createSignal<string | null>(null);
   const [channels, setChannels] = createSignal<Channel[]>([]);
   const [members, setMembers] = createSignal<Member[]>([]);
+  const [pinnedGroupIds, setPinnedGroupIds] = createSignal<Set<string>>(new Set());
 
   const refreshGroups = async () => {
     const gs = await listGroups();
     setGroups(gs);
   };
 
+  const refreshPins = async () => {
+    const ids = await listPinnedGroups();
+    setPinnedGroupIds(new Set(ids));
+  };
+
+  const handleTogglePin = async (groupId: string) => {
+    if (pinnedGroupIds().has(groupId)) {
+      await unpinGroup(groupId);
+    } else {
+      await pinGroup(groupId);
+    }
+    await refreshPins();
+  };
+
   onMount(async () => {
     const id = await getIdentity();
     setIdentity(id);
     await refreshGroups();
+    await refreshPins();
   });
 
   createEffect(on(selectedGroupId, async (id) => {
@@ -38,9 +55,11 @@ export function Layout() {
       <Sidebar
         identity={identity()}
         groups={groups()}
+        pinnedGroupIds={pinnedGroupIds()}
         selectedGroupId={selectedGroupId()}
         onSelectGroup={setSelectedGroupId}
         onGroupCreated={refreshGroups}
+        onTogglePin={handleTogglePin}
       />
       <main class="flex-1 flex flex-col min-w-0">
         <div data-tauri-drag-region class="h-7 flex-shrink-0" />
@@ -60,6 +79,11 @@ export function Layout() {
       <Show when={selectedGroup()}>
         <MemberPanel members={members()} />
       </Show>
+      <CommandPalette
+        groups={groups()}
+        pinnedGroupIds={pinnedGroupIds()}
+        onSelectGroup={setSelectedGroupId}
+      />
     </div>
   );
 }

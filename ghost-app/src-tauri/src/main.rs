@@ -15,6 +15,9 @@ fn main() {
             commands::create_group,
             commands::list_channels,
             commands::list_members,
+            commands::pin_group,
+            commands::unpin_group,
+            commands::list_pinned_groups,
         ])
         .run(tauri::generate_context!())
         .expect("error while running ghost");
