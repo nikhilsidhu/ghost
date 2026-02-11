@@ -3,15 +3,17 @@ use std::path::Path;
 
 use openmls::prelude::KeyPackage;
 
-use crate::crypto::GhostProvider;
-use crate::error::Result;
+use crate::crypto::{GhostProvider, MessageType};
+use crate::error::{GhostError, Result};
 use crate::identity::Identity;
 use crate::mls::credential::generate_key_package;
 use crate::mls::group::GhostGroup;
 use crate::storage::{
-    Channel, ChannelKind, GhostStore, Group, Member, MemberRole,
+    Channel, ChannelKind, GhostStore, Group, Member, MemberRole, StoredMessage,
 };
-use crate::wire::derive_default_channel_id;
+use crate::wire::{
+    derive_default_channel_id, group_mailbox_id, open, seal, ApplicationMessage, Outbound,
+};
 
 /// Session-level orchestration: holds identity, MLS state, and local storage.
 pub struct GhostClient {
@@ -96,11 +98,121 @@ impl GhostClient {
         self.groups.insert(group_id, ghost_group);
         Ok(group_id)
     }
+
+    pub fn send_message(
+        &mut self,
+        group_id: &[u8; 32],
+        channel_id: &[u8; 32],
+        content: Vec<u8>,
+        references: Vec<[u8; 32]>,
+        timestamp: u64,
+    ) -> Result<(Outbound, [u8; 32])> {
+        let group = self.groups.get_mut(group_id).ok_or_else(|| {
+            GhostError::GroupNotLoaded(hex::encode(&group_id[..8]))
+        })?;
+
+        let msg = ApplicationMessage::new(
+            MessageType::Text,
+            *channel_id,
+            self.identity.fingerprint,
+            timestamp,
+            references,
+            content,
+        )?;
+
+        let blob = seal(group, &self.provider, &msg)?;
+        let mailbox_id = group_mailbox_id(group.group_id());
+        let message_id = msg.message_id;
+
+        self.store.insert_message(&StoredMessage {
+            message_id: msg.message_id,
+            channel_id: msg.channel_id,
+            sender_fp: msg.sender_fp,
+            message_type: msg.message_type as u8,
+            timestamp: msg.timestamp,
+            content: msg.content,
+            expires_at: None,
+            references: msg.references,
+        })?;
+
+        Ok((Outbound { mailbox_id, blob }, message_id))
+    }
+
+    pub fn receive_blob(
+        &mut self,
+        group_id: &[u8; 32],
+        blob: &[u8],
+    ) -> Result<ApplicationMessage> {
+        let group = self.groups.get_mut(group_id).ok_or_else(|| {
+            GhostError::GroupNotLoaded(hex::encode(&group_id[..8]))
+        })?;
+
+        let msg = open(group, &self.provider, blob)?;
+
+        self.store.insert_message(&StoredMessage {
+            message_id: msg.message_id,
+            channel_id: msg.channel_id,
+            sender_fp: msg.sender_fp,
+            message_type: msg.message_type as u8,
+            timestamp: msg.timestamp,
+            content: msg.content.clone(),
+            expires_at: None,
+            references: msg.references.clone(),
+        })?;
+
+        Ok(msg)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mls::credential::generate_key_package;
+
+    /// Returns (creator, joiner, group_id) with both clients in a shared MLS group.
+    fn setup_two_clients() -> (GhostClient, GhostClient, [u8; 32]) {
+        let mut c1 = GhostClient::open_in_memory([0x01; 32]).unwrap();
+        let mut c2 = GhostClient::open_in_memory([0x02; 32]).unwrap();
+
+        let group_id = c1.create_group("test", 1000).unwrap();
+        let channel_id = derive_default_channel_id(&group_id);
+
+        let kp = generate_key_package(&c2.provider, &c2.identity).unwrap();
+        let g1 = c1.groups.get_mut(&group_id).unwrap();
+        let (_commit, welcome) = g1.add_member(&c1.provider, kp).unwrap();
+
+        let g2 = GhostGroup::join_from_welcome(&c2.provider, &c2.identity, welcome).unwrap();
+        c2.groups.insert(group_id, g2);
+
+        c2.store
+            .insert_group(&Group {
+                group_id,
+                name: "test".to_string(),
+                creator_fp: c1.identity.fingerprint,
+                created_at: 1000,
+            })
+            .unwrap();
+        c2.store
+            .insert_channel(&Channel {
+                channel_id,
+                group_id,
+                name: "general".to_string(),
+                kind: ChannelKind::Text,
+                position: 0,
+            })
+            .unwrap();
+        c2.store
+            .insert_member(&Member {
+                group_id,
+                fingerprint: c2.identity.fingerprint,
+                display_name: c2.identity.display_name.clone(),
+                role: MemberRole::Member,
+                joined_at: 1000,
+            })
+            .unwrap();
+
+        (c1, c2, group_id)
+    }
 
     #[test]
     fn open_in_memory_succeeds() {
@@ -135,5 +247,52 @@ mod tests {
         assert_eq!(members.len(), 1);
         assert_eq!(members[0].fingerprint, *client.fingerprint());
         assert_eq!(members[0].role, MemberRole::Creator);
+    }
+
+    #[test]
+    fn send_to_unknown_group_fails() {
+        let mut client = GhostClient::open_in_memory([0x01; 32]).unwrap();
+        let result = client.send_message(&[0xFF; 32], &[0xAA; 32], b"hi".to_vec(), vec![], 1000);
+        assert!(matches!(result, Err(GhostError::GroupNotLoaded(_))));
+    }
+
+    #[test]
+    fn receive_from_unknown_group_fails() {
+        let mut client = GhostClient::open_in_memory([0x01; 32]).unwrap();
+        let result = client.receive_blob(&[0xFF; 32], &[0x00; 64]);
+        assert!(matches!(result, Err(GhostError::GroupNotLoaded(_))));
+    }
+
+    #[test]
+    fn send_message_stores_in_db() {
+        let (mut c1, _c2, group_id) = setup_two_clients();
+        let channel_id = derive_default_channel_id(&group_id);
+
+        let (_outbound, msg_id) = c1
+            .send_message(&group_id, &channel_id, b"hello".to_vec(), vec![], 2000)
+            .unwrap();
+
+        let stored = c1.store().get_message(&msg_id).unwrap();
+        assert_eq!(stored.content, b"hello");
+        assert_eq!(stored.sender_fp, *c1.fingerprint());
+        assert_eq!(stored.timestamp, 2000);
+    }
+
+    #[test]
+    fn send_receive_roundtrip() {
+        let (mut c1, mut c2, group_id) = setup_two_clients();
+        let channel_id = derive_default_channel_id(&group_id);
+
+        let (outbound, msg_id) = c1
+            .send_message(&group_id, &channel_id, b"hello".to_vec(), vec![], 2000)
+            .unwrap();
+
+        let received = c2.receive_blob(&group_id, &outbound.blob).unwrap();
+        assert_eq!(received.content, b"hello");
+        assert_eq!(received.sender_fp, *c1.fingerprint());
+        assert_eq!(received.message_id, msg_id);
+
+        let stored = c2.store().get_message(&msg_id).unwrap();
+        assert_eq!(stored.content, b"hello");
     }
 }
