@@ -5,4 +5,5 @@ pub mod mailbox;
 pub mod routes;
 pub mod state;
 pub mod util;
+pub mod voice;
 pub mod worker;

@@ -7,6 +7,8 @@ pub struct Config {
     pub max_blob_size: usize,
     pub max_memory: usize,
     pub ttl: Duration,
+    pub voice_port: u16,
+    pub max_voice_participants: usize,
 }
 
 impl Config {
@@ -16,9 +18,13 @@ impl Config {
             max_blob_size: parse_env("GHOST_MAX_BLOB_SIZE", DEFAULT_MAX_BLOB_SIZE),
             max_memory: parse_env("GHOST_MAX_MEMORY", DEFAULT_MAX_MEMORY),
             ttl: Duration::from_secs(parse_env("GHOST_TTL_SECS", DEFAULT_TTL_SECS)),
+            voice_port: parse_env("GHOST_VOICE_PORT", DEFAULT_VOICE_PORT),
+            max_voice_participants: parse_env(
+                "GHOST_MAX_VOICE_PARTICIPANTS",
+                DEFAULT_MAX_VOICE_PARTICIPANTS,
+            ),
         }
     }
-
 }
 
 fn parse_env<T: std::str::FromStr>(name: &str, default: T) -> T {

@@ -3,10 +3,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, watch, RwLock};
 
 use crate::config::Config;
 use crate::mailbox::Mailbox;
+use crate::voice::{RoutingTable, VoiceChannel};
 
 pub struct Invite {
     pub expires_at: u64,
@@ -20,6 +21,10 @@ pub struct Invite {
 pub struct Inner {
     pub mailboxes: RwLock<HashMap<[u8; 32], Mailbox>>,
     pub invites: RwLock<HashMap<String, Invite>>,
+    pub voice_channels: RwLock<HashMap<[u8; 32], VoiceChannel>>,
+    pub routing: RoutingTable,
+    pub voice_udp_port: watch::Sender<u16>,
+    pub voice_udp_port_rx: watch::Receiver<u16>,
     pub config: Config,
     pub start_time: Instant,
     pub memory_used: AtomicUsize,
@@ -45,9 +50,14 @@ impl Inner {
 pub type AppState = Arc<Inner>;
 
 pub fn new_state(config: Config) -> AppState {
+    let (voice_udp_port, voice_udp_port_rx) = watch::channel(0);
     Arc::new(Inner {
         mailboxes: RwLock::new(HashMap::new()),
         invites: RwLock::new(HashMap::new()),
+        voice_channels: RwLock::new(HashMap::new()),
+        routing: RoutingTable::new(),
+        voice_udp_port,
+        voice_udp_port_rx,
         config,
         start_time: Instant::now(),
         memory_used: AtomicUsize::new(0),

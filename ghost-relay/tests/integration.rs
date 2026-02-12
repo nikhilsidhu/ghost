@@ -26,6 +26,8 @@ fn test_config() -> Config {
         max_blob_size: 1024,
         max_memory: 4096,
         ttl: Duration::from_secs(3600),
+        voice_port: 0,
+        max_voice_participants: 25,
     }
 }
 
