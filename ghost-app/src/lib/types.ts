@@ -27,6 +27,11 @@ export interface Member {
   joined_at: number;
 }
 
+export interface Invite {
+  token: string;
+  link: string;
+}
+
 export interface Message {
   message_id: string;
   channel_id: string;

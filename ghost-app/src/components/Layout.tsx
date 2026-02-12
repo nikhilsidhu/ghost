@@ -5,11 +5,13 @@ import {
   listPinnedGroups, pinGroup, unpinGroup,
   createGroup, createChannel as apiCreateChannel,
   renameChannel as apiRenameChannel, deleteChannel as apiDeleteChannel,
+  createInvite, joinByInvite,
 } from "../lib/api";
 import { Sidebar } from "./Sidebar";
 import { GroupView } from "./GroupView";
 import { MemberPanel } from "./MemberPanel";
 import { CommandPalette, type CommandDef } from "./CommandPalette";
+import { InviteDialog } from "./InviteDialog";
 
 export function Layout() {
   const [identity, setIdentity] = createSignal<Identity | null>(null);
@@ -20,6 +22,7 @@ export function Layout() {
   const [pinnedGroupIds, setPinnedGroupIds] = createSignal<Set<string>>(new Set());
   const [selectedChannelId, setSelectedChannelId] = createSignal<string | null>(null);
   const [openCommandId, setOpenCommandId] = createSignal<string | null>(null);
+  const [inviteLink, setInviteLink] = createSignal<string | null>(null);
 
   // --- Refresh helpers ---
 
@@ -145,6 +148,35 @@ export function Layout() {
         await refreshChannels();
       },
     },
+    {
+      id: "invite",
+      command: "invite",
+      args: [
+        {
+          name: "group",
+          placeholder: "group",
+          complete: groupCompleter,
+          defaultValue: () => selectedGroupId(),
+        },
+      ],
+      execute: async (args) => {
+        const invite = await createInvite(args.group);
+        setInviteLink(invite.link);
+      },
+    },
+    {
+      id: "join",
+      command: "join",
+      args: [{ name: "link", placeholder: "paste invite link" }],
+      execute: async (args) => {
+        const url = new URL(args.link);
+        const relay = url.searchParams.get("relay");
+        const token = url.searchParams.get("token");
+        if (!relay || !token) throw new Error("invalid invite link");
+        await joinByInvite(relay, token);
+        await refreshGroups();
+      },
+    },
   ];
 
   return (
@@ -194,6 +226,7 @@ export function Layout() {
         openCommandId={openCommandId()}
         onOpenCommandHandled={() => setOpenCommandId(null)}
       />
+      <InviteDialog link={inviteLink()} onClose={() => setInviteLink(null)} />
     </div>
   );
 }

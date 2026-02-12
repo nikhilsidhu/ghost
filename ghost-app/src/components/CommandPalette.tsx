@@ -119,14 +119,32 @@ export function CommandPalette(props: Props) {
       cmd.execute({});
       return;
     }
+
+    // Auto-confirm leading args where defaultValue matches a completion
+    let idx = 0;
+    const autoArgs: Record<string, string> = {};
+    while (idx < cmd.args.length) {
+      const arg = cmd.args[idx];
+      const val = arg.defaultValue?.();
+      if (!val || !arg.complete) break;
+      if (!arg.complete("").some((c) => c.value === val)) break;
+      autoArgs[arg.name] = val;
+      idx++;
+    }
+
+    if (idx >= cmd.args.length) {
+      setOpen(false);
+      cmd.execute(autoArgs);
+      return;
+    }
+
     batch(() => {
       setResolvedCommand(cmd);
-      setArgIndex(0);
-      setCollectedArgs({});
+      setArgIndex(idx);
+      setCollectedArgs(autoArgs);
       setFocusedIndex(0);
-      // Pre-fill with default value if available
-      const firstArg = cmd.args[0];
-      const defaultVal = firstArg.defaultValue?.() ?? null;
+      const nextArg = cmd.args[idx];
+      const defaultVal = nextArg.defaultValue?.() ?? null;
       setQuery(defaultVal ?? "");
     });
   };
@@ -138,11 +156,8 @@ export function CommandPalette(props: Props) {
       if ((e.metaKey || e.ctrlKey) && e.key === "k") {
         e.preventDefault();
         batch(() => {
-          if (e.shiftKey) {
-            setQuery("/");
-          } else {
-            resetAll();
-          }
+          resetAll();
+          if (e.shiftKey) setQuery("/");
           setOpen(true);
         });
       }
@@ -251,7 +266,8 @@ export function CommandPalette(props: Props) {
     const newArgs = { ...collectedArgs(), [arg.name]: trimmed };
 
     if (next >= cmd.args.length) {
-      // All args collected — execute
+      // All args collected — reset state then execute
+      resetAll();
       setOpen(false);
       cmd.execute(newArgs);
       return;

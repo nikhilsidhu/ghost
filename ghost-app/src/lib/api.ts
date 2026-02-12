@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Identity, Group, Channel, Member, Message } from "./types";
+import type { Identity, Group, Channel, Member, Message, Invite } from "./types";
 
 export const getIdentity = () => invoke<Identity>("get_identity");
 
@@ -37,3 +37,9 @@ export const renameChannel = (channelId: string, name: string) =>
 
 export const deleteChannel = (channelId: string) =>
   invoke<void>("delete_channel", { channelId });
+
+export const createInvite = (groupId: string) =>
+  invoke<Invite>("create_invite", { groupId });
+
+export const joinByInvite = (relayUrl: string, token: string) =>
+  invoke<Group>("join_by_invite", { relayUrl, token });
