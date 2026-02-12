@@ -1,6 +1,7 @@
 mod blob;
 mod health;
 mod invite;
+mod voice;
 mod ws;
 
 use axum::extract::DefaultBodyLimit;
@@ -19,6 +20,7 @@ pub fn router(state: AppState) -> Router {
             delete(blob::delete_blob),
         )
         .route("/ws/{mailbox_id}", get(ws::ws_upgrade))
+        .route("/voice/{channel_id}", get(voice::ws_upgrade))
         .route("/invite", post(invite::register))
         .route(
             "/invite/{token}/join",
