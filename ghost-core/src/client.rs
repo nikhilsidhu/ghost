@@ -427,6 +427,25 @@ impl GhostClient {
         Ok(payload.to_bytes())
     }
 
+    /// Returns (group_id, mailbox_id) for every loaded group.
+    pub fn group_mailboxes(&self) -> Vec<([u8; 32], [u8; 32])> {
+        self.groups
+            .iter()
+            .map(|(gid, g)| (*gid, group_mailbox_id(g.group_id())))
+            .collect()
+    }
+
+    /// Reverse lookup: find group_id for a given mailbox_id.
+    pub fn group_id_for_mailbox(&self, mailbox_id: &[u8; 32]) -> Option<[u8; 32]> {
+        self.groups.iter().find_map(|(gid, g)| {
+            if group_mailbox_id(g.group_id()) == *mailbox_id {
+                Some(*gid)
+            } else {
+                None
+            }
+        })
+    }
+
     /// Process an inbound blob — could be an app message or a commit.
     /// Returns the app message if it was one, or None if it was a commit (already merged).
     pub fn receive_any(
