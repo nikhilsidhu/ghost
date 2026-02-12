@@ -12,6 +12,7 @@ pub struct Invite {
     pub expires_at: u64,
     pub join: Option<Vec<u8>>,
     pub accept: Option<Vec<u8>>,
+    pub seq: u64,
     pub join_notify: broadcast::Sender<()>,
     pub accept_notify: broadcast::Sender<()>,
 }

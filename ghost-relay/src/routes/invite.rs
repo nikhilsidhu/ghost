@@ -39,6 +39,7 @@ pub async fn register(
             expires_at,
             join: None,
             accept: None,
+            seq: 0,
             join_notify,
             accept_notify,
         },
@@ -50,10 +51,17 @@ pub async fn register(
 pub async fn join(
     State(state): State<AppState>,
     Path(token): Path<String>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode> {
     let now = now_millis();
     let payload = body.to_vec();
+
+    let expected_seq: u64 = headers
+        .get("X-Ghost-Seq")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
 
     if !state.try_reserve(payload.len()) {
         return Err(RelayError::StorageFull);
@@ -73,12 +81,18 @@ pub async fn join(
         return Err(RelayError::Gone("invite expired".into()));
     }
 
-    if invite.join.is_some() {
+    // Reject stale writes so concurrent joiners don't overwrite each other
+    if expected_seq != invite.seq {
         state.release(payload.len());
-        return Err(RelayError::BadRequest("already joined".into()));
+        return Err(RelayError::Conflict);
     }
 
+    if let Some(ref old) = invite.join {
+        state.release(old.len());
+    }
     invite.join = Some(payload);
+    invite.accept = None;
+    invite.seq += 1;
     let _ = invite.join_notify.send(());
 
     Ok(StatusCode::ACCEPTED)
@@ -88,7 +102,7 @@ pub async fn get_join(
     State(state): State<AppState>,
     Path(token): Path<String>,
     headers: HeaderMap,
-) -> Result<(StatusCode, Vec<u8>)> {
+) -> Result<(StatusCode, HeaderMap, Vec<u8>)> {
     let timeout_ms: u64 = headers
         .get("X-Ghost-Long-Poll")
         .and_then(|v| v.to_str().ok())
@@ -101,7 +115,9 @@ pub async fn get_join(
         let invites = state.invites.read().await;
         let invite = invites.get(&token).ok_or(RelayError::NotFound)?;
         if let Some(ref join) = invite.join {
-            return Ok((StatusCode::OK, join.clone()));
+            let mut resp_headers = HeaderMap::new();
+            resp_headers.insert("X-Ghost-Seq", invite.seq.into());
+            return Ok((StatusCode::OK, resp_headers, join.clone()));
         }
         invite.join_notify.subscribe()
     };
@@ -112,8 +128,12 @@ pub async fn get_join(
     let invites = state.invites.read().await;
     let invite = invites.get(&token).ok_or(RelayError::NotFound)?;
     match &invite.join {
-        Some(join) => Ok((StatusCode::OK, join.clone())),
-        None => Ok((StatusCode::NO_CONTENT, Vec::new())),
+        Some(join) => {
+            let mut resp_headers = HeaderMap::new();
+            resp_headers.insert("X-Ghost-Seq", invite.seq.into());
+            Ok((StatusCode::OK, resp_headers, join.clone()))
+        }
+        None => Ok((StatusCode::NO_CONTENT, HeaderMap::new(), Vec::new())),
     }
 }
 
@@ -137,11 +157,9 @@ pub async fn post_accept(
         }
     };
 
-    if invite.accept.is_some() {
-        state.release(payload.len());
-        return Err(RelayError::BadRequest("accept already posted".into()));
+    if let Some(ref old) = invite.accept {
+        state.release(old.len());
     }
-
     invite.accept = Some(payload);
     let _ = invite.accept_notify.send(());
 
