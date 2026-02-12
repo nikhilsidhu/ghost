@@ -3,6 +3,7 @@ import type { Group } from "../lib/types";
 import { Dialog, DialogContent } from "./ui/dialog";
 import { Input } from "./ui/input";
 import { cn } from "../lib/cn";
+import { findShortcut } from "../lib/shortcuts";
 import { Pin } from "lucide-solid";
 
 // --- Public types for command definitions ---
@@ -152,14 +153,15 @@ export function CommandPalette(props: Props) {
   // --- Keyboard shortcut ---
 
   onMount(() => {
+    const searchDef = findShortcut("search");
+    const commandsDef = findShortcut("commands");
     const handler = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === "k") {
+      if (commandsDef.match(e)) {
         e.preventDefault();
-        batch(() => {
-          resetAll();
-          if (e.shiftKey) setQuery("/");
-          setOpen(true);
-        });
+        batch(() => { resetAll(); setQuery("/"); setOpen(true); });
+      } else if (searchDef.match(e)) {
+        e.preventDefault();
+        batch(() => { resetAll(); setOpen(true); });
       }
     };
     document.addEventListener("keydown", handler);

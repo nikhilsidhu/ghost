@@ -13,6 +13,7 @@ import { MemberPanel } from "./MemberPanel";
 import { CommandPalette, type CommandDef } from "./CommandPalette";
 import { InviteDialog } from "./InviteDialog";
 import { ShortcutOverlay } from "./ShortcutOverlay";
+import { shortcuts as shortcutDefs, formatHint } from "../lib/shortcuts";
 
 export function Layout() {
   const [identity, setIdentity] = createSignal<Identity | null>(null);
@@ -92,7 +93,9 @@ export function Layout() {
     { label: "voice", value: "voice" },
   ];
 
-  // --- Command definitions ---
+  // --- Shortcuts & commands ---
+
+  const overlayShortcuts = shortcutDefs.filter((s) => s.id !== "shortcuts");
 
   const commands: CommandDef[] = [
     {
@@ -212,7 +215,7 @@ export function Layout() {
                   select a group
                 </span>
                 <span class="text-[10px] block mt-2" style={{ color: "var(--neutral-600)" }}>
-                  {"\u2318"}K to search &middot; {"\u2318\u21e7"}K for commands &middot; hold ? for shortcuts
+                  {shortcutDefs.map((s) => formatHint(s)).join(" \u00b7 ")}
                 </span>
               </div>
             </div>
@@ -242,7 +245,7 @@ export function Layout() {
         onOpenCommandHandled={() => setOpenCommandId(null)}
       />
       <InviteDialog link={inviteLink()} onClose={() => setInviteLink(null)} />
-      <ShortcutOverlay forceOpen={showInfo()} onClose={() => setShowInfo(false)} />
+      <ShortcutOverlay shortcuts={overlayShortcuts} forceOpen={showInfo()} onClose={() => setShowInfo(false)} />
     </div>
   );
 }

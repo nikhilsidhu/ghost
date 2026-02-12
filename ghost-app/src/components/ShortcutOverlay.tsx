@@ -1,66 +1,33 @@
 import { createSignal, onMount, onCleanup, Show, For } from "solid-js";
-import {
-  Search, Terminal, ArrowUp, ArrowDown, CornerDownLeft,
-  Keyboard, MessageSquare, X, TabletSmartphone,
-} from "lucide-solid";
+import { Command, ArrowBigUp, Keyboard } from "lucide-solid";
+import { findShortcut, type ShortcutDef } from "../lib/shortcuts";
 import type { JSX } from "solid-js";
 
-const isMac = navigator.platform.includes("Mac");
-const mod = isMac ? "\u2318" : "Ctrl";
+export type { ShortcutDef };
 
-interface Shortcut {
-  keys: string[];
-  label: string;
-  icon: () => JSX.Element;
-}
-
-const shortcuts: Shortcut[] = [
-  {
-    keys: [mod, "K"],
-    label: "Search groups",
-    icon: () => <Search size={14} />,
-  },
-  {
-    keys: [mod, "\u21e7", "K"],
-    label: "Command palette",
-    icon: () => <Terminal size={14} />,
-  },
-  {
-    keys: ["\u21b5"],
-    label: "Send message / confirm",
-    icon: () => <CornerDownLeft size={14} />,
-  },
-  {
-    keys: ["\u2191", "\u2193"],
-    label: "Navigate lists",
-    icon: () => <ArrowUp size={14} />,
-  },
-  {
-    keys: ["Tab"],
-    label: "Autocomplete",
-    icon: () => <TabletSmartphone size={14} />,
-  },
-  {
-    keys: ["Esc"],
-    label: "Close dialog",
-    icon: () => <X size={14} />,
-  },
-  {
-    keys: ["?"],
-    label: "Show this overlay",
-    icon: () => <Keyboard size={14} />,
-  },
-];
-
-function Kbd(props: { children: string }) {
+function Kbd(props: { children: JSX.Element }) {
   return (
-    <kbd class="inline-flex items-center justify-center min-w-[22px] h-[22px] px-1.5 rounded text-[11px] font-medium bg-[var(--neutral-700)] text-[var(--neutral-300)] border border-[var(--neutral-600)]">
+    <kbd class="inline-flex items-center justify-center min-w-[28px] h-7 px-2 rounded text-sm font-semibold bg-[var(--neutral-700)] text-[var(--neutral-200)] border border-[var(--neutral-600)]">
       {props.children}
     </kbd>
   );
 }
 
+function KeyBadge(props: { value: string }) {
+  switch (props.value) {
+    case "Cmd":
+      return <Kbd><Command size={16} strokeWidth={2.5} /></Kbd>;
+    case "Ctrl":
+      return <Kbd>Ctrl</Kbd>;
+    case "\u21e7":
+      return <Kbd><ArrowBigUp size={16} strokeWidth={2.5} /></Kbd>;
+    default:
+      return <Kbd><span class="text-[15px] font-bold leading-none">{props.value}</span></Kbd>;
+  }
+}
+
 interface Props {
+  shortcuts: ShortcutDef[];
   forceOpen?: boolean;
   onClose?: () => void;
 }
@@ -74,14 +41,21 @@ export function ShortcutOverlay(props: Props) {
   };
 
   onMount(() => {
+    const def = findShortcut("shortcuts");
     const onDown = (e: KeyboardEvent) => {
-      if (e.key === "?" && !isInputFocused() && !e.metaKey && !e.ctrlKey) {
+      if (e.key === "Escape" && (visible() || props.forceOpen)) {
+        e.preventDefault();
+        setVisible(false);
+        props.onClose?.();
+        return;
+      }
+      if (def.match(e) && !isInputFocused()) {
         e.preventDefault();
         setVisible(true);
       }
     };
     const onUp = (e: KeyboardEvent) => {
-      if (e.key === "?" || e.key === "Shift") {
+      if (e.key === "Shift" || def.keys.includes(e.key)) {
         setVisible(false);
       }
     };
@@ -107,30 +81,29 @@ export function ShortcutOverlay(props: Props) {
         onClick={handleBackdropClick}
       >
         <div
-          class="w-80 rounded-lg border border-[var(--neutral-700)] bg-[var(--neutral-900)] p-5 shadow-2xl"
+          class="w-96 rounded-lg border border-[var(--neutral-700)] bg-[var(--neutral-900)] p-6 shadow-2xl"
           onClick={(e) => e.stopPropagation()}
         >
-          <div class="flex items-center gap-2 mb-4">
-            <Keyboard size={16} class="text-[var(--purple-400)]" />
-            <span class="text-sm font-medium text-[var(--neutral-100)]">keyboard shortcuts</span>
+          <div class="flex items-center gap-2.5 mb-5">
+            <Keyboard size={18} strokeWidth={2.5} class="text-[var(--purple-400)]" />
+            <span class="text-base font-medium text-[var(--neutral-100)]">keyboard shortcuts</span>
           </div>
-          <div class="flex flex-col gap-2.5">
-            <For each={shortcuts}>
+          <div class="flex flex-col gap-3">
+            <For each={props.shortcuts}>
               {(s) => (
-                <div class="flex items-center gap-3">
-                  <span class="text-[var(--purple-400)] flex-shrink-0 w-4">{s.icon()}</span>
-                  <span class="flex-1 text-xs text-[var(--neutral-400)]">{s.label}</span>
-                  <div class="flex items-center gap-0.5">
+                <div class="flex items-center justify-between gap-4">
+                  <span class="text-sm text-[var(--neutral-300)]">{s.label}</span>
+                  <div class="flex items-center gap-1 flex-shrink-0">
                     <For each={s.keys}>
-                      {(k) => <Kbd>{k}</Kbd>}
+                      {(k) => <KeyBadge value={k} />}
                     </For>
                   </div>
                 </div>
               )}
             </For>
           </div>
-          <p class="text-[10px] text-[var(--neutral-600)] mt-4 text-center">
-            hold <Kbd>?</Kbd> to show &middot; release to dismiss
+          <p class="text-xs text-[var(--neutral-600)] mt-5 text-center">
+            hold <Kbd>?</Kbd> or <span class="text-[var(--purple-400)]">/info</span> to show &middot; <Kbd>Esc</Kbd> to dismiss
           </p>
         </div>
       </div>
