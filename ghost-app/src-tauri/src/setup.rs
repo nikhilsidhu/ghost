@@ -8,7 +8,10 @@ use ghost_core::identity::Identity;
 use crate::state::AppState;
 
 fn ghost_dir() -> PathBuf {
-    dirs::home_dir().expect("no home directory").join(".ghost")
+    match std::env::var("GHOST_DATA_DIR") {
+        Ok(dir) => PathBuf::from(dir),
+        Err(_) => dirs::home_dir().expect("no home directory").join(".ghost"),
+    }
 }
 
 fn seed_file() -> PathBuf {
