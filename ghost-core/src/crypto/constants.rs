@@ -6,16 +6,16 @@ pub const MLS_CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128
 /// Label used when deriving per-sender voice encryption keys from MLS epoch secrets.
 pub const VOICE_EXPORT_LABEL: &str = "ghost-voice";
 
-/// HKDF domain-separation label for deriving Ed25519 signing keys from identity seeds.
+/// Label used when deriving Ed25519 signing keys from identity seeds.
 pub const ED25519_DERIVE_LABEL: &[u8] = b"ghost-ed25519";
 
-/// HKDF domain-separation label for deriving X25519 keys from identity seeds.
+/// Label used when deriving X25519 keys from identity seeds.
 pub const X25519_DERIVE_LABEL: &[u8] = b"ghost-x25519";
 
 /// How many bytes of a fingerprint to use for short display names (produces 2x hex chars).
 pub const FINGERPRINT_SHORT_BYTES: usize = 8;
 
-/// HKDF domain-separation label for deriving the SQLCipher database encryption key from the identity seed.
+/// Label used when deriving the SQLCipher database encryption key from the identity seed.
 pub const DB_KEY_DERIVE_LABEL: &[u8] = b"ghost-db-key";
 pub const MLS_DB_KEY_DERIVE_LABEL: &[u8] = b"ghost-mls-db-key";
 
@@ -62,7 +62,7 @@ impl TryFrom<u8> for MessageType {
     }
 }
 
-// BLAKE3 domain-separation tags for ID derivation
+// Tags used to derive unique IDs from a shared seed
 pub const MLS_GROUP_ID_TAG: &[u8] = b"ghost-mls";
 pub const MAILBOX_ID_TAG: &[u8] = b"ghost-mailbox";
 pub const DEFAULT_CHANNEL_TAG: &[u8] = b"ghost-default-channel";

@@ -18,8 +18,8 @@ fn row_to_raw_message(row: &rusqlite::Row) -> rusqlite::Result<RawMessage> {
 }
 
 impl GhostStore {
-    /// Insert a message and its references atomically. Duplicate message_ids are silently
-    /// ignored (idempotent) so relay re-deliveries don't cause errors.
+    /// Insert a message and its references in one transaction. Idempotent — relay
+    /// re-deliveries are harmless.
     pub fn insert_message(&self, msg: &StoredMessage) -> Result<()> {
         let tx = self.conn.unchecked_transaction()
             .map_err(|e| GhostError::Database(format!("begin transaction: {e}")))?;

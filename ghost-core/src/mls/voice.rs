@@ -50,7 +50,6 @@ pub fn decrypt_voice_frame(
         .map_err(|e| GhostError::Crypto(format!("voice decrypt: {e}")))
 }
 
-// Build a 12-byte nonce: 8 zero bytes then the sequence number.
 fn voice_nonce(sequence: u32) -> [u8; 12] {
     let mut nonce = [0u8; 12];
     nonce[8..12].copy_from_slice(&sequence.to_be_bytes());

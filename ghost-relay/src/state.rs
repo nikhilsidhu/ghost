@@ -26,7 +26,7 @@ pub struct Inner {
 }
 
 impl Inner {
-    /// Atomically reserve `size` bytes. Returns false if over limit.
+    /// Try to reserve `size` bytes. Returns false if over limit.
     pub fn try_reserve(&self, size: usize) -> bool {
         let prev = self.memory_used.fetch_add(size, Ordering::Relaxed);
         if prev + size > self.config.max_memory {

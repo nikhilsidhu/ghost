@@ -110,7 +110,7 @@ pub async fn get_join(
         .unwrap_or(DEFAULT_LONG_POLL_MS)
         .min(MAX_LONG_POLL_MS);
 
-    // Check + subscribe under one lock to avoid race
+    // Must subscribe under the read guard to avoid missing notifications
     let mut rx = {
         let invites = state.invites.read().await;
         let invite = invites.get(&token).ok_or(RelayError::NotFound)?;
@@ -178,7 +178,7 @@ pub async fn get_accept(
         .unwrap_or(DEFAULT_LONG_POLL_MS)
         .min(MAX_LONG_POLL_MS);
 
-    // Check + subscribe under one lock to avoid race
+    // Must subscribe under the read guard to avoid missing notifications
     let mut rx = {
         let invites = state.invites.read().await;
         let invite = invites.get(&token).ok_or(RelayError::NotFound)?;

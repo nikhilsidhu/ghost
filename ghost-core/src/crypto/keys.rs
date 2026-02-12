@@ -4,7 +4,7 @@ use x25519_dalek::StaticSecret;
 
 use crate::error::{GhostError, Result};
 
-/// HKDF-SHA256: extract-then-expand with domain separation
+/// Different `info` values yield different keys from the same input
 pub fn derive_key(ikm: &[u8], info: &[u8]) -> Result<[u8; 32]> {
     let hk = Hkdf::<Sha256>::new(None, ikm);
     let mut out = [0u8; 32];

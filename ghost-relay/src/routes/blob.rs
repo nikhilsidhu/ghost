@@ -88,7 +88,6 @@ pub async fn get_blobs(
         .unwrap_or(0)
         .min(MAX_LONG_POLL_MS);
 
-    // No long-poll: read lock, no mailbox creation
     if timeout_ms == 0 {
         let map = state.mailboxes.read().await;
         return match map.get(&id) {
@@ -97,7 +96,7 @@ pub async fn get_blobs(
         };
     }
 
-    // Long-poll: write lock to ensure mailbox exists, check + subscribe atomically
+    // Must subscribe under the write guard to avoid missing notifications
     let mut rx = {
         let mut map = state.mailboxes.write().await;
         let mailbox = map.entry(id).or_insert_with(Mailbox::new);
