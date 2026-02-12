@@ -30,6 +30,9 @@ Thumbs.db
 *.swp
 *.swo
 
+# Prototypes / demos
+prototypes/
+
 # Build artifacts
 *.app
 *.dmg
