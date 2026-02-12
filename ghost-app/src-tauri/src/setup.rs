@@ -61,7 +61,12 @@ pub fn initialize() -> AppState {
 
     let seed = load_or_create_seed();
     let client = GhostClient::open(seed, &db_path()).expect("failed to open database");
+    let relay_url = std::env::var("GHOST_RELAY_URL")
+        .unwrap_or_else(|_| "http://localhost:7700".into());
+
     AppState {
         client: Mutex::new(client),
+        relay_url,
+        http: reqwest::Client::new(),
     }
 }

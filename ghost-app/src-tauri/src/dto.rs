@@ -98,6 +98,12 @@ impl From<&StoredMessage> for MessageDto {
     }
 }
 
+#[derive(Serialize)]
+pub struct InviteDto {
+    pub token: String,
+    pub link: String,
+}
+
 impl From<&Member> for MemberDto {
     fn from(m: &Member) -> Self {
         Self {

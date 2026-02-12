@@ -1,11 +1,13 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use base64::Engine;
 use rand::RngCore;
 use tauri::State;
 
 use ghost_core::storage::{Channel, ChannelKind};
 
-use crate::dto::{ChannelDto, GroupDto, IdentityDto, MemberDto, MessageDto};
+use crate::constants::{INVITE_EXPIRY_MS, SEQ_HEADER};
+use crate::dto::{ChannelDto, GroupDto, IdentityDto, InviteDto, MemberDto, MessageDto};
 use crate::state::AppState;
 
 fn now_millis() -> u64 {
@@ -190,4 +192,126 @@ pub fn delete_channel(channel_id: String, state: State<AppState>) -> Result<(), 
         .store()
         .delete_channel(&cid)
         .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn create_invite(
+    group_id: String,
+    state: State<'_, AppState>,
+) -> Result<InviteDto, String> {
+    let gid = parse_id(&group_id)?;
+
+    let (token, payload_bytes) = {
+        let client = state.client.lock().map_err(|e| e.to_string())?;
+        client.create_invite(&gid).map_err(|e| e.to_string())?
+    };
+
+    let expires_at = now_millis() + INVITE_EXPIRY_MS;
+    state
+        .http
+        .post(format!("{}/invite", state.relay_url))
+        .json(&serde_json::json!({ "token": token, "expires_at": expires_at }))
+        .send()
+        .await
+        .map_err(|e| format!("register invite: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("register invite: {e}"))?;
+
+    state
+        .http
+        .post(format!("{}/invite/{}/join", state.relay_url, token))
+        .header(SEQ_HEADER, "0")
+        .body(payload_bytes)
+        .send()
+        .await
+        .map_err(|e| format!("upload invite payload: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("upload invite payload: {e}"))?;
+
+    let mut link = url::Url::parse("ghost://join").expect("valid base URL");
+    link.query_pairs_mut()
+        .append_pair("relay", &state.relay_url)
+        .append_pair("token", &token);
+    let link = link.to_string();
+
+    Ok(InviteDto { token, link })
+}
+
+#[tauri::command]
+pub async fn join_by_invite(
+    relay_url: String,
+    token: String,
+    state: State<'_, AppState>,
+) -> Result<GroupDto, String> {
+    // Fetch the invite payload and current sequence number
+    let response = state
+        .http
+        .get(format!("{}/invite/{}/join", relay_url, token))
+        .send()
+        .await
+        .map_err(|e| format!("fetch invite: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("fetch invite: {e}"))?;
+
+    let seq: u64 = response
+        .headers()
+        .get(SEQ_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let payload_bytes = response
+        .bytes()
+        .await
+        .map_err(|e| format!("read invite body: {e}"))?;
+
+    // External commit — join the MLS group locally
+    let (group_id, commit_bytes, mailbox_id) = {
+        let mut client = state.client.lock().map_err(|e| e.to_string())?;
+        client
+            .join_by_invite(&payload_bytes, now_millis())
+            .map_err(|e| e.to_string())?
+    };
+
+    // Broadcast the external commit so existing members see us
+    let mailbox_b64 =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mailbox_id);
+    state
+        .http
+        .post(format!("{}/box/{}", relay_url, mailbox_b64))
+        .body(commit_bytes)
+        .send()
+        .await
+        .map_err(|e| format!("broadcast commit: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("broadcast commit: {e}"))?;
+
+    // Refresh the invite payload with fresh GroupInfo for the next joiner
+    let updated_payload = {
+        let client = state.client.lock().map_err(|e| e.to_string())?;
+        client
+            .refresh_invite_payload(&group_id)
+            .map_err(|e| e.to_string())?
+    };
+
+    let resp = state
+        .http
+        .post(format!("{}/invite/{}/join", relay_url, token))
+        .header(SEQ_HEADER, seq.to_string())
+        .body(updated_payload)
+        .send()
+        .await
+        .map_err(|e| format!("refresh invite: {e}"))?;
+
+    // 409 means another joiner refreshed first — our join still succeeded,
+    // the invite just has slightly stale GroupInfo
+    if !resp.status().is_success() && resp.status() != reqwest::StatusCode::CONFLICT {
+        return Err(format!("refresh invite: HTTP {}", resp.status()));
+    }
+
+    let client = state.client.lock().map_err(|e| e.to_string())?;
+    let group = client
+        .store()
+        .get_group(&group_id)
+        .map_err(|e| e.to_string())?;
+    Ok(GroupDto::from(&group))
 }

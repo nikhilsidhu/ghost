@@ -1,6 +1,7 @@
 use tauri::Manager;
 
 mod commands;
+mod constants;
 mod dto;
 mod setup;
 mod state;
@@ -38,6 +39,8 @@ fn main() {
             commands::create_channel,
             commands::rename_channel,
             commands::delete_channel,
+            commands::create_invite,
+            commands::join_by_invite,
         ])
         .run(tauri::generate_context!())
         .expect("error while running ghost");

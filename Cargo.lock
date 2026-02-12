@@ -1461,16 +1461,19 @@ dependencies = [
 name = "ghost-app"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "dirs",
  "ghost-core",
  "hex",
  "objc2-app-kit",
  "objc2-core-foundation",
  "rand 0.8.5",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "tauri",
  "tauri-build",
+ "url",
 ]
 
 [[package]]
