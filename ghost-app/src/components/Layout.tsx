@@ -12,6 +12,7 @@ import { GroupView } from "./GroupView";
 import { MemberPanel } from "./MemberPanel";
 import { CommandPalette, type CommandDef } from "./CommandPalette";
 import { InviteDialog } from "./InviteDialog";
+import { ShortcutOverlay } from "./ShortcutOverlay";
 
 export function Layout() {
   const [identity, setIdentity] = createSignal<Identity | null>(null);
@@ -23,6 +24,7 @@ export function Layout() {
   const [selectedChannelId, setSelectedChannelId] = createSignal<string | null>(null);
   const [openCommandId, setOpenCommandId] = createSignal<string | null>(null);
   const [inviteLink, setInviteLink] = createSignal<string | null>(null);
+  const [showInfo, setShowInfo] = createSignal(false);
 
   // --- Refresh helpers ---
 
@@ -177,6 +179,14 @@ export function Layout() {
         await refreshGroups();
       },
     },
+    {
+      id: "info",
+      command: "info",
+      args: [],
+      execute: async () => {
+        setShowInfo(true);
+      },
+    },
   ];
 
   return (
@@ -197,9 +207,14 @@ export function Layout() {
           when={selectedGroup()}
           fallback={
             <div class="flex-1 flex items-center justify-center">
-              <span class="text-xs" style={{ color: "var(--neutral-500)" }}>
-                select a group
-              </span>
+              <div class="text-center">
+                <span class="text-xs block" style={{ color: "var(--neutral-500)" }}>
+                  select a group
+                </span>
+                <span class="text-[10px] block mt-2" style={{ color: "var(--neutral-600)" }}>
+                  {"\u2318"}K to search &middot; {"\u2318\u21e7"}K for commands &middot; hold ? for shortcuts
+                </span>
+              </div>
             </div>
           }
         >
@@ -227,6 +242,7 @@ export function Layout() {
         onOpenCommandHandled={() => setOpenCommandId(null)}
       />
       <InviteDialog link={inviteLink()} onClose={() => setInviteLink(null)} />
+      <ShortcutOverlay forceOpen={showInfo()} onClose={() => setShowInfo(false)} />
     </div>
   );
 }
