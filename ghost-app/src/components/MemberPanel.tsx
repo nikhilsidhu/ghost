@@ -12,7 +12,7 @@ export function MemberPanel(props: Props) {
       class="w-56 flex-shrink-0 border-l border-[var(--neutral-800)] flex flex-col"
       style={{ background: "var(--neutral-900)" }}
     >
-      <div class="h-7 flex-shrink-0" />
+      <div data-tauri-drag-region class="h-7 flex-shrink-0" />
       <div class="h-14 flex-shrink-0 flex items-center px-3">
         <span class="text-xs uppercase tracking-wider text-[var(--neutral-500)]">
           members — {props.members.length}

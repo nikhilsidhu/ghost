@@ -228,11 +228,22 @@ export function CommandPalette(props: Props) {
 
   // --- Scroll into view ---
 
+  let inputRef!: HTMLInputElement;
   let listRef!: HTMLDivElement;
 
   createEffect(() => {
     query();
     setFocusedIndex(0);
+  });
+
+  // Move cursor to end when dialog opens
+  createEffect(() => {
+    if (open() && inputRef) {
+      requestAnimationFrame(() => {
+        inputRef.focus();
+        inputRef.setSelectionRange(inputRef.value.length, inputRef.value.length);
+      });
+    }
   });
 
   createEffect(() => {
@@ -415,6 +426,7 @@ export function CommandPalette(props: Props) {
         {/* Input */}
         <div class={cn("p-3 border-b border-[var(--neutral-600)]", mode() === "args" ? "pt-1.5" : "")}>
           <Input
+            ref={inputRef}
             placeholder={placeholder()}
             value={query()}
             onInput={(e: InputEvent) => setQuery((e.currentTarget as HTMLInputElement).value)}

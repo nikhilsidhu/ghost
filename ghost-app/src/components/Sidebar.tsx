@@ -71,7 +71,7 @@ export function Sidebar(props: SidebarProps) {
       class="w-64 flex-shrink-0 flex flex-col border-r border-[var(--neutral-800)]"
       style={{ background: "var(--neutral-900)" }}
     >
-      <div class="h-7 flex-shrink-0" />
+      <div data-tauri-drag-region class="h-7 flex-shrink-0" />
 
       <Show when={props.identity}>
         {(id) => {
