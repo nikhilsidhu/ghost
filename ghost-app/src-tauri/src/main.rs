@@ -1,3 +1,5 @@
+use tauri::Manager;
+
 mod commands;
 mod dto;
 mod setup;
@@ -9,6 +11,19 @@ fn main() {
 
     tauri::Builder::default()
         .manage(app_state)
+        .setup(|app| {
+            // Set native window background to black so macOS doesn't flash white
+            #[cfg(target_os = "macos")]
+            {
+                use objc2_app_kit::{NSColor, NSWindow};
+
+                let window = app.get_webview_window("main").unwrap();
+                let ns_window = unsafe { &*(window.ns_window().unwrap() as *mut NSWindow) };
+                let color = NSColor::colorWithSRGBRed_green_blue_alpha(0.0, 0.0, 0.0, 1.0);
+                ns_window.setBackgroundColor(Some(&color));
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             commands::get_identity,
             commands::list_groups,
