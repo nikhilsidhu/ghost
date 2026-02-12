@@ -15,7 +15,8 @@ use crate::storage::{
     Channel, ChannelKind, GhostStore, Group, Member, MemberRole, StoredMessage,
 };
 use crate::wire::{
-    derive_default_channel_id, group_mailbox_id, open, seal, ApplicationMessage, Outbound,
+    derive_default_channel_id, group_mailbox_id, open, open_any, seal, ApplicationMessage,
+    InboundMessage, InviteChannel, InviteMember, InvitePayload, Outbound,
 };
 
 /// Open an encrypted SQLite connection for MLS state, separate from the app DB.
@@ -288,6 +289,184 @@ impl GhostClient {
         self.groups.insert(*group_id, ghost_group);
         Ok(())
     }
+
+    fn build_invite_payload(
+        group_id: &[u8; 32],
+        group_name: &str,
+        members: &[Member],
+        channels: &[Channel],
+        group_info_bytes: Vec<u8>,
+    ) -> InvitePayload {
+        InvitePayload {
+            group_id: *group_id,
+            group_name: group_name.to_string(),
+            members: members
+                .iter()
+                .map(|m| InviteMember {
+                    fingerprint: m.fingerprint,
+                    display_name: m.display_name.clone(),
+                    role: m.role,
+                })
+                .collect(),
+            channels: channels
+                .iter()
+                .map(|c| InviteChannel {
+                    channel_id: c.channel_id,
+                    name: c.name.clone(),
+                    kind: c.kind,
+                    position: c.position,
+                })
+                .collect(),
+            group_info_bytes,
+        }
+    }
+
+    /// Creator exports an invite payload containing GroupInfo + group metadata.
+    /// Returns (random_token, serialized_payload).
+    pub fn create_invite(&self, group_id: &[u8; 32]) -> Result<(String, Vec<u8>)> {
+        let member = self.store.get_member(group_id, &self.identity.fingerprint)?;
+        if member.role != MemberRole::Creator {
+            return Err(GhostError::PermissionDenied(
+                "only the creator can create invites".into(),
+            ));
+        }
+
+        let group = self.groups.get(group_id).ok_or_else(|| {
+            GhostError::GroupNotLoaded(hex::encode(&group_id[..8]))
+        })?;
+
+        let group_info_bytes = group.export_group_info(&self.provider)?;
+        let meta = self.store.get_group(group_id)?;
+        let members = self.store.list_members(group_id)?;
+        let channels = self.store.list_channels(group_id)?;
+
+        let payload = Self::build_invite_payload(group_id, &meta.name, &members, &channels, group_info_bytes);
+
+        let mut token_bytes = [0u8; 16];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut token_bytes);
+        let token = hex::encode(token_bytes);
+
+        Ok((token, payload.to_bytes()))
+    }
+
+    /// Join a group via an invite payload (external commit).
+    /// Returns (group_id, commit_bytes_to_broadcast, mailbox_id).
+    pub fn join_by_invite(
+        &mut self,
+        payload_bytes: &[u8],
+        timestamp: u64,
+    ) -> Result<([u8; 32], Vec<u8>, [u8; 32])> {
+        let payload = InvitePayload::from_bytes(payload_bytes)?;
+
+        let (ghost_group, commit_bytes) = GhostGroup::join_by_external_commit(
+            &self.provider,
+            &self.identity,
+            &payload.group_info_bytes,
+        )?;
+
+        let creator_fp = payload
+            .members
+            .iter()
+            .find(|m| m.role == MemberRole::Creator)
+            .map(|m| m.fingerprint)
+            .unwrap_or([0u8; 32]);
+
+        self.store.insert_group(&Group {
+            group_id: payload.group_id,
+            name: payload.group_name,
+            creator_fp,
+            created_at: timestamp,
+        })?;
+
+        for ch in &payload.channels {
+            self.store.insert_channel(&Channel {
+                channel_id: ch.channel_id,
+                group_id: payload.group_id,
+                name: ch.name.clone(),
+                kind: ch.kind,
+                position: ch.position,
+            })?;
+        }
+
+        for m in &payload.members {
+            self.store.insert_member(&Member {
+                group_id: payload.group_id,
+                fingerprint: m.fingerprint,
+                display_name: m.display_name.clone(),
+                role: m.role.clone(),
+                joined_at: timestamp,
+            })?;
+        }
+
+        self.store.insert_member(&Member {
+            group_id: payload.group_id,
+            fingerprint: self.identity.fingerprint,
+            display_name: self.identity.display_name.clone(),
+            role: MemberRole::Member,
+            joined_at: timestamp,
+        })?;
+
+        let mailbox_id = group_mailbox_id(ghost_group.group_id());
+        self.groups.insert(payload.group_id, ghost_group);
+
+        Ok((payload.group_id, commit_bytes, mailbox_id))
+    }
+
+    /// Re-export an invite payload with fresh GroupInfo (after joining via external commit).
+    pub fn refresh_invite_payload(&self, group_id: &[u8; 32]) -> Result<Vec<u8>> {
+        let group = self.groups.get(group_id).ok_or_else(|| {
+            GhostError::GroupNotLoaded(hex::encode(&group_id[..8]))
+        })?;
+
+        let group_info_bytes = group.export_group_info(&self.provider)?;
+        let meta = self.store.get_group(group_id)?;
+        let members = self.store.list_members(group_id)?;
+        let channels = self.store.list_channels(group_id)?;
+
+        let payload = Self::build_invite_payload(group_id, &meta.name, &members, &channels, group_info_bytes);
+        Ok(payload.to_bytes())
+    }
+
+    /// Process an inbound blob — could be an app message or a commit.
+    /// Returns the app message if it was one, or None if it was a commit (already merged).
+    pub fn receive_any(
+        &mut self,
+        group_id: &[u8; 32],
+        blob: &[u8],
+        received_at: u64,
+    ) -> Result<Option<ApplicationMessage>> {
+        let group = self.groups.get_mut(group_id).ok_or_else(|| {
+            GhostError::GroupNotLoaded(hex::encode(&group_id[..8]))
+        })?;
+
+        match open_any(group, &self.provider, blob)? {
+            InboundMessage::Application(msg) => {
+                let recv_ts = if received_at > 0 {
+                    received_at
+                } else {
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis() as u64
+                };
+
+                self.store.insert_message(&StoredMessage {
+                    message_id: msg.message_id,
+                    channel_id: msg.channel_id,
+                    sender_fp: msg.sender_fp,
+                    message_type: msg.message_type as u8,
+                    timestamp: msg.timestamp,
+                    received_at: recv_ts,
+                    content: msg.content.clone(),
+                    expires_at: None,
+                    references: msg.references.clone(),
+                })?;
+
+                Ok(Some(msg))
+            }
+            InboundMessage::Commit => Ok(None),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -433,5 +612,64 @@ mod tests {
         assert_eq!(c1.store().get_message(&id2).unwrap().content, b"from c2");
         assert_eq!(c2.store().get_message(&id1).unwrap().content, b"from c1");
         assert_eq!(c2.store().get_message(&id2).unwrap().content, b"from c2");
+    }
+
+    #[test]
+    fn create_invite_requires_creator() {
+        let (c1, c2, group_id) = setup_two_clients();
+
+        // c1 (creator) can create invite
+        let result = c1.create_invite(&group_id);
+        assert!(result.is_ok());
+
+        // c2 (member) cannot
+        let result = c2.create_invite(&group_id);
+        assert!(matches!(result, Err(GhostError::PermissionDenied(_))));
+    }
+
+    #[test]
+    fn invite_full_roundtrip() {
+        let mut c1 = GhostClient::open_in_memory([0x01; 32]).unwrap();
+        let mut c2 = GhostClient::open_in_memory([0x02; 32]).unwrap();
+
+        let group_id = c1.create_group("test", 1000).unwrap();
+
+        let (_token, payload_bytes) = c1.create_invite(&group_id).unwrap();
+
+        let (joined_group_id, commit_bytes, _mailbox_id) =
+            c2.join_by_invite(&payload_bytes, 2000).unwrap();
+        assert_eq!(joined_group_id, group_id);
+
+        // c2 should have the group, channel, and members in their store
+        let group = c2.store().get_group(&group_id).unwrap();
+        assert_eq!(group.name, "test");
+        let channels = c2.store().list_channels(&group_id).unwrap();
+        assert_eq!(channels.len(), 1);
+        assert_eq!(channels[0].name, "general");
+        let members = c2.store().list_members(&group_id).unwrap();
+        assert_eq!(members.len(), 2); // c1 + c2
+
+        // c1 processes the external commit
+        let result = c1.receive_any(&group_id, &commit_bytes, 2000).unwrap();
+        assert!(result.is_none()); // commit, not app message
+    }
+
+    #[test]
+    fn refresh_invite_payload_has_new_member() {
+        let mut c1 = GhostClient::open_in_memory([0x01; 32]).unwrap();
+        let mut c2 = GhostClient::open_in_memory([0x02; 32]).unwrap();
+
+        let group_id = c1.create_group("test", 1000).unwrap();
+        let (_, payload_bytes) = c1.create_invite(&group_id).unwrap();
+
+        c2.join_by_invite(&payload_bytes, 2000).unwrap();
+
+        let refreshed = c2.refresh_invite_payload(&group_id).unwrap();
+        let payload = InvitePayload::from_bytes(&refreshed).unwrap();
+
+        // Should include c1 + c2
+        assert_eq!(payload.members.len(), 2);
+        assert_eq!(payload.group_name, "test");
+        assert!(!payload.group_info_bytes.is_empty());
     }
 }

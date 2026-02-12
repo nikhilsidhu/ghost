@@ -29,6 +29,9 @@ pub enum GhostError {
     #[error("group not loaded: {0}")]
     GroupNotLoaded(String),
 
+    #[error("permission denied: {0}")]
+    PermissionDenied(String),
+
     #[error("network: {0}")]
     Network(String),
 

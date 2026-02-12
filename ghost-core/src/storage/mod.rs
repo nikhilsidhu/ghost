@@ -81,7 +81,7 @@ pub struct Group {
     pub created_at: u64,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ChannelKind {
     Text,
     Voice,
@@ -104,6 +104,21 @@ impl ChannelKind {
             ))),
         }
     }
+
+    pub fn to_byte(self) -> u8 {
+        match self {
+            ChannelKind::Text => 0,
+            ChannelKind::Voice => 1,
+        }
+    }
+
+    pub fn from_byte(b: u8) -> Result<Self> {
+        match b {
+            0 => Ok(ChannelKind::Text),
+            1 => Ok(ChannelKind::Voice),
+            _ => Err(GhostError::Format(format!("unknown channel kind byte: {b}"))),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -115,7 +130,7 @@ pub struct Channel {
     pub position: i32,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum MemberRole {
     Creator,
     Member,
@@ -134,6 +149,21 @@ impl MemberRole {
             "creator" => Ok(MemberRole::Creator),
             "member" => Ok(MemberRole::Member),
             other => Err(GhostError::Database(format!("unknown role: {other}"))),
+        }
+    }
+
+    pub fn to_byte(self) -> u8 {
+        match self {
+            MemberRole::Creator => 0,
+            MemberRole::Member => 1,
+        }
+    }
+
+    pub fn from_byte(b: u8) -> Result<Self> {
+        match b {
+            0 => Ok(MemberRole::Creator),
+            1 => Ok(MemberRole::Member),
+            _ => Err(GhostError::Format(format!("unknown role byte: {b}"))),
         }
     }
 }

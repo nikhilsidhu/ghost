@@ -224,6 +224,51 @@ impl GhostGroup {
     pub fn members(&self) -> impl Iterator<Item = Member> + '_ {
         self.mls_group.members()
     }
+
+    /// Export the group's current state so someone can join via external commit.
+    pub fn export_group_info(&self, provider: &GhostProvider) -> Result<Vec<u8>> {
+        let msg = self
+            .mls_group
+            .export_group_info(provider.crypto(), &self.signer, true)
+            .map_err(|e| GhostError::Mls(format!("export group info: {e}")))?;
+        msg.to_bytes()
+            .map_err(|e| GhostError::Mls(format!("serialize group info: {e}")))
+    }
+
+    /// Join an existing group using exported GroupInfo (external commit).
+    /// Returns the new group and the serialized commit to broadcast to existing members.
+    pub fn join_by_external_commit(
+        provider: &GhostProvider,
+        identity: &Identity,
+        group_info_bytes: &[u8],
+    ) -> Result<(Self, Vec<u8>)> {
+        let signer = signer_from_identity(identity);
+        let credential = credential_from_identity(identity);
+
+        let msg_in = MlsMessageIn::tls_deserialize_exact(group_info_bytes)
+            .map_err(|e| GhostError::Mls(format!("deserialize group info: {e}")))?;
+        let vgi = match msg_in.extract() {
+            MlsMessageBodyIn::GroupInfo(vgi) => vgi,
+            _ => return Err(GhostError::Mls("expected GroupInfo message".into())),
+        };
+
+        let (mls_group, commit_bundle) = MlsGroup::external_commit_builder()
+            .build_group(provider, vgi, credential)
+            .map_err(|e| GhostError::Mls(format!("build external commit: {e}")))?
+            .load_psks(provider.storage())
+            .map_err(|e| GhostError::Mls(format!("load psks: {e}")))?
+            .build(provider.rand(), provider.crypto(), &signer, |_| true)
+            .map_err(|e| GhostError::Mls(format!("build commit: {e}")))?
+            .finalize(provider)
+            .map_err(|e| GhostError::Mls(format!("finalize external commit: {e}")))?;
+
+        let commit_bytes = commit_bundle
+            .into_commit()
+            .to_bytes()
+            .map_err(|e| GhostError::Mls(format!("serialize commit: {e}")))?;
+
+        Ok((Self { mls_group, signer }, commit_bytes))
+    }
 }
 
 #[cfg(test)]
@@ -294,6 +339,24 @@ mod tests {
             .export_secret(&provider, "ghost-voice", b"test-context", 32)
             .unwrap();
         assert_eq!(secret.len(), 32);
+    }
+
+    #[test]
+    fn export_and_external_commit() {
+        let provider_a = GhostProvider::new_in_memory().unwrap();
+        let provider_b = GhostProvider::new_in_memory().unwrap();
+
+        let id_a = Identity::from_seed([0x01u8; 32]).unwrap();
+        let id_b = Identity::from_seed([0x02u8; 32]).unwrap();
+
+        let group_a = GhostGroup::create(&provider_a, &id_a).unwrap();
+        let group_info_bytes = group_a.export_group_info(&provider_a).unwrap();
+
+        let (group_b, commit_bytes) =
+            GhostGroup::join_by_external_commit(&provider_b, &id_b, &group_info_bytes).unwrap();
+
+        assert_eq!(group_a.group_id(), group_b.group_id());
+        assert!(!commit_bytes.is_empty());
     }
 
     #[test]

@@ -7,6 +7,7 @@ use crate::crypto::{
 };
 use crate::error::{GhostError, Result};
 use crate::mls::group::GhostGroup;
+use crate::storage::{ChannelKind, MemberRole};
 
 const MAX_REFERENCES: usize = 255;
 
@@ -79,70 +80,31 @@ impl ApplicationMessage {
 
     /// Deserialize from wire format.
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        if data.len() < FIXED_HEADER_LEN {
-            return Err(GhostError::Format("message too short".into()));
-        }
-
         let mut pos = 0;
 
-        let version = data[pos];
-        pos += 1;
+        let version = read_u8(data, &mut pos)?;
         if version != PROTOCOL_VERSION {
             return Err(GhostError::Format(format!(
                 "unsupported version: {version:#04x}"
             )));
         }
 
-        let type_byte = data[pos];
-        pos += 1;
+        let type_byte = read_u8(data, &mut pos)?;
         let message_type = MessageType::try_from(type_byte)
             .map_err(|v| GhostError::Format(format!("unknown message type: {v:#04x}")))?;
 
-        let channel_id: [u8; 32] = data[pos..pos + 32]
-            .try_into()
-            .map_err(|_| GhostError::Format("bad channel_id".into()))?;
-        pos += 32;
+        let channel_id = read_blob32(data, &mut pos)?;
+        let sender_fp = read_blob32(data, &mut pos)?;
+        let timestamp = read_u64(data, &mut pos)?;
+        let message_id = read_blob32(data, &mut pos)?;
 
-        let sender_fp: [u8; 32] = data[pos..pos + 32]
-            .try_into()
-            .map_err(|_| GhostError::Format("bad sender_fp".into()))?;
-        pos += 32;
-
-        let timestamp = u64::from_be_bytes(
-            data[pos..pos + 8]
-                .try_into()
-                .map_err(|_| GhostError::Format("bad timestamp".into()))?,
-        );
-        pos += 8;
-
-        let message_id: [u8; 32] = data[pos..pos + 32]
-            .try_into()
-            .map_err(|_| GhostError::Format("bad message_id".into()))?;
-        pos += 32;
-
-        let ref_count = data[pos] as usize;
-        pos += 1;
-
-        if data.len() < pos + ref_count * 32 + 4 {
-            return Err(GhostError::Format("truncated references".into()));
-        }
-
+        let ref_count = read_u8(data, &mut pos)? as usize;
         let mut references = Vec::with_capacity(ref_count);
         for _ in 0..ref_count {
-            let r: [u8; 32] = data[pos..pos + 32]
-                .try_into()
-                .map_err(|_| GhostError::Format("bad reference".into()))?;
-            pos += 32;
-            references.push(r);
+            references.push(read_blob32(data, &mut pos)?);
         }
 
-        let content_len = u32::from_be_bytes(
-            data[pos..pos + 4]
-                .try_into()
-                .map_err(|_| GhostError::Format("bad content_len".into()))?,
-        ) as usize;
-        pos += 4;
-
+        let content_len = read_u32(data, &mut pos)? as usize;
         if pos + content_len != data.len() {
             return Err(GhostError::Format(format!(
                 "expected {} bytes, got {}",
@@ -150,8 +112,7 @@ impl ApplicationMessage {
                 data.len()
             )));
         }
-
-        let content = data[pos..pos + content_len].to_vec();
+        let content = data[pos..].to_vec();
 
         let expected_id = derive_message_id(&channel_id, &sender_fp, timestamp, &content);
         if message_id != expected_id {
@@ -203,6 +164,208 @@ pub fn derive_default_channel_id(group_id: &[u8; 32]) -> [u8; 32] {
     hasher.update(group_id);
     hasher.update(DEFAULT_CHANNEL_TAG);
     hasher.finalize().into()
+}
+
+// --- InvitePayload: metadata + GroupInfo for external commit joins ---
+
+pub struct InviteMember {
+    pub fingerprint: [u8; 32],
+    pub display_name: String,
+    pub role: MemberRole,
+}
+
+pub struct InviteChannel {
+    pub channel_id: [u8; 32],
+    pub name: String,
+    pub kind: ChannelKind,
+    pub position: i32,
+}
+
+pub struct InvitePayload {
+    pub group_id: [u8; 32],
+    pub group_name: String,
+    pub members: Vec<InviteMember>,
+    pub channels: Vec<InviteChannel>,
+    pub group_info_bytes: Vec<u8>,
+}
+
+fn write_string(buf: &mut Vec<u8>, s: &str) {
+    let bytes = s.as_bytes();
+    buf.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+    buf.extend_from_slice(bytes);
+}
+
+fn read_string(data: &[u8], pos: &mut usize) -> Result<String> {
+    if *pos + 2 > data.len() {
+        return Err(GhostError::Format("truncated string length".into()));
+    }
+    let len = u16::from_be_bytes(data[*pos..*pos + 2].try_into().unwrap()) as usize;
+    *pos += 2;
+    if *pos + len > data.len() {
+        return Err(GhostError::Format("truncated string".into()));
+    }
+    let s = String::from_utf8(data[*pos..*pos + len].to_vec())
+        .map_err(|_| GhostError::Format("invalid UTF-8".into()))?;
+    *pos += len;
+    Ok(s)
+}
+
+fn read_u8(data: &[u8], pos: &mut usize) -> Result<u8> {
+    if *pos >= data.len() {
+        return Err(GhostError::Format("truncated u8".into()));
+    }
+    let val = data[*pos];
+    *pos += 1;
+    Ok(val)
+}
+
+fn read_u16(data: &[u8], pos: &mut usize) -> Result<u16> {
+    if *pos + 2 > data.len() {
+        return Err(GhostError::Format("truncated u16".into()));
+    }
+    let val = u16::from_be_bytes(data[*pos..*pos + 2].try_into().unwrap());
+    *pos += 2;
+    Ok(val)
+}
+
+fn read_u64(data: &[u8], pos: &mut usize) -> Result<u64> {
+    if *pos + 8 > data.len() {
+        return Err(GhostError::Format("truncated u64".into()));
+    }
+    let val = u64::from_be_bytes(data[*pos..*pos + 8].try_into().unwrap());
+    *pos += 8;
+    Ok(val)
+}
+
+fn read_u32(data: &[u8], pos: &mut usize) -> Result<u32> {
+    if *pos + 4 > data.len() {
+        return Err(GhostError::Format("truncated u32".into()));
+    }
+    let val = u32::from_be_bytes(data[*pos..*pos + 4].try_into().unwrap());
+    *pos += 4;
+    Ok(val)
+}
+
+fn read_i32(data: &[u8], pos: &mut usize) -> Result<i32> {
+    if *pos + 4 > data.len() {
+        return Err(GhostError::Format("truncated i32".into()));
+    }
+    let val = i32::from_be_bytes(data[*pos..*pos + 4].try_into().unwrap());
+    *pos += 4;
+    Ok(val)
+}
+
+fn read_blob32(data: &[u8], pos: &mut usize) -> Result<[u8; 32]> {
+    if *pos + 32 > data.len() {
+        return Err(GhostError::Format("truncated blob32".into()));
+    }
+    let blob: [u8; 32] = data[*pos..*pos + 32].try_into().unwrap();
+    *pos += 32;
+    Ok(blob)
+}
+
+impl InvitePayload {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&self.group_id);
+        write_string(&mut buf, &self.group_name);
+
+        buf.extend_from_slice(&(self.members.len() as u16).to_be_bytes());
+        for m in &self.members {
+            buf.extend_from_slice(&m.fingerprint);
+            write_string(&mut buf, &m.display_name);
+            buf.push(m.role.to_byte());
+        }
+
+        buf.extend_from_slice(&(self.channels.len() as u16).to_be_bytes());
+        for c in &self.channels {
+            buf.extend_from_slice(&c.channel_id);
+            write_string(&mut buf, &c.name);
+            buf.push(c.kind.to_byte());
+            buf.extend_from_slice(&c.position.to_be_bytes());
+        }
+
+        buf.extend_from_slice(&(self.group_info_bytes.len() as u32).to_be_bytes());
+        buf.extend_from_slice(&self.group_info_bytes);
+        buf
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        let mut pos = 0;
+
+        let group_id = read_blob32(data, &mut pos)?;
+        let group_name = read_string(data, &mut pos)?;
+
+        let member_count = read_u16(data, &mut pos)? as usize;
+        let mut members = Vec::with_capacity(member_count);
+        for _ in 0..member_count {
+            members.push(InviteMember {
+                fingerprint: read_blob32(data, &mut pos)?,
+                display_name: read_string(data, &mut pos)?,
+                role: MemberRole::from_byte(read_u8(data, &mut pos)?)?,
+            });
+        }
+
+        let channel_count = read_u16(data, &mut pos)? as usize;
+        let mut channels = Vec::with_capacity(channel_count);
+        for _ in 0..channel_count {
+            channels.push(InviteChannel {
+                channel_id: read_blob32(data, &mut pos)?,
+                name: read_string(data, &mut pos)?,
+                kind: ChannelKind::from_byte(read_u8(data, &mut pos)?)?,
+                position: read_i32(data, &mut pos)?,
+            });
+        }
+
+        let gi_len = read_u32(data, &mut pos)? as usize;
+        if pos + gi_len != data.len() {
+            return Err(GhostError::Format(format!(
+                "group info: expected {} bytes, got {}",
+                gi_len,
+                data.len() - pos
+            )));
+        }
+        let group_info_bytes = data[pos..].to_vec();
+
+        Ok(Self { group_id, group_name, members, channels, group_info_bytes })
+    }
+}
+
+// --- open_any: handle both app messages and commits from the relay ---
+
+pub enum InboundMessage {
+    Application(ApplicationMessage),
+    Commit,
+}
+
+/// Process an inbound blob that could be an application message or a commit.
+/// App messages are returned; commits are merged into the group automatically.
+pub fn open_any(
+    group: &mut GhostGroup,
+    provider: &GhostProvider,
+    blob: &[u8],
+) -> Result<InboundMessage> {
+    let processed = group.process_message_bytes(provider, blob)?;
+    let credential = processed.credential().clone();
+
+    match processed.into_content() {
+        ProcessedMessageContent::ApplicationMessage(app_msg) => {
+            let mls_basic = BasicCredential::try_from(credential)
+                .map_err(|_| GhostError::Mls("sender has non-basic credential".into()))?;
+            let msg = ApplicationMessage::from_bytes(&app_msg.into_bytes())?;
+            if msg.sender_fp != mls_basic.identity() {
+                return Err(GhostError::Format(
+                    "sender_fp does not match MLS credential".into(),
+                ));
+            }
+            Ok(InboundMessage::Application(msg))
+        }
+        ProcessedMessageContent::StagedCommitMessage(staged_commit) => {
+            group.merge_staged_commit(provider, *staged_commit)?;
+            Ok(InboundMessage::Commit)
+        }
+        _ => Err(GhostError::Mls("unexpected message type".into())),
+    }
 }
 
 /// Encrypted blob addressed to a relay mailbox.
