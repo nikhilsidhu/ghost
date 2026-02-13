@@ -14,6 +14,8 @@ async fn start_relay() -> String {
         max_blob_size: 10 * 1024 * 1024,
         max_memory: 512 * 1024 * 1024,
         ttl: Duration::from_secs(3600),
+        voice_port: 0,
+        max_voice_participants: 25,
     };
     let st = state::new_state(config);
     let app = routes::router(st);

@@ -443,6 +443,19 @@ impl GhostClient {
         Ok(payload.to_bytes())
     }
 
+    /// Derive a per-sender encryption key for voice in this group+channel.
+    pub fn derive_voice_key(
+        &self,
+        group_id: &[u8; 32],
+        channel_id: &[u8; 32],
+        sender_fp: &[u8; 32],
+    ) -> Result<[u8; 32]> {
+        let group = self.groups.get(group_id).ok_or_else(|| {
+            GhostError::GroupNotLoaded(hex::encode(&group_id[..8]))
+        })?;
+        crate::mls::voice::derive_voice_key(group, &self.provider, channel_id, sender_fp)
+    }
+
     /// Returns (group_id, mailbox_id) for every loaded group.
     pub fn group_mailboxes(&self) -> Vec<([u8; 32], [u8; 32])> {
         self.groups

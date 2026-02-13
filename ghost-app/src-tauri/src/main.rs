@@ -1,5 +1,6 @@
 use tauri::Manager;
 
+mod audio;
 mod commands;
 mod config;
 mod constants;
@@ -7,6 +8,7 @@ mod dto;
 mod relay_task;
 mod setup;
 mod state;
+mod udp_transport;
 mod voice_task;
 
 #[cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
@@ -18,6 +20,7 @@ fn main() {
         voice_state_tx,
     } = setup::initialize();
     let client = app_state.client.clone();
+    let voice_client = app_state.client.clone();
     let relay = app_state.relay.clone();
 
     tauri::Builder::default()
@@ -42,6 +45,7 @@ fn main() {
             ));
             tauri::async_runtime::spawn(voice_task::run(
                 handle,
+                voice_client,
                 voice_cmd_rx,
                 voice_state_tx,
             ));
