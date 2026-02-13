@@ -236,13 +236,13 @@ export function CommandPalette(props: Props) {
     setFocusedIndex(0);
   });
 
-  // Move cursor to end when dialog opens
+  // Focus and move cursor to end when dialog opens
   createEffect(() => {
     if (open() && inputRef) {
-      requestAnimationFrame(() => {
+      setTimeout(() => {
         inputRef.focus();
         inputRef.setSelectionRange(inputRef.value.length, inputRef.value.length);
-      });
+      }, 0);
     }
   });
 
@@ -435,7 +435,6 @@ export function CommandPalette(props: Props) {
             autocorrect="off"
             autocapitalize="off"
             spellcheck={false}
-            autofocus
           />
         </div>
 
