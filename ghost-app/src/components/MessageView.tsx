@@ -1,4 +1,5 @@
-import { createSignal, createEffect, on, For, Show } from "solid-js";
+import { createSignal, createEffect, on, onCleanup, For, Show } from "solid-js";
+import { listen } from "@tauri-apps/api/event";
 import type { Member, Identity, Message } from "../lib/types";
 import { listMessages, sendMessage } from "../lib/api";
 
@@ -8,6 +9,9 @@ interface Props {
   members: Member[];
   identity: Identity | null;
 }
+
+const PAGE_SIZE = 50;
+const SCROLL_BOTTOM_THRESHOLD = 80;
 
 const formatTime = (ts: number) => {
   const d = new Date(ts);
@@ -20,6 +24,7 @@ export function MessageView(props: Props) {
   const [hasMore, setHasMore] = createSignal(true);
   const [inputText, setInputText] = createSignal("");
   const [error, setError] = createSignal<string | null>(null);
+  const seenIds = new Set<string>();
 
   let containerRef!: HTMLDivElement;
   let inputRef!: HTMLInputElement;
@@ -36,13 +41,38 @@ export function MessageView(props: Props) {
     if (containerRef) containerRef.scrollTop = containerRef.scrollHeight;
   };
 
-  createEffect(on(() => props.channelId, async (cid) => {
+  createEffect(on(() => props.channelId, (cid) => {
     setMessages([]);
+    seenIds.clear();
     setHasMore(true);
-    const msgs = await listMessages(cid, undefined, 50);
-    setMessages(msgs.reverse());
-    setHasMore(msgs.length === 50);
-    requestAnimationFrame(scrollToBottom);
+
+    // Load history — merge with any relay messages that arrived during the await
+    (async () => {
+      const msgs = await listMessages(cid, undefined, PAGE_SIZE);
+      const loaded = msgs.reverse();
+      setMessages((prev) => {
+        const loadedIds = new Set(loaded.map((m) => m.message_id));
+        const arrived = prev.filter((m) => !loadedIds.has(m.message_id));
+        const merged = [...loaded, ...arrived];
+        for (const m of merged) seenIds.add(m.message_id);
+        return merged;
+      });
+      setHasMore(msgs.length === PAGE_SIZE);
+      requestAnimationFrame(scrollToBottom);
+    })();
+
+    // Real-time messages from relay
+    const unlisten = listen<Message>("message", (event) => {
+      const msg = event.payload;
+      if (msg.channel_id !== cid) return;
+      if (seenIds.has(msg.message_id)) return;
+      seenIds.add(msg.message_id);
+      setMessages((prev) => [...prev, msg]);
+      const el = containerRef;
+      const nearBottom = el && (el.scrollHeight - el.scrollTop - el.clientHeight < SCROLL_BOTTOM_THRESHOLD);
+      if (nearBottom) requestAnimationFrame(scrollToBottom);
+    });
+    onCleanup(() => { unlisten.then((fn) => fn()); });
   }));
 
   const loadMore = async () => {
@@ -50,9 +80,10 @@ export function MessageView(props: Props) {
     if (!current.length || loading()) return;
     setLoading(true);
     const oldest = current[0];
-    const older = await listMessages(props.channelId, oldest.received_at, 50);
+    const older = await listMessages(props.channelId, oldest.received_at, PAGE_SIZE);
+    for (const m of older) seenIds.add(m.message_id);
     setMessages([...older.reverse(), ...current]);
-    setHasMore(older.length === 50);
+    setHasMore(older.length === PAGE_SIZE);
     setLoading(false);
   };
 
@@ -64,6 +95,7 @@ export function MessageView(props: Props) {
     setError(null);
     try {
       const msg = await sendMessage(props.groupId, props.channelId, text);
+      seenIds.add(msg.message_id);
       setMessages((prev) => [...prev, msg]);
       requestAnimationFrame(scrollToBottom);
     } catch (e: any) {

@@ -1,9 +1,12 @@
-use std::sync::Mutex;
+use std::sync::Arc;
 
 use ghost_core::client::GhostClient;
+use ghost_core::relay::RelayClient;
+use tokio::sync::Mutex;
 
 pub struct AppState {
-    pub client: Mutex<GhostClient>,
+    pub client: Arc<Mutex<GhostClient>>,
+    pub relay: Arc<Mutex<RelayClient>>,
     pub relay_url: String,
     pub http: reqwest::Client,
 }

@@ -2,6 +2,7 @@ use serde::Serialize;
 
 use ghost_core::identity::Identity;
 use ghost_core::storage::{Channel, ChannelKind, Group, Member, MemberRole, StoredMessage};
+use ghost_core::wire::ApplicationMessage;
 
 #[derive(Serialize)]
 pub struct IdentityDto {
@@ -73,7 +74,7 @@ impl From<&Channel> for ChannelDto {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct MessageDto {
     pub message_id: String,
     pub channel_id: String,
@@ -82,6 +83,20 @@ pub struct MessageDto {
     pub timestamp: u64,
     pub received_at: u64,
     pub content: String,
+}
+
+impl MessageDto {
+    pub fn from_incoming(msg: &ApplicationMessage, received_at: u64) -> Self {
+        Self {
+            message_id: hex::encode(msg.message_id),
+            channel_id: hex::encode(msg.channel_id),
+            sender_fp: hex::encode(msg.sender_fp),
+            message_type: msg.message_type as u8,
+            timestamp: msg.timestamp,
+            received_at,
+            content: String::from_utf8_lossy(&msg.content).into_owned(),
+        }
+    }
 }
 
 impl From<&StoredMessage> for MessageDto {

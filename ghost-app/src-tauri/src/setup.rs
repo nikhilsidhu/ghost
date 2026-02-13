@@ -1,9 +1,11 @@
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::Arc;
 
 use ghost_core::client::GhostClient;
 use ghost_core::identity::Identity;
+use ghost_core::relay::{IncomingBlob, RelayClient};
+use tokio::sync::{mpsc, Mutex};
 
 use crate::state::AppState;
 
@@ -58,7 +60,7 @@ fn load_or_create_seed() -> [u8; 32] {
     }
 }
 
-pub fn initialize() -> AppState {
+pub fn initialize() -> (AppState, mpsc::Receiver<IncomingBlob>) {
     let dir = ghost_dir();
     fs::create_dir_all(&dir).expect("failed to create ~/.ghost");
 
@@ -67,9 +69,14 @@ pub fn initialize() -> AppState {
     let relay_url = std::env::var("GHOST_RELAY_URL")
         .unwrap_or_else(|_| "http://localhost:7700".into());
 
-    AppState {
-        client: Mutex::new(client),
+    let (relay, inbox_rx) = RelayClient::new(&relay_url);
+
+    let state = AppState {
+        client: Arc::new(Mutex::new(client)),
+        relay: Arc::new(Mutex::new(relay)),
         relay_url,
         http: reqwest::Client::new(),
-    }
+    };
+
+    (state, inbox_rx)
 }

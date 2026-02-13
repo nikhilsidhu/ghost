@@ -6,7 +6,7 @@ use tauri::State;
 
 use ghost_core::storage::{Channel, ChannelKind};
 
-use crate::constants::{INVITE_EXPIRY_MS, SEQ_HEADER};
+use crate::constants::{DEFAULT_PAGE_SIZE, INVITE_EXPIRY_MS, SEQ_HEADER};
 use crate::dto::{ChannelDto, GroupDto, IdentityDto, InviteDto, MemberDto, MessageDto};
 use crate::state::AppState;
 
@@ -23,35 +23,48 @@ fn parse_id(hex_str: &str) -> Result<[u8; 32], String> {
 }
 
 #[tauri::command]
-pub fn get_identity(state: State<AppState>) -> Result<IdentityDto, String> {
-    let client = state.client.lock().map_err(|e| e.to_string())?;
+pub async fn get_identity(state: State<'_, AppState>) -> Result<IdentityDto, String> {
+    let client = state.client.lock().await;
     Ok(IdentityDto::from(client.identity()))
 }
 
 #[tauri::command]
-pub fn list_groups(state: State<AppState>) -> Result<Vec<GroupDto>, String> {
-    let client = state.client.lock().map_err(|e| e.to_string())?;
+pub async fn list_groups(state: State<'_, AppState>) -> Result<Vec<GroupDto>, String> {
+    let client = state.client.lock().await;
     let groups = client.store().list_groups().map_err(|e| e.to_string())?;
     Ok(groups.iter().map(GroupDto::from).collect())
 }
 
 #[tauri::command]
-pub fn create_group(name: String, state: State<AppState>) -> Result<GroupDto, String> {
-    let mut client = state.client.lock().map_err(|e| e.to_string())?;
-    let group_id = client
-        .create_group(&name, now_millis())
-        .map_err(|e| e.to_string())?;
-    let group = client
-        .store()
-        .get_group(&group_id)
-        .map_err(|e| e.to_string())?;
-    Ok(GroupDto::from(&group))
+pub async fn create_group(name: String, state: State<'_, AppState>) -> Result<GroupDto, String> {
+    let (group_dto, mailbox_id) = {
+        let mut client = state.client.lock().await;
+        let group_id = client
+            .create_group(&name, now_millis())
+            .map_err(|e| e.to_string())?;
+        let group = client
+            .store()
+            .get_group(&group_id)
+            .map_err(|e| e.to_string())?;
+        let mid = client.mailbox_id_for_group(&group_id);
+        (GroupDto::from(&group), mid)
+    };
+
+    if let Some(mid) = mailbox_id {
+        let mut relay = state.relay.lock().await;
+        let _ = relay.subscribe(mid).await;
+    }
+
+    Ok(group_dto)
 }
 
 #[tauri::command]
-pub fn list_channels(group_id: String, state: State<AppState>) -> Result<Vec<ChannelDto>, String> {
+pub async fn list_channels(
+    group_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<ChannelDto>, String> {
     let gid = parse_id(&group_id)?;
-    let client = state.client.lock().map_err(|e| e.to_string())?;
+    let client = state.client.lock().await;
     let channels = client
         .store()
         .list_channels(&gid)
@@ -60,9 +73,12 @@ pub fn list_channels(group_id: String, state: State<AppState>) -> Result<Vec<Cha
 }
 
 #[tauri::command]
-pub fn list_members(group_id: String, state: State<AppState>) -> Result<Vec<MemberDto>, String> {
+pub async fn list_members(
+    group_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<MemberDto>, String> {
     let gid = parse_id(&group_id)?;
-    let client = state.client.lock().map_err(|e| e.to_string())?;
+    let client = state.client.lock().await;
     let members = client
         .store()
         .list_members(&gid)
@@ -71,9 +87,9 @@ pub fn list_members(group_id: String, state: State<AppState>) -> Result<Vec<Memb
 }
 
 #[tauri::command]
-pub fn pin_group(group_id: String, state: State<AppState>) -> Result<(), String> {
+pub async fn pin_group(group_id: String, state: State<'_, AppState>) -> Result<(), String> {
     let gid = parse_id(&group_id)?;
-    let client = state.client.lock().map_err(|e| e.to_string())?;
+    let client = state.client.lock().await;
     client
         .store()
         .pin_group(&gid, now_millis())
@@ -81,9 +97,9 @@ pub fn pin_group(group_id: String, state: State<AppState>) -> Result<(), String>
 }
 
 #[tauri::command]
-pub fn unpin_group(group_id: String, state: State<AppState>) -> Result<(), String> {
+pub async fn unpin_group(group_id: String, state: State<'_, AppState>) -> Result<(), String> {
     let gid = parse_id(&group_id)?;
-    let client = state.client.lock().map_err(|e| e.to_string())?;
+    let client = state.client.lock().await;
     client
         .store()
         .unpin_group(&gid)
@@ -91,8 +107,8 @@ pub fn unpin_group(group_id: String, state: State<AppState>) -> Result<(), Strin
 }
 
 #[tauri::command]
-pub fn list_pinned_groups(state: State<AppState>) -> Result<Vec<String>, String> {
-    let client = state.client.lock().map_err(|e| e.to_string())?;
+pub async fn list_pinned_groups(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    let client = state.client.lock().await;
     let ids = client
         .store()
         .list_pinned_group_ids()
@@ -101,47 +117,56 @@ pub fn list_pinned_groups(state: State<AppState>) -> Result<Vec<String>, String>
 }
 
 #[tauri::command]
-pub fn list_messages(
+pub async fn list_messages(
     channel_id: String,
     before: Option<u64>,
     limit: Option<u32>,
-    state: State<AppState>,
+    state: State<'_, AppState>,
 ) -> Result<Vec<MessageDto>, String> {
     let cid = parse_id(&channel_id)?;
-    let client = state.client.lock().map_err(|e| e.to_string())?;
+    let client = state.client.lock().await;
     let msgs = client
         .store()
-        .get_messages(&cid, before, limit.unwrap_or(50))
+        .get_messages(&cid, before, limit.unwrap_or(DEFAULT_PAGE_SIZE))
         .map_err(|e| e.to_string())?;
     Ok(msgs.iter().map(MessageDto::from).collect())
 }
 
 #[tauri::command]
-pub fn send_message(
+pub async fn send_message(
     group_id: String,
     channel_id: String,
     content: String,
-    state: State<AppState>,
+    state: State<'_, AppState>,
 ) -> Result<MessageDto, String> {
     let gid = parse_id(&group_id)?;
     let cid = parse_id(&channel_id)?;
-    let mut client = state.client.lock().map_err(|e| e.to_string())?;
-    let (_, msg_id) = client
-        .send_message(&gid, &cid, content.into_bytes(), vec![], now_millis())
-        .map_err(|e| e.to_string())?;
-    let stored = client
-        .store()
-        .get_message(&msg_id)
-        .map_err(|e| e.to_string())?;
-    Ok(MessageDto::from(&stored))
+
+    let (outbound, dto) = {
+        let mut client = state.client.lock().await;
+        let (outbound, msg_id) = client
+            .send_message(&gid, &cid, content.into_bytes(), vec![], now_millis())
+            .map_err(|e| e.to_string())?;
+        let stored = client
+            .store()
+            .get_message(&msg_id)
+            .map_err(|e| e.to_string())?;
+        (outbound, MessageDto::from(&stored))
+    };
+
+    // Forward to relay (best-effort, don't fail the command)
+    let relay = state.relay.lock().await;
+    let _ = relay.send(&outbound.mailbox_id, outbound.blob).await;
+
+    Ok(dto)
 }
 
 #[tauri::command]
-pub fn create_channel(
+pub async fn create_channel(
     group_id: String,
     name: String,
     kind: String,
-    state: State<AppState>,
+    state: State<'_, AppState>,
 ) -> Result<ChannelDto, String> {
     let gid = parse_id(&group_id)?;
     let mut channel_id = [0u8; 32];
@@ -150,7 +175,7 @@ pub fn create_channel(
         "voice" => ChannelKind::Voice,
         _ => ChannelKind::Text,
     };
-    let client = state.client.lock().map_err(|e| e.to_string())?;
+    let client = state.client.lock().await;
     let position = client
         .store()
         .list_channels(&gid)
@@ -171,13 +196,13 @@ pub fn create_channel(
 }
 
 #[tauri::command]
-pub fn rename_channel(
+pub async fn rename_channel(
     channel_id: String,
     name: String,
-    state: State<AppState>,
+    state: State<'_, AppState>,
 ) -> Result<(), String> {
     let cid = parse_id(&channel_id)?;
-    let client = state.client.lock().map_err(|e| e.to_string())?;
+    let client = state.client.lock().await;
     client
         .store()
         .rename_channel(&cid, &name)
@@ -185,9 +210,12 @@ pub fn rename_channel(
 }
 
 #[tauri::command]
-pub fn delete_channel(channel_id: String, state: State<AppState>) -> Result<(), String> {
+pub async fn delete_channel(
+    channel_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
     let cid = parse_id(&channel_id)?;
-    let client = state.client.lock().map_err(|e| e.to_string())?;
+    let client = state.client.lock().await;
     client
         .store()
         .delete_channel(&cid)
@@ -202,7 +230,7 @@ pub async fn create_invite(
     let gid = parse_id(&group_id)?;
 
     let (token, payload_bytes) = {
-        let client = state.client.lock().map_err(|e| e.to_string())?;
+        let client = state.client.lock().await;
         client.create_invite(&gid).map_err(|e| e.to_string())?
     };
 
@@ -243,7 +271,6 @@ pub async fn join_by_invite(
     token: String,
     state: State<'_, AppState>,
 ) -> Result<GroupDto, String> {
-    // Fetch the invite payload and current sequence number
     let response = state
         .http
         .get(format!("{}/invite/{}/join", relay_url, token))
@@ -264,9 +291,8 @@ pub async fn join_by_invite(
         .await
         .map_err(|e| format!("read invite body: {e}"))?;
 
-    // External commit — join the MLS group locally
     let (group_id, commit_bytes, mailbox_id) = {
-        let mut client = state.client.lock().map_err(|e| e.to_string())?;
+        let mut client = state.client.lock().await;
         client
             .join_by_invite(&payload_bytes, now_millis())
             .map_err(|e| e.to_string())?
@@ -287,7 +313,7 @@ pub async fn join_by_invite(
 
     // Refresh the invite payload with fresh GroupInfo for the next joiner
     let updated_payload = {
-        let client = state.client.lock().map_err(|e| e.to_string())?;
+        let client = state.client.lock().await;
         client
             .refresh_invite_payload(&group_id)
             .map_err(|e| e.to_string())?
@@ -302,13 +328,17 @@ pub async fn join_by_invite(
         .await
         .map_err(|e| format!("refresh invite: {e}"))?;
 
-    // 409 means another joiner refreshed first — our join still succeeded,
-    // the invite just has slightly stale GroupInfo
     if !resp.status().is_success() && resp.status() != reqwest::StatusCode::CONFLICT {
         return Err(format!("refresh invite: HTTP {}", resp.status()));
     }
 
-    let client = state.client.lock().map_err(|e| e.to_string())?;
+    // Subscribe to the new group's mailbox for real-time messages
+    {
+        let mut relay = state.relay.lock().await;
+        let _ = relay.subscribe(mailbox_id).await;
+    }
+
+    let client = state.client.lock().await;
     let group = client
         .store()
         .get_group(&group_id)

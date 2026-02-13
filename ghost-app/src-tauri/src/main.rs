@@ -3,17 +3,19 @@ use tauri::Manager;
 mod commands;
 mod constants;
 mod dto;
+mod relay_task;
 mod setup;
 mod state;
 
 #[cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 fn main() {
-    let app_state = setup::initialize();
+    let (app_state, inbox_rx) = setup::initialize();
+    let client = app_state.client.clone();
+    let relay = app_state.relay.clone();
 
     tauri::Builder::default()
         .manage(app_state)
-        .setup(|app| {
-            // Set native window background to black so macOS doesn't flash white
+        .setup(move |app| {
             #[cfg(target_os = "macos")]
             {
                 use objc2_app_kit::{NSColor, NSWindow};
@@ -23,6 +25,10 @@ fn main() {
                 let color = NSColor::colorWithSRGBRed_green_blue_alpha(0.0, 0.0, 0.0, 1.0);
                 ns_window.setBackgroundColor(Some(&color));
             }
+
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(relay_task::run(handle, client, relay, inbox_rx));
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
