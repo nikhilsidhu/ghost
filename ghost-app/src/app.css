@@ -130,3 +130,13 @@ body {
 input, textarea {
   user-select: text;
 }
+
+/* Only animate named view-transition elements, not the whole page */
+:root {
+  view-transition-name: none;
+}
+
+::view-transition-group(*) {
+  animation-duration: 200ms;
+  animation-timing-function: ease-in-out;
+}

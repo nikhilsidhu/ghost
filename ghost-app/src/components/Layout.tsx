@@ -26,6 +26,7 @@ export function Layout() {
   const [openCommandId, setOpenCommandId] = createSignal<string | null>(null);
   const [inviteLink, setInviteLink] = createSignal<string | null>(null);
   const [showInfo, setShowInfo] = createSignal(false);
+  const [desiredChannelKind, setDesiredChannelKind] = createSignal<string>("text");
 
   // --- Refresh helpers ---
 
@@ -53,6 +54,11 @@ export function Layout() {
       await pinGroup(groupId);
     }
     await refreshPins();
+  };
+
+  const handleCreateChannel = (kind: "text" | "voice") => {
+    setDesiredChannelKind(kind);
+    setOpenCommandId("create-channel");
   };
 
   onMount(async () => {
@@ -122,7 +128,7 @@ export function Layout() {
           name: "type",
           placeholder: "text or voice",
           complete: typeCompleter,
-          defaultValue: () => "text",
+          defaultValue: () => desiredChannelKind(),
         },
       ],
       execute: async (args) => {
@@ -200,9 +206,13 @@ export function Layout() {
         groups={groups()}
         pinnedGroupIds={pinnedGroupIds()}
         selectedGroupId={selectedGroupId()}
+        channels={channels()}
+        selectedChannelId={selectedChannelId()}
         onSelectGroup={setSelectedGroupId}
-        onCreateGroup={() => setOpenCommandId("create-group")}
+        onDeselectGroup={() => setSelectedGroupId(null)}
+        onSelectChannel={setSelectedChannelId}
         onTogglePin={handleTogglePin}
+        onCreateChannel={handleCreateChannel}
       />
       <main class="flex-1 flex flex-col min-w-0">
         <div data-tauri-drag-region class="h-7 flex-shrink-0" />
@@ -222,14 +232,28 @@ export function Layout() {
           }
         >
           {(group) => (
-            <GroupView
-              group={group()}
-              channels={channels()}
-              members={members()}
-              identity={identity()}
-              selectedChannelId={selectedChannelId()}
-              onSelectChannel={setSelectedChannelId}
-            />
+            <Show
+              when={selectedChannelId()}
+              fallback={
+                <div class="flex-1 flex items-center justify-center">
+                  <span class="text-xs text-[var(--neutral-500)]">select a channel</span>
+                </div>
+              }
+            >
+              {(channelId) => {
+                const channelName = () =>
+                  channels().find((c) => c.channel_id === channelId())?.name ?? "";
+                return (
+                  <GroupView
+                    group={group()}
+                    channelId={channelId()}
+                    channelName={channelName()}
+                    members={members()}
+                    identity={identity()}
+                  />
+                );
+              }}
+            </Show>
           )}
         </Show>
       </main>
