@@ -42,6 +42,8 @@ pub struct GhostClient {
     provider: GhostProvider,
     store: GhostStore,
     groups: HashMap<[u8; 32], GhostGroup>,
+    /// mailbox_id → group_id for O(1) reverse lookup
+    mailbox_map: HashMap<[u8; 32], [u8; 32]>,
 }
 
 impl GhostClient {
@@ -64,11 +66,17 @@ impl GhostClient {
             }
         }
 
+        let mailbox_map = groups
+            .iter()
+            .map(|(gid, g)| (group_mailbox_id(g.group_id()), *gid))
+            .collect();
+
         Ok(Self {
             identity,
             provider,
             store,
             groups,
+            mailbox_map,
         })
     }
 
@@ -81,6 +89,7 @@ impl GhostClient {
             provider,
             store,
             groups: HashMap::new(),
+            mailbox_map: HashMap::new(),
         })
     }
 
@@ -131,7 +140,9 @@ impl GhostClient {
             joined_at: timestamp,
         })?;
 
+        let mailbox_id = group_mailbox_id(ghost_group.group_id());
         self.groups.insert(group_id, ghost_group);
+        self.mailbox_map.insert(mailbox_id, group_id);
         Ok(group_id)
     }
 
@@ -180,13 +191,13 @@ impl GhostClient {
         Ok((Outbound { mailbox_id, blob }, message_id))
     }
 
-    /// Decrypt a blob and store the message. `received_at` is the relay-stamped arrival
-    /// time (ms since epoch) used for ordering; pass 0 to fall back to local clock.
+    /// Decrypt a blob and store the message. Uses relay-stamped arrival time if
+    /// provided, otherwise falls back to local clock.
     pub fn receive_blob(
         &mut self,
         group_id: &[u8; 32],
         blob: &[u8],
-        received_at: u64,
+        received_at: Option<u64>,
     ) -> Result<ApplicationMessage> {
         let group = self.groups.get_mut(group_id).ok_or_else(|| {
             GhostError::GroupNotLoaded(hex::encode(&group_id[..8]))
@@ -194,14 +205,12 @@ impl GhostClient {
 
         let msg = open(group, &self.provider, blob)?;
 
-        let recv_ts = if received_at > 0 {
-            received_at
-        } else {
+        let recv_ts = received_at.unwrap_or_else(|| {
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_millis() as u64
-        };
+        });
 
         self.store.insert_message(&StoredMessage {
             message_id: msg.message_id,
@@ -286,7 +295,9 @@ impl GhostClient {
             joined_at: timestamp,
         })?;
 
+        let mailbox_id = group_mailbox_id(ghost_group.group_id());
         self.groups.insert(*group_id, ghost_group);
+        self.mailbox_map.insert(mailbox_id, *group_id);
         Ok(())
     }
 
@@ -408,6 +419,7 @@ impl GhostClient {
 
         let mailbox_id = group_mailbox_id(ghost_group.group_id());
         self.groups.insert(payload.group_id, ghost_group);
+        self.mailbox_map.insert(mailbox_id, payload.group_id);
 
         Ok((payload.group_id, commit_bytes, mailbox_id))
     }
@@ -435,15 +447,16 @@ impl GhostClient {
             .collect()
     }
 
+    /// Direct lookup: get mailbox_id for a group.
+    pub fn mailbox_id_for_group(&self, group_id: &[u8; 32]) -> Option<[u8; 32]> {
+        self.groups
+            .get(group_id)
+            .map(|g| group_mailbox_id(g.group_id()))
+    }
+
     /// Reverse lookup: find group_id for a given mailbox_id.
     pub fn group_id_for_mailbox(&self, mailbox_id: &[u8; 32]) -> Option<[u8; 32]> {
-        self.groups.iter().find_map(|(gid, g)| {
-            if group_mailbox_id(g.group_id()) == *mailbox_id {
-                Some(*gid)
-            } else {
-                None
-            }
-        })
+        self.mailbox_map.get(mailbox_id).copied()
     }
 
     /// Process an inbound blob — could be an app message or a commit.
@@ -452,22 +465,25 @@ impl GhostClient {
         &mut self,
         group_id: &[u8; 32],
         blob: &[u8],
-        received_at: u64,
+        received_at: Option<u64>,
     ) -> Result<Option<ApplicationMessage>> {
         let group = self.groups.get_mut(group_id).ok_or_else(|| {
             GhostError::GroupNotLoaded(hex::encode(&group_id[..8]))
         })?;
 
-        match open_any(group, &self.provider, blob)? {
+        let inbound = match open_any(group, &self.provider, blob) {
+            Err(GhostError::SelfMessage) => return Ok(None),
+            other => other?,
+        };
+
+        match inbound {
             InboundMessage::Application(msg) => {
-                let recv_ts = if received_at > 0 {
-                    received_at
-                } else {
+                let recv_ts = received_at.unwrap_or_else(|| {
                     SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .unwrap()
                         .as_millis() as u64
-                };
+                });
 
                 self.store.insert_message(&StoredMessage {
                     message_id: msg.message_id,
@@ -555,7 +571,7 @@ mod tests {
     #[test]
     fn receive_from_unknown_group_fails() {
         let mut client = GhostClient::open_in_memory([0x01; 32]).unwrap();
-        let result = client.receive_blob(&[0xFF; 32], &[0x00; 64], 0);
+        let result = client.receive_blob(&[0xFF; 32], &[0x00; 64], None);
         assert!(matches!(result, Err(GhostError::GroupNotLoaded(_))));
     }
 
@@ -583,7 +599,7 @@ mod tests {
             .send_message(&group_id, &channel_id, b"hello".to_vec(), vec![], 2000)
             .unwrap();
 
-        let received = c2.receive_blob(&group_id, &outbound.blob, 0).unwrap();
+        let received = c2.receive_blob(&group_id, &outbound.blob, None).unwrap();
         assert_eq!(received.content, b"hello");
         assert_eq!(received.sender_fp, *c1.fingerprint());
         assert_eq!(received.message_id, msg_id);
@@ -614,7 +630,7 @@ mod tests {
         let (out1, id1) = c1
             .send_message(&group_id, &channel_id, b"from c1".to_vec(), vec![], 2000)
             .unwrap();
-        let recv1 = c2.receive_blob(&group_id, &out1.blob, 0).unwrap();
+        let recv1 = c2.receive_blob(&group_id, &out1.blob, None).unwrap();
         assert_eq!(recv1.content, b"from c1");
         assert_eq!(recv1.sender_fp, *c1.fingerprint());
 
@@ -622,7 +638,7 @@ mod tests {
         let (out2, id2) = c2
             .send_message(&group_id, &channel_id, b"from c2".to_vec(), vec![], 3000)
             .unwrap();
-        let recv2 = c1.receive_blob(&group_id, &out2.blob, 0).unwrap();
+        let recv2 = c1.receive_blob(&group_id, &out2.blob, None).unwrap();
         assert_eq!(recv2.content, b"from c2");
         assert_eq!(recv2.sender_fp, *c2.fingerprint());
 
@@ -669,7 +685,7 @@ mod tests {
         assert_eq!(members.len(), 2); // c1 + c2
 
         // c1 processes the external commit
-        let result = c1.receive_any(&group_id, &commit_bytes, 2000).unwrap();
+        let result = c1.receive_any(&group_id, &commit_bytes, Some(2000)).unwrap();
         assert!(result.is_none()); // commit, not app message
     }
 

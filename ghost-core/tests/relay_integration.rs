@@ -73,7 +73,7 @@ async fn encrypted_message_through_relay() {
     assert_eq!(incoming.mailbox_id, mailbox_id);
 
     let msg = receiver
-        .receive_blob(&group_id, &incoming.payload, incoming.received_at)
+        .receive_blob(&group_id, &incoming.payload, Some(incoming.received_at))
         .unwrap();
     assert_eq!(msg.content, b"hello through relay");
     assert_eq!(msg.sender_fp, *sender.fingerprint());

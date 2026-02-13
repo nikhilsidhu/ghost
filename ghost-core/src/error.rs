@@ -32,6 +32,9 @@ pub enum GhostError {
     #[error("permission denied: {0}")]
     PermissionDenied(String),
 
+    #[error("received own message (relay echo)")]
+    SelfMessage,
+
     #[error("network: {0}")]
     Network(String),
 

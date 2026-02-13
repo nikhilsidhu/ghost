@@ -168,7 +168,12 @@ impl GhostGroup {
             .map_err(|_| GhostError::Mls("not a protocol message".into()))?;
         self.mls_group
             .process_message(provider, protocol_message)
-            .map_err(|e| GhostError::Mls(format!("process message: {e}")))
+            .map_err(|e| match e {
+                ProcessMessageError::ValidationError(
+                    ValidationError::CannotDecryptOwnMessage,
+                ) => GhostError::SelfMessage,
+                _ => GhostError::Mls(format!("process message: {e}")),
+            })
     }
 
     /// Apply a commit that we received and already validated via process_message.
