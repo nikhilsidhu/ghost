@@ -10,6 +10,7 @@ use crate::config::GhostConfig;
 use crate::constants::{DEFAULT_PAGE_SIZE, INVITE_EXPIRY_MS, SEQ_HEADER};
 use crate::dto::{ChannelDto, ConfigDto, GroupDto, IdentityDto, InviteDto, MemberDto, MessageDto};
 use crate::state::AppState;
+use crate::voice_task::VoiceCommand;
 
 fn now_millis() -> u64 {
     SystemTime::now()
@@ -379,4 +380,57 @@ pub async fn set_relay_url(
     cfg.relay_url = Some(url);
     cfg.save(&state.config_path)?;
     Ok(())
+}
+
+#[tauri::command]
+pub async fn join_voice(
+    group_id: String,
+    channel_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let fingerprint = {
+        let client = state.client.lock().await;
+        hex::encode(client.fingerprint())
+    };
+    state
+        .voice
+        .cmd_tx
+        .send(VoiceCommand::Join {
+            group_id,
+            channel_id,
+            relay_url: state.relay_url.clone(),
+            fingerprint,
+        })
+        .await
+        .map_err(|_| "voice task not running".to_string())
+}
+
+#[tauri::command]
+pub async fn leave_voice(state: State<'_, AppState>) -> Result<(), String> {
+    state
+        .voice
+        .cmd_tx
+        .send(VoiceCommand::Leave)
+        .await
+        .map_err(|_| "voice task not running".to_string())
+}
+
+#[tauri::command]
+pub async fn set_muted(muted: bool, state: State<'_, AppState>) -> Result<(), String> {
+    state
+        .voice
+        .cmd_tx
+        .send(VoiceCommand::SetMuted(muted))
+        .await
+        .map_err(|_| "voice task not running".to_string())
+}
+
+#[tauri::command]
+pub async fn set_deafened(deafened: bool, state: State<'_, AppState>) -> Result<(), String> {
+    state
+        .voice
+        .cmd_tx
+        .send(VoiceCommand::SetDeafened(deafened))
+        .await
+        .map_err(|_| "voice task not running".to_string())
 }

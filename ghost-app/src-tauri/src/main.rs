@@ -7,10 +7,16 @@ mod dto;
 mod relay_task;
 mod setup;
 mod state;
+mod voice_task;
 
 #[cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 fn main() {
-    let (app_state, inbox_rx) = setup::initialize();
+    let setup::SetupResult {
+        state: app_state,
+        inbox_rx,
+        voice_cmd_rx,
+        voice_state_tx,
+    } = setup::initialize();
     let client = app_state.client.clone();
     let relay = app_state.relay.clone();
 
@@ -28,7 +34,17 @@ fn main() {
             }
 
             let handle = app.handle().clone();
-            tauri::async_runtime::spawn(relay_task::run(handle, client, relay, inbox_rx));
+            tauri::async_runtime::spawn(relay_task::run(
+                handle.clone(),
+                client,
+                relay,
+                inbox_rx,
+            ));
+            tauri::async_runtime::spawn(voice_task::run(
+                handle,
+                voice_cmd_rx,
+                voice_state_tx,
+            ));
 
             Ok(())
         })
@@ -51,6 +67,10 @@ fn main() {
             commands::get_config,
             commands::set_display_name,
             commands::set_relay_url,
+            commands::join_voice,
+            commands::leave_voice,
+            commands::set_muted,
+            commands::set_deafened,
         ])
         .run(tauri::generate_context!())
         .expect("error while running ghost");

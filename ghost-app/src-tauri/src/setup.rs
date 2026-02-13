@@ -5,10 +5,12 @@ use std::sync::Arc;
 use ghost_core::client::GhostClient;
 use ghost_core::identity::Identity;
 use ghost_core::relay::{IncomingBlob, RelayClient};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, watch, Mutex};
 
 use crate::config::{self, GhostConfig};
+use crate::constants::VOICE_CMD_CHANNEL_SIZE;
 use crate::state::AppState;
+use crate::voice_task::{VoiceCommand, VoiceHandle, VoiceStateEvent};
 
 fn ghost_dir() -> PathBuf {
     match std::env::var("GHOST_DATA_DIR") {
@@ -61,7 +63,14 @@ fn load_or_create_seed() -> [u8; 32] {
     }
 }
 
-pub fn initialize() -> (AppState, mpsc::Receiver<IncomingBlob>) {
+pub struct SetupResult {
+    pub state: AppState,
+    pub inbox_rx: mpsc::Receiver<IncomingBlob>,
+    pub voice_cmd_rx: mpsc::Receiver<VoiceCommand>,
+    pub voice_state_tx: watch::Sender<VoiceStateEvent>,
+}
+
+pub fn initialize() -> SetupResult {
     let dir = ghost_dir();
     fs::create_dir_all(&dir).expect("failed to create ~/.ghost");
 
@@ -84,13 +93,25 @@ pub fn initialize() -> (AppState, mpsc::Receiver<IncomingBlob>) {
 
     let (relay, inbox_rx) = RelayClient::new(&relay_url);
 
+    let (voice_cmd_tx, voice_cmd_rx) = mpsc::channel(VOICE_CMD_CHANNEL_SIZE);
+    let (voice_state_tx, voice_state_rx) = watch::channel(VoiceStateEvent::default());
+
     let state = AppState {
         client: Arc::new(Mutex::new(client)),
         relay: Arc::new(Mutex::new(relay)),
         relay_url,
         http: reqwest::Client::new(),
         config_path: cfg_path,
+        voice: VoiceHandle {
+            cmd_tx: voice_cmd_tx,
+            state_rx: voice_state_rx,
+        },
     };
 
-    (state, inbox_rx)
+    SetupResult {
+        state,
+        inbox_rx,
+        voice_cmd_rx,
+        voice_state_tx,
+    }
 }
