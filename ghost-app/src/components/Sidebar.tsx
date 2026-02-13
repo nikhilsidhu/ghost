@@ -1,210 +1,257 @@
 import { createSignal, createEffect, on, For, Show } from "solid-js";
+import type { JSX } from "solid-js";
 import type { Identity, Group, Channel } from "../lib/types";
+import { hashGradient, onFlareMove, onFlareLeave } from "../lib/gradients";
 import { ScrollArea } from "./ui/scroll-area";
 import { cn } from "../lib/cn";
-import { Pin, PinOff, AudioLines } from "lucide-solid";
-
-const GROUP_COLORS: { bg: string; fg: string }[] = [
-  { bg: "var(--purple-700)", fg: "var(--purple-200)" },
-  { bg: "var(--violet-700)", fg: "var(--violet-200)" },
-  { bg: "var(--cyan-700)", fg: "var(--cyan-200)" },
-  { bg: "var(--emerald-700)", fg: "var(--emerald-200)" },
-  { bg: "var(--amber-700)", fg: "var(--amber-200)" },
-  { bg: "var(--rose-700)", fg: "var(--rose-200)" },
-  { bg: "var(--red-700)", fg: "var(--red-200)" },
-];
-
-const groupColor = (groupId: string) => {
-  let hash = 0;
-  for (let i = 0; i < groupId.length; i++) {
-    hash = (hash * 31 + groupId.charCodeAt(i)) | 0;
-  }
-  return GROUP_COLORS[Math.abs(hash) % GROUP_COLORS.length];
-};
-
-// Wraps a DOM update in a view transition when supported (Safari 18+, Chrome 111+)
-const withTransition = (fn: () => void) => {
-  if ("startViewTransition" in document) {
-    (document as any).startViewTransition(fn);
-  } else {
-    fn();
-  }
-};
+import { AudioLines, Settings } from "lucide-solid";
+import {
+  DragDropProvider,
+  DragDropSensors,
+  DragOverlay,
+  SortableProvider,
+  createSortable,
+  closestCenter,
+  transformStyle,
+} from "@thisbeyond/solid-dnd";
+import type { DragEvent } from "@thisbeyond/solid-dnd";
 
 interface SidebarProps {
   identity: Identity | null;
   groups: Group[];
-  pinnedGroupIds: Set<string>;
   selectedGroupId: string | null;
   channels: Channel[];
   selectedChannelId: string | null;
   onSelectGroup: (id: string) => void;
   onDeselectGroup: () => void;
   onSelectChannel: (id: string) => void;
-  onTogglePin: (id: string) => void;
   onCreateChannel: (kind: "text" | "voice") => void;
 }
 
 export function Sidebar(props: SidebarProps) {
   const [textCollapsed, setTextCollapsed] = createSignal(false);
   const [voiceCollapsed, setVoiceCollapsed] = createSignal(false);
+  const [groupOrder, setGroupOrder] = createSignal<string[]>([]);
+  const [channelOrder, setChannelOrder] = createSignal<string[]>([]);
+  const [activeGroupId, setActiveGroupId] = createSignal<string | null>(null);
+  const [activeChannelId, setActiveChannelId] = createSignal<string | null>(null);
 
   createEffect(on(() => props.selectedGroupId, () => {
     setTextCollapsed(false);
     setVoiceCollapsed(false);
   }));
 
+  // Sync group order when groups change
+  createEffect(on(() => props.groups, (groups) => {
+    const current = groupOrder();
+    const ids = groups.map((g) => g.group_id);
+    // Keep existing order for known groups, append new ones
+    const ordered = current.filter((id) => ids.includes(id));
+    const newIds = ids.filter((id) => !ordered.includes(id));
+    if (newIds.length > 0 || ordered.length !== current.length) {
+      setGroupOrder([...ordered, ...newIds]);
+    }
+  }));
+
+  // Sync channel order when channels change
+  createEffect(on(() => props.channels, (channels) => {
+    const current = channelOrder();
+    const ids = channels.map((c) => c.channel_id);
+    const ordered = current.filter((id) => ids.includes(id));
+    const newIds = ids.filter((id) => !ordered.includes(id));
+    if (newIds.length > 0 || ordered.length !== current.length) {
+      setChannelOrder([...ordered, ...newIds]);
+    }
+  }));
+
   const selectedGroup = () =>
     props.groups.find((g) => g.group_id === props.selectedGroupId);
 
-  const sortedGroups = () => {
-    const all = props.groups;
-    const pinIds = props.pinnedGroupIds;
-    const pinned = all.filter((g) => pinIds.has(g.group_id));
-    const unpinned = all.filter((g) => !pinIds.has(g.group_id));
-    return [...pinned, ...unpinned];
+  const orderedGroups = () => {
+    const order = groupOrder();
+    const map = new Map(props.groups.map((g) => [g.group_id, g]));
+    return order.map((id) => map.get(id)!).filter(Boolean);
   };
 
-  const textChannels = () => props.channels.filter((c) => c.kind === "text");
-  const voiceChannels = () => props.channels.filter((c) => c.kind === "voice");
+  const textChannels = () => {
+    const order = channelOrder();
+    const text = props.channels.filter((c) => c.kind === "text");
+    const map = new Map(text.map((c) => [c.channel_id, c]));
+    return order.map((id) => map.get(id)).filter((c): c is Channel => c !== undefined && c.kind === "text");
+  };
+
+  const voiceChannels = () => {
+    const order = channelOrder();
+    const voice = props.channels.filter((c) => c.kind === "voice");
+    const map = new Map(voice.map((c) => [c.channel_id, c]));
+    return order.map((id) => map.get(id)).filter((c): c is Channel => c !== undefined && c.kind === "voice");
+  };
+
+  const handleGroupClick = (groupId: string) => {
+    if (groupId === props.selectedGroupId) {
+      props.onDeselectGroup();
+    } else {
+      props.onSelectGroup(groupId);
+    }
+  };
+
+  const onGroupDragStart = (e: DragEvent) => setActiveGroupId(String(e.draggable.id));
+  const onGroupDragEnd = (e: DragEvent) => {
+    setActiveGroupId(null);
+    if (e.draggable && e.droppable) {
+      const from = String(e.draggable.id);
+      const to = String(e.droppable.id);
+      if (from !== to) {
+        const order = [...groupOrder()];
+        const fromIdx = order.indexOf(from);
+        const toIdx = order.indexOf(to);
+        if (fromIdx >= 0 && toIdx >= 0) {
+          order.splice(fromIdx, 1);
+          order.splice(toIdx, 0, from);
+          setGroupOrder(order);
+        }
+      }
+    }
+  };
+
+  const onChannelDragStart = (e: DragEvent) => setActiveChannelId(String(e.draggable.id));
+  const onChannelDragEnd = (e: DragEvent) => {
+    setActiveChannelId(null);
+    if (e.draggable && e.droppable) {
+      const from = String(e.draggable.id);
+      const to = String(e.droppable.id);
+      if (from !== to) {
+        const order = [...channelOrder()];
+        const fromIdx = order.indexOf(from);
+        const toIdx = order.indexOf(to);
+        if (fromIdx >= 0 && toIdx >= 0) {
+          order.splice(fromIdx, 1);
+          order.splice(toIdx, 0, from);
+          setChannelOrder(order);
+        }
+      }
+    }
+  };
 
   return (
-    <div
-      class="w-64 flex-shrink-0 flex flex-col border-r border-[var(--neutral-800)]"
-      style={{ background: "var(--neutral-900)" }}
-    >
-      <div data-tauri-drag-region class="h-7 flex-shrink-0" />
-
-      <Show when={props.identity}>
-        {(id) => {
-          const [copied, setCopied] = createSignal(false);
-          const copyFp = () => {
-            navigator.clipboard.writeText(id().fingerprint);
-            setCopied(true);
-            setTimeout(() => setCopied(false), 1200);
-          };
-          return (
-            <div class="h-14 flex-shrink-0 flex items-center gap-3 px-3 cursor-pointer" onClick={copyFp}>
-              <div
-                class="w-8 h-8 rounded-full flex items-center justify-center text-sm flex-shrink-0"
-                style={{ background: "var(--purple-700)", color: "var(--purple-200)" }}
-              >
-                {id().display_name[0]}
-              </div>
-              <div class="min-w-0">
-                <div class="text-sm text-[var(--neutral-200)] truncate leading-tight">
-                  {id().display_name}
-                </div>
-                <div class="text-xs text-[var(--neutral-500)] truncate leading-tight">
-                  {copied() ? "copied" : id().fingerprint_short}
-                </div>
-              </div>
-            </div>
-          );
-        }}
-      </Show>
-
-      <Show
-        when={selectedGroup()}
-        fallback={
-          <ScrollArea class="flex-1">
-            <div class="px-1.5 pt-1">
-              <For each={sortedGroups()}>
-                {(group) => {
-                  const isPinned = () => props.pinnedGroupIds.has(group.group_id);
-                  const color = groupColor(group.group_id);
-                  return (
-                    <div
-                      class="group relative flex items-center gap-2.5 mx-1.5 px-2 py-1.5 rounded text-sm cursor-pointer text-[var(--neutral-400)] hover:bg-[var(--neutral-800)]"
-                      onClick={() => withTransition(() => props.onSelectGroup(group.group_id))}
-                    >
-                      <div
-                        class="w-8 h-8 rounded-lg flex items-center justify-center text-xs font-medium flex-shrink-0"
-                        style={{
-                          background: color.bg,
-                          color: color.fg,
-                          "view-transition-name": `g-${group.group_id}`,
-                        }}
-                      >
-                        {group.name[0].toUpperCase()}
-                      </div>
-                      <span class="truncate flex-1">{group.name}</span>
-                      <button
-                        onClick={(e) => { e.stopPropagation(); props.onTogglePin(group.group_id); }}
-                        class="flex-shrink-0 ml-1 p-0.5 rounded cursor-pointer"
-                        title={isPinned() ? "unpin" : "pin"}
-                      >
-                        <Show when={isPinned()} fallback={
-                          <Pin size={13} class="transition-opacity text-[var(--neutral-500)] opacity-0 group-hover:opacity-100" />
-                        }>
-                          <span class="relative flex items-center justify-center w-[13px] h-[13px]">
-                            <Pin size={13} class="absolute inset-0 transition-opacity text-[var(--purple-400)] opacity-40 group-hover:opacity-0" />
-                            <PinOff size={13} class="absolute inset-0 transition-opacity text-[var(--neutral-400)] opacity-0 group-hover:opacity-100" />
-                          </span>
-                        </Show>
-                      </button>
-                    </div>
-                  );
-                }}
-              </For>
-            </div>
-          </ScrollArea>
-        }
+    <div class="flex-shrink-0 flex h-full">
+      {/* Activity bar */}
+      <div
+        class="w-[var(--size-lg)] flex-shrink-0 flex flex-col"
+        style={{ background: "var(--neutral-950)" }}
       >
-        {(group) => (
-          <div class="flex-1 flex min-h-0">
-            {/* Icon column: back button + group icons */}
-            <div
-              class="w-12 flex-shrink-0 flex flex-col items-center pt-1.5"
-              style={{ "box-shadow": "2px 0 8px rgba(0,0,0,0.35)" }}
-            >
-              <button
-                class="w-8 h-8 flex-shrink-0 rounded-lg flex items-center justify-center text-lg text-[var(--neutral-500)] hover:text-[var(--neutral-200)] hover:bg-[var(--neutral-800)] cursor-pointer"
-                onClick={() => withTransition(() => props.onDeselectGroup())}
-                title="back to groups"
-              >
-                {"\u2039"}
-              </button>
-              <ScrollArea class="flex-1 w-full">
-                <div class="flex flex-col items-center gap-1.5 py-1.5">
-                  <For each={sortedGroups()}>
-                    {(g) => {
-                      const color = groupColor(g.group_id);
-                      const isActive = () => g.group_id === props.selectedGroupId;
-                      return (
-                        <button
-                          class={cn(
-                            "w-8 h-8 flex-shrink-0 rounded-lg flex items-center justify-center text-xs font-medium cursor-pointer",
-                            isActive()
-                              ? "ring-2 ring-[var(--purple-400)]"
-                              : "opacity-60 hover:opacity-100",
-                          )}
-                          style={{
-                            background: color.bg,
-                            color: color.fg,
-                            "view-transition-name": `g-${g.group_id}`,
-                          }}
-                          onClick={() => withTransition(() => props.onSelectGroup(g.group_id))}
-                          title={g.name}
-                        >
-                          {g.name[0].toUpperCase()}
-                        </button>
-                      );
+        <div class="h-7 flex-shrink-0" />
+
+        {/* Scrollable group icons */}
+        <DragDropProvider
+          collisionDetector={closestCenter}
+          onDragStart={onGroupDragStart}
+          onDragEnd={onGroupDragEnd}
+        >
+          <DragDropSensors />
+          <ScrollArea class="flex-1 w-full">
+            <SortableProvider ids={groupOrder()}>
+              <div class="flex flex-col items-center">
+                <For each={orderedGroups()}>
+                  {(g) => <GroupIcon group={g} isActive={g.group_id === props.selectedGroupId} onClick={handleGroupClick} />}
+                </For>
+              </div>
+            </SortableProvider>
+          </ScrollArea>
+          <DragOverlay>
+            {(() => {
+              const id = activeGroupId();
+              if (!id) return null;
+              const g = props.groups.find((x) => x.group_id === id);
+              if (!g) return null;
+              const grad = hashGradient(g.group_id);
+              return (
+                <div class="w-[var(--size-lg)] h-[var(--size-lg)] flex items-center justify-center">
+                  <div
+                    class="w-[var(--size-md)] h-[var(--size-md)] rounded-[14%] flex items-center justify-center text-sm font-semibold opacity-80"
+                    style={{
+                      background: `linear-gradient(${grad.angle}deg, ${grad.from}, ${grad.to})`,
+                      color: "var(--neutral-100)",
                     }}
-                  </For>
+                  >
+                    {g.name[0]?.toUpperCase()}
+                  </div>
                 </div>
-              </ScrollArea>
+              );
+            })()}
+          </DragOverlay>
+        </DragDropProvider>
+
+        {/* Bottom dock */}
+        <div class="flex-shrink-0 flex flex-col items-center pb-2">
+          <div class="divider-h w-8 mb-2" />
+
+          <button
+            class="w-[var(--size-md)] h-[var(--size-md)] rounded-lg flex items-center justify-center cursor-pointer opacity-50 hover:opacity-100 mb-1.5"
+            title="settings"
+          >
+            <Settings size={16} class="text-[var(--neutral-300)]" />
+          </button>
+
+          <Show when={props.identity}>
+            {(id) => {
+              const [copied, setCopied] = createSignal(false);
+              const grad = hashGradient(id().fingerprint);
+              const copyFp = () => {
+                navigator.clipboard.writeText(id().fingerprint);
+                setCopied(true);
+                setTimeout(() => setCopied(false), 1200);
+              };
+              return (
+                <button
+                  class="flex flex-col items-center gap-0.5 cursor-pointer hover:opacity-80"
+                  onClick={copyFp}
+                  title={copied() ? "copied!" : id().fingerprint_short}
+                >
+                  <div
+                    class="avatar-flare w-[var(--size-md)] h-[var(--size-md)] rounded-full flex items-center justify-center text-sm font-semibold"
+                    style={{
+                      background: `linear-gradient(${grad.angle}deg, ${grad.from}, ${grad.to})`,
+                      color: "var(--neutral-100)",
+                    }}
+                    onMouseMove={onFlareMove}
+                    onMouseLeave={onFlareLeave}
+                  >
+                    {id().display_name[0]?.toUpperCase()}
+                  </div>
+                  <span class="text-[9px] text-[var(--neutral-500)] truncate max-w-[40px] leading-tight">
+                    {copied() ? "copied" : id().display_name}
+                  </span>
+                </button>
+              );
+            }}
+          </Show>
+        </div>
+      </div>
+
+      <div class="divider-v" />
+
+      {/* Channel panel */}
+      <Show when={selectedGroup()}>
+        {(group) => (
+          <div
+            class="w-52 flex-shrink-0 flex flex-col min-h-0"
+            style={{ background: "var(--neutral-950)" }}
+          >
+            <div class="h-7 flex-shrink-0" />
+
+            <div class="h-[var(--size-lg)] flex items-center px-3 flex-shrink-0">
+              <span class="text-base font-semibold text-[var(--neutral-100)] truncate">
+                {group().name}
+              </span>
             </div>
 
-            {/* Channel panel */}
-            <div class="flex-1 flex flex-col min-h-0 min-w-0">
-              <button
-                class="h-8 flex items-center px-3 mt-1.5 flex-shrink-0 text-sm text-[var(--neutral-300)] hover:text-[var(--neutral-200)] cursor-pointer truncate"
-                onClick={() => withTransition(() => props.onDeselectGroup())}
-              >
-                {group().name}
-              </button>
-
+            <DragDropProvider
+              collisionDetector={closestCenter}
+              onDragStart={onChannelDragStart}
+              onDragEnd={onChannelDragEnd}
+            >
+              <DragDropSensors />
               <ScrollArea class="flex-1">
                 <div>
                   <div class="flex items-center justify-between px-3 py-1">
@@ -216,30 +263,26 @@ export function Sidebar(props: SidebarProps) {
                       text channels
                     </button>
                     <button
-                      class="w-5 h-5 flex items-center justify-center rounded text-sm leading-none text-[var(--neutral-500)] hover:text-[var(--neutral-200)] hover:bg-[var(--neutral-700)] cursor-pointer"
+                      class="w-[var(--size-sm)] h-[var(--size-sm)] flex items-center justify-center rounded-md text-sm leading-none text-[var(--neutral-500)] hover:text-[var(--neutral-200)] cursor-pointer hover:bg-[var(--hover)]"
                       onClick={() => props.onCreateChannel("text")}
                     >
                       +
                     </button>
                   </div>
                   <Show when={!textCollapsed()}>
-                    <div class="px-1.5">
-                      <For each={textChannels()}>
-                        {(ch) => (
-                          <button
-                            class={cn(
-                              "w-full flex items-center gap-2 mx-1.5 px-2.5 py-1.5 rounded text-sm cursor-pointer",
-                              ch.channel_id === props.selectedChannelId
-                                ? "bg-[var(--purple-800)] text-[var(--neutral-100)]"
-                                : "text-[var(--neutral-400)] hover:bg-[var(--neutral-800)]",
-                            )}
-                            onClick={() => props.onSelectChannel(ch.channel_id)}
-                          >
-                            <span class="text-[var(--neutral-500)]">#</span>
-                            {ch.name}
-                          </button>
-                        )}
-                      </For>
+                    <div class="px-2">
+                      <SortableProvider ids={textChannels().map((c) => c.channel_id)}>
+                        <For each={textChannels()}>
+                          {(ch) => (
+                            <ChannelItem
+                              channel={ch}
+                              isSelected={ch.channel_id === props.selectedChannelId}
+                              onSelect={props.onSelectChannel}
+                              icon={<span class="text-[var(--neutral-500)]">#</span>}
+                            />
+                          )}
+                        </For>
+                      </SortableProvider>
                     </div>
                   </Show>
                 </div>
@@ -254,38 +297,133 @@ export function Sidebar(props: SidebarProps) {
                       voice channels
                     </button>
                     <button
-                      class="w-5 h-5 flex items-center justify-center rounded text-sm leading-none text-[var(--neutral-500)] hover:text-[var(--neutral-200)] hover:bg-[var(--neutral-700)] cursor-pointer"
+                      class="w-[var(--size-sm)] h-[var(--size-sm)] flex items-center justify-center rounded-md text-sm leading-none text-[var(--neutral-500)] hover:text-[var(--neutral-200)] cursor-pointer hover:bg-[var(--hover)]"
                       onClick={() => props.onCreateChannel("voice")}
                     >
                       +
                     </button>
                   </div>
                   <Show when={!voiceCollapsed()}>
-                    <div class="px-1.5">
-                      <For each={voiceChannels()}>
-                        {(ch) => (
-                          <button
-                            class={cn(
-                              "w-full flex items-center gap-2 mx-1.5 px-2.5 py-1.5 rounded text-sm cursor-pointer",
-                              ch.channel_id === props.selectedChannelId
-                                ? "bg-[var(--purple-800)] text-[var(--neutral-100)]"
-                                : "text-[var(--neutral-400)] hover:bg-[var(--neutral-800)]",
-                            )}
-                            onClick={() => props.onSelectChannel(ch.channel_id)}
-                          >
-                            <AudioLines size={14} class="text-[var(--neutral-500)] flex-shrink-0" />
-                            {ch.name}
-                          </button>
-                        )}
-                      </For>
+                    <div class="px-2">
+                      <SortableProvider ids={voiceChannels().map((c) => c.channel_id)}>
+                        <For each={voiceChannels()}>
+                          {(ch) => (
+                            <ChannelItem
+                              channel={ch}
+                              isSelected={ch.channel_id === props.selectedChannelId}
+                              onSelect={props.onSelectChannel}
+                              icon={<AudioLines size={14} class="text-[var(--neutral-500)] flex-shrink-0" />}
+                            />
+                          )}
+                        </For>
+                      </SortableProvider>
                     </div>
                   </Show>
                 </div>
               </ScrollArea>
-            </div>
+              <DragOverlay>
+                {(() => {
+                  const id = activeChannelId();
+                  if (!id) return null;
+                  const ch = props.channels.find((c) => c.channel_id === id);
+                  if (!ch) return null;
+                  return (
+                    <div class="flex items-center gap-2 px-2 py-1.5 rounded-md text-sm text-[var(--neutral-200)] bg-[var(--neutral-800)] opacity-80">
+                      {ch.kind === "text" ? "#" : "\u266a"} {ch.name}
+                    </div>
+                  );
+                })()}
+              </DragOverlay>
+            </DragDropProvider>
           </div>
         )}
       </Show>
     </div>
+  );
+}
+
+// Rounded group icon with active indicator bar
+function GroupIcon(props: { group: Group; isActive: boolean; onClick: (id: string) => void }) {
+  const sortable = createSortable(props.group.group_id);
+  const grad = hashGradient(props.group.group_id);
+
+  return (
+    <div
+      ref={sortable.ref}
+      class="relative flex items-center justify-center w-full group/gi"
+      style={transformStyle(sortable.transform)}
+      {...sortable.dragActivators}
+    >
+      {/* Left indicator — tall bar when active, short pill on hover */}
+      <div
+        class={cn(
+          "absolute left-0 w-[3px] rounded-r-full transition-all duration-200",
+          props.isActive
+            ? "top-1 bottom-1 opacity-100"
+            : "top-[38%] bottom-[38%] opacity-0 group-hover/gi:opacity-100",
+        )}
+        style={{ background: "var(--neutral-400)" }}
+      />
+      <button
+        class="w-[var(--size-lg)] h-[var(--size-lg)] flex items-center justify-center cursor-pointer"
+        onClick={() => props.onClick(props.group.group_id)}
+        title={props.group.name}
+      >
+        <div
+          class={cn(
+            "avatar-flare relative w-[var(--size-md)] h-[var(--size-md)] rounded-[14%] flex items-center justify-center text-sm font-semibold transition-all duration-200",
+            props.isActive
+              ? "opacity-100 scale-100"
+              : "opacity-50 scale-95 group-hover/gi:opacity-90 group-hover/gi:scale-100",
+          )}
+          style={{
+            background: `linear-gradient(${grad.angle}deg, ${grad.from}, ${grad.to})`,
+            color: "var(--neutral-100)",
+          }}
+          onMouseMove={onFlareMove}
+          onMouseLeave={onFlareLeave}
+        >
+          {props.group.name[0]?.toUpperCase()}
+          {/* Pulsing glow on active group */}
+          <Show when={props.isActive}>
+            <div
+              class="group-glow absolute inset-0 rounded-[14%] pointer-events-none"
+              style={{
+                "box-shadow": `0 0 6px 1.5px ${grad.glow}35, 0 0 12px 2px ${grad.glow}12`,
+                animation: "breathe 3.5s ease-in-out infinite",
+              }}
+            />
+          </Show>
+        </div>
+      </button>
+    </div>
+  );
+}
+
+// Sortable channel item for drag-reorder
+function ChannelItem(props: {
+  channel: Channel;
+  isSelected: boolean;
+  onSelect: (id: string) => void;
+  icon: JSX.Element;
+}) {
+  const sortable = createSortable(props.channel.channel_id);
+
+  return (
+    <button
+      ref={sortable.ref}
+      class={cn(
+        "w-full flex items-center gap-2 px-2 py-1.5 rounded-md text-sm cursor-pointer",
+        props.isSelected
+          ? "bg-[var(--active)] text-[var(--neutral-100)]"
+          : "text-[var(--neutral-400)] hover:bg-[var(--hover)]",
+      )}
+      style={transformStyle(sortable.transform)}
+      {...sortable.dragActivators}
+      onClick={() => props.onSelect(props.channel.channel_id)}
+    >
+      {props.icon}
+      {props.channel.name}
+    </button>
   );
 }

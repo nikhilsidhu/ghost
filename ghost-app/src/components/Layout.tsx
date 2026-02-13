@@ -2,10 +2,10 @@ import { createSignal, createEffect, on, onMount, Show } from "solid-js";
 import type { Identity, Group, Channel, Member } from "../lib/types";
 import {
   getIdentity, listGroups, listChannels, listMembers,
-  listPinnedGroups, pinGroup, unpinGroup,
+  listPinnedGroups,
   createGroup, createChannel as apiCreateChannel,
   renameChannel as apiRenameChannel, deleteChannel as apiDeleteChannel,
-  createInvite, joinByInvite,
+  createInvite, joinByInvite, seedTestData,
 } from "../lib/api";
 import { Sidebar } from "./Sidebar";
 import { GroupView } from "./GroupView";
@@ -45,15 +45,6 @@ export function Layout() {
   const refreshPins = async () => {
     const ids = await listPinnedGroups();
     setPinnedGroupIds(new Set(ids));
-  };
-
-  const handleTogglePin = async (groupId: string) => {
-    if (pinnedGroupIds().has(groupId)) {
-      await unpinGroup(groupId);
-    } else {
-      await pinGroup(groupId);
-    }
-    await refreshPins();
   };
 
   const handleCreateChannel = (kind: "text" | "voice") => {
@@ -200,33 +191,44 @@ export function Layout() {
 
   return (
     <div class="h-screen flex relative" style={{ background: "var(--neutral-950)" }}>
-      <div class="absolute left-0 right-0 top-[84px] h-px bg-[var(--neutral-800)] z-10" />
+      <div data-tauri-drag-region class="absolute inset-x-0 top-0 h-7 z-10" />
       <Sidebar
         identity={identity()}
         groups={groups()}
-        pinnedGroupIds={pinnedGroupIds()}
         selectedGroupId={selectedGroupId()}
         channels={channels()}
         selectedChannelId={selectedChannelId()}
         onSelectGroup={setSelectedGroupId}
         onDeselectGroup={() => setSelectedGroupId(null)}
         onSelectChannel={setSelectedChannelId}
-        onTogglePin={handleTogglePin}
         onCreateChannel={handleCreateChannel}
       />
-      <main class="flex-1 flex flex-col min-w-0">
-        <div data-tauri-drag-region class="h-7 flex-shrink-0" />
+      <div class="divider-v" />
+      <main class="flex-1 flex flex-col min-w-0 pt-7">
         <Show
           when={selectedGroup()}
           fallback={
             <div class="flex-1 flex items-center justify-center">
               <div class="text-center">
-                <span class="text-xs block" style={{ color: "var(--neutral-500)" }}>
+                <span class="text-sm block text-[var(--neutral-400)]">
                   select a group
                 </span>
-                <span class="text-[10px] block mt-2" style={{ color: "var(--neutral-600)" }}>
+                <span class="text-[10px] block mt-3 text-[var(--neutral-600)]">
                   {shortcutDefs.map((s) => formatHint(s)).join(" \u00b7 ")}
                 </span>
+                <button
+                  class="mt-4 px-3 py-1.5 rounded-md text-xs text-[var(--neutral-400)] hover:bg-[var(--hover)] cursor-pointer"
+                  style={{ border: "1px solid var(--neutral-700)" }}
+                  onClick={async () => {
+                    try {
+                      await seedTestData();
+                      await refreshGroups();
+                      await refreshPins();
+                    } catch {}
+                  }}
+                >
+                  seed test data
+                </button>
               </div>
             </div>
           }
@@ -236,7 +238,10 @@ export function Layout() {
               when={selectedChannelId()}
               fallback={
                 <div class="flex-1 flex items-center justify-center">
-                  <span class="text-xs text-[var(--neutral-500)]">select a channel</span>
+                  <div class="text-center">
+                    <span class="text-sm text-[var(--neutral-400)]">select a channel</span>
+                    <span class="text-xs block mt-1 text-[var(--neutral-600)]">from the sidebar</span>
+                  </div>
                 </div>
               }
             >
@@ -258,6 +263,7 @@ export function Layout() {
         </Show>
       </main>
       <Show when={selectedGroup()}>
+        <div class="divider-v" />
         <MemberPanel members={members()} />
       </Show>
       <CommandPalette

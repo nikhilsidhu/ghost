@@ -27,11 +27,10 @@ export function DialogContent(props: { children: JSX.Element; class?: string }) 
       <div class="fixed inset-0 z-50 flex items-center justify-center">
         <KDialog.Content
           class={cn(
-            "w-full max-w-md rounded-lg p-6",
-            "bg-[var(--neutral-800)] border border-[var(--neutral-600)]",
-            "shadow-xl",
+            "w-full max-w-md rounded-lg border border-[var(--neutral-700)] p-6",
             props.class,
           )}
+          style={{ background: "var(--neutral-800)" }}
         >
           {props.children}
         </KDialog.Content>

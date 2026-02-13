@@ -11,9 +11,9 @@
   --neutral-50: #eeedf5;
   --neutral-100: #d8d6e3;
   --neutral-200: #adabc0;
-  --neutral-300: #83809d;
-  --neutral-400: #5d5a78;
-  --neutral-500: #403d58;
+  --neutral-300: #9593ad;
+  --neutral-400: #78758f;
+  --neutral-500: #5c5975;
   --neutral-600: #2b2940;
   --neutral-700: #1e1c2e;
   --neutral-800: #141320;
@@ -111,7 +111,21 @@
   --rose-900: #340a1a;
   --rose-950: #1a050d;
 
+  /* Interactive states */
+  --hover: #1e1c2e;        /* same as neutral-700, for list item hovers */
+  --active: #24163e;       /* same as purple-900, for selected items */
+  --accent-hover: #3a2464; /* same as purple-800, for accent button hovers */
+
   --font-mono: 'Iosevka', 'SF Mono', 'Fira Code', 'JetBrains Mono', monospace;
+
+  /* Element sizing — 4px grid */
+  --grid: 4px;
+  --size-sm: 24px;
+  --size-md: 36px;
+  --size-lg: 52px;
+
+  /* Derived: left indent for grouped messages (px-2 + avatar + gap-3) */
+  --msg-indent: calc(var(--size-md) + 20px);
 }
 
 * {
@@ -119,8 +133,13 @@
   user-select: none;
 }
 
-body {
+html, body {
   margin: 0;
+  overflow: hidden;
+  overscroll-behavior: none;
+}
+
+body {
   background: var(--neutral-950);
   color: var(--neutral-100);
   font-family: var(--font-mono);
@@ -131,12 +150,89 @@ input, textarea {
   user-select: text;
 }
 
-/* Only animate named view-transition elements, not the whole page */
-:root {
-  view-transition-name: none;
+/* Scrollbar — thin, inset from edges */
+::-webkit-scrollbar {
+  width: 4px;
+  height: 4px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+  margin-block: 4px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--neutral-700);
+  border-radius: 2px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--neutral-600);
 }
 
-::view-transition-group(*) {
-  animation-duration: 200ms;
-  animation-timing-function: ease-in-out;
+/* Tapered dividers */
+.divider-v {
+  width: 1px;
+  flex-shrink: 0;
+  background: linear-gradient(to bottom, transparent, var(--neutral-700) 20%, var(--neutral-700) 80%, transparent);
+}
+.divider-h {
+  height: 1px;
+  flex-shrink: 0;
+  background: linear-gradient(to right, transparent, var(--neutral-700) 15%, var(--neutral-700) 85%, transparent);
+}
+
+/* New message slide-in */
+@keyframes msg-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.msg-new {
+  animation: msg-in 180ms ease-out;
+}
+
+/* Command palette slide-up */
+@keyframes palette-in {
+  from { opacity: 0; transform: translateY(12px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes overlay-fade {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+/* Active group pulsing glow */
+@keyframes breathe {
+  0%, 100% { opacity: 0.35; }
+  50% { opacity: 1; }
+}
+
+/* Avatar highlight — radial spot follows the mouse cursor */
+.avatar-flare {
+  position: relative;
+  overflow: hidden;
+}
+.avatar-flare::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  background: radial-gradient(
+    circle at var(--flare-x, 50%) var(--flare-y, 50%),
+    rgba(255, 255, 255, 0.32) 0%,
+    rgba(255, 255, 255, 0.08) 42%,
+    transparent 68%
+  );
+  opacity: var(--flare-opacity, 0);
+  transition: opacity 150ms ease-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .msg-new,
+  [data-palette-content],
+  [data-palette-overlay],
+  .group-glow { animation: none; }
+  .avatar-flare::after {
+    transition: none;
+    /* Static centered highlight on hover instead of mouse tracking */
+    background: radial-gradient(circle at 50% 50%, rgba(255, 255, 255, 0.10) 0%, transparent 70%);
+  }
 }

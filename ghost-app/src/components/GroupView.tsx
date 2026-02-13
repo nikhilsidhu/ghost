@@ -18,6 +18,7 @@ export function GroupView(props: Props) {
           {props.channelName}
         </span>
       </div>
+      <div class="divider-h" />
       <MessageView
         groupId={props.group.group_id}
         channelId={props.channelId}

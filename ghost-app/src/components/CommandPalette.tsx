@@ -1,7 +1,6 @@
 import { createSignal, createEffect, createMemo, For, Show, onMount, onCleanup, batch } from "solid-js";
 import type { Group } from "../lib/types";
-import { Dialog, DialogContent } from "./ui/dialog";
-import { Input } from "./ui/input";
+import { Dialog as KDialog } from "@kobalte/core/dialog";
 import { cn } from "../lib/cn";
 import { findShortcut } from "../lib/shortcuts";
 import { Pin } from "lucide-solid";
@@ -407,117 +406,139 @@ export function CommandPalette(props: Props) {
   // --- Render ---
 
   return (
-    <Dialog open={open()} onOpenChange={handleOpenChange}>
-      <DialogContent class="max-w-sm p-0 overflow-hidden">
-        {/* Breadcrumbs */}
-        <Show when={mode() === "args" && resolvedCommand()}>
-          <div class="px-3 pt-3 pb-0 flex items-center gap-1 flex-wrap">
-            <span class="text-xs text-[var(--purple-300)]">/{resolvedCommand()!.command}</span>
-            <For each={Object.entries(collectedArgs())}>
-              {([, val]) => (
-                <>
-                  <span class="text-xs text-[var(--neutral-600)]">&rsaquo;</span>
-                  <span class="text-xs text-[var(--neutral-400)]">{val}</span>
-                </>
-              )}
-            </For>
-            <span class="text-xs text-[var(--neutral-600)]">&rsaquo;</span>
-          </div>
-        </Show>
+    <KDialog open={open()} onOpenChange={handleOpenChange}>
+      <KDialog.Portal>
+        <KDialog.Overlay
+          data-palette-overlay
+          class="fixed inset-0 z-50"
+          style={{ background: "rgba(0, 0, 0, 0.25)", animation: "overlay-fade 180ms ease-out" }}
+        />
+        <div class="fixed inset-0 z-50 flex items-end justify-center pb-6">
+          <KDialog.Content
+            data-palette-content
+            class="w-full max-w-sm rounded-xl overflow-hidden"
+            style={{
+              background: "rgba(10, 10, 20, 0.82)",
+              "backdrop-filter": "blur(24px)",
+              "-webkit-backdrop-filter": "blur(24px)",
+              border: "1px solid var(--neutral-700)",
+              "box-shadow": "0 -4px 24px rgba(0, 0, 0, 0.35)",
+              animation: "palette-in 180ms ease-out",
+            }}
+          >
+            {/* Breadcrumbs */}
+            <Show when={mode() === "args" && resolvedCommand()}>
+              <div class="px-3 pt-3 pb-0 flex items-center gap-1 flex-wrap">
+                <span class="text-xs text-[var(--purple-300)]">/{resolvedCommand()!.command}</span>
+                <For each={Object.entries(collectedArgs())}>
+                  {([, val]) => (
+                    <>
+                      <span class="text-xs text-[var(--neutral-600)]">&rsaquo;</span>
+                      <span class="text-xs text-[var(--neutral-400)]">{val}</span>
+                    </>
+                  )}
+                </For>
+                <span class="text-xs text-[var(--neutral-600)]">&rsaquo;</span>
+              </div>
+            </Show>
 
-        {/* Input */}
-        <div class={cn("p-3 border-b border-[var(--neutral-600)]", mode() === "args" ? "pt-1.5" : "")}>
-          <Input
-            ref={inputRef}
-            placeholder={placeholder()}
-            value={query()}
-            onInput={(e: InputEvent) => setQuery((e.currentTarget as HTMLInputElement).value)}
-            onKeyDown={handleKeyDown}
-            autocomplete="off"
-            autocorrect="off"
-            autocapitalize="off"
-            spellcheck={false}
-          />
+            {/* Input — borderless, blends with palette bg */}
+            <div class={cn("p-3", mode() === "args" ? "pt-1.5" : "")}>
+              <input
+                ref={inputRef}
+                placeholder={placeholder()}
+                value={query()}
+                onInput={(e) => setQuery(e.currentTarget.value)}
+                onKeyDown={handleKeyDown}
+                autocomplete="off"
+                autocorrect="off"
+                autocapitalize="off"
+                spellcheck={false}
+                class="h-8 w-full bg-transparent text-sm text-[var(--neutral-100)] placeholder:text-[var(--neutral-500)] outline-none"
+              />
+            </div>
+            <div class="divider-h" />
+
+            {/* Results list */}
+            <div ref={listRef} class="max-h-64 overflow-y-auto py-1">
+              {/* Search mode: groups */}
+              <Show when={mode() === "search"}>
+                <Show
+                  when={filteredGroups().length > 0}
+                  fallback={<div class="px-3 py-4 text-xs text-[var(--neutral-500)] text-center">no groups found</div>}
+                >
+                  <For each={filteredGroups()}>
+                    {(group, idx) => (
+                      <button
+                        onClick={() => selectGroup(group.group_id)}
+                        onMouseEnter={() => setFocusedIndex(idx())}
+                        class={cn(
+                          "w-full text-left px-3 py-2 text-sm flex items-center gap-2 cursor-pointer transition-colors",
+                          idx() === focusedIndex()
+                            ? "bg-[var(--active)] text-[var(--neutral-100)]"
+                            : "text-[var(--neutral-400)] hover:bg-[var(--hover)]",
+                        )}
+                      >
+                        <Show when={props.pinnedGroupIds.has(group.group_id)}>
+                          <Pin size={12} class="text-[var(--purple-400)] flex-shrink-0" />
+                        </Show>
+                        <span class="truncate">{group.name}</span>
+                      </button>
+                    )}
+                  </For>
+                </Show>
+              </Show>
+
+              {/* Command mode: commands */}
+              <Show when={mode() === "command"}>
+                <Show
+                  when={filteredCommands().length > 0}
+                  fallback={<div class="px-3 py-4 text-xs text-[var(--neutral-500)] text-center">no commands found</div>}
+                >
+                  <For each={filteredCommands()}>
+                    {(cmd, idx) => (
+                      <button
+                        onClick={() => resolveCommand(cmd)}
+                        onMouseEnter={() => setFocusedIndex(idx())}
+                        class={cn(
+                          "w-full text-left px-3 py-2 text-sm flex items-center cursor-pointer transition-colors",
+                          idx() === focusedIndex()
+                            ? "bg-[var(--active)]"
+                            : "hover:bg-[var(--hover)]",
+                        )}
+                      >
+                        <CommandHighlight command={cmd.command} query={commandQuery()} />
+                      </button>
+                    )}
+                  </For>
+                </Show>
+              </Show>
+
+              {/* Args mode: completions */}
+              <Show when={mode() === "args"}>
+                <Show when={argCompletions().length > 0}>
+                  <For each={argCompletions()}>
+                    {(opt, idx) => (
+                      <button
+                        onClick={() => confirmArg(opt.value)}
+                        onMouseEnter={() => setFocusedIndex(idx())}
+                        class={cn(
+                          "w-full text-left px-3 py-2 text-sm flex items-center cursor-pointer transition-colors",
+                          idx() === focusedIndex()
+                            ? "bg-[var(--active)] text-[var(--neutral-100)]"
+                            : "text-[var(--neutral-400)] hover:bg-[var(--hover)]",
+                        )}
+                      >
+                        <span class="truncate">{opt.label}</span>
+                      </button>
+                    )}
+                  </For>
+                </Show>
+              </Show>
+            </div>
+          </KDialog.Content>
         </div>
-
-        {/* Results list */}
-        <div ref={listRef} class="max-h-64 overflow-y-auto py-1">
-          {/* Search mode: groups */}
-          <Show when={mode() === "search"}>
-            <Show
-              when={filteredGroups().length > 0}
-              fallback={<div class="px-3 py-4 text-xs text-[var(--neutral-500)] text-center">no groups found</div>}
-            >
-              <For each={filteredGroups()}>
-                {(group, idx) => (
-                  <button
-                    onClick={() => selectGroup(group.group_id)}
-                    onMouseEnter={() => setFocusedIndex(idx())}
-                    class={cn(
-                      "w-full text-left px-3 py-2 text-sm flex items-center gap-2 cursor-pointer transition-colors",
-                      idx() === focusedIndex()
-                        ? "bg-[var(--purple-800)] text-[var(--neutral-100)]"
-                        : "text-[var(--neutral-400)] hover:bg-[var(--neutral-700)]",
-                    )}
-                  >
-                    <Show when={props.pinnedGroupIds.has(group.group_id)}>
-                      <Pin size={12} class="text-[var(--purple-400)] flex-shrink-0" />
-                    </Show>
-                    <span class="truncate">{group.name}</span>
-                  </button>
-                )}
-              </For>
-            </Show>
-          </Show>
-
-          {/* Command mode: commands */}
-          <Show when={mode() === "command"}>
-            <Show
-              when={filteredCommands().length > 0}
-              fallback={<div class="px-3 py-4 text-xs text-[var(--neutral-500)] text-center">no commands found</div>}
-            >
-              <For each={filteredCommands()}>
-                {(cmd, idx) => (
-                  <button
-                    onClick={() => resolveCommand(cmd)}
-                    onMouseEnter={() => setFocusedIndex(idx())}
-                    class={cn(
-                      "w-full text-left px-3 py-2 text-sm flex items-center cursor-pointer transition-colors",
-                      idx() === focusedIndex()
-                        ? "bg-[var(--purple-800)]"
-                        : "hover:bg-[var(--neutral-700)]",
-                    )}
-                  >
-                    <CommandHighlight command={cmd.command} query={commandQuery()} />
-                  </button>
-                )}
-              </For>
-            </Show>
-          </Show>
-
-          {/* Args mode: completions */}
-          <Show when={mode() === "args"}>
-            <Show when={argCompletions().length > 0}>
-              <For each={argCompletions()}>
-                {(opt, idx) => (
-                  <button
-                    onClick={() => confirmArg(opt.value)}
-                    onMouseEnter={() => setFocusedIndex(idx())}
-                    class={cn(
-                      "w-full text-left px-3 py-2 text-sm flex items-center cursor-pointer transition-colors",
-                      idx() === focusedIndex()
-                        ? "bg-[var(--purple-800)] text-[var(--neutral-100)]"
-                        : "text-[var(--neutral-400)] hover:bg-[var(--neutral-700)]",
-                    )}
-                  >
-                    <span class="truncate">{opt.label}</span>
-                  </button>
-                )}
-              </For>
-            </Show>
-          </Show>
-        </div>
-      </DialogContent>
-    </Dialog>
+      </KDialog.Portal>
+    </KDialog>
   );
 }

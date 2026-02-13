@@ -8,8 +8,8 @@ export function Input(props: JSX.InputHTMLAttributes<HTMLInputElement>) {
       class={cn(
         "h-8 w-full rounded px-3 text-sm",
         "bg-[var(--neutral-800)] text-[var(--neutral-100)] placeholder:text-[var(--neutral-500)]",
-        "border border-[var(--neutral-600)] focus:border-[var(--purple-500)]",
-        "outline-none transition-colors",
+        "border border-[var(--neutral-700)] outline-none",
+        "focus:border-[var(--purple-500)]",
         local.class,
       )}
       {...rest}

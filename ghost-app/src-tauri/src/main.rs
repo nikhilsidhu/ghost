@@ -32,6 +32,7 @@ fn main() {
 
                 let window = app.get_webview_window("main").unwrap();
                 let ns_window = unsafe { &*(window.ns_window().unwrap() as *mut NSWindow) };
+                // pure black — matches --neutral-950
                 let color = NSColor::colorWithSRGBRed_green_blue_alpha(0.0, 0.0, 0.0, 1.0);
                 ns_window.setBackgroundColor(Some(&color));
             }
@@ -75,6 +76,7 @@ fn main() {
             commands::leave_voice,
             commands::set_muted,
             commands::set_deafened,
+            commands::seed_test_data,
         ])
         .run(tauri::generate_context!())
         .expect("error while running ghost");

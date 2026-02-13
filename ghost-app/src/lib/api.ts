@@ -51,3 +51,5 @@ export const setDisplayName = (name: string) =>
 
 export const setRelayUrl = (url: string) =>
   invoke<void>("set_relay_url", { url });
+
+export const seedTestData = () => invoke<void>("seed_test_data");

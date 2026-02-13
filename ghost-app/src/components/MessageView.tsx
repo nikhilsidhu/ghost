@@ -2,6 +2,9 @@ import { createSignal, createEffect, on, onCleanup, For, Show } from "solid-js";
 import { listen } from "@tauri-apps/api/event";
 import type { Member, Identity, Message } from "../lib/types";
 import { listMessages, sendMessage } from "../lib/api";
+import { hashGradient, onFlareMove, onFlareLeave } from "../lib/gradients";
+import { cn } from "../lib/cn";
+import { ChevronDown, SendHorizonal } from "lucide-solid";
 
 interface Props {
   groupId: string;
@@ -12,6 +15,7 @@ interface Props {
 
 const PAGE_SIZE = 50;
 const SCROLL_BOTTOM_THRESHOLD = 80;
+const GROUP_WINDOW_MS = 5 * 60 * 1000;
 
 const formatTime = (ts: number) => {
   const d = new Date(ts);
@@ -24,7 +28,9 @@ export function MessageView(props: Props) {
   const [hasMore, setHasMore] = createSignal(true);
   const [inputText, setInputText] = createSignal("");
   const [error, setError] = createSignal<string | null>(null);
+  const [nearBottom, setNearBottom] = createSignal(true);
   const seenIds = new Set<string>();
+  let initialLoad = true;
 
   let containerRef!: HTMLDivElement;
   let inputRef!: HTMLInputElement;
@@ -41,12 +47,26 @@ export function MessageView(props: Props) {
     if (containerRef) containerRef.scrollTop = containerRef.scrollHeight;
   };
 
+  const updateNearBottom = () => {
+    if (!containerRef) return;
+    const nb = containerRef.scrollHeight - containerRef.scrollTop - containerRef.clientHeight < SCROLL_BOTTOM_THRESHOLD;
+    setNearBottom(nb);
+  };
+
+  // Group consecutive messages from same sender within 5min
+  const isGrouped = (msgs: Message[], idx: number) => {
+    if (idx === 0) return false;
+    const prev = msgs[idx - 1];
+    const cur = msgs[idx];
+    return prev.sender_fp === cur.sender_fp && cur.timestamp - prev.timestamp < GROUP_WINDOW_MS;
+  };
+
   createEffect(on(() => props.channelId, (cid) => {
     setMessages([]);
     seenIds.clear();
     setHasMore(true);
+    initialLoad = true;
 
-    // Load history — merge with any relay messages that arrived during the await
     (async () => {
       const msgs = await listMessages(cid, undefined, PAGE_SIZE);
       const loaded = msgs.reverse();
@@ -58,19 +78,19 @@ export function MessageView(props: Props) {
         return merged;
       });
       setHasMore(msgs.length === PAGE_SIZE);
-      requestAnimationFrame(scrollToBottom);
+      requestAnimationFrame(() => {
+        scrollToBottom();
+        initialLoad = false;
+      });
     })();
 
-    // Real-time messages from relay
     const unlisten = listen<Message>("message", (event) => {
       const msg = event.payload;
       if (msg.channel_id !== cid) return;
       if (seenIds.has(msg.message_id)) return;
       seenIds.add(msg.message_id);
       setMessages((prev) => [...prev, msg]);
-      const el = containerRef;
-      const nearBottom = el && (el.scrollHeight - el.scrollTop - el.clientHeight < SCROLL_BOTTOM_THRESHOLD);
-      if (nearBottom) requestAnimationFrame(scrollToBottom);
+      if (nearBottom()) requestAnimationFrame(scrollToBottom);
     });
     onCleanup(() => { unlisten.then((fn) => fn()); });
   }));
@@ -104,11 +124,15 @@ export function MessageView(props: Props) {
   };
 
   return (
-    <div class="flex-1 flex flex-col min-h-0">
-      <div ref={containerRef} class="flex-1 overflow-y-auto px-4 py-2">
+    <div class="flex-1 flex flex-col min-h-0 relative pr-1">
+      <div
+        ref={containerRef}
+        class="flex-1 overflow-y-auto px-4 py-2"
+        onScroll={updateNearBottom}
+      >
         <Show when={hasMore()}>
           <button
-            class="w-full text-xs text-[var(--neutral-500)] py-2 hover:text-[var(--neutral-300)] cursor-pointer"
+            class="w-full text-xs text-[var(--neutral-500)] py-2 hover:text-[var(--neutral-300)] cursor-pointer transition-colors duration-150"
             onClick={loadMore}
             disabled={loading()}
           >
@@ -116,36 +140,104 @@ export function MessageView(props: Props) {
           </button>
         </Show>
         <For each={messages()}>
-          {(msg) => (
-            <div class="py-1.5">
-              <div class="flex items-baseline gap-2">
-                <span class="text-sm font-medium text-[var(--purple-300)]">
-                  {senderMap().get(msg.sender_fp) ?? msg.sender_fp.slice(0, 16)}
-                </span>
-                <span class="text-xs text-[var(--neutral-600)]">
-                  {formatTime(msg.timestamp)}
-                </span>
+          {(msg, idx) => {
+            const grouped = () => isGrouped(messages(), idx());
+            const name = () => senderMap().get(msg.sender_fp) ?? msg.sender_fp.slice(0, 16);
+            const grad = () => hashGradient(msg.sender_fp);
+            return (
+              <div
+                class={cn(
+                  "group/msg -mx-2 px-2 rounded-md hover:bg-[var(--neutral-900)]",
+                  grouped() ? "py-1 pl-[var(--msg-indent)]" : "mt-2 py-1.5",
+                  !initialLoad && idx() === messages().length - 1 ? "msg-new" : "",
+                )}
+              >
+                <Show when={!grouped()}>
+                  <div class="flex items-start gap-3">
+                    <button
+                      class="avatar-flare w-[var(--size-md)] h-[var(--size-md)] rounded-full flex items-center justify-center text-xs font-semibold flex-shrink-0 mt-1 cursor-pointer transition-all duration-200 opacity-85 hover:opacity-100 hover:scale-105"
+                      style={{
+                        background: `linear-gradient(${grad().angle}deg, ${grad().from}, ${grad().to})`,
+                        color: "var(--neutral-100)",
+                      }}
+                      onMouseMove={onFlareMove}
+                      onMouseLeave={onFlareLeave}
+                    >
+                      {name()[0]?.toUpperCase()}
+                    </button>
+                    <div class="flex-1 min-w-0">
+                      <div class="flex items-baseline gap-2">
+                        <span
+                          class="text-sm font-medium"
+                          style={{ color: grad().from }}
+                        >
+                          {name()}
+                        </span>
+                        <span class="text-xs text-[var(--neutral-600)]">
+                          {formatTime(msg.timestamp)}
+                        </span>
+                      </div>
+                      <div class="text-sm text-[var(--neutral-300)] break-words leading-relaxed">
+                        {msg.content}
+                      </div>
+                    </div>
+                  </div>
+                </Show>
+                <Show when={grouped()}>
+                  <div class="text-sm text-[var(--neutral-300)] break-words leading-relaxed">
+                    {msg.content}
+                  </div>
+                </Show>
               </div>
-              <div class="text-sm text-[var(--neutral-200)] break-words">
-                {msg.content}
-              </div>
-            </div>
-          )}
+            );
+          }}
         </For>
       </div>
+
+      {/* Scroll-to-bottom */}
+      <Show when={!nearBottom()}>
+        <button
+          class="absolute right-4 bottom-20 w-[var(--size-md)] h-[var(--size-md)] rounded-full flex items-center justify-center cursor-pointer transition-colors duration-150"
+          style={{
+            background: "var(--neutral-800)",
+            border: "1px solid var(--neutral-700)",
+          }}
+          onClick={scrollToBottom}
+        >
+          <ChevronDown size={16} class="text-[var(--neutral-300)]" />
+        </button>
+      </Show>
 
       <Show when={error()}>
         <div class="px-4 py-1 text-xs text-[var(--red-400)]">{error()}</div>
       </Show>
-      <div class="flex-shrink-0 px-4 py-3 border-t border-[var(--neutral-800)]">
-        <input
-          ref={inputRef}
-          class="w-full h-9 rounded px-3 text-sm bg-[var(--neutral-800)] text-[var(--neutral-100)] placeholder:text-[var(--neutral-500)] border border-[var(--neutral-700)] focus:border-[var(--purple-500)] outline-none"
-          placeholder="send a message..."
-          value={inputText()}
-          onInput={(e) => setInputText(e.currentTarget.value)}
-          onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); handleSend(); } }}
-        />
+      <div class="flex-shrink-0 px-4 py-3">
+        <div
+          class="flex items-center gap-2 rounded-lg px-3"
+          style={{
+            background: "var(--neutral-800)",
+            border: "1px solid var(--neutral-700)",
+          }}
+        >
+          <input
+            ref={inputRef}
+            class="flex-1 h-10 bg-transparent text-sm text-[var(--neutral-100)] placeholder:text-[var(--neutral-500)] outline-none"
+            placeholder="send a message..."
+            value={inputText()}
+            onInput={(e) => setInputText(e.currentTarget.value)}
+            onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); handleSend(); } }}
+          />
+          <button
+            class="w-7 h-7 flex items-center justify-center rounded-md cursor-pointer transition-colors duration-150"
+            classList={{
+              "text-[var(--purple-400)] hover:text-[var(--purple-300)] hover:bg-[var(--accent-hover)]": inputText().trim().length > 0,
+              "text-[var(--neutral-600)]": inputText().trim().length === 0,
+            }}
+            onClick={handleSend}
+          >
+            <SendHorizonal size={16} />
+          </button>
+        </div>
       </div>
     </div>
   );
