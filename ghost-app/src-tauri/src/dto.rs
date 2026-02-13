@@ -119,6 +119,12 @@ pub struct InviteDto {
     pub link: String,
 }
 
+#[derive(Serialize)]
+pub struct ConfigDto {
+    pub display_name: Option<String>,
+    pub relay_url: Option<String>,
+}
+
 impl From<&Member> for MemberDto {
     fn from(m: &Member) -> Self {
         Self {

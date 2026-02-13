@@ -1,6 +1,7 @@
 use tauri::Manager;
 
 mod commands;
+mod config;
 mod constants;
 mod dto;
 mod relay_task;
@@ -47,6 +48,9 @@ fn main() {
             commands::delete_channel,
             commands::create_invite,
             commands::join_by_invite,
+            commands::get_config,
+            commands::set_display_name,
+            commands::set_relay_url,
         ])
         .run(tauri::generate_context!())
         .expect("error while running ghost");

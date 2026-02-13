@@ -32,6 +32,11 @@ export interface Invite {
   link: string;
 }
 
+export interface Config {
+  display_name: string | null;
+  relay_url: string | null;
+}
+
 export interface Message {
   message_id: string;
   channel_id: string;

@@ -7,6 +7,7 @@ use ghost_core::identity::Identity;
 use ghost_core::relay::{IncomingBlob, RelayClient};
 use tokio::sync::{mpsc, Mutex};
 
+use crate::config::{self, GhostConfig};
 use crate::state::AppState;
 
 fn ghost_dir() -> PathBuf {
@@ -64,10 +65,22 @@ pub fn initialize() -> (AppState, mpsc::Receiver<IncomingBlob>) {
     let dir = ghost_dir();
     fs::create_dir_all(&dir).expect("failed to create ~/.ghost");
 
+    let cfg_path = config::config_path(&dir);
+    let cfg = GhostConfig::load(&cfg_path);
+
     let seed = load_or_create_seed();
-    let client = GhostClient::open(seed, &db_path()).expect("failed to open database");
-    let relay_url = std::env::var("GHOST_RELAY_URL")
-        .unwrap_or_else(|_| "http://localhost:7700".into());
+    let mut client = GhostClient::open(seed, &db_path()).expect("failed to open database");
+
+    if let Some(name) = &cfg.display_name {
+        client.set_display_name(name.clone());
+    }
+
+    // Config file takes priority, then env var, then default
+    let relay_url = cfg
+        .relay_url
+        .clone()
+        .or_else(|| std::env::var("GHOST_RELAY_URL").ok())
+        .unwrap_or_else(|| "http://localhost:7700".into());
 
     let (relay, inbox_rx) = RelayClient::new(&relay_url);
 
@@ -76,6 +89,7 @@ pub fn initialize() -> (AppState, mpsc::Receiver<IncomingBlob>) {
         relay: Arc::new(Mutex::new(relay)),
         relay_url,
         http: reqwest::Client::new(),
+        config_path: cfg_path,
     };
 
     (state, inbox_rx)

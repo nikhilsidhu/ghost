@@ -105,6 +105,10 @@ impl GhostClient {
         &self.store
     }
 
+    pub fn set_display_name(&mut self, name: String) {
+        self.identity.display_name = name;
+    }
+
     pub fn generate_key_package(&self) -> Result<KeyPackage> {
         generate_key_package(&self.provider, &self.identity)
     }

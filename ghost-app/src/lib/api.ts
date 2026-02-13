@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Identity, Group, Channel, Member, Message, Invite } from "./types";
+import type { Identity, Group, Channel, Member, Message, Invite, Config } from "./types";
 
 export const getIdentity = () => invoke<Identity>("get_identity");
 
@@ -43,3 +43,11 @@ export const createInvite = (groupId: string) =>
 
 export const joinByInvite = (relayUrl: string, token: string) =>
   invoke<Group>("join_by_invite", { relayUrl, token });
+
+export const getConfig = () => invoke<Config>("get_config");
+
+export const setDisplayName = (name: string) =>
+  invoke<void>("set_display_name", { name });
+
+export const setRelayUrl = (url: string) =>
+  invoke<void>("set_relay_url", { url });
