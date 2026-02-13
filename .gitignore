@@ -15,8 +15,12 @@ dist/
 **/src-tauri/gen/
 **/src-tauri/WixTools/
 
-# Secrets
+# Secrets & data
 *.key
+*.db
+*.db-wal
+*.db-shm
+config.toml
 .env
 .env.*
 
