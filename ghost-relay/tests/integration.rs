@@ -293,6 +293,58 @@ async fn epoch_gating() {
 }
 
 #[tokio::test]
+async fn ws_catchup_replay() {
+    let base = start_server(test_config()).await;
+    let client = reqwest::Client::new();
+    let mailbox_id = [0x09; 32];
+    let url = mailbox_url(&base, &mailbox_id);
+    let ws_base = base.replace("http://", "ws://");
+    let mailbox = URL_SAFE_NO_PAD.encode(mailbox_id);
+    let ws_url = format!("{ws_base}/ws/{mailbox}");
+
+    // Post 3 blobs via HTTP
+    for i in 0..3u8 {
+        let resp = client.post(&url).body(test_envelope(&[i])).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    // Connect with last_seen=0 — should replay all 3
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
+    ws_handshake(&mut ws, 0).await;
+
+    for i in 0..3u8 {
+        let data = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let m = ws.next().await.unwrap().unwrap();
+                if m.is_binary() { break m.into_data(); }
+            }
+        })
+        .await
+        .expect("timed out waiting for replay");
+        let seq = u64::from_be_bytes(data[..8].try_into().unwrap());
+        assert_eq!(seq, (i as u64) + 1);
+        // 16-byte frame header + 10-byte envelope header + 1-byte payload
+        assert_eq!(data[26], i);
+    }
+
+    // Connect with last_seen=2 — should replay only seq 3
+    let (mut ws2, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
+    ws_handshake(&mut ws2, 2).await;
+
+    let data = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let m = ws2.next().await.unwrap().unwrap();
+            if m.is_binary() { break m.into_data(); }
+        }
+    })
+    .await
+    .expect("timed out waiting for partial replay");
+    let seq = u64::from_be_bytes(data[..8].try_into().unwrap());
+    assert_eq!(seq, 3);
+    assert_eq!(data[26], 2);
+}
+
+#[tokio::test]
 async fn blob_size_limit() {
     let base = start_server(test_config()).await;
     let client = reqwest::Client::new();
