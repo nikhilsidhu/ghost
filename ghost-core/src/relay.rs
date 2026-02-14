@@ -9,14 +9,25 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::error::{GhostError, Result};
 
-const UUID_SIZE: usize = 16;
+const SEQ_SIZE: usize = 8;
 const TIMESTAMP_SIZE: usize = 8;
-const BLOB_HEADER_SIZE: usize = UUID_SIZE + TIMESTAMP_SIZE;
+const FRAME_HEADER_SIZE: usize = SEQ_SIZE + TIMESTAMP_SIZE;
 
 pub struct IncomingBlob {
     pub mailbox_id: [u8; 32],
+    pub seq: u64,
     pub received_at: u64,
     pub payload: Vec<u8>,
+}
+
+pub struct Ack {
+    pub seq: u64,
+    pub epoch_mismatch: bool,
+}
+
+pub enum RelayEvent {
+    Blob(IncomingBlob),
+    Ack(Ack),
 }
 
 struct WsHandle {
@@ -28,28 +39,28 @@ pub struct RelayClient {
     base_url: String,
     ws_base_url: String,
     http: reqwest::Client,
-    inbox_tx: mpsc::Sender<IncomingBlob>,
+    event_tx: mpsc::Sender<RelayEvent>,
     connections: HashMap<[u8; 32], WsHandle>,
 }
 
 impl RelayClient {
-    pub fn new(base_url: &str) -> (Self, mpsc::Receiver<IncomingBlob>) {
+    pub fn new(base_url: &str) -> (Self, mpsc::Receiver<RelayEvent>) {
         let base = base_url.trim_end_matches('/').to_string();
         let ws_base = base
             .replace("http://", "ws://")
             .replace("https://", "wss://");
-        let (inbox_tx, inbox_rx) = mpsc::channel(256);
+        let (event_tx, event_rx) = mpsc::channel(256);
         let client = Self {
             base_url: base,
             ws_base_url: ws_base,
             http: reqwest::Client::new(),
-            inbox_tx,
+            event_tx,
             connections: HashMap::new(),
         };
-        (client, inbox_rx)
+        (client, event_rx)
     }
 
-    pub async fn subscribe(&mut self, mailbox_id: [u8; 32]) -> Result<()> {
+    pub async fn subscribe(&mut self, mailbox_id: [u8; 32], last_seen_seq: u64) -> Result<()> {
         let url = format!(
             "{}/ws/{}",
             self.ws_base_url,
@@ -59,14 +70,13 @@ impl RelayClient {
             .await
             .map_err(|e| GhostError::Network(e.to_string()))?;
 
-        // Clean up any existing connection for this mailbox
         if let Some(old) = self.connections.remove(&mailbox_id) {
             old.task.abort();
         }
 
         let (outbox_tx, outbox_rx) = mpsc::channel(64);
-        let inbox_tx = self.inbox_tx.clone();
-        let task = tokio::spawn(ws_loop(ws, mailbox_id, inbox_tx, outbox_rx));
+        let event_tx = self.event_tx.clone();
+        let task = tokio::spawn(ws_loop(ws, mailbox_id, last_seen_seq, event_tx, outbox_rx));
         self.connections
             .insert(mailbox_id, WsHandle { outbox: outbox_tx, task });
         Ok(())
@@ -200,10 +210,17 @@ type WsStream =
 async fn ws_loop(
     ws: WsStream,
     mailbox_id: [u8; 32],
-    inbox_tx: mpsc::Sender<IncomingBlob>,
+    last_seen_seq: u64,
+    event_tx: mpsc::Sender<RelayEvent>,
     mut outbox_rx: mpsc::Receiver<Vec<u8>>,
 ) {
     let (mut sink, mut stream) = ws.split();
+
+    // Handshake: send last_seen_seq so the relay replays missed entries
+    let handshake = last_seen_seq.to_be_bytes().to_vec();
+    if sink.send(Message::Binary(handshake.into())).await.is_err() {
+        return;
+    }
 
     loop {
         tokio::select! {
@@ -220,24 +237,37 @@ async fn ws_loop(
             msg = stream.next() => {
                 match msg {
                     Some(Ok(Message::Binary(data))) => {
-                        if data.len() < BLOB_HEADER_SIZE {
+                        if data.len() < FRAME_HEADER_SIZE {
                             continue;
                         }
+                        let seq = u64::from_be_bytes(data[..SEQ_SIZE].try_into().unwrap());
                         let received_at = u64::from_be_bytes(
-                            data[UUID_SIZE..BLOB_HEADER_SIZE].try_into().unwrap(),
+                            data[SEQ_SIZE..FRAME_HEADER_SIZE].try_into().unwrap(),
                         );
-                        let payload = data[BLOB_HEADER_SIZE..].to_vec();
-                        let _ = inbox_tx.send(IncomingBlob {
+                        let payload = data[FRAME_HEADER_SIZE..].to_vec();
+                        let _ = event_tx.send(RelayEvent::Blob(IncomingBlob {
                             mailbox_id,
+                            seq,
                             received_at,
                             payload,
-                        }).await;
+                        })).await;
                     }
-                    Some(Ok(Message::Text(_))) => {}
+                    Some(Ok(Message::Text(text))) => {
+                        if let Some(ack) = parse_ack(&text) {
+                            let _ = event_tx.send(RelayEvent::Ack(ack)).await;
+                        }
+                    }
                     Some(Ok(Message::Close(_))) | None => break,
                     _ => {}
                 }
             }
         }
     }
+}
+
+fn parse_ack(text: &str) -> Option<Ack> {
+    let mut parts = text.splitn(2, ' ');
+    let seq: u64 = parts.next()?.parse().ok()?;
+    let epoch_mismatch = parts.next() == Some("epoch_mismatch");
+    Some(Ack { seq, epoch_mismatch })
 }
