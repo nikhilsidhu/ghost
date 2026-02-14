@@ -11,9 +11,15 @@ use crate::mailbox::Mailbox;
 use crate::state::AppState;
 use crate::util::decode_mailbox_id;
 
+fn is_false(b: &bool) -> bool {
+    !b
+}
+
 #[derive(Serialize)]
 pub(crate) struct PostBlobResponse {
     seq: u64,
+    #[serde(skip_serializing_if = "is_false")]
+    epoch_mismatch: bool,
 }
 
 #[derive(Serialize)]
@@ -45,8 +51,8 @@ pub async fn post_blob(
     body: Bytes,
 ) -> Result<(StatusCode, Json<PostBlobResponse>)> {
     let id = decode_mailbox_id(&mailbox_id)?;
-    let seq = state.store_blob(&id, &body).await?;
-    Ok((StatusCode::CREATED, Json(PostBlobResponse { seq })))
+    let (seq, epoch_mismatch) = state.store_blob(&id, &body).await?;
+    Ok((StatusCode::CREATED, Json(PostBlobResponse { seq, epoch_mismatch })))
 }
 
 pub async fn get_blobs(

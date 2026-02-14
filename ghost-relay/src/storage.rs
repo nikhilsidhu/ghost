@@ -163,13 +163,13 @@ impl Storage {
         Ok(epoch.unwrap_or(0) as u64)
     }
 
-    /// Advance the epoch for a mailbox (set to epoch + 1).
-    pub fn advance_epoch(&self, mailbox_id: &[u8; 32]) -> Result<(), RelayError> {
+    /// Set the epoch for a mailbox, never going backward.
+    pub fn set_epoch(&self, mailbox_id: &[u8; 32], epoch: u64) -> Result<(), RelayError> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE mailbox_state SET current_epoch = current_epoch + 1
+            "UPDATE mailbox_state SET current_epoch = MAX(current_epoch, ?2)
              WHERE mailbox_id = ?1",
-            params![mailbox_id.as_slice()],
+            params![mailbox_id.as_slice(), epoch as i64],
         )
         .map_err(|e| RelayError::Storage(e.to_string()))?;
         Ok(())
@@ -285,14 +285,20 @@ mod tests {
 
         assert_eq!(store.get_epoch(&mb).unwrap(), 0);
 
+        // Append creates the mailbox_state row
         store.append(&mb, COMMIT, 0, b"commit").unwrap();
         assert_eq!(store.get_epoch(&mb).unwrap(), 0);
 
-        store.advance_epoch(&mb).unwrap();
+        // set_epoch advances forward
+        store.set_epoch(&mb, 1).unwrap();
         assert_eq!(store.get_epoch(&mb).unwrap(), 1);
 
-        store.advance_epoch(&mb).unwrap();
-        assert_eq!(store.get_epoch(&mb).unwrap(), 2);
+        store.set_epoch(&mb, 3).unwrap();
+        assert_eq!(store.get_epoch(&mb).unwrap(), 3);
+
+        // set_epoch never goes backward
+        store.set_epoch(&mb, 1).unwrap();
+        assert_eq!(store.get_epoch(&mb).unwrap(), 3);
     }
 
     #[test]

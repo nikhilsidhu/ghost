@@ -52,13 +52,16 @@ fn mailbox_url(base: &str, id: &[u8; 32]) -> String {
     format!("{base}/box/{}", URL_SAFE_NO_PAD.encode(id))
 }
 
-/// Build a valid envelope-wrapped payload for testing.
-fn test_envelope(payload: &[u8]) -> Vec<u8> {
-    let header = ghost_wire::encode_envelope(ghost_wire::EnvelopeType::Application, 0);
+fn envelope(typ: ghost_wire::EnvelopeType, epoch: u64, payload: &[u8]) -> Vec<u8> {
+    let header = ghost_wire::encode_envelope(typ, epoch);
     let mut out = Vec::with_capacity(header.len() + payload.len());
     out.extend_from_slice(&header);
     out.extend_from_slice(payload);
     out
+}
+
+fn test_envelope(payload: &[u8]) -> Vec<u8> {
+    envelope(ghost_wire::EnvelopeType::Application, 0, payload)
 }
 
 #[tokio::test]
@@ -160,6 +163,49 @@ async fn ws_fanout() {
 }
 
 #[tokio::test]
+async fn ws_epoch_mismatch_ack() {
+    use ghost_wire::EnvelopeType;
+
+    let base = start_server(test_config()).await;
+    let ws_base = base.replace("http://", "ws://");
+    let mailbox = URL_SAFE_NO_PAD.encode([0x08; 32]);
+    let ws_url = format!("{ws_base}/ws/{mailbox}");
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Send at epoch 0 — no mismatch, ack is just the seq number
+    ws.send(Message::Binary(envelope(EnvelopeType::Application, 0, b"ok").into())).await.unwrap();
+    let ack = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let m = ws.next().await.unwrap().unwrap();
+            if let Message::Text(t) = m { break t.to_string(); }
+        }
+    }).await.expect("timed out");
+    assert_eq!(ack, "1");
+
+    // Send commit at epoch 0 — advances relay to epoch 1
+    ws.send(Message::Binary(envelope(EnvelopeType::Commit, 0, b"commit").into())).await.unwrap();
+    let ack = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let m = ws.next().await.unwrap().unwrap();
+            if let Message::Text(t) = m { break t.to_string(); }
+        }
+    }).await.expect("timed out");
+    assert_eq!(ack, "2");
+
+    // Send at stale epoch 0 — relay is at 1, expect mismatch hint
+    ws.send(Message::Binary(envelope(EnvelopeType::Application, 0, b"stale").into())).await.unwrap();
+    let ack = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let m = ws.next().await.unwrap().unwrap();
+            if let Message::Text(t) = m { break t.to_string(); }
+        }
+    }).await.expect("timed out");
+    assert_eq!(ack, "3 epoch_mismatch");
+}
+
+#[tokio::test]
 async fn invalid_envelope_rejected() {
     let base = start_server(test_config()).await;
     let client = reqwest::Client::new();
@@ -167,6 +213,69 @@ async fn invalid_envelope_rejected() {
 
     let resp = client.post(&url).body(b"not an envelope".to_vec()).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn epoch_gating() {
+    use ghost_wire::EnvelopeType;
+
+    let base = start_server(test_config()).await;
+    let client = reqwest::Client::new();
+    let url = mailbox_url(&base, &[0x07; 32]);
+
+    // Application at epoch 0 — relay epoch is 0, no mismatch
+    let body: Value = client.post(&url)
+        .body(envelope(EnvelopeType::Application, 0, b"msg1"))
+        .send().await.unwrap().json().await.unwrap();
+    assert_eq!(body["seq"], 1);
+    assert!(body.get("epoch_mismatch").is_none());
+
+    // Commit at epoch 0 — advances relay epoch to 1
+    let body: Value = client.post(&url)
+        .body(envelope(EnvelopeType::Commit, 0, b"commit"))
+        .send().await.unwrap().json().await.unwrap();
+    assert_eq!(body["seq"], 2);
+    assert!(body.get("epoch_mismatch").is_none());
+
+    // Application at epoch 1 — matches new relay epoch
+    let body: Value = client.post(&url)
+        .body(envelope(EnvelopeType::Application, 1, b"msg2"))
+        .send().await.unwrap().json().await.unwrap();
+    assert!(body.get("epoch_mismatch").is_none());
+
+    // Application at epoch 0 — stale, relay expects 1
+    let body: Value = client.post(&url)
+        .body(envelope(EnvelopeType::Application, 0, b"stale"))
+        .send().await.unwrap().json().await.unwrap();
+    assert_eq!(body["epoch_mismatch"], true);
+
+    // Blob was still stored despite mismatch
+    let blobs: Vec<Value> = client.get(&url).send().await.unwrap().json().await.unwrap();
+    assert_eq!(blobs.len(), 4);
+
+    // Stale commit at epoch 0 — relay stays at 1 (MAX prevents backward)
+    let body: Value = client.post(&url)
+        .body(envelope(EnvelopeType::Commit, 0, b"stale-commit"))
+        .send().await.unwrap().json().await.unwrap();
+    assert_eq!(body["epoch_mismatch"], true);
+
+    // Application at epoch 1 still matches — relay didn't go backward
+    let body: Value = client.post(&url)
+        .body(envelope(EnvelopeType::Application, 1, b"still-ok"))
+        .send().await.unwrap().json().await.unwrap();
+    assert!(body.get("epoch_mismatch").is_none());
+
+    // Commit at epoch 5 — relay jumps from 1 to 6
+    let body: Value = client.post(&url)
+        .body(envelope(EnvelopeType::Commit, 5, b"future-commit"))
+        .send().await.unwrap().json().await.unwrap();
+    assert_eq!(body["epoch_mismatch"], true); // 5 != 1
+
+    // Application at epoch 6 — matches the jumped relay epoch
+    let body: Value = client.post(&url)
+        .body(envelope(EnvelopeType::Application, 6, b"after-jump"))
+        .send().await.unwrap().json().await.unwrap();
+    assert!(body.get("epoch_mismatch").is_none());
 }
 
 #[tokio::test]

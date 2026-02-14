@@ -41,9 +41,13 @@ async fn ws_connection(socket: WebSocket, mailbox_id: [u8; 32], state: AppState)
                 match msg {
                     Some(Ok(Message::Binary(data))) => {
                         match state.store_blob(&mailbox_id, &data).await {
-                            Ok(seq) => {
+                            Ok((seq, epoch_mismatch)) => {
                                 own_seqs.push(seq);
-                                let ack = Message::text(seq.to_string());
+                                let ack = if epoch_mismatch {
+                                    Message::text(format!("{seq} epoch_mismatch"))
+                                } else {
+                                    Message::text(seq.to_string())
+                                };
                                 if sink.send(ack).await.is_err() {
                                     break;
                                 }
