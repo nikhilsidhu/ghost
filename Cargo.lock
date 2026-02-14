@@ -1860,6 +1860,7 @@ dependencies = [
  "ghost-wire",
  "hex",
  "reqwest 0.12.28",
+ "rusqlite",
  "serde",
  "serde_json",
  "smallvec",

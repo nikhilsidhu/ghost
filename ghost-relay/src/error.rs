@@ -20,6 +20,9 @@ pub enum RelayError {
 
     #[error("conflict")]
     Conflict,
+
+    #[error("storage error: {0}")]
+    Storage(String),
 }
 
 impl IntoResponse for RelayError {
@@ -31,6 +34,7 @@ impl IntoResponse for RelayError {
             Self::PayloadTooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "payload too large".into()),
             Self::StorageFull => (StatusCode::INSUFFICIENT_STORAGE, "storage full".into()),
             Self::Conflict => (StatusCode::CONFLICT, "conflict".into()),
+            Self::Storage(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
         };
         (status, body).into_response()
     }
