@@ -243,11 +243,7 @@ impl GhostClient {
             GhostError::GroupNotLoaded(hex::encode(&group_id[..8]))
         })?;
 
-        let (commit, welcome) = group.add_member(&self.provider, key_package)?;
-
-        let commit_blob = commit
-            .to_bytes()
-            .map_err(|e| GhostError::Mls(format!("serialize commit: {e}")))?;
+        let (commit_blob, welcome) = group.add_member(&self.provider, key_package)?;
         let welcome_bytes = welcome
             .to_bytes()
             .map_err(|e| GhostError::Mls(format!("serialize welcome: {e}")))?;
