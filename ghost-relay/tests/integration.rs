@@ -64,6 +64,18 @@ fn test_envelope(payload: &[u8]) -> Vec<u8> {
     envelope(ghost_wire::EnvelopeType::Application, 0, payload)
 }
 
+/// Send the WS catch-up handshake (8-byte BE last_seen_seq).
+async fn ws_handshake(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    last_seen: u64,
+) {
+    ws.send(Message::Binary(last_seen.to_be_bytes().to_vec().into()))
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
 async fn health() {
     let base = start_server(test_config()).await;
@@ -143,6 +155,8 @@ async fn ws_fanout() {
 
     let (mut ws_a, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
     let (mut ws_b, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
+    ws_handshake(&mut ws_a, 0).await;
+    ws_handshake(&mut ws_b, 0).await;
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -172,7 +186,7 @@ async fn ws_epoch_mismatch_ack() {
     let ws_url = format!("{ws_base}/ws/{mailbox}");
 
     let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    ws_handshake(&mut ws, 0).await;
 
     // Send at epoch 0 — no mismatch, ack is just the seq number
     ws.send(Message::Binary(envelope(EnvelopeType::Application, 0, b"ok").into())).await.unwrap();

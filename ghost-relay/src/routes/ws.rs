@@ -9,6 +9,8 @@ use crate::mailbox::Mailbox;
 use crate::state::AppState;
 use crate::util::decode_mailbox_id;
 
+const HANDSHAKE_TIMEOUT_SECS: u64 = 5;
+
 pub async fn ws_upgrade(
     State(state): State<AppState>,
     Path(mailbox_id): Path<String>,
@@ -24,15 +26,42 @@ pub async fn ws_upgrade(
 async fn ws_connection(socket: WebSocket, mailbox_id: [u8; 32], state: AppState) {
     let (mut sink, mut stream) = socket.split();
 
+    // Subscribe before handshake so we don't miss blobs during replay
     let mut seq_rx = {
         let mut map = state.mailboxes.write().await;
         let mailbox = map.entry(mailbox_id).or_insert_with(Mailbox::new);
         mailbox.seq_tx.subscribe()
     };
 
+    // Handshake: first binary frame is 8-byte BE last_seen_seq
+    let timeout = Duration::from_secs(HANDSHAKE_TIMEOUT_SECS);
+    let mut last_seen: u64 = match tokio::time::timeout(timeout, stream.next()).await {
+        Ok(Some(Ok(Message::Binary(data)))) if data.len() == 8 => {
+            u64::from_be_bytes(data[..8].try_into().unwrap())
+        }
+        _ => return,
+    };
+
+    // Replay missed entries
+    loop {
+        let entries = match state.storage.read_from(&mailbox_id, last_seen, WS_MAX_FANOUT_BATCH) {
+            Ok(e) => e,
+            Err(_) => break,
+        };
+        if entries.is_empty() {
+            break;
+        }
+        for entry in &entries {
+            last_seen = entry.seq;
+            let frame = encode_frame(entry.seq, entry.received_at, &entry.payload);
+            if sink.send(Message::binary(frame)).await.is_err() {
+                return;
+            }
+        }
+    }
+
     let ping_interval_dur = Duration::from_secs(WS_PING_INTERVAL_SECS);
     let mut ping_interval = tokio::time::interval(ping_interval_dur);
-    let mut last_seen: u64 = 0;
     let mut own_seqs: Vec<u64> = Vec::new();
 
     loop {
