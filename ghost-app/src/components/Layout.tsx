@@ -11,7 +11,8 @@ import {
 import { Sidebar } from "./Sidebar";
 import { GroupView } from "./GroupView";
 import { MemberPanel } from "./MemberPanel";
-import { CommandPalette, type CommandDef, type SearchProvider } from "./CommandPalette";
+import { CommandPalette } from "./CommandPalette";
+import { registerCommand, registerProvider, triggerCommand, type CommandDef, type SearchProvider } from "../lib/registry";
 import { channelPrefix } from "../lib/constants";
 import { InviteDialog } from "./InviteDialog";
 import { ShortcutOverlay } from "./ShortcutOverlay";
@@ -26,7 +27,6 @@ export function Layout() {
   const [members, setMembers] = createSignal<Member[]>([]);
   const [pinnedGroupIds, setPinnedGroupIds] = createSignal<Set<string>>(new Set());
   const [selectedChannelId, setSelectedChannelId] = createSignal<string | null>(null);
-  const [openCommandId, setOpenCommandId] = createSignal<string | null>(null);
   const [inviteLink, setInviteLink] = createSignal<string | null>(null);
   const [showInfo, setShowInfo] = createSignal(false);
   const [desiredChannelKind, setDesiredChannelKind] = createSignal<string>("text");
@@ -62,7 +62,7 @@ export function Layout() {
 
   const handleCreateChannel = (kind: "text" | "voice") => {
     setDesiredChannelKind(kind);
-    setOpenCommandId("create-channel");
+    triggerCommand("create-channel");
   };
 
   const handleSelectChannel = (id: string) => {
@@ -296,6 +296,13 @@ export function Layout() {
     },
   ];
 
+  const unsubs = [
+    ...commands.map(registerCommand),
+    registerProvider(groupProvider),
+    registerProvider(channelProvider),
+  ];
+  onCleanup(() => unsubs.forEach((u) => u()));
+
   return (
     <div class="h-screen flex relative" style={{ background: "var(--neutral-950)" }}>
       <div data-tauri-drag-region class="absolute inset-x-0 top-0 h-7 z-10" />
@@ -382,12 +389,7 @@ export function Layout() {
         <div class="divider-v" />
         <MemberPanel members={members()} />
       </Show>
-      <CommandPalette
-        providers={[groupProvider, channelProvider]}
-        commands={commands}
-        openCommandId={openCommandId()}
-        onOpenCommandHandled={() => setOpenCommandId(null)}
-      />
+      <CommandPalette />
       <InviteDialog link={inviteLink()} onClose={() => setInviteLink(null)} />
       <ShortcutOverlay shortcuts={overlayShortcuts} forceOpen={showInfo()} onClose={() => setShowInfo(false)} />
     </div>

@@ -6,52 +6,8 @@ import { recordUsage, frecencyScore } from "../lib/frecency";
 import { findShortcut } from "../lib/shortcuts";
 import { hashGradient } from "../lib/gradients";
 import { KeyBadge } from "./KeyBadge";
-
-// --- Public types ---
-
-export interface SelectOption {
-  label: string;
-  value: string;
-  iconKey?: string;
-  iconLabel?: string;
-}
-
-export interface ArgDef {
-  name: string;
-  placeholder: string;
-  complete?: (query: string, collected: Record<string, string>) => SelectOption[];
-  defaultValue?: () => string | null;
-}
-
-export interface CommandDef {
-  id: string;
-  command: string;
-  args: ArgDef[];
-  execute: (args: Record<string, string>) => void | Promise<void>;
-  shortcut?: string[];
-  dangerous?: boolean;
-}
-
-export interface SearchResult {
-  id: string;
-  label: string;
-  prefix?: string;
-  iconKey?: string;
-  iconLabel?: string;
-  badge?: string;
-  onSelect: () => void;
-}
-
-export type SearchProvider = (query: string) => SearchResult[];
-
-// --- Props ---
-
-interface Props {
-  providers: SearchProvider[];
-  commands: CommandDef[];
-  openCommandId?: string | null;
-  onOpenCommandHandled?: () => void;
-}
+import { commands, providers, triggeredCommandId, clearTriggeredCommand } from "../lib/registry";
+import type { CommandDef, SearchResult } from "../lib/registry";
 
 // --- Highlight matching text ---
 
@@ -93,7 +49,7 @@ function longestCommonPrefix(items: string[]): string {
 
 // --- Main component ---
 
-export function CommandPalette(props: Props) {
+export function CommandPalette() {
   const [open, setOpen] = createSignal(false);
   const [query, setQuery] = createSignal("");
   const [focusedIndex, setFocusedIndex] = createSignal(0);
@@ -210,27 +166,27 @@ export function CommandPalette(props: Props) {
   // --- External trigger (+ button) ---
 
   createEffect(() => {
-    const cmdId = props.openCommandId;
+    const cmdId = triggeredCommandId();
     if (!cmdId) return;
-    const cmd = props.commands.find((c) => c.id === cmdId);
+    const cmd = commands().find((c) => c.id === cmdId);
     if (cmd) {
       setOpen(true);
       activateCommand(cmd);
     }
-    props.onOpenCommandHandled?.();
+    clearTriggeredCommand();
   });
 
   // --- Filtered lists ---
 
   const searchResults = createMemo((): SearchResult[] => {
     const q = query().toLowerCase().trim();
-    return props.providers.flatMap((p) => p(q));
+    return providers().flatMap((p) => p(q));
   });
 
   const filteredCommands = createMemo(() => {
     const q = commandQuery();
-    if (!q) return [...props.commands].sort((a, b) => frecencyScore(b.id) - frecencyScore(a.id));
-    return props.commands
+    if (!q) return [...commands()].sort((a, b) => frecencyScore(b.id) - frecencyScore(a.id));
+    return commands()
       .filter((c) => c.command.toLowerCase().includes(q))
       .sort((a, b) => {
         const aStarts = a.command.toLowerCase().startsWith(q) ? 0 : 1;
