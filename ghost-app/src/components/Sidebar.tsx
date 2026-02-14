@@ -5,6 +5,7 @@ import { hashGradient, onFlareMove, onFlareLeave } from "../lib/gradients";
 import { ScrollArea } from "./ui/scroll-area";
 import { cn } from "../lib/cn";
 import { AudioLines, Settings } from "lucide-solid";
+import { channelPrefix } from "../lib/constants";
 import {
   DragDropProvider,
   DragDropSensors,
@@ -329,7 +330,7 @@ export function Sidebar(props: SidebarProps) {
                   if (!ch) return null;
                   return (
                     <div class="flex items-center gap-2 px-2 py-1.5 rounded-md text-sm text-[var(--neutral-200)] bg-[var(--neutral-800)] opacity-80">
-                      {ch.kind === "text" ? "#" : "\u266a"} {ch.name}
+                      {channelPrefix(ch.kind)} {ch.name}
                     </div>
                   );
                 })()}

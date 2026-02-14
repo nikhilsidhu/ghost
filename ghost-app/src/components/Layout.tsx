@@ -11,7 +11,8 @@ import {
 import { Sidebar } from "./Sidebar";
 import { GroupView } from "./GroupView";
 import { MemberPanel } from "./MemberPanel";
-import { CommandPalette, type CommandDef } from "./CommandPalette";
+import { CommandPalette, type CommandDef, type SearchProvider } from "./CommandPalette";
+import { channelPrefix } from "../lib/constants";
 import { InviteDialog } from "./InviteDialog";
 import { ShortcutOverlay } from "./ShortcutOverlay";
 import { KeyBadge } from "./KeyBadge";
@@ -134,13 +135,54 @@ export function Layout() {
     const lq = q.toLowerCase();
     return pool
       .filter((ch) => !lq || ch.name.toLowerCase().includes(lq))
-      .map((ch) => ({ label: `${ch.kind === "text" ? "#" : "\u266a"} ${ch.name}`, value: ch.channel_id }));
+      .map((ch) => ({ label: `${channelPrefix(ch.kind)} ${ch.name}`, value: ch.channel_id }));
   };
 
   const typeCompleter = (_q: string, _collected: Record<string, string>) => [
     { label: "text", value: "text" },
     { label: "voice", value: "voice" },
   ];
+
+  // --- Search providers ---
+
+  const groupProvider: SearchProvider = (q) => {
+    let gList = groups();
+    if (q) {
+      gList = gList
+        .filter((g) => g.name.toLowerCase().includes(q))
+        .sort((a, b) => {
+          const aExact = a.name.toLowerCase() === q ? 0 : 1;
+          const bExact = b.name.toLowerCase() === q ? 0 : 1;
+          if (aExact !== bExact) return aExact - bExact;
+          const aStarts = a.name.toLowerCase().startsWith(q) ? 0 : 1;
+          const bStarts = b.name.toLowerCase().startsWith(q) ? 0 : 1;
+          return aStarts - bStarts;
+        });
+    }
+    const pinned = gList.filter((g) => pinnedGroupIds().has(g.group_id));
+    const rest = gList.filter((g) => !pinnedGroupIds().has(g.group_id));
+    return [...pinned, ...rest].map((g) => ({
+      id: g.group_id,
+      label: g.name,
+      iconKey: g.group_id,
+      iconLabel: g.name[0]?.toUpperCase(),
+      onSelect: () => setSelectedGroupId(g.group_id),
+    }));
+  };
+
+  const channelProvider: SearchProvider = (q) => {
+    if (!q) return [];
+    const groupMap = new Map(groups().map((g) => [g.group_id, g.name]));
+    return allChannels()
+      .filter((ch) => ch.name.toLowerCase().includes(q))
+      .map((ch) => ({
+        id: ch.channel_id,
+        label: ch.name,
+        prefix: channelPrefix(ch.kind),
+        badge: groupMap.get(ch.group_id) ?? "",
+        onSelect: () => { setSelectedGroupId(ch.group_id); handleSelectChannel(ch.channel_id); },
+      }));
+  };
 
   // --- Shortcuts & commands ---
 
@@ -165,7 +207,6 @@ export function Layout() {
           placeholder: "group",
           complete: groupCompleter,
           defaultValue: () => selectedGroupId(),
-
         },
         { name: "name", placeholder: "channel name" },
         {
@@ -206,6 +247,7 @@ export function Layout() {
     {
       id: "delete-channel",
       command: "delete channel",
+      dangerous: true,
       args: [
         { name: "group", placeholder: "group", complete: groupCompleter, defaultValue: () => selectedGroupId() },
         { name: "channel", placeholder: "channel", complete: channelCompleter },
@@ -224,7 +266,6 @@ export function Layout() {
           placeholder: "group",
           complete: groupCompleter,
           defaultValue: () => selectedGroupId(),
-
         },
       ],
       execute: async (args) => {
@@ -342,12 +383,8 @@ export function Layout() {
         <MemberPanel members={members()} />
       </Show>
       <CommandPalette
-        groups={groups()}
-        channels={allChannels()}
-        pinnedGroupIds={pinnedGroupIds()}
+        providers={[groupProvider, channelProvider]}
         commands={commands}
-        onSelectGroup={setSelectedGroupId}
-        onSelectChannel={handleSelectChannel}
         openCommandId={openCommandId()}
         onOpenCommandHandled={() => setOpenCommandId(null)}
       />
