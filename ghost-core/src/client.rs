@@ -36,6 +36,12 @@ fn open_mls_connection(seed: &[u8; 32], app_db_path: &Path) -> Result<Connection
     Ok(conn)
 }
 
+pub enum ReceiveResult {
+    Message(ApplicationMessage),
+    CommitProcessed,
+    Skipped,
+}
+
 /// Session-level orchestration: holds identity, MLS state, and local storage.
 pub struct GhostClient {
     identity: Identity,
@@ -439,6 +445,39 @@ impl GhostClient {
         Ok(payload.to_bytes())
     }
 
+    /// Export GroupInfo for a group so other clients can recover via external commit.
+    pub fn export_group_info(&self, group_id: &[u8; 32]) -> Result<Vec<u8>> {
+        let group = self.groups.get(group_id).ok_or_else(|| {
+            GhostError::GroupNotLoaded(hex::encode(&group_id[..8]))
+        })?;
+        group.export_group_info(&self.provider)
+    }
+
+    /// Rejoin a group via external commit after falling too far behind.
+    /// Deletes old MLS state and creates a fresh session from GroupInfo.
+    /// Returns (commit_bytes_to_broadcast, mailbox_id).
+    pub fn recover_via_external_commit(
+        &mut self,
+        group_id: &[u8; 32],
+        group_info_bytes: &[u8],
+    ) -> Result<(Vec<u8>, [u8; 32])> {
+        if let Some(old_group) = self.groups.remove(group_id) {
+            let _ = old_group.delete(&self.provider);
+        }
+
+        let (ghost_group, commit_bytes) = GhostGroup::join_by_external_commit(
+            &self.provider,
+            &self.identity,
+            group_info_bytes,
+        )?;
+
+        let mailbox_id = group_mailbox_id(ghost_group.group_id());
+        self.groups.insert(*group_id, ghost_group);
+        self.mailbox_map.insert(mailbox_id, *group_id);
+
+        Ok((commit_bytes, mailbox_id))
+    }
+
     /// Derive a per-sender encryption key for voice in this group+channel.
     pub fn derive_voice_key(
         &self,
@@ -472,20 +511,19 @@ impl GhostClient {
         self.mailbox_map.get(mailbox_id).copied()
     }
 
-    /// Process an inbound blob — could be an app message or a commit.
-    /// Returns the app message if it was one, or None if it was a commit (already merged).
+    /// Process an inbound blob — could be an app message, a commit, or a self-message.
     pub fn receive_any(
         &mut self,
         group_id: &[u8; 32],
         blob: &[u8],
         received_at: Option<u64>,
-    ) -> Result<Option<ApplicationMessage>> {
+    ) -> Result<ReceiveResult> {
         let group = self.groups.get_mut(group_id).ok_or_else(|| {
             GhostError::GroupNotLoaded(hex::encode(&group_id[..8]))
         })?;
 
         let inbound = match open_any(group, &self.provider, blob) {
-            Err(GhostError::SelfMessage) => return Ok(None),
+            Err(GhostError::SelfMessage) => return Ok(ReceiveResult::Skipped),
             other => other?,
         };
 
@@ -510,9 +548,9 @@ impl GhostClient {
                     references: msg.references.clone(),
                 })?;
 
-                Ok(Some(msg))
+                Ok(ReceiveResult::Message(msg))
             }
-            InboundMessage::Commit => Ok(None),
+            InboundMessage::Commit => Ok(ReceiveResult::CommitProcessed),
         }
     }
 }
@@ -699,7 +737,7 @@ mod tests {
 
         // c1 processes the external commit
         let result = c1.receive_any(&group_id, &commit_bytes, Some(2000)).unwrap();
-        assert!(result.is_none()); // commit, not app message
+        assert!(matches!(result, ReceiveResult::CommitProcessed));
     }
 
     #[test]

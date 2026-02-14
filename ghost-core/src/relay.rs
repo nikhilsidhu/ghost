@@ -8,7 +8,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 
-use ghost_wire::{WS_FRAME_HEADER_SIZE, WS_SEQ_SIZE};
+use ghost_wire::{WS_FRAME_HEADER_SIZE, WS_SEQ_SIZE, WS_SIGNAL_EPOCH_MISMATCH, WS_SIGNAL_GAP};
 
 use crate::error::{GhostError, Result};
 
@@ -30,6 +30,7 @@ pub struct Ack {
 pub enum RelayEvent {
     Blob(IncomingBlob),
     Ack(Ack),
+    Gap { mailbox_id: [u8; 32] },
 }
 
 struct WsHandle {
@@ -194,6 +195,50 @@ impl RelayClient {
             .map(|b| b.to_vec())
             .map_err(|e| GhostError::Network(e.to_string()))
     }
+
+    pub async fn put_group_info(&self, mailbox_id: &[u8; 32], data: Vec<u8>) -> Result<()> {
+        let resp = self
+            .http
+            .put(format!(
+                "{}/box/{}/group_info",
+                self.base_url,
+                URL_SAFE_NO_PAD.encode(mailbox_id)
+            ))
+            .body(data)
+            .send()
+            .await
+            .map_err(|e| GhostError::Network(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(GhostError::Network(format!(
+                "put group_info: {}",
+                resp.status()
+            )));
+        }
+        Ok(())
+    }
+
+    pub async fn get_group_info(&self, mailbox_id: &[u8; 32]) -> Result<Vec<u8>> {
+        let resp = self
+            .http
+            .get(format!(
+                "{}/box/{}/group_info",
+                self.base_url,
+                URL_SAFE_NO_PAD.encode(mailbox_id)
+            ))
+            .send()
+            .await
+            .map_err(|e| GhostError::Network(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(GhostError::Network(format!(
+                "get group_info: {}",
+                resp.status()
+            )));
+        }
+        resp.bytes()
+            .await
+            .map(|b| b.to_vec())
+            .map_err(|e| GhostError::Network(e.to_string()))
+    }
 }
 
 impl Drop for RelayClient {
@@ -281,7 +326,9 @@ async fn ws_task(
                                 got_message = true;
                                 backoff = INITIAL_BACKOFF;
                             }
-                            if let Some(ack) = parse_ack(&text) {
+                            if text.as_str() == WS_SIGNAL_GAP {
+                                let _ = event_tx.send(RelayEvent::Gap { mailbox_id }).await;
+                            } else if let Some(ack) = parse_ack(&text) {
                                 let _ = event_tx.send(RelayEvent::Ack(ack)).await;
                             }
                         }
@@ -297,6 +344,6 @@ async fn ws_task(
 fn parse_ack(text: &str) -> Option<Ack> {
     let mut parts = text.splitn(2, ' ');
     let seq: u64 = parts.next()?.parse().ok()?;
-    let epoch_mismatch = parts.next() == Some("epoch_mismatch");
+    let epoch_mismatch = parts.next() == Some(WS_SIGNAL_EPOCH_MISMATCH);
     Some(Ack { seq, epoch_mismatch })
 }

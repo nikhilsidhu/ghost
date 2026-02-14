@@ -4,7 +4,7 @@ use axum::response::{IntoResponse, Response};
 use futures_util::{SinkExt, StreamExt};
 use std::time::Duration;
 
-use ghost_wire::WS_FRAME_HEADER_SIZE;
+use ghost_wire::{WS_FRAME_HEADER_SIZE, WS_SIGNAL_EPOCH_MISMATCH, WS_SIGNAL_GAP};
 
 use crate::constants::{WS_MAX_FANOUT_BATCH, WS_PING_INTERVAL_SECS};
 use crate::mailbox::Mailbox;
@@ -52,7 +52,7 @@ async fn ws_connection(socket: WebSocket, mailbox_id: [u8; 32], state: AppState)
             Err(_) => false,
         };
         if has_gap {
-            if sink.send(Message::text("gap")).await.is_err() {
+            if sink.send(Message::text(WS_SIGNAL_GAP)).await.is_err() {
                 return;
             }
         }
@@ -89,7 +89,7 @@ async fn ws_connection(socket: WebSocket, mailbox_id: [u8; 32], state: AppState)
                             Ok((seq, epoch_mismatch)) => {
                                 own_seqs.push(seq);
                                 let ack = if epoch_mismatch {
-                                    Message::text(format!("{seq} epoch_mismatch"))
+                                    Message::text(format!("{seq} {WS_SIGNAL_EPOCH_MISMATCH}"))
                                 } else {
                                     Message::text(seq.to_string())
                                 };

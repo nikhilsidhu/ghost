@@ -240,6 +240,13 @@ impl GhostGroup {
             .map_err(|e| GhostError::Mls(format!("export secret: {e}")))
     }
 
+    /// Remove all MLS state for this group from persistent storage.
+    pub fn delete(mut self, provider: &GhostProvider) -> Result<()> {
+        self.mls_group
+            .delete(provider.storage())
+            .map_err(|e| GhostError::Mls(format!("delete group: {e}")))
+    }
+
     pub fn group_id(&self) -> &[u8] {
         self.mls_group.group_id().as_slice()
     }
