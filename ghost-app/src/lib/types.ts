@@ -9,6 +9,7 @@ export interface Group {
   name: string;
   creator_fp: string;
   created_at: number;
+  has_unread: boolean;
 }
 
 export interface Channel {
@@ -17,6 +18,7 @@ export interface Channel {
   name: string;
   kind: "text" | "voice";
   position: number;
+  unread_count: number;
 }
 
 export interface Member {

@@ -17,6 +17,7 @@ pub struct GroupDto {
     pub name: String,
     pub creator_fp: String,
     pub created_at: u64,
+    pub has_unread: bool,
 }
 
 #[derive(Serialize)]
@@ -26,6 +27,7 @@ pub struct ChannelDto {
     pub name: String,
     pub kind: String,
     pub position: i32,
+    pub unread_count: u32,
 }
 
 #[derive(Serialize)]
@@ -47,19 +49,20 @@ impl From<&Identity> for IdentityDto {
     }
 }
 
-impl From<&Group> for GroupDto {
-    fn from(g: &Group) -> Self {
+impl GroupDto {
+    pub fn from_group(g: &Group, has_unread: bool) -> Self {
         Self {
             group_id: hex::encode(g.group_id),
             name: g.name.clone(),
             creator_fp: hex::encode(g.creator_fp),
             created_at: g.created_at,
+            has_unread,
         }
     }
 }
 
-impl From<&Channel> for ChannelDto {
-    fn from(c: &Channel) -> Self {
+impl ChannelDto {
+    pub fn from_channel(c: &Channel, unread_count: u32) -> Self {
         Self {
             channel_id: hex::encode(c.channel_id),
             group_id: hex::encode(c.group_id),
@@ -70,6 +73,7 @@ impl From<&Channel> for ChannelDto {
             }
             .to_string(),
             position: c.position,
+            unread_count,
         }
     }
 }

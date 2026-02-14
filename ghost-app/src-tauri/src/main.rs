@@ -67,6 +67,7 @@ fn main() {
             commands::create_channel,
             commands::rename_channel,
             commands::delete_channel,
+            commands::mark_channel_read,
             commands::create_invite,
             commands::join_by_invite,
             commands::get_config,

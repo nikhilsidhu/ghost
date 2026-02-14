@@ -33,8 +33,13 @@ pub async fn get_identity(state: State<'_, AppState>) -> Result<IdentityDto, Str
 #[tauri::command]
 pub async fn list_groups(state: State<'_, AppState>) -> Result<Vec<GroupDto>, String> {
     let client = state.client.lock().await;
-    let groups = client.store().list_groups().map_err(|e| e.to_string())?;
-    Ok(groups.iter().map(GroupDto::from).collect())
+    let store = client.store();
+    let groups = store.list_groups().map_err(|e| e.to_string())?;
+    let unread_groups = store.groups_with_unread().map_err(|e| e.to_string())?;
+    Ok(groups
+        .iter()
+        .map(|g| GroupDto::from_group(g, unread_groups.contains(&g.group_id)))
+        .collect())
 }
 
 #[tauri::command]
@@ -49,7 +54,7 @@ pub async fn create_group(name: String, state: State<'_, AppState>) -> Result<Gr
             .get_group(&group_id)
             .map_err(|e| e.to_string())?;
         let mid = client.mailbox_id_for_group(&group_id);
-        (GroupDto::from(&group), mid)
+        (GroupDto::from_group(&group, false), mid)
     };
 
     if let Some(mid) = mailbox_id {
@@ -67,11 +72,14 @@ pub async fn list_channels(
 ) -> Result<Vec<ChannelDto>, String> {
     let gid = parse_id(&group_id)?;
     let client = state.client.lock().await;
-    let channels = client
-        .store()
-        .list_channels(&gid)
-        .map_err(|e| e.to_string())?;
-    Ok(channels.iter().map(ChannelDto::from).collect())
+    let store = client.store();
+    let channels = store.list_channels(&gid).map_err(|e| e.to_string())?;
+    let unread = store.get_unread_counts(&gid).map_err(|e| e.to_string())?;
+    let unread_map: std::collections::HashMap<[u8; 32], u32> = unread.into_iter().collect();
+    Ok(channels
+        .iter()
+        .map(|c| ChannelDto::from_channel(c, unread_map.get(&c.channel_id).copied().unwrap_or(0)))
+        .collect())
 }
 
 #[tauri::command]
@@ -194,7 +202,7 @@ pub async fn create_channel(
         .store()
         .insert_channel(&channel)
         .map_err(|e| e.to_string())?;
-    Ok(ChannelDto::from(&channel))
+    Ok(ChannelDto::from_channel(&channel, 0))
 }
 
 #[tauri::command]
@@ -221,6 +229,19 @@ pub async fn delete_channel(
     client
         .store()
         .delete_channel(&cid)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn mark_channel_read(
+    channel_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let cid = parse_id(&channel_id)?;
+    let client = state.client.lock().await;
+    client
+        .store()
+        .mark_channel_read(&cid, now_millis())
         .map_err(|e| e.to_string())
 }
 
@@ -345,7 +366,7 @@ pub async fn join_by_invite(
         .store()
         .get_group(&group_id)
         .map_err(|e| e.to_string())?;
-    Ok(GroupDto::from(&group))
+    Ok(GroupDto::from_group(&group, false))
 }
 
 #[tauri::command]

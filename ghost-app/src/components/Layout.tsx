@@ -1,8 +1,9 @@
-import { createSignal, createEffect, on, onMount, Show, For } from "solid-js";
-import type { Identity, Group, Channel, Member } from "../lib/types";
+import { createSignal, createEffect, on, onMount, onCleanup, Show, For } from "solid-js";
+import { listen } from "@tauri-apps/api/event";
+import type { Identity, Group, Channel, Member, Message } from "../lib/types";
 import {
   getIdentity, listGroups, listChannels, listMembers,
-  listPinnedGroups,
+  listPinnedGroups, markChannelRead,
   createGroup, createChannel as apiCreateChannel,
   renameChannel as apiRenameChannel, deleteChannel as apiDeleteChannel,
   createInvite, joinByInvite, seedTestData,
@@ -52,11 +53,48 @@ export function Layout() {
     setOpenCommandId("create-channel");
   };
 
+  const handleSelectChannel = (id: string) => {
+    setSelectedChannelId(id);
+    // Zero out unread locally and persist to backend
+    setChannels((prev) => {
+      const updated = prev.map((c) =>
+        c.channel_id === id ? { ...c, unread_count: 0 } : c
+      );
+      // If no channels have unreads left, clear the group's has_unread flag
+      if (!updated.some((c) => c.unread_count > 0)) {
+        const gid = selectedGroupId();
+        if (gid) {
+          setGroups((gs) => gs.map((g) =>
+            g.group_id === gid ? { ...g, has_unread: false } : g
+          ));
+        }
+      }
+      return updated;
+    });
+    markChannelRead(id).catch(() => {});
+  };
+
   onMount(async () => {
     const id = await getIdentity();
     setIdentity(id);
     await refreshGroups();
     await refreshPins();
+
+    // Track unread for messages arriving in non-active channels
+    const unlisten = await listen<Message>("message", (event) => {
+      const msg = event.payload;
+      if (msg.channel_id === selectedChannelId()) return;
+      const inCurrentGroup = channels().some((c) => c.channel_id === msg.channel_id);
+      if (inCurrentGroup) {
+        setChannels((prev) => prev.map((c) =>
+          c.channel_id === msg.channel_id ? { ...c, unread_count: c.unread_count + 1 } : c
+        ));
+      } else {
+        // Message for another group — refresh to update has_unread flags
+        refreshGroups();
+      }
+    });
+    onCleanup(unlisten);
   });
 
   createEffect(on(selectedGroupId, async (id) => {
@@ -200,7 +238,7 @@ export function Layout() {
         selectedChannelId={selectedChannelId()}
         onSelectGroup={setSelectedGroupId}
         onDeselectGroup={() => setSelectedGroupId(null)}
-        onSelectChannel={setSelectedChannelId}
+        onSelectChannel={handleSelectChannel}
         onCreateChannel={handleCreateChannel}
       />
       <div class="divider-v" />

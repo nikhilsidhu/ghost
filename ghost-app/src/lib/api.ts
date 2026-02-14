@@ -38,6 +38,9 @@ export const renameChannel = (channelId: string, name: string) =>
 export const deleteChannel = (channelId: string) =>
   invoke<void>("delete_channel", { channelId });
 
+export const markChannelRead = (channelId: string) =>
+  invoke<void>("mark_channel_read", { channelId });
+
 export const createInvite = (groupId: string) =>
   invoke<Invite>("create_invite", { groupId });
 

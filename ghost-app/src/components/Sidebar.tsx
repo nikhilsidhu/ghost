@@ -372,22 +372,32 @@ function GroupIcon(props: { group: Group; isActive: boolean; onClick: (id: strin
         <div
           class={cn(
             "avatar-flare relative w-[var(--size-md)] h-[var(--size-md)] rounded-[14%] flex items-center justify-center text-sm font-semibold transition-all duration-200",
-            props.isActive
+            props.isActive || props.group.has_unread
               ? "opacity-100 scale-100"
-              : "opacity-50 scale-95 group-hover/gi:opacity-90 group-hover/gi:scale-100",
+              : "opacity-60 scale-95 group-hover/gi:opacity-90 group-hover/gi:scale-100",
           )}
           style={{
             background: `linear-gradient(${grad.angle}deg, ${grad.from}, ${grad.to})`,
             color: "var(--neutral-100)",
+            "box-shadow": props.isActive
+              ? `0 0 10px 2px ${grad.glow}30, 0 0 20px 4px ${grad.glow}12`
+              : `0 0 6px 1px ${grad.glow}18`,
           }}
           onMouseMove={onFlareMove}
           onMouseLeave={onFlareLeave}
         >
           {props.group.name[0]?.toUpperCase()}
-          {/* Pulsing glow on active group */}
+          {/* Unread dot */}
+          <Show when={!props.isActive && props.group.has_unread}>
+            <div
+              class="absolute -top-0.5 -right-0.5 w-[10px] h-[10px] rounded-full border-2"
+              style={{ background: "var(--neutral-100)", "border-color": "var(--neutral-950)" }}
+            />
+          </Show>
+          {/* Breathing glow on active group */}
           <Show when={props.isActive}>
             <div
-              class="group-glow absolute inset-0 rounded-[14%] pointer-events-none"
+              class="absolute inset-0 rounded-[14%] pointer-events-none"
               style={{
                 "box-shadow": `0 0 6px 1.5px ${grad.glow}35, 0 0 12px 2px ${grad.glow}12`,
                 animation: "breathe 3.5s ease-in-out infinite",
@@ -416,14 +426,24 @@ function ChannelItem(props: {
         "w-full flex items-center gap-2 px-2 py-1.5 rounded-md text-sm cursor-pointer",
         props.isSelected
           ? "bg-[var(--active)] text-[var(--neutral-100)]"
-          : "text-[var(--neutral-400)] hover:bg-[var(--hover)]",
+          : props.channel.unread_count > 0
+            ? "text-[var(--neutral-100)] font-medium hover:bg-[var(--hover)]"
+            : "text-[var(--neutral-400)] hover:bg-[var(--hover)]",
       )}
       style={transformStyle(sortable.transform)}
       {...sortable.dragActivators}
       onClick={() => props.onSelect(props.channel.channel_id)}
     >
       {props.icon}
-      {props.channel.name}
+      <span class="flex-1 truncate">{props.channel.name}</span>
+      {/* Fixed-width slot so badge doesn't shift channel name */}
+      <span class="flex-shrink-0 w-5 flex items-center justify-end">
+        <Show when={props.channel.unread_count > 0 && !props.isSelected}>
+          <span class="min-w-[18px] h-[18px] px-1 rounded-full text-[10px] font-semibold flex items-center justify-center bg-[var(--purple-500)] text-[var(--neutral-100)]">
+            {props.channel.unread_count > 99 ? "99+" : props.channel.unread_count}
+          </span>
+        </Show>
+      </span>
     </button>
   );
 }

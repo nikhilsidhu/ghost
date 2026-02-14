@@ -3,6 +3,7 @@ pub mod groups;
 pub mod members;
 pub mod messages;
 pub mod pins;
+pub mod read_state;
 mod schema;
 
 use std::path::Path;
