@@ -52,6 +52,12 @@ impl Storage {
 
              CREATE INDEX IF NOT EXISTS idx_log_expiry ON log(received_at);
 
+             CREATE TABLE IF NOT EXISTS group_info (
+                 mailbox_id BLOB PRIMARY KEY,
+                 data BLOB NOT NULL,
+                 updated_at INTEGER NOT NULL
+             );
+
              CREATE TABLE IF NOT EXISTS mailbox_state (
                  mailbox_id BLOB NOT NULL PRIMARY KEY,
                  current_epoch INTEGER NOT NULL DEFAULT 0,
@@ -184,6 +190,29 @@ impl Storage {
             |row| row.get::<_, Option<i64>>(0),
         )
         .map(|v| v.map(|n| n as u64))
+        .map_err(|e| RelayError::Storage(e.to_string()))
+    }
+
+    pub fn put_group_info(&self, mailbox_id: &[u8; 32], data: &[u8]) -> Result<(), RelayError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO group_info (mailbox_id, data, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT (mailbox_id) DO UPDATE SET data = ?2, updated_at = ?3",
+            params![mailbox_id.as_slice(), data, now_millis() as i64],
+        )
+        .map_err(|e| RelayError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn get_group_info(&self, mailbox_id: &[u8; 32]) -> Result<Option<Vec<u8>>, RelayError> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT data FROM group_info WHERE mailbox_id = ?1",
+            params![mailbox_id.as_slice()],
+            |row| row.get(0),
+        )
+        .optional()
         .map_err(|e| RelayError::Storage(e.to_string()))
     }
 

@@ -1,11 +1,12 @@
 mod blob;
+mod group_info;
 mod health;
 mod invite;
 mod voice;
 mod ws;
 
 use axum::extract::DefaultBodyLimit;
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::Router;
 
 use crate::state::AppState;
@@ -15,6 +16,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health::health))
         .route("/box/{mailbox_id}", post(blob::post_blob).get(blob::get_blobs))
+        .route("/box/{mailbox_id}/group_info", put(group_info::put).get(group_info::get))
         .route("/ws/{mailbox_id}", get(ws::ws_upgrade))
         .route("/voice/{channel_id}", get(voice::ws_upgrade))
         .route("/invite", post(invite::register))
