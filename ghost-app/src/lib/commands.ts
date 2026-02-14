@@ -63,17 +63,16 @@ const groupProvider: SearchProvider = (q) => {
 };
 
 const channelProvider: SearchProvider = (q) => {
-  if (!q) return [];
   const groupMap = new Map(groups().map((g) => [g.group_id, g.name]));
-  return allChannels()
-    .filter((ch) => ch.name.toLowerCase().includes(q))
-    .map((ch) => ({
-      id: ch.channel_id,
-      label: ch.name,
-      prefix: channelPrefix(ch.kind),
-      badge: groupMap.get(ch.group_id) ?? "",
-      onSelect: () => { selectGroup(ch.group_id); selectChannel(ch.channel_id); },
-    }));
+  const pool = q ? allChannels().filter((ch) => ch.name.toLowerCase().includes(q)) : allChannels();
+  return pool.map((ch) => ({
+    id: ch.channel_id,
+    label: ch.name,
+    prefix: channelPrefix(ch.kind),
+    badge: groupMap.get(ch.group_id) ?? "",
+    badgeIconKey: ch.group_id,
+    onSelect: () => { selectGroup(ch.group_id); selectChannel(ch.channel_id); },
+  }));
 };
 
 // --- Commands ---
@@ -166,11 +165,17 @@ const commands: CommandDef[] = [
   },
 ];
 
-// --- Auto-register on import ---
+// --- Auto-register on import (with HMR cleanup) ---
 
-commands.forEach(registerCommand);
-registerProvider(groupProvider);
-registerProvider(channelProvider);
+const cleanups: (() => void)[] = [];
+
+if (import.meta.hot) {
+  import.meta.hot.dispose(() => { cleanups.forEach((fn) => fn()); cleanups.length = 0; });
+}
+
+cleanups.push(...commands.map(registerCommand));
+cleanups.push(registerProvider(groupProvider));
+cleanups.push(registerProvider(channelProvider));
 
 // Sidebar uses this to open the create-channel command with the right kind
 export const handleCreateChannel = (kind: "text" | "voice") => {

@@ -33,6 +33,7 @@ export interface SearchResult {
   iconKey?: string;
   iconLabel?: string;
   badge?: string;
+  badgeIconKey?: string;
   onSelect: () => void;
 }
 

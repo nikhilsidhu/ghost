@@ -34,19 +34,6 @@ function CommandHighlight(props: { command: string; query: string }) {
   );
 }
 
-// --- Longest common prefix helper ---
-
-function longestCommonPrefix(items: string[]): string {
-  if (items.length === 0) return "";
-  let prefix = items[0];
-  for (let i = 1; i < items.length; i++) {
-    let j = 0;
-    while (j < prefix.length && j < items[i].length && prefix[j].toLowerCase() === items[i][j].toLowerCase()) j++;
-    prefix = prefix.slice(0, j);
-  }
-  return prefix;
-}
-
 // --- Main component ---
 
 export function CommandPalette() {
@@ -54,27 +41,37 @@ export function CommandPalette() {
   const [query, setQuery] = createSignal("");
   const [focusedIndex, setFocusedIndex] = createSignal(0);
 
-  // Args state — activeCommand being non-null means we're collecting args
-  const [activeCommand, setActiveCommand] = createSignal<CommandDef | null>(null);
-  const [argIndex, setArgIndex] = createSignal(0);
-  const [collectedArgs, setCollectedArgs] = createSignal<Record<string, string>>({});
-  const [cmdWordCount, setCmdWordCount] = createSignal(0);
+  // Two pill arrays — one source of truth for each token type
+  const [cmdPills, setCmdPills] = createSignal<string[]>([]);
+  const [argPills, setArgPills] = createSignal<{ name: string; value: string }[]>([]);
 
-  // Dangerous command confirmation — holds args pending user confirm
+  // Dangerous command confirmation
   const [pendingExec, setPendingExec] = createSignal<{ cmd: CommandDef; args: Record<string, string> } | null>(null);
+
+  // --- Derived state ---
+
+  const resolvedCommand = createMemo((): CommandDef | null => {
+    const text = cmdPills().join(" ").toLowerCase();
+    if (!text) return null;
+    return commands().find((c) => c.command.toLowerCase() === text) ?? null;
+  });
 
   const mode = createMemo(() => {
     if (pendingExec()) return "confirm" as const;
-    if (activeCommand()) return "args" as const;
-    return query().startsWith("/") ? "command" as const : "search" as const;
+    if (resolvedCommand()) return "args" as const;
+    if (cmdPills().length > 0 || query().startsWith("/")) return "command" as const;
+    return "search" as const;
   });
 
-  const commandQuery = createMemo(() => query().slice(1).toLowerCase().trim());
+  const commandQuery = createMemo(() => {
+    if (cmdPills().length > 0) return query().toLowerCase().trim();
+    return query().slice(1).toLowerCase().trim();
+  });
 
   const currentArg = createMemo(() => {
-    const cmd = activeCommand();
-    if (!cmd || mode() !== "args") return null;
-    return cmd.args[argIndex()] ?? null;
+    const cmd = resolvedCommand();
+    if (!cmd) return null;
+    return cmd.args[argPills().length] ?? null;
   });
 
   const runCommand = (cmd: CommandDef, args: Record<string, string>) => {
@@ -87,7 +84,6 @@ export function CommandPalette() {
     }
   };
 
-  // Execute or enter confirmation for dangerous commands
   const executeOrConfirm = (cmd: CommandDef, args: Record<string, string>) => {
     if (cmd.dangerous) {
       setPendingExec({ cmd, args });
@@ -97,54 +93,86 @@ export function CommandPalette() {
     runCommand(cmd, args);
   };
 
-  // --- Reset helpers ---
+  // --- Reset ---
 
   const resetAll = () => {
     batch(() => {
-      setActiveCommand(null);
-      setArgIndex(0);
-      setCollectedArgs({});
-      setCmdWordCount(0);
+      setCmdPills([]);
+      setArgPills([]);
       setQuery("");
       setFocusedIndex(0);
       setPendingExec(null);
     });
   };
 
+  // --- Auto-confirm helper ---
+
+  const autoConfirmArgs = (cmd: CommandDef, existing: { name: string; value: string }[]): { pills: { name: string; value: string }[]; nextQuery: string } => {
+    const result = [...existing];
+    let idx = result.length;
+    while (idx < cmd.args.length) {
+      const arg = cmd.args[idx];
+      const val = arg.defaultValue?.();
+      if (!val || !arg.complete) break;
+      const collected = Object.fromEntries(result.map((p) => [p.name, p.value]));
+      if (!arg.complete("", collected).some((c) => c.value === val)) break;
+      result.push({ name: arg.name, value: val });
+      idx++;
+    }
+    const nextArg = cmd.args[result.length];
+    return { pills: result, nextQuery: nextArg?.defaultValue?.() ?? "" };
+  };
+
+  // --- Activate / submit ---
+
   const activateCommand = (cmd: CommandDef) => {
+    const words = cmd.command.split(" ");
+
     if (cmd.args.length === 0) {
       resetAll();
       executeOrConfirm(cmd, {});
       return;
     }
 
-    // Auto-confirm leading args where defaultValue matches a completion
-    let idx = 0;
-    const autoArgs: Record<string, string> = {};
-    while (idx < cmd.args.length) {
-      const arg = cmd.args[idx];
-      const val = arg.defaultValue?.();
-      if (!val || !arg.complete) break;
-      if (!arg.complete("", autoArgs).some((c) => c.value === val)) break;
-      autoArgs[arg.name] = val;
-      idx++;
-    }
+    const { pills, nextQuery } = autoConfirmArgs(cmd, []);
 
-    if (idx >= cmd.args.length) {
+    if (pills.length >= cmd.args.length) {
       resetAll();
-      executeOrConfirm(cmd, autoArgs);
+      executeOrConfirm(cmd, Object.fromEntries(pills.map((p) => [p.name, p.value])));
       return;
     }
 
     batch(() => {
-      setActiveCommand(cmd);
-      setCmdWordCount(cmd.command.split(" ").length);
-      setArgIndex(idx);
-      setCollectedArgs(autoArgs);
+      setCmdPills(words);
+      setArgPills(pills);
       setFocusedIndex(0);
-      const nextArg = cmd.args[idx];
-      const defaultVal = nextArg.defaultValue?.() ?? null;
-      setQuery(defaultVal ?? "");
+      setQuery(nextQuery);
+    });
+  };
+
+  const submitArg = (value: string, autoConfirm = true) => {
+    const cmd = resolvedCommand();
+    if (!cmd) return;
+    const argDef = currentArg();
+    if (!argDef) return;
+
+    const trimmed = value.trim();
+    if (!trimmed) return;
+
+    const newArgPills = [...argPills(), { name: argDef.name, value: trimmed }];
+    const { pills, nextQuery } = autoConfirm ? autoConfirmArgs(cmd, newArgPills) : { pills: newArgPills, nextQuery: cmd.args[newArgPills.length]?.defaultValue?.() ?? "" };
+
+    if (pills.length >= cmd.args.length) {
+      const args = Object.fromEntries(pills.map((p) => [p.name, p.value]));
+      resetAll();
+      executeOrConfirm(cmd, args);
+      return;
+    }
+
+    batch(() => {
+      setArgPills(pills);
+      setFocusedIndex(0);
+      setQuery(nextQuery);
     });
   };
 
@@ -183,26 +211,52 @@ export function CommandPalette() {
 
   const searchResults = createMemo((): SearchResult[] => {
     const q = query().toLowerCase().trim();
-    return providers().flatMap((p) => p(q));
+    const seen = new Set<string>();
+    return providers().flatMap((p) => p(q))
+      .filter((r) => { if (seen.has(r.id)) return false; seen.add(r.id); return true; })
+      .sort((a, b) => frecencyScore(b.id) - frecencyScore(a.id));
   });
 
   const filteredCommands = createMemo(() => {
+    const pills = cmdPills();
     const q = commandQuery();
-    if (!q) return [...commands()].sort((a, b) => frecencyScore(b.id) - frecencyScore(a.id));
+
+    if (pills.length === 0) {
+      if (!q) return [...commands()].sort((a, b) => frecencyScore(b.id) - frecencyScore(a.id));
+      return commands()
+        .filter((c) => c.command.toLowerCase().includes(q))
+        .sort((a, b) => {
+          const aStarts = a.command.toLowerCase().startsWith(q) ? 0 : 1;
+          const bStarts = b.command.toLowerCase().startsWith(q) ? 0 : 1;
+          if (aStarts !== bStarts) return aStarts - bStarts;
+          return frecencyScore(b.id) - frecencyScore(a.id);
+        });
+    }
+
+    const prefix = pills.join(" ").toLowerCase();
     return commands()
-      .filter((c) => c.command.toLowerCase().includes(q))
-      .sort((a, b) => {
-        const aStarts = a.command.toLowerCase().startsWith(q) ? 0 : 1;
-        const bStarts = b.command.toLowerCase().startsWith(q) ? 0 : 1;
-        if (aStarts !== bStarts) return aStarts - bStarts;
-        return frecencyScore(b.id) - frecencyScore(a.id);
-      });
+      .filter((c) => {
+        const cmd = c.command.toLowerCase();
+        if (!cmd.startsWith(prefix)) return false;
+        const remainder = cmd.slice(prefix.length).trimStart();
+        return !q || remainder.includes(q);
+      })
+      .sort((a, b) => frecencyScore(b.id) - frecencyScore(a.id));
+  });
+
+  // For dropdown highlighting — includes pilled words so they show as matched
+  const highlightQuery = createMemo(() => {
+    const pills = cmdPills();
+    const q = commandQuery();
+    if (pills.length === 0) return q;
+    return q ? pills.join(" ") + " " + q : pills.join(" ");
   });
 
   const argCompletions = createMemo(() => {
     const arg = currentArg();
     if (!arg?.complete) return [];
-    return arg.complete(query().trim(), collectedArgs());
+    const collected = Object.fromEntries(argPills().map((p) => [p.name, p.value]));
+    return arg.complete(query().trim(), collected);
   });
 
   const itemCount = createMemo(() => {
@@ -219,12 +273,6 @@ export function CommandPalette() {
   let listRef!: HTMLDivElement;
 
   createEffect(() => {
-    query();
-    setFocusedIndex(0);
-  });
-
-  // Focus and move cursor to end when dialog opens
-  createEffect(() => {
     if (open() && inputRef) {
       setTimeout(() => {
         inputRef.focus();
@@ -240,43 +288,11 @@ export function CommandPalette() {
     el?.scrollIntoView({ block: "nearest" });
   });
 
-  // --- Selection handlers ---
-
-  const submitArg = (value: string) => {
-    const cmd = activeCommand();
-    if (!cmd) return;
-    const arg = currentArg();
-    if (!arg) return;
-
-    const trimmed = value.trim();
-    if (!trimmed) return;
-
-    const next = argIndex() + 1;
-    const newArgs = { ...collectedArgs(), [arg.name]: trimmed };
-
-    if (next >= cmd.args.length) {
-      resetAll();
-      executeOrConfirm(cmd, newArgs);
-      return;
-    }
-
-    // Advance to next arg
-    batch(() => {
-      setCollectedArgs(newArgs);
-      setArgIndex(next);
-      setFocusedIndex(0);
-      const nextArg = cmd.args[next];
-      const defaultVal = nextArg.defaultValue?.() ?? null;
-      setQuery(defaultVal ?? "");
-    });
-  };
-
   // --- Key handling ---
 
   const handleKeyDown = (e: KeyboardEvent) => {
     const m = mode();
-
-    // Confirm mode: Enter executes, Escape cancels
+    // Confirm mode
     if (m === "confirm") {
       if (e.key === "Enter") {
         e.preventDefault();
@@ -292,69 +308,58 @@ export function CommandPalette() {
       return;
     }
 
-    // Tab autocomplete
+    // Tab — pill exactly one token from the focused dropdown item
     if (e.key === "Tab") {
       e.preventDefault();
       if (m === "command") {
         const cmds = filteredCommands();
         if (cmds.length === 0) return;
-        if (cmds.length === 1) {
-          activateCommand(cmds[0]);
-          return;
-        }
-        const prefix = longestCommonPrefix(cmds.map((c) => c.command));
-        if (prefix.length > commandQuery().length) {
-          setQuery("/" + prefix);
-        }
+        const focused = cmds[Math.min(focusedIndex(), cmds.length - 1)];
+        const pills = cmdPills();
+        const words = focused.command.split(" ");
+        const nextIdx = pills.length;
+        if (nextIdx >= words.length) return;
+        batch(() => {
+          setCmdPills([...pills, words[nextIdx]]);
+          setQuery("");
+          setFocusedIndex(0);
+        });
       } else if (m === "args") {
         const completions = argCompletions();
-        if (completions.length === 0) return;
-        if (completions.length === 1) {
-          submitArg(completions[0].value);
+        if (completions.length === 0) {
+          if (!currentArg()?.complete) submitArg(query(), false);
           return;
         }
-        const prefix = longestCommonPrefix(completions.map((c) => c.label));
-        if (prefix.length > query().trim().length) {
-          setQuery(prefix);
-        }
+        submitArg(completions[Math.min(focusedIndex(), completions.length - 1)].value, false);
       }
       return;
     }
 
-    // Backspace on empty in args phase — go back
-    if (e.key === "Backspace" && query() === "" && m === "args") {
-      e.preventDefault();
-      const idx = argIndex();
-      if (idx === 0) {
-        const wc = cmdWordCount();
-        if (wc <= 1) {
-          // Last command word pill — exit to command list
-          batch(() => {
-            setActiveCommand(null);
-            setCollectedArgs({});
-            setCmdWordCount(0);
-            setQuery("/");
-            setFocusedIndex(0);
-          });
-        } else {
-          setCmdWordCount(wc - 1);
-        }
-      } else {
-        // Back to previous arg
-        const cmd = activeCommand()!;
-        const prevArg = cmd.args[idx - 1];
-        const prevVal = collectedArgs()[prevArg.name] ?? "";
+    // Backspace on empty — pop last pill
+    if (e.key === "Backspace" && query() === "") {
+      if (argPills().length > 0) {
+        e.preventDefault();
+        const pills = argPills();
+        const cmd = resolvedCommand()!;
+        const argDef = cmd.args[pills.length - 1];
         batch(() => {
-          const newArgs = { ...collectedArgs() };
-          delete newArgs[prevArg.name];
-          setCollectedArgs(newArgs);
-          setArgIndex(idx - 1);
-          // Completer args use IDs — show empty to re-select; free text keeps the value
-          setQuery(prevArg.complete ? "" : prevVal);
+          setArgPills(pills.slice(0, -1));
+          setQuery(argDef.complete ? "" : pills[pills.length - 1].value);
           setFocusedIndex(0);
         });
+        return;
       }
-      return;
+
+      if (cmdPills().length > 0) {
+        e.preventDefault();
+        const pills = cmdPills();
+        batch(() => {
+          setCmdPills(pills.slice(0, -1));
+          setQuery(pills.length === 1 ? "/" : "");
+          setFocusedIndex(0);
+        });
+        return;
+      }
     }
 
     // Arrow navigation
@@ -367,16 +372,18 @@ export function CommandPalette() {
       setFocusedIndex((i) => Math.max(i - 1, 0));
     } else if (e.key === "Enter" && (count > 0 || m === "args")) {
       e.preventDefault();
+      const idx = Math.min(focusedIndex(), count - 1);
       if (m === "search" && count > 0) {
-        const item = searchResults()[focusedIndex()];
-        item.onSelect();
+        const result = searchResults()[idx];
+        recordUsage(result.id);
+        result.onSelect();
         setOpen(false);
       } else if (m === "command" && count > 0) {
-        activateCommand(filteredCommands()[focusedIndex()]);
+        activateCommand(filteredCommands()[idx]);
       } else if (m === "args") {
         const completions = argCompletions();
-        if (completions.length > 0 && focusedIndex() < completions.length) {
-          submitArg(completions[focusedIndex()].value);
+        if (completions.length > 0) {
+          submitArg(completions[Math.min(idx, completions.length - 1)].value);
         } else if (!currentArg()?.complete) {
           submitArg(query());
         }
@@ -391,6 +398,35 @@ export function CommandPalette() {
     if (!v) resetAll();
   };
 
+  // --- Ghost text: what Tab would complete ---
+
+  const ghostText = createMemo(() => {
+    const m = mode();
+    if (m === "command") {
+      const cmds = filteredCommands();
+      if (cmds.length === 0) return "";
+      const focused = cmds[Math.min(focusedIndex(), cmds.length - 1)];
+      const pills = cmdPills();
+      const words = focused.command.split(" ");
+      const nextIdx = pills.length;
+      if (nextIdx >= words.length) return "";
+      const nextWord = words[nextIdx];
+      const q = commandQuery();
+      if (q && nextWord.toLowerCase().startsWith(q)) return nextWord.slice(q.length);
+      return q ? "" : nextWord;
+    }
+    if (m === "args") {
+      const q = query().trim();
+      if (!q) return ""; // placeholder handles empty state
+      const completions = argCompletions();
+      if (completions.length === 0) return "";
+      const focused = completions[Math.min(focusedIndex(), completions.length - 1)];
+      if (focused.label.toLowerCase().startsWith(q.toLowerCase())) return focused.label.slice(q.length);
+      return "";
+    }
+    return "";
+  });
+
   // --- Placeholder text ---
 
   const placeholder = createMemo(() => {
@@ -399,7 +435,7 @@ export function CommandPalette() {
       const arg = currentArg();
       return arg?.placeholder ?? "...";
     }
-    if (m === "command") return "/command...";
+    if (m === "command") return cmdPills().length > 0 ? "" : "/command...";
     return "search...";
   });
 
@@ -417,7 +453,6 @@ export function CommandPalette() {
           <KDialog.Content
             data-palette-content
             class="relative w-full max-w-[40rem] rounded-xl overflow-hidden"
-            onKeyDown={handleKeyDown}
             style:max-width="calc(100vw - 3rem)"
             style={{
               background: "radial-gradient(ellipse at 50% 0%, rgba(255,255,255,0.03), transparent 60%), var(--palette-bg)",
@@ -427,101 +462,104 @@ export function CommandPalette() {
           >
             {/* Input with inline token pills */}
             <div class="p-3 flex items-center gap-1.5 flex-wrap">
-              <Show when={(mode() === "args" || mode() === "confirm") && activeCommand()}>
-                {(() => {
-                  const words = () => activeCommand()!.command.split(" ").slice(0, cmdWordCount());
-                  return (
-                    <>
-                      <For each={words()}>
-                        {(word, wordIdx) => (
-                          <span
-                            class="group/pill inline-flex items-center h-7 rounded-md text-xs font-medium text-[var(--purple-300)] flex-shrink-0 cursor-pointer transition-all duration-150"
-                            style={{ background: "var(--pill-purple)" }}
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              if (wordIdx() === 0) {
-                                batch(() => {
-                                  setPendingExec(null);
-                                  setActiveCommand(null);
-                                  setCollectedArgs({});
-                                  setCmdWordCount(0);
-                                  setArgIndex(0);
-                                  setQuery("/");
-                                  setFocusedIndex(0);
-                                });
-                              } else {
-                                setCmdWordCount(wordIdx());
-                              }
-                              inputRef?.focus();
-                            }}
-                          >
-                            <span class="px-2">{wordIdx() === 0 ? `/${word}` : word}</span>
-                            <span class="w-0 overflow-hidden group-hover/pill:w-5 transition-all duration-150 flex items-center justify-center">
-                              <X size={12} strokeWidth={2.5} class="text-[var(--purple-400)]" />
-                            </span>
-                          </span>
-                        )}
-                      </For>
-                      <For each={activeCommand()!.args.slice(0, mode() === "confirm" ? activeCommand()!.args.length : argIndex())}>
-                        {(arg, i) => {
-                          const args = () => mode() === "confirm" ? pendingExec()!.args : collectedArgs();
-                          const val = () => args()[arg.name] ?? "";
-                          const label = () => arg.complete?.("", args()).find((c) => c.value === val())?.label ?? val();
-                          return (
-                            <span
-                              class="group/pill inline-flex items-center h-7 rounded-md text-xs flex-shrink-0 cursor-pointer transition-all duration-150"
-                              style={{ background: "var(--pill-ember)" }}
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                const cmd = activeCommand()!;
-                                const newArgs: Record<string, string> = {};
-                                for (let j = 0; j < i(); j++) {
-                                  newArgs[cmd.args[j].name] = args()[cmd.args[j].name];
-                                }
-                                batch(() => {
-                                  setPendingExec(null);
-                                  setCollectedArgs(newArgs);
-                                  setArgIndex(i());
-                                  setQuery("");
-                                  setFocusedIndex(0);
-                                });
-                                inputRef?.focus();
-                              }}
-                            >
-                              <span class="inline-flex items-center gap-1 px-2">
-                                <span class="text-[var(--ember-500)]">{arg.name}:</span>
-                                <span class="font-medium text-[var(--ember-300)]">{label()}</span>
-                              </span>
-                              <span class="w-0 overflow-hidden group-hover/pill:w-5 transition-all duration-150 flex items-center justify-center">
-                                <X size={12} strokeWidth={2.5} class="text-[var(--ember-400)]" />
-                              </span>
-                            </span>
-                          );
+              {/* Command word pills */}
+              <Show when={cmdPills().length > 0}>
+                <For each={cmdPills()}>
+                  {(word, wordIdx) => (
+                    <span
+                      class="group/pill inline-flex items-center h-7 rounded-md text-xs font-medium text-[var(--purple-300)] flex-shrink-0 cursor-pointer transition-all duration-150"
+                      style={{ background: "var(--pill-purple)" }}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        if (wordIdx() === 0) {
+                          batch(() => { setCmdPills([]); setArgPills([]); setQuery("/"); setFocusedIndex(0); });
+                        } else {
+                          batch(() => { setCmdPills(cmdPills().slice(0, wordIdx())); setArgPills([]); setQuery(""); setFocusedIndex(0); });
+                        }
+                        inputRef?.focus();
+                      }}
+                    >
+                      <span class="px-2">{wordIdx() === 0 ? `/${word}` : word}</span>
+                      <span class="w-0 overflow-hidden group-hover/pill:w-5 transition-all duration-150 flex items-center justify-center">
+                        <X size={12} strokeWidth={2.5} class="text-[var(--purple-400)]" />
+                      </span>
+                    </span>
+                  )}
+                </For>
+              </Show>
+              {/* Arg pills */}
+              <Show when={resolvedCommand() && argPills().length > 0}>
+                <For each={argPills()}>
+                  {(pill, i) => {
+                    const cmd = () => resolvedCommand()!;
+                    const argDef = () => cmd().args[i()];
+                    const label = () => {
+                      const collected = Object.fromEntries(argPills().slice(0, i() + 1).map((p) => [p.name, p.value]));
+                      return argDef().complete?.("", collected).find((c) => c.value === pill.value)?.label ?? pill.value;
+                    };
+                    return (
+                      <span
+                        class="group/pill inline-flex items-center h-7 rounded-md text-xs flex-shrink-0 cursor-pointer transition-all duration-150"
+                        style={{ background: "var(--pill-ember)" }}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          batch(() => {
+                            setPendingExec(null);
+                            setArgPills(argPills().slice(0, i()));
+                            setQuery("");
+                            setFocusedIndex(0);
+                          });
+                          inputRef?.focus();
                         }}
-                      </For>
-                    </>
-                  );
-                })()}
+                      >
+                        <span class="inline-flex items-center gap-1 px-2">
+                          <span class="text-[var(--ember-500)]">{argDef().name}:</span>
+                          <span class="font-medium text-[var(--ember-300)]">{label()}</span>
+                        </span>
+                        <span class="w-0 overflow-hidden group-hover/pill:w-5 transition-all duration-150 flex items-center justify-center">
+                          <X size={12} strokeWidth={2.5} class="text-[var(--ember-400)]" />
+                        </span>
+                      </span>
+                    );
+                  }}
+                </For>
               </Show>
               <Show
                 when={mode() !== "confirm"}
                 fallback={
-                  <span class="h-7 flex items-center text-sm text-[var(--red-400)]">
+                  <span
+                    tabIndex={0}
+                    ref={(el) => setTimeout(() => el.focus(), 0)}
+                    on:keydown={handleKeyDown}
+                    class="h-7 flex items-center text-sm text-[var(--red-400)] outline-none"
+                  >
                     press <KeyBadge value="Enter" size="sm" /> to confirm or <KeyBadge value="Esc" size="sm" /> to cancel
                   </span>
                 }
               >
-                <input
-                  ref={inputRef}
-                  placeholder={placeholder()}
-                  value={query()}
-                  onInput={(e) => setQuery(e.currentTarget.value)}
-                  autocomplete="off"
-                  autocorrect="off"
-                  autocapitalize="off"
-                  spellcheck={false}
-                  class="h-7 flex-1 min-w-[80px] bg-transparent text-sm text-[var(--neutral-100)] placeholder:text-[var(--neutral-500)] outline-none"
-                />
+                <div class="relative flex-1 min-w-[80px] flex items-center">
+                  <input
+                    ref={inputRef}
+                    on:keydown={handleKeyDown}
+                    placeholder={placeholder()}
+                    value={query()}
+                    onInput={(e) => { setQuery(e.currentTarget.value); setFocusedIndex(0); }}
+                    autocomplete="off"
+                    autocorrect="off"
+                    autocapitalize="off"
+                    spellcheck={false}
+                    class="h-7 w-full bg-transparent text-sm text-[var(--neutral-100)] placeholder:text-[var(--neutral-500)] outline-none relative z-10"
+                  />
+                  <Show when={ghostText()}>
+                    <span class="absolute inset-0 flex items-center h-7 text-sm text-[var(--neutral-500)] pointer-events-none select-none">
+                      <span class="invisible whitespace-pre">{query()}</span>
+                      <span>{ghostText()}</span>
+                    </span>
+                  </Show>
+                </div>
+                <Show when={ghostText()}>
+                  <KeyBadge value="Tab" size="sm" />
+                </Show>
               </Show>
             </div>
 
@@ -530,10 +568,6 @@ export function CommandPalette() {
             <div ref={listRef} class="scrollarea max-h-64 overflow-y-auto py-1">
               {/* Search mode */}
               <Show when={mode() === "search"}>
-                <Show
-                  when={searchResults().length > 0}
-                  fallback={<div class="px-3 py-4 text-xs text-[var(--neutral-500)] text-center">no results</div>}
-                >
                   <For each={searchResults()}>
                     {(item, idx) => {
                       const focused = () => idx() === focusedIndex();
@@ -546,7 +580,7 @@ export function CommandPalette() {
                       const grad = item.iconKey ? hashGradient(item.iconKey) : null;
                       return (
                         <button
-                          onClick={() => { item.onSelect(); setOpen(false); }}
+                          onClick={() => { recordUsage(item.id); item.onSelect(); setOpen(false); }}
                           onMouseEnter={() => setFocusedIndex(idx())}
                           class={rowClass()}
                         >
@@ -565,28 +599,48 @@ export function CommandPalette() {
                           </Show>
                           <span class="truncate">{item.label}</span>
                           <Show when={item.badge}>
-                            <span
-                              class="ml-auto text-[10px] px-1.5 py-0.5 rounded text-[var(--neutral-500)] flex-shrink-0"
-                              style={{ background: "var(--neutral-800)" }}
-                            >
-                              {item.badge}
+                            <span class="ml-auto flex items-center gap-1.5 flex-shrink-0">
+                              <span
+                                class="text-[10px] px-1.5 py-0.5 rounded text-[var(--neutral-500)]"
+                                style={{ background: "var(--neutral-800)" }}
+                              >
+                                {item.badge}
+                              </span>
+                              <Show when={item.badgeIconKey}>
+                                {(key) => {
+                                  const bg = hashGradient(key());
+                                  return (
+                                    <div
+                                      class="w-4 h-4 rounded-[3px] flex items-center justify-center text-[9px] font-bold"
+                                      style={{ background: `linear-gradient(${bg.angle}deg, ${bg.from}, ${bg.to})`, color: "var(--neutral-100)" }}
+                                    >
+                                      {item.badge![0]}
+                                    </div>
+                                  );
+                                }}
+                              </Show>
                             </span>
                           </Show>
                         </button>
                       );
                     }}
                   </For>
-                </Show>
               </Show>
 
               {/* Command mode */}
               <Show when={mode() === "command"}>
-                <Show
-                  when={filteredCommands().length > 0}
-                  fallback={<div class="px-3 py-4 text-xs text-[var(--neutral-500)] text-center">no commands found</div>}
-                >
                   <For each={filteredCommands()}>
-                    {(cmd, idx) => (
+                    {(cmd, idx) => {
+                      const preview = () => {
+                        if (cmd.args.length === 0) return [];
+                        const { pills } = autoConfirmArgs(cmd, []);
+                        return pills.map((p) => {
+                          const argDef = cmd.args.find((a) => a.name === p.name);
+                          const label = argDef?.complete?.("", {}).find((c) => c.value === p.value)?.label ?? p.value;
+                          return { name: p.name, label };
+                        });
+                      };
+                      return (
                       <button
                         onClick={() => activateCommand(cmd)}
                         onMouseEnter={() => setFocusedIndex(idx())}
@@ -597,7 +651,18 @@ export function CommandPalette() {
                             : "hover:bg-[var(--hover)]",
                         )}
                       >
-                        <CommandHighlight command={cmd.command} query={commandQuery()} />
+                        <CommandHighlight command={cmd.command} query={highlightQuery()} />
+                        <Show when={preview().length > 0}>
+                          <div class="flex items-center gap-1 ml-2">
+                            <For each={preview()}>
+                              {(p) => (
+                                <span class="text-[10px] px-1.5 py-0.5 rounded text-[var(--neutral-500)] flex-shrink-0" style={{ background: "var(--neutral-800)" }}>
+                                  {p.name}: {p.label}
+                                </span>
+                              )}
+                            </For>
+                          </div>
+                        </Show>
                         <Show when={cmd.shortcut}>
                           <div class="ml-auto flex items-center gap-0.5 pl-3">
                             <For each={cmd.shortcut!}>
@@ -606,9 +671,9 @@ export function CommandPalette() {
                           </div>
                         </Show>
                       </button>
-                    )}
+                      );
+                    }}
                   </For>
-                </Show>
               </Show>
 
               {/* Args mode: completions */}
