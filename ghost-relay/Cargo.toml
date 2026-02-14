@@ -20,6 +20,7 @@ tower-http = { version = "0.6", features = ["limit"] }
 dashmap = "6"
 hex = "0.4"
 smallvec = "1"
+ghost-wire = { path = "../ghost-wire" }
 
 [dev-dependencies]
 reqwest = { version = "0.12", features = ["json"] }
