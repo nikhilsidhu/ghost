@@ -1,17 +1,11 @@
 import { createSignal, createEffect, on, onCleanup, For, Show } from "solid-js";
 import { listen } from "@tauri-apps/api/event";
-import type { Member, Identity, Message } from "../lib/types";
+import type { Message } from "../lib/types";
 import { listMessages, sendMessage } from "../lib/api";
 import { hashGradient, onFlareMove, onFlareLeave } from "../lib/gradients";
 import { cn } from "../lib/cn";
 import { ChevronDown, SendHorizonal } from "lucide-solid";
-
-interface Props {
-  groupId: string;
-  channelId: string;
-  members: Member[];
-  identity: Identity | null;
-}
+import { selectedGroupId, selectedChannelId, members } from "../lib/store";
 
 const PAGE_SIZE = 50;
 const SCROLL_BOTTOM_THRESHOLD = 80;
@@ -22,7 +16,7 @@ const formatTime = (ts: number) => {
   return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 };
 
-export function MessageView(props: Props) {
+export function MessageView() {
   const [messages, setMessages] = createSignal<Message[]>([]);
   const [loading, setLoading] = createSignal(false);
   const [hasMore, setHasMore] = createSignal(true);
@@ -37,7 +31,7 @@ export function MessageView(props: Props) {
 
   const senderMap = () => {
     const m = new Map<string, string>();
-    for (const member of props.members) {
+    for (const member of members()) {
       m.set(member.fingerprint, member.display_name);
     }
     return m;
@@ -61,7 +55,8 @@ export function MessageView(props: Props) {
     return prev.sender_fp === cur.sender_fp && cur.timestamp - prev.timestamp < GROUP_WINDOW_MS;
   };
 
-  createEffect(on(() => props.channelId, (cid) => {
+  createEffect(on(selectedChannelId, (cid) => {
+    if (!cid) return;
     setMessages([]);
     seenIds.clear();
     setHasMore(true);
@@ -97,10 +92,11 @@ export function MessageView(props: Props) {
 
   const loadMore = async () => {
     const current = messages();
-    if (!current.length || loading()) return;
+    const cid = selectedChannelId();
+    if (!current.length || loading() || !cid) return;
     setLoading(true);
     const oldest = current[0];
-    const older = await listMessages(props.channelId, oldest.received_at, PAGE_SIZE);
+    const older = await listMessages(cid, oldest.received_at, PAGE_SIZE);
     for (const m of older) seenIds.add(m.message_id);
     setMessages([...older.reverse(), ...current]);
     setHasMore(older.length === PAGE_SIZE);
@@ -109,12 +105,14 @@ export function MessageView(props: Props) {
 
   const handleSend = async () => {
     const text = inputText().trim();
-    if (!text) return;
+    const gid = selectedGroupId();
+    const cid = selectedChannelId();
+    if (!text || !gid || !cid) return;
     setInputText("");
     if (inputRef) inputRef.value = "";
     setError(null);
     try {
-      const msg = await sendMessage(props.groupId, props.channelId, text);
+      const msg = await sendMessage(gid, cid, text);
       seenIds.add(msg.message_id);
       setMessages((prev) => [...prev, msg]);
       requestAnimationFrame(scrollToBottom);

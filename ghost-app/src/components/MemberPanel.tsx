@@ -1,13 +1,9 @@
 import { For, Show } from "solid-js";
-import type { Member } from "../lib/types";
 import { hashGradient, onFlareMove, onFlareLeave } from "../lib/gradients";
 import { ScrollArea } from "./ui/scroll-area";
+import { members } from "../lib/store";
 
-interface Props {
-  members: Member[];
-}
-
-export function MemberPanel(props: Props) {
+export function MemberPanel() {
   return (
     <div
       class="w-56 flex-shrink-0 flex flex-col"
@@ -16,12 +12,12 @@ export function MemberPanel(props: Props) {
       <div class="h-7 flex-shrink-0" />
       <div class="h-10 flex-shrink-0 flex items-center px-3">
         <span class="text-xs uppercase tracking-wider text-[var(--neutral-500)]">
-          members — {props.members.length}
+          members — {members().length}
         </span>
       </div>
       <ScrollArea class="flex-1">
         <div class="px-2 py-1">
-          <For each={props.members}>
+          <For each={members()}>
             {(m) => {
               const grad = hashGradient(m.fingerprint);
               return (

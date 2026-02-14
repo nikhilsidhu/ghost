@@ -1,11 +1,16 @@
 import { createSignal, createEffect, on, For, Show } from "solid-js";
 import type { JSX } from "solid-js";
-import type { Identity, Group, Channel } from "../lib/types";
+import type { Group, Channel } from "../lib/types";
 import { hashGradient, onFlareMove, onFlareLeave } from "../lib/gradients";
 import { ScrollArea } from "./ui/scroll-area";
 import { cn } from "../lib/cn";
 import { AudioLines, Settings } from "lucide-solid";
 import { channelPrefix } from "../lib/constants";
+import {
+  identity, groups, selectedGroupId, channels, selectedChannelId,
+  selectedGroup, selectGroup, selectChannel,
+} from "../lib/store";
+import { handleCreateChannel } from "../lib/commands";
 import {
   DragDropProvider,
   DragDropSensors,
@@ -17,19 +22,7 @@ import {
 } from "@thisbeyond/solid-dnd";
 import type { DragEvent } from "@thisbeyond/solid-dnd";
 
-interface SidebarProps {
-  identity: Identity | null;
-  groups: Group[];
-  selectedGroupId: string | null;
-  channels: Channel[];
-  selectedChannelId: string | null;
-  onSelectGroup: (id: string) => void;
-  onDeselectGroup: () => void;
-  onSelectChannel: (id: string) => void;
-  onCreateChannel: (kind: "text" | "voice") => void;
-}
-
-export function Sidebar(props: SidebarProps) {
+export function Sidebar() {
   const [textCollapsed, setTextCollapsed] = createSignal(false);
   const [voiceCollapsed, setVoiceCollapsed] = createSignal(false);
   const [groupOrder, setGroupOrder] = createSignal<string[]>([]);
@@ -37,16 +30,14 @@ export function Sidebar(props: SidebarProps) {
   const [activeGroupId, setActiveGroupId] = createSignal<string | null>(null);
   const [activeChannelId, setActiveChannelId] = createSignal<string | null>(null);
 
-  createEffect(on(() => props.selectedGroupId, () => {
+  createEffect(on(selectedGroupId, () => {
     setTextCollapsed(false);
     setVoiceCollapsed(false);
   }));
 
-  // Sync group order when groups change
-  createEffect(on(() => props.groups, (groups) => {
+  createEffect(on(groups, (gs) => {
     const current = groupOrder();
-    const ids = groups.map((g) => g.group_id);
-    // Keep existing order for known groups, append new ones
+    const ids = gs.map((g) => g.group_id);
     const ordered = current.filter((id) => ids.includes(id));
     const newIds = ids.filter((id) => !ordered.includes(id));
     if (newIds.length > 0 || ordered.length !== current.length) {
@@ -54,10 +45,9 @@ export function Sidebar(props: SidebarProps) {
     }
   }));
 
-  // Sync channel order when channels change
-  createEffect(on(() => props.channels, (channels) => {
+  createEffect(on(channels, (chs) => {
     const current = channelOrder();
-    const ids = channels.map((c) => c.channel_id);
+    const ids = chs.map((c) => c.channel_id);
     const ordered = current.filter((id) => ids.includes(id));
     const newIds = ids.filter((id) => !ordered.includes(id));
     if (newIds.length > 0 || ordered.length !== current.length) {
@@ -65,35 +55,28 @@ export function Sidebar(props: SidebarProps) {
     }
   }));
 
-  const selectedGroup = () =>
-    props.groups.find((g) => g.group_id === props.selectedGroupId);
-
   const orderedGroups = () => {
     const order = groupOrder();
-    const map = new Map(props.groups.map((g) => [g.group_id, g]));
+    const map = new Map(groups().map((g) => [g.group_id, g]));
     return order.map((id) => map.get(id)!).filter(Boolean);
   };
 
   const textChannels = () => {
     const order = channelOrder();
-    const text = props.channels.filter((c) => c.kind === "text");
+    const text = channels().filter((c) => c.kind === "text");
     const map = new Map(text.map((c) => [c.channel_id, c]));
     return order.map((id) => map.get(id)).filter((c): c is Channel => c !== undefined && c.kind === "text");
   };
 
   const voiceChannels = () => {
     const order = channelOrder();
-    const voice = props.channels.filter((c) => c.kind === "voice");
+    const voice = channels().filter((c) => c.kind === "voice");
     const map = new Map(voice.map((c) => [c.channel_id, c]));
     return order.map((id) => map.get(id)).filter((c): c is Channel => c !== undefined && c.kind === "voice");
   };
 
   const handleGroupClick = (groupId: string) => {
-    if (groupId === props.selectedGroupId) {
-      props.onDeselectGroup();
-    } else {
-      props.onSelectGroup(groupId);
-    }
+    selectGroup(groupId === selectedGroupId() ? null : groupId);
   };
 
   const onGroupDragStart = (e: DragEvent) => setActiveGroupId(String(e.draggable.id));
@@ -154,7 +137,7 @@ export function Sidebar(props: SidebarProps) {
             <SortableProvider ids={groupOrder()}>
               <div class="flex flex-col items-center">
                 <For each={orderedGroups()}>
-                  {(g) => <GroupIcon group={g} isActive={g.group_id === props.selectedGroupId} onClick={handleGroupClick} />}
+                  {(g) => <GroupIcon group={g} isActive={g.group_id === selectedGroupId()} onClick={handleGroupClick} />}
                 </For>
               </div>
             </SortableProvider>
@@ -163,7 +146,7 @@ export function Sidebar(props: SidebarProps) {
             {(() => {
               const id = activeGroupId();
               if (!id) return null;
-              const g = props.groups.find((x) => x.group_id === id);
+              const g = groups().find((x) => x.group_id === id);
               if (!g) return null;
               const grad = hashGradient(g.group_id);
               return (
@@ -194,7 +177,7 @@ export function Sidebar(props: SidebarProps) {
             <Settings size={16} class="text-[var(--neutral-300)]" />
           </button>
 
-          <Show when={props.identity}>
+          <Show when={identity()}>
             {(id) => {
               const [copied, setCopied] = createSignal(false);
               const grad = hashGradient(id().fingerprint);
@@ -265,7 +248,7 @@ export function Sidebar(props: SidebarProps) {
                     </button>
                     <button
                       class="w-[var(--size-sm)] h-[var(--size-sm)] flex items-center justify-center rounded-md text-sm leading-none text-[var(--neutral-500)] hover:text-[var(--neutral-200)] cursor-pointer hover:bg-[var(--hover)]"
-                      onClick={() => props.onCreateChannel("text")}
+                      onClick={() => handleCreateChannel("text")}
                     >
                       +
                     </button>
@@ -277,8 +260,8 @@ export function Sidebar(props: SidebarProps) {
                           {(ch) => (
                             <ChannelItem
                               channel={ch}
-                              isSelected={ch.channel_id === props.selectedChannelId}
-                              onSelect={props.onSelectChannel}
+                              isSelected={ch.channel_id === selectedChannelId()}
+                              onSelect={selectChannel}
                               icon={<span class="text-[var(--neutral-500)]">#</span>}
                             />
                           )}
@@ -299,7 +282,7 @@ export function Sidebar(props: SidebarProps) {
                     </button>
                     <button
                       class="w-[var(--size-sm)] h-[var(--size-sm)] flex items-center justify-center rounded-md text-sm leading-none text-[var(--neutral-500)] hover:text-[var(--neutral-200)] cursor-pointer hover:bg-[var(--hover)]"
-                      onClick={() => props.onCreateChannel("voice")}
+                      onClick={() => handleCreateChannel("voice")}
                     >
                       +
                     </button>
@@ -311,8 +294,8 @@ export function Sidebar(props: SidebarProps) {
                           {(ch) => (
                             <ChannelItem
                               channel={ch}
-                              isSelected={ch.channel_id === props.selectedChannelId}
-                              onSelect={props.onSelectChannel}
+                              isSelected={ch.channel_id === selectedChannelId()}
+                              onSelect={selectChannel}
                               icon={<AudioLines size={14} class="text-[var(--neutral-500)] flex-shrink-0" />}
                             />
                           )}
@@ -326,7 +309,7 @@ export function Sidebar(props: SidebarProps) {
                 {(() => {
                   const id = activeChannelId();
                   if (!id) return null;
-                  const ch = props.channels.find((c) => c.channel_id === id);
+                  const ch = channels().find((c) => c.channel_id === id);
                   if (!ch) return null;
                   return (
                     <div class="flex items-center gap-2 px-2 py-1.5 rounded-md text-sm text-[var(--neutral-200)] bg-[var(--neutral-800)] opacity-80">
