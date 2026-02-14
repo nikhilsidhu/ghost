@@ -2,7 +2,8 @@ import { createSignal, createEffect, on, onCleanup, For, Show } from "solid-js";
 import { listen } from "@tauri-apps/api/event";
 import type { Message } from "../lib/types";
 import { listMessages, sendMessage } from "../lib/api";
-import { hashGradient, onFlareMove, onFlareLeave } from "../lib/gradients";
+import { hashGradient } from "../lib/gradients";
+import { Avatar } from "./ui/avatar";
 import { cn } from "../lib/cn";
 import { ChevronDown, SendHorizonal } from "lucide-solid";
 import { selectedGroupId, selectedChannelId, members } from "../lib/store";
@@ -125,7 +126,7 @@ export function MessageView() {
     <div class="flex-1 flex flex-col min-h-0 relative pr-1">
       <div
         ref={containerRef}
-        class="flex-1 overflow-y-auto px-4 py-2"
+        class="scrollarea flex-1 overflow-y-auto px-4 py-2"
         onScroll={updateNearBottom}
       >
         <Show when={hasMore()}>
@@ -152,17 +153,11 @@ export function MessageView() {
               >
                 <Show when={!grouped()}>
                   <div class="flex items-start gap-3">
-                    <button
-                      class="avatar-flare w-[var(--size-md)] h-[var(--size-md)] rounded-full flex items-center justify-center text-xs font-semibold flex-shrink-0 mt-1 cursor-pointer transition-all duration-200 opacity-85 hover:opacity-100 hover:scale-105"
-                      style={{
-                        background: `linear-gradient(${grad().angle}deg, ${grad().from}, ${grad().to})`,
-                        color: "var(--neutral-100)",
-                      }}
-                      onMouseMove={onFlareMove}
-                      onMouseLeave={onFlareLeave}
-                    >
-                      {name()[0]?.toUpperCase()}
-                    </button>
+                    <Avatar
+                      hashKey={msg.sender_fp}
+                      label={name()}
+                      class="w-[var(--size-md)] h-[var(--size-md)] text-xs mt-1 transition-all duration-200 opacity-85 hover:opacity-100 hover:scale-105"
+                    />
                     <div class="flex-1 min-w-0">
                       <div class="flex items-baseline gap-2">
                         <span

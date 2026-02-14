@@ -1,7 +1,9 @@
 import { createSignal, createEffect, on, For, Show } from "solid-js";
 import type { JSX } from "solid-js";
 import type { Group, Channel } from "../lib/types";
-import { hashGradient, onFlareMove, onFlareLeave } from "../lib/gradients";
+import { hashGradient } from "../lib/gradients";
+import { Avatar } from "./ui/avatar";
+import { Tooltip } from "./ui/tooltip";
 import { ScrollArea } from "./ui/scroll-area";
 import { cn } from "../lib/cn";
 import { AudioLines, Settings } from "lucide-solid";
@@ -170,43 +172,38 @@ export function Sidebar() {
         <div class="flex-shrink-0 flex flex-col items-center pb-2">
           <div class="divider-h w-8 mb-2" />
 
-          <button
-            class="w-[var(--size-md)] h-[var(--size-md)] rounded-lg flex items-center justify-center cursor-pointer opacity-50 hover:opacity-100 mb-1.5"
-            title="settings"
-          >
-            <Settings size={16} class="text-[var(--neutral-300)]" />
-          </button>
+          <Tooltip label="settings">
+            <button
+              class="w-[var(--size-md)] h-[var(--size-md)] rounded-lg flex items-center justify-center cursor-pointer opacity-50 hover:opacity-100 mb-1.5"
+            >
+              <Settings size={16} class="text-[var(--neutral-300)]" />
+            </button>
+          </Tooltip>
 
           <Show when={identity()}>
             {(id) => {
               const [copied, setCopied] = createSignal(false);
-              const grad = hashGradient(id().fingerprint);
               const copyFp = () => {
                 navigator.clipboard.writeText(id().fingerprint);
                 setCopied(true);
                 setTimeout(() => setCopied(false), 1200);
               };
               return (
-                <button
-                  class="flex flex-col items-center gap-0.5 cursor-pointer hover:opacity-80"
-                  onClick={copyFp}
-                  title={copied() ? "copied!" : id().fingerprint_short}
-                >
-                  <div
-                    class="avatar-flare w-[var(--size-md)] h-[var(--size-md)] rounded-full flex items-center justify-center text-sm font-semibold"
-                    style={{
-                      background: `linear-gradient(${grad.angle}deg, ${grad.from}, ${grad.to})`,
-                      color: "var(--neutral-100)",
-                    }}
-                    onMouseMove={onFlareMove}
-                    onMouseLeave={onFlareLeave}
+                <Tooltip label={copied() ? "copied!" : id().fingerprint_short}>
+                  <button
+                    class="flex flex-col items-center gap-0.5 cursor-pointer hover:opacity-80"
+                    onClick={copyFp}
                   >
-                    {id().display_name[0]?.toUpperCase()}
-                  </div>
-                  <span class="text-[9px] text-[var(--neutral-500)] truncate max-w-[40px] leading-tight">
-                    {copied() ? "copied" : id().display_name}
-                  </span>
-                </button>
+                    <Avatar
+                      hashKey={id().fingerprint}
+                      label={id().display_name}
+                      class="w-[var(--size-md)] h-[var(--size-md)] text-sm"
+                    />
+                    <span class="text-[9px] text-[var(--neutral-500)] truncate max-w-[40px] leading-tight">
+                      {copied() ? "copied" : id().display_name}
+                    </span>
+                  </button>
+                </Tooltip>
               );
             }}
           </Show>
@@ -348,48 +345,44 @@ function GroupIcon(props: { group: Group; isActive: boolean; onClick: (id: strin
         )}
         style={{ background: "var(--neutral-400)" }}
       />
-      <button
-        class="w-[var(--size-lg)] h-[var(--size-lg)] flex items-center justify-center cursor-pointer"
-        onClick={() => props.onClick(props.group.group_id)}
-        title={props.group.name}
-      >
-        <div
-          class={cn(
-            "avatar-flare relative w-[var(--size-md)] h-[var(--size-md)] rounded-[14%] flex items-center justify-center text-sm font-semibold transition-all duration-200",
-            props.isActive || props.group.has_unread
-              ? "opacity-100 scale-100"
-              : "opacity-60 scale-95 group-hover/gi:opacity-90 group-hover/gi:scale-100",
-          )}
-          style={{
-            background: `linear-gradient(${grad.angle}deg, ${grad.from}, ${grad.to})`,
-            color: "var(--neutral-100)",
-            "box-shadow": props.isActive
-              ? `0 0 10px 2px ${grad.glow}30, 0 0 20px 4px ${grad.glow}12`
-              : `0 0 6px 1px ${grad.glow}18`,
-          }}
-          onMouseMove={onFlareMove}
-          onMouseLeave={onFlareLeave}
+      <Tooltip label={props.group.name}>
+        <button
+          class="w-[var(--size-lg)] h-[var(--size-lg)] flex items-center justify-center cursor-pointer"
+          onClick={() => props.onClick(props.group.group_id)}
         >
-          {props.group.name[0]?.toUpperCase()}
-          {/* Unread dot */}
-          <Show when={!props.isActive && props.group.has_unread}>
-            <div
-              class="absolute -top-0.5 -right-0.5 w-[10px] h-[10px] rounded-full border-2"
-              style={{ background: "var(--neutral-100)", "border-color": "var(--neutral-950)" }}
-            />
-          </Show>
-          {/* Breathing glow on active group */}
-          <Show when={props.isActive}>
-            <div
-              class="absolute inset-0 rounded-[14%] pointer-events-none"
-              style={{
-                "box-shadow": `0 0 6px 1.5px ${grad.glow}35, 0 0 12px 2px ${grad.glow}12`,
-                animation: "breathe 3.5s ease-in-out infinite",
-              }}
-            />
-          </Show>
-        </div>
-      </button>
+          <Avatar
+            hashKey={props.group.group_id}
+            label={props.group.name}
+            square
+            active={props.isActive}
+            class={cn(
+              "relative w-[var(--size-md)] h-[var(--size-md)] text-sm transition-all duration-200",
+              props.isActive || props.group.has_unread
+                ? "opacity-100 scale-100"
+                : "opacity-60 scale-95 group-hover/gi:opacity-90 group-hover/gi:scale-100",
+            )}
+          >
+            {props.group.name[0]?.toUpperCase()}
+            {/* Unread dot */}
+            <Show when={!props.isActive && props.group.has_unread}>
+              <div
+                class="absolute -top-0.5 -right-0.5 w-[10px] h-[10px] rounded-full border-2"
+                style={{ background: "var(--neutral-100)", "border-color": "var(--neutral-950)" }}
+              />
+            </Show>
+            {/* Breathing glow on active group */}
+            <Show when={props.isActive}>
+              <div
+                class="absolute inset-0 rounded-[14%] pointer-events-none"
+                style={{
+                  "box-shadow": `0 0 6px 1.5px ${grad.glow}35, 0 0 12px 2px ${grad.glow}12`,
+                  animation: "breathe 3.5s ease-in-out infinite",
+                }}
+              />
+            </Show>
+          </Avatar>
+        </button>
+      </Tooltip>
     </div>
   );
 }
