@@ -3,7 +3,7 @@ use rusqlite::Connection;
 use crate::crypto::MessageType;
 use crate::error::{GhostError, Result};
 
-const CURRENT_VERSION: u32 = 3;
+const CURRENT_VERSION: u32 = 4;
 
 pub fn initialize(conn: &Connection) -> Result<()> {
     let version = get_version(conn)?;
@@ -132,6 +132,11 @@ fn create_tables(conn: &Connection) -> Result<()> {
             channel_id   BLOB PRIMARY KEY REFERENCES channels(channel_id) ON DELETE CASCADE,
             last_read_ts INTEGER NOT NULL
         );
+
+        CREATE TABLE relay_state (
+            mailbox_id    BLOB PRIMARY KEY,
+            last_seen_seq INTEGER NOT NULL DEFAULT 0
+        );
         "
     ))
     .map_err(|e| GhostError::Database(format!("create tables: {e}")))?;
@@ -160,6 +165,15 @@ fn migrate(conn: &Connection, from_version: u32) -> Result<()> {
                     );"
                 )
                 .map_err(|e| GhostError::Database(format!("migrate v2->v3: {e}")))?;
+            }
+            3 => {
+                conn.execute_batch(
+                    "CREATE TABLE relay_state (
+                        mailbox_id    BLOB PRIMARY KEY,
+                        last_seen_seq INTEGER NOT NULL DEFAULT 0
+                    );"
+                )
+                .map_err(|e| GhostError::Database(format!("migrate v3->v4: {e}")))?;
             }
             _ => {
                 return Err(GhostError::Database(format!(

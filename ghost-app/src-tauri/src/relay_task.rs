@@ -13,15 +13,14 @@ pub async fn run(
     relay: Arc<Mutex<RelayClient>>,
     mut events: mpsc::Receiver<RelayEvent>,
 ) {
-    // Subscribe to all existing group mailboxes
-    let mailboxes = {
-        let c = client.lock().await;
-        c.group_mailboxes()
-    };
+    // Subscribe to all existing group mailboxes with persisted last_seen_seq
     {
+        let c = client.lock().await;
+        let mailboxes = c.group_mailboxes();
         let mut r = relay.lock().await;
         for (_, mailbox_id) in &mailboxes {
-            if let Err(e) = r.subscribe(*mailbox_id, 0).await {
+            let seq = c.store().get_last_seen_seq(mailbox_id).unwrap_or(0);
+            if let Err(e) = r.subscribe(*mailbox_id, seq).await {
                 eprintln!("relay subscribe error: {e}");
             }
         }
@@ -38,9 +37,11 @@ pub async fn run(
             }
         };
         let received_at = blob.received_at;
+        let mailbox_id = blob.mailbox_id;
+        let seq = blob.seq;
         let result = {
             let mut c = client.lock().await;
-            match c.group_id_for_mailbox(&blob.mailbox_id) {
+            match c.group_id_for_mailbox(&mailbox_id) {
                 Some(gid) => Some(c.receive_any(&gid, &blob.payload, Some(received_at))),
                 None => None,
             }
@@ -50,9 +51,16 @@ pub async fn run(
             Some(Ok(Some(msg))) => {
                 let dto = MessageDto::from_incoming(&msg, received_at);
                 let _ = app.emit("message", &dto);
+                let c = client.lock().await;
+                let _ = c.store().set_last_seen_seq(&mailbox_id, seq);
+            }
+            Some(Ok(None)) => {
+                // Commit or self-message — still advance seq
+                let c = client.lock().await;
+                let _ = c.store().set_last_seen_seq(&mailbox_id, seq);
             }
             Some(Err(e)) => eprintln!("relay receive error: {e}"),
-            _ => {}
+            None => {}
         }
     }
 }
