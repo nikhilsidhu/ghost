@@ -1,30 +1,9 @@
 import { createSignal, onMount, onCleanup, Show, For } from "solid-js";
-import { Command, ArrowBigUp, Keyboard } from "lucide-solid";
+import { Keyboard } from "lucide-solid";
 import { findShortcut, type ShortcutDef } from "../lib/shortcuts";
-import type { JSX } from "solid-js";
+import { KeyBadge } from "./KeyBadge";
 
 export type { ShortcutDef };
-
-function Kbd(props: { children: JSX.Element }) {
-  return (
-    <kbd class="inline-flex items-center justify-center min-w-[28px] h-7 px-2 rounded text-sm font-semibold bg-[var(--neutral-700)] text-[var(--neutral-200)] border border-[var(--neutral-600)]">
-      {props.children}
-    </kbd>
-  );
-}
-
-function KeyBadge(props: { value: string }) {
-  switch (props.value) {
-    case "Cmd":
-      return <Kbd><Command size={16} strokeWidth={2.5} /></Kbd>;
-    case "Ctrl":
-      return <Kbd>Ctrl</Kbd>;
-    case "\u21e7":
-      return <Kbd><ArrowBigUp size={16} strokeWidth={2.5} /></Kbd>;
-    default:
-      return <Kbd><span class="text-[15px] font-bold leading-none">{props.value}</span></Kbd>;
-  }
-}
 
 interface Props {
   shortcuts: ShortcutDef[];
@@ -95,7 +74,7 @@ export function ShortcutOverlay(props: Props) {
                   <span class="text-sm text-[var(--neutral-300)]">{s.label}</span>
                   <div class="flex items-center gap-1 flex-shrink-0">
                     <For each={s.keys}>
-                      {(k) => <KeyBadge value={k} />}
+                      {(k) => <KeyBadge value={k} size="lg" />}
                     </For>
                   </div>
                 </div>
@@ -103,7 +82,7 @@ export function ShortcutOverlay(props: Props) {
             </For>
           </div>
           <p class="text-xs text-[var(--neutral-600)] mt-5 text-center">
-            hold <Kbd>?</Kbd> or <span class="text-[var(--purple-400)]">/info</span> to show &middot; <Kbd>Esc</Kbd> to dismiss
+            hold <KeyBadge value="?" size="lg" /> or <span class="text-[var(--purple-400)]">/info</span> to show &middot; <KeyBadge value="Esc" size="lg" /> to dismiss
           </p>
         </div>
       </div>

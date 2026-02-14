@@ -46,6 +46,19 @@
   --violet-900: #10102e;
   --violet-950: #080818;
 
+  /* Ember — secondary accent, warm complement to purple */
+  --ember-50:  #fef3ee;
+  --ember-100: #fcddc8;
+  --ember-200: #f8b898;
+  --ember-300: #e8906a;
+  --ember-400: #d0744c;
+  --ember-500: #b05e38;
+  --ember-600: #8e4a2a;
+  --ember-700: #6c3820;
+  --ember-800: #4c2816;
+  --ember-900: #2e180e;
+  --ember-950: #180c06;
+
   /* Red — danger, crimson matte */
   --red-50: #fff0f0;
   --red-100: #ffd6d8;
@@ -115,6 +128,15 @@
   --hover: #1e1c2e;        /* same as neutral-700, for list item hovers */
   --active: #24163e;       /* same as purple-900, for selected items */
   --accent-hover: #3a2464; /* same as purple-800, for accent button hovers */
+
+  /* Token pill backgrounds */
+  --pill-purple: color-mix(in srgb, var(--purple-400) 15%, transparent);
+  --pill-ember: color-mix(in srgb, var(--ember-500) 15%, transparent);
+
+  /* Palette glass */
+  --palette-overlay: rgba(0, 0, 0, 0.4);
+  --palette-bg: rgba(10, 10, 20, 0.78);
+  --palette-shadow: 0 4px 24px rgba(0, 0, 0, 0.35);
 
   --font-mono: 'Iosevka', 'SF Mono', 'Fira Code', 'JetBrains Mono', monospace;
 

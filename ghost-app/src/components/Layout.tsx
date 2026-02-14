@@ -6,7 +6,7 @@ import {
   listPinnedGroups, markChannelRead,
   createGroup, createChannel as apiCreateChannel,
   renameChannel as apiRenameChannel, deleteChannel as apiDeleteChannel,
-  createInvite, joinByInvite, seedTestData,
+  createInvite, joinByInvite, setDisplayName, seedTestData,
 } from "../lib/api";
 import { Sidebar } from "./Sidebar";
 import { GroupView } from "./GroupView";
@@ -14,6 +14,7 @@ import { MemberPanel } from "./MemberPanel";
 import { CommandPalette, type CommandDef } from "./CommandPalette";
 import { InviteDialog } from "./InviteDialog";
 import { ShortcutOverlay } from "./ShortcutOverlay";
+import { KeyBadge } from "./KeyBadge";
 import { shortcuts as shortcutDefs } from "../lib/shortcuts";
 
 export function Layout() {
@@ -28,6 +29,7 @@ export function Layout() {
   const [inviteLink, setInviteLink] = createSignal<string | null>(null);
   const [showInfo, setShowInfo] = createSignal(false);
   const [desiredChannelKind, setDesiredChannelKind] = createSignal<string>("text");
+  const [allChannels, setAllChannels] = createSignal<Channel[]>([]);
 
   // --- Refresh helpers ---
 
@@ -36,11 +38,20 @@ export function Layout() {
     setGroups(gs);
   };
 
+  const refreshAllChannels = async () => {
+    const gs = groups();
+    if (gs.length === 0) { setAllChannels([]); return; }
+    const results = await Promise.all(gs.map((g) => listChannels(g.group_id)));
+    setAllChannels(results.flat());
+  };
+
   const refreshChannels = async () => {
     const gid = selectedGroupId();
     if (!gid) { setChannels([]); return; }
     const ch = await listChannels(gid);
     setChannels(ch);
+    // Keep allChannels in sync for search
+    setAllChannels((prev) => [...prev.filter((c) => c.group_id !== gid), ...ch]);
   };
 
   const refreshPins = async () => {
@@ -79,6 +90,7 @@ export function Layout() {
     setIdentity(id);
     await refreshGroups();
     await refreshPins();
+    await refreshAllChannels();
 
     // Track unread for messages arriving in non-active channels
     const unlisten = await listen<Message>("message", (event) => {
@@ -113,7 +125,7 @@ export function Layout() {
     const lq = q.toLowerCase();
     return groups()
       .filter((g) => !lq || g.name.toLowerCase().includes(lq))
-      .map((g) => ({ label: g.name, value: g.group_id }));
+      .map((g) => ({ label: g.name, value: g.group_id, iconKey: g.group_id, iconLabel: g.name[0]?.toUpperCase() }));
   };
 
   const channelCompleter = (q: string) => {
@@ -151,6 +163,7 @@ export function Layout() {
           placeholder: "group",
           complete: groupCompleter,
           defaultValue: () => selectedGroupId(),
+          onConfirm: setSelectedGroupId,
         },
         { name: "name", placeholder: "channel name" },
         {
@@ -169,6 +182,7 @@ export function Layout() {
       id: "rename-channel",
       command: "rename channel",
       args: [
+        { name: "group", placeholder: "group", complete: groupCompleter, defaultValue: () => selectedGroupId(), onConfirm: setSelectedGroupId },
         { name: "channel", placeholder: "channel", complete: channelCompleter },
         { name: "name", placeholder: "new name" },
       ],
@@ -178,9 +192,20 @@ export function Layout() {
       },
     },
     {
+      id: "rename-self",
+      command: "rename self",
+      args: [{ name: "name", placeholder: "new display name" }],
+      execute: async (args) => {
+        await setDisplayName(args.name);
+        const id = await getIdentity();
+        setIdentity(id);
+      },
+    },
+    {
       id: "delete-channel",
       command: "delete channel",
       args: [
+        { name: "group", placeholder: "group", complete: groupCompleter, defaultValue: () => selectedGroupId(), onConfirm: setSelectedGroupId },
         { name: "channel", placeholder: "channel", complete: channelCompleter },
       ],
       execute: async (args) => {
@@ -197,6 +222,7 @@ export function Layout() {
           placeholder: "group",
           complete: groupCompleter,
           defaultValue: () => selectedGroupId(),
+          onConfirm: setSelectedGroupId,
         },
       ],
       execute: async (args) => {
@@ -255,11 +281,7 @@ export function Layout() {
                       <div class="flex items-center gap-3">
                         <div class="flex items-center gap-1 w-[76px] justify-end">
                           <For each={s.keys}>
-                            {(k) => (
-                              <kbd class="inline-flex items-center justify-center min-w-[22px] h-[22px] px-1.5 rounded text-[11px] font-medium bg-[var(--neutral-800)] text-[var(--neutral-400)] border border-[var(--neutral-700)]">
-                                {k === "Cmd" ? "\u2318" : k}
-                              </kbd>
-                            )}
+                            {(k) => <KeyBadge value={k} />}
                           </For>
                         </div>
                         <span class="text-xs text-[var(--neutral-500)]">{s.label.toLowerCase()}</span>
@@ -319,9 +341,11 @@ export function Layout() {
       </Show>
       <CommandPalette
         groups={groups()}
+        channels={allChannels()}
         pinnedGroupIds={pinnedGroupIds()}
         commands={commands}
         onSelectGroup={setSelectedGroupId}
+        onSelectChannel={handleSelectChannel}
         openCommandId={openCommandId()}
         onOpenCommandHandled={() => setOpenCommandId(null)}
       />

@@ -1,15 +1,20 @@
 import { createSignal, createEffect, createMemo, For, Show, onMount, onCleanup, batch } from "solid-js";
-import type { Group } from "../lib/types";
+import type { Group, Channel } from "../lib/types";
 import { Dialog as KDialog } from "@kobalte/core/dialog";
+import { X } from "lucide-solid";
 import { cn } from "../lib/cn";
+import { recordUsage, frecencyScore } from "../lib/frecency";
 import { findShortcut } from "../lib/shortcuts";
-import { Pin } from "lucide-solid";
+import { hashGradient } from "../lib/gradients";
+import { KeyBadge } from "./KeyBadge";
 
 // --- Public types for command definitions ---
 
 export interface SelectOption {
   label: string;
   value: string;
+  iconKey?: string;
+  iconLabel?: string;
 }
 
 export interface ArgDef {
@@ -17,6 +22,7 @@ export interface ArgDef {
   placeholder: string;
   complete?: (query: string) => SelectOption[];
   defaultValue?: () => string | null;
+  onConfirm?: (value: string) => void;
 }
 
 export interface CommandDef {
@@ -24,20 +30,23 @@ export interface CommandDef {
   command: string;
   args: ArgDef[];
   execute: (args: Record<string, string>) => void | Promise<void>;
+  shortcut?: string[];
 }
 
 // --- Props ---
 
 interface Props {
   groups: Group[];
+  channels: Channel[];
   pinnedGroupIds: Set<string>;
   commands: CommandDef[];
   onSelectGroup: (id: string) => void;
+  onSelectChannel: (channelId: string) => void;
   openCommandId?: string | null;
   onOpenCommandHandled?: () => void;
 }
 
-// --- Highlight component for command phase ---
+// --- Highlight matching text ---
 
 function CommandHighlight(props: { command: string; query: string }) {
   const parts = createMemo(() => {
@@ -82,21 +91,21 @@ export function CommandPalette(props: Props) {
   const [query, setQuery] = createSignal("");
   const [focusedIndex, setFocusedIndex] = createSignal(0);
 
-  // Args state — resolvedCommand being non-null means we're collecting args
-  const [resolvedCommand, setResolvedCommand] = createSignal<CommandDef | null>(null);
+  // Args state — activeCommand being non-null means we're collecting args
+  const [activeCommand, setActiveCommand] = createSignal<CommandDef | null>(null);
   const [argIndex, setArgIndex] = createSignal(0);
   const [collectedArgs, setCollectedArgs] = createSignal<Record<string, string>>({});
 
   // Mode derived purely from state: args if command resolved, else query prefix
   const mode = createMemo(() => {
-    if (resolvedCommand()) return "args" as const;
+    if (activeCommand()) return "args" as const;
     return query().startsWith("/") ? "command" as const : "search" as const;
   });
 
   const commandQuery = createMemo(() => query().slice(1).toLowerCase().trim());
 
   const currentArg = createMemo(() => {
-    const cmd = resolvedCommand();
+    const cmd = activeCommand();
     if (!cmd || mode() !== "args") return null;
     return cmd.args[argIndex()] ?? null;
   });
@@ -105,7 +114,7 @@ export function CommandPalette(props: Props) {
 
   const resetAll = () => {
     batch(() => {
-      setResolvedCommand(null);
+      setActiveCommand(null);
       setArgIndex(0);
       setCollectedArgs({});
       setQuery("");
@@ -113,9 +122,10 @@ export function CommandPalette(props: Props) {
     });
   };
 
-  const enterArgsPhase = (cmd: CommandDef) => {
+  const activateCommand = (cmd: CommandDef) => {
     if (cmd.args.length === 0) {
       setOpen(false);
+      recordUsage(cmd.id);
       cmd.execute({});
       return;
     }
@@ -129,17 +139,19 @@ export function CommandPalette(props: Props) {
       if (!val || !arg.complete) break;
       if (!arg.complete("").some((c) => c.value === val)) break;
       autoArgs[arg.name] = val;
+      arg.onConfirm?.(val);
       idx++;
     }
 
     if (idx >= cmd.args.length) {
       setOpen(false);
+      recordUsage(cmd.id);
       cmd.execute(autoArgs);
       return;
     }
 
     batch(() => {
-      setResolvedCommand(cmd);
+      setActiveCommand(cmd);
       setArgIndex(idx);
       setCollectedArgs(autoArgs);
       setFocusedIndex(0);
@@ -175,18 +187,23 @@ export function CommandPalette(props: Props) {
     const cmd = props.commands.find((c) => c.id === cmdId);
     if (cmd) {
       setOpen(true);
-      enterArgsPhase(cmd);
+      activateCommand(cmd);
     }
     props.onOpenCommandHandled?.();
   });
 
   // --- Filtered lists ---
 
-  const filteredGroups = createMemo(() => {
+  type SearchItem =
+    | { kind: "group"; group: Group }
+    | { kind: "channel"; channel: Channel; groupName: string };
+
+  const searchResults = createMemo((): SearchItem[] => {
     const q = query().toLowerCase().trim();
-    let list = props.groups;
+    // Groups
+    let gList = props.groups;
     if (q) {
-      list = list
+      gList = gList
         .filter((g) => g.name.toLowerCase().includes(q))
         .sort((a, b) => {
           const aExact = a.name.toLowerCase() === q ? 0 : 1;
@@ -197,20 +214,34 @@ export function CommandPalette(props: Props) {
           return aStarts - bStarts;
         });
     }
-    const pinned = list.filter((g) => props.pinnedGroupIds.has(g.group_id));
-    const rest = list.filter((g) => !props.pinnedGroupIds.has(g.group_id));
-    return [...pinned, ...rest];
+    const pinned = gList.filter((g) => props.pinnedGroupIds.has(g.group_id));
+    const rest = gList.filter((g) => !props.pinnedGroupIds.has(g.group_id));
+    const groups: SearchItem[] = [...pinned, ...rest].map((g) => ({ kind: "group", group: g }));
+
+    // Channels (only when query is non-empty to avoid clutter)
+    if (!q) return groups;
+    const groupMap = new Map(props.groups.map((g) => [g.group_id, g.name]));
+    const chList = props.channels
+      .filter((ch) => ch.name.toLowerCase().includes(q))
+      .map((ch): SearchItem => ({
+        kind: "channel",
+        channel: ch,
+        groupName: groupMap.get(ch.group_id) ?? "",
+      }));
+
+    return [...groups, ...chList];
   });
 
   const filteredCommands = createMemo(() => {
     const q = commandQuery();
-    if (!q) return props.commands;
+    if (!q) return [...props.commands].sort((a, b) => frecencyScore(b.id) - frecencyScore(a.id));
     return props.commands
       .filter((c) => c.command.toLowerCase().includes(q))
       .sort((a, b) => {
         const aStarts = a.command.toLowerCase().startsWith(q) ? 0 : 1;
         const bStarts = b.command.toLowerCase().startsWith(q) ? 0 : 1;
-        return aStarts - bStarts;
+        if (aStarts !== bStarts) return aStarts - bStarts;
+        return frecencyScore(b.id) - frecencyScore(a.id);
       });
   });
 
@@ -221,9 +252,9 @@ export function CommandPalette(props: Props) {
   });
 
   const itemCount = createMemo(() => {
-    const ep = mode();
-    if (ep === "search") return filteredGroups().length;
-    if (ep === "command") return filteredCommands().length;
+    const m = mode();
+    if (m === "search") return searchResults().length;
+    if (m === "command") return filteredCommands().length;
     return argCompletions().length;
   });
 
@@ -261,12 +292,8 @@ export function CommandPalette(props: Props) {
     setOpen(false);
   };
 
-  const resolveCommand = (cmd: CommandDef) => {
-    enterArgsPhase(cmd);
-  };
-
   const confirmArg = (value: string) => {
-    const cmd = resolvedCommand();
+    const cmd = activeCommand();
     if (!cmd) return;
     const arg = currentArg();
     if (!arg) return;
@@ -274,6 +301,7 @@ export function CommandPalette(props: Props) {
     const trimmed = value.trim();
     if (!trimmed) return;
 
+    arg.onConfirm?.(trimmed);
     const next = argIndex() + 1;
     const newArgs = { ...collectedArgs(), [arg.name]: trimmed };
 
@@ -281,6 +309,7 @@ export function CommandPalette(props: Props) {
       // All args collected — reset state then execute
       resetAll();
       setOpen(false);
+      recordUsage(cmd.id);
       cmd.execute(newArgs);
       return;
     }
@@ -299,23 +328,23 @@ export function CommandPalette(props: Props) {
   // --- Key handling ---
 
   const handleKeyDown = (e: KeyboardEvent) => {
-    const ep = mode();
+    const m = mode();
 
     // Tab autocomplete
     if (e.key === "Tab") {
       e.preventDefault();
-      if (ep === "command") {
+      if (m === "command") {
         const cmds = filteredCommands();
         if (cmds.length === 0) return;
         if (cmds.length === 1) {
-          resolveCommand(cmds[0]);
+          activateCommand(cmds[0]);
           return;
         }
         const prefix = longestCommonPrefix(cmds.map((c) => c.command));
         if (prefix.length > commandQuery().length) {
           setQuery("/" + prefix);
         }
-      } else if (ep === "args") {
+      } else if (m === "args") {
         const completions = argCompletions();
         if (completions.length === 0) return;
         if (completions.length === 1) {
@@ -331,19 +360,19 @@ export function CommandPalette(props: Props) {
     }
 
     // Backspace on empty in args phase — go back
-    if (e.key === "Backspace" && query() === "" && ep === "args") {
+    if (e.key === "Backspace" && query() === "" && m=== "args") {
       e.preventDefault();
       const idx = argIndex();
       if (idx === 0) {
         // Back to command phase
         batch(() => {
-          setResolvedCommand(null);
-          setQuery("/" + (resolvedCommand()?.command ?? ""));
+          setActiveCommand(null);
+          setQuery("/" + (activeCommand()?.command ?? ""));
           setFocusedIndex(0);
         });
       } else {
         // Back to previous arg
-        const cmd = resolvedCommand()!;
+        const cmd = activeCommand()!;
         const prevArg = cmd.args[idx - 1];
         const prevVal = collectedArgs()[prevArg.name] ?? "";
         batch(() => {
@@ -351,7 +380,8 @@ export function CommandPalette(props: Props) {
           delete newArgs[prevArg.name];
           setCollectedArgs(newArgs);
           setArgIndex(idx - 1);
-          setQuery(prevVal);
+          // Completer args use IDs — show empty to re-select; free text keeps the value
+          setQuery(prevArg.complete ? "" : prevVal);
           setFocusedIndex(0);
         });
       }
@@ -366,13 +396,15 @@ export function CommandPalette(props: Props) {
     } else if (e.key === "ArrowUp") {
       e.preventDefault();
       setFocusedIndex((i) => Math.max(i - 1, 0));
-    } else if (e.key === "Enter" && (count > 0 || ep === "args")) {
+    } else if (e.key === "Enter" && (count > 0 || m=== "args")) {
       e.preventDefault();
-      if (ep === "search" && count > 0) {
-        selectGroup(filteredGroups()[focusedIndex()].group_id);
-      } else if (ep === "command" && count > 0) {
-        resolveCommand(filteredCommands()[focusedIndex()]);
-      } else if (ep === "args") {
+      if (m === "search" && count > 0) {
+        const item = searchResults()[focusedIndex()];
+        if (item.kind === "group") selectGroup(item.group.group_id);
+        else { props.onSelectGroup(item.channel.group_id); props.onSelectChannel(item.channel.channel_id); setOpen(false); }
+      } else if (m === "command" && count > 0) {
+        activateCommand(filteredCommands()[focusedIndex()]);
+      } else if (m === "args") {
         const completions = argCompletions();
         if (completions.length > 0 && focusedIndex() < completions.length) {
           confirmArg(completions[focusedIndex()].value);
@@ -394,13 +426,13 @@ export function CommandPalette(props: Props) {
   // --- Placeholder text ---
 
   const placeholder = createMemo(() => {
-    const ep = mode();
-    if (ep === "args") {
+    const m = mode();
+    if (m === "args") {
       const arg = currentArg();
       return arg?.placeholder ?? "...";
     }
-    if (ep === "command") return "/command...";
-    return "search groups...";
+    if (m === "command") return "/command...";
+    return "search...";
   });
 
   // --- Render ---
@@ -411,39 +443,93 @@ export function CommandPalette(props: Props) {
         <KDialog.Overlay
           data-palette-overlay
           class="fixed inset-0 z-50"
-          style={{ background: "rgba(0, 0, 0, 0.25)", animation: "overlay-fade 180ms ease-out" }}
+          style={{ background: "var(--palette-overlay)", animation: "overlay-fade 180ms ease-out" }}
         />
-        <div class="fixed inset-0 z-50 flex items-end justify-center pb-6">
+        <div class="fixed inset-0 z-50 flex items-center justify-center">
           <KDialog.Content
             data-palette-content
-            class="w-full max-w-sm rounded-xl overflow-hidden"
+            class="w-full max-w-[40rem] rounded-xl overflow-hidden"
+            style:max-width="calc(100vw - 3rem)"
             style={{
-              background: "rgba(10, 10, 20, 0.82)",
-              "backdrop-filter": "blur(24px)",
-              "-webkit-backdrop-filter": "blur(24px)",
+              background: "var(--palette-bg)",
+              "backdrop-filter": "blur(16px) saturate(180%)",
+              "-webkit-backdrop-filter": "blur(16px) saturate(180%)",
               border: "1px solid var(--neutral-700)",
-              "box-shadow": "0 -4px 24px rgba(0, 0, 0, 0.35)",
+              "box-shadow": "var(--palette-shadow)",
               animation: "palette-in 180ms ease-out",
             }}
           >
-            {/* Breadcrumbs */}
-            <Show when={mode() === "args" && resolvedCommand()}>
-              <div class="px-3 pt-3 pb-0 flex items-center gap-1 flex-wrap">
-                <span class="text-xs text-[var(--purple-300)]">/{resolvedCommand()!.command}</span>
-                <For each={Object.entries(collectedArgs())}>
-                  {([, val]) => (
-                    <>
-                      <span class="text-xs text-[var(--neutral-600)]">&rsaquo;</span>
-                      <span class="text-xs text-[var(--neutral-400)]">{val}</span>
-                    </>
-                  )}
+            {/* Input with inline token pills */}
+            <div class="p-3 flex items-center gap-1.5 flex-wrap">
+              <Show when={mode() === "args" && activeCommand()}>
+                <For each={activeCommand()!.command.split(" ")}>
+                  {(word, wordIdx) => {
+                    const words = () => activeCommand()!.command.split(" ");
+                    return (
+                      <span
+                        class="group/pill inline-flex items-center h-6 rounded-md text-xs font-medium text-[var(--purple-300)] flex-shrink-0 cursor-pointer transition-all duration-150"
+                        style={{ background: "var(--pill-purple)" }}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          // X on word i → back to command mode with words before i as prefix
+                          const prefix = words().slice(0, wordIdx()).join(" ");
+                          batch(() => {
+                            setActiveCommand(null);
+                            setCollectedArgs({});
+                            setArgIndex(0);
+                            setQuery("/" + prefix);
+                            setFocusedIndex(0);
+                          });
+                          inputRef?.focus();
+                        }}
+                      >
+                        <span class="px-2">{wordIdx() === 0 ? `/${word}` : word}</span>
+                        <span class="w-0 overflow-hidden group-hover/pill:w-5 transition-all duration-150 flex items-center justify-center">
+                          <X size={12} strokeWidth={2.5} class="text-[var(--purple-400)]" />
+                        </span>
+                      </span>
+                    );
+                  }}
                 </For>
-                <span class="text-xs text-[var(--neutral-600)]">&rsaquo;</span>
-              </div>
-            </Show>
-
-            {/* Input — borderless, blends with palette bg */}
-            <div class={cn("p-3", mode() === "args" ? "pt-1.5" : "")}>
+                <For each={Object.entries(collectedArgs())}>
+                  {([name, val]) => {
+                    const arg = activeCommand()!.args.find((a) => a.name === name);
+                    const label = arg?.complete?.("").find((c) => c.value === val)?.label ?? val;
+                    const argIdx = activeCommand()!.args.findIndex((a) => a.name === name);
+                    return (
+                      <span
+                        class="group/pill inline-flex items-center h-6 rounded-md text-xs flex-shrink-0 cursor-pointer transition-all duration-150"
+                        style={{ background: "var(--pill-ember)" }}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          // Remove this arg and all after it
+                          const cmd = activeCommand()!;
+                          const newArgs: Record<string, string> = {};
+                          for (let j = 0; j < argIdx; j++) {
+                            const n = cmd.args[j].name;
+                            if (collectedArgs()[n] !== undefined) newArgs[n] = collectedArgs()[n];
+                          }
+                          batch(() => {
+                            setCollectedArgs(newArgs);
+                            setArgIndex(argIdx);
+                            setQuery("");
+                            setFocusedIndex(0);
+                          });
+                          inputRef?.focus();
+                        }}
+                      >
+                        <span class="inline-flex items-center gap-1 px-2">
+                          <span class="text-[var(--ember-500)]">{name}:</span>
+                          <span class="font-medium text-[var(--ember-300)]">{label}</span>
+                        </span>
+                        <span class="w-0 overflow-hidden group-hover/pill:w-5 transition-all duration-150 flex items-center justify-center">
+                          <X size={12} strokeWidth={2.5} class="text-[var(--ember-400)]" />
+                        </span>
+                      </span>
+                    );
+                  }}
+                </For>
+              </Show>
               <input
                 ref={inputRef}
                 placeholder={placeholder()}
@@ -454,37 +540,62 @@ export function CommandPalette(props: Props) {
                 autocorrect="off"
                 autocapitalize="off"
                 spellcheck={false}
-                class="h-8 w-full bg-transparent text-sm text-[var(--neutral-100)] placeholder:text-[var(--neutral-500)] outline-none"
+                class="h-8 flex-1 min-w-[80px] bg-transparent text-sm text-[var(--neutral-100)] placeholder:text-[var(--neutral-500)] outline-none"
               />
             </div>
-            <div class="divider-h" />
 
             {/* Results list */}
             <div ref={listRef} class="max-h-64 overflow-y-auto py-1">
-              {/* Search mode: groups */}
+              {/* Search mode: groups + channels */}
               <Show when={mode() === "search"}>
                 <Show
-                  when={filteredGroups().length > 0}
-                  fallback={<div class="px-3 py-4 text-xs text-[var(--neutral-500)] text-center">no groups found</div>}
+                  when={searchResults().length > 0}
+                  fallback={<div class="px-3 py-4 text-xs text-[var(--neutral-500)] text-center">no results</div>}
                 >
-                  <For each={filteredGroups()}>
-                    {(group, idx) => (
-                      <button
-                        onClick={() => selectGroup(group.group_id)}
-                        onMouseEnter={() => setFocusedIndex(idx())}
-                        class={cn(
-                          "w-full text-left px-3 py-2 text-sm flex items-center gap-2 cursor-pointer transition-colors",
-                          idx() === focusedIndex()
-                            ? "bg-[var(--active)] text-[var(--neutral-100)]"
-                            : "text-[var(--neutral-400)] hover:bg-[var(--hover)]",
-                        )}
-                      >
-                        <Show when={props.pinnedGroupIds.has(group.group_id)}>
-                          <Pin size={12} class="text-[var(--purple-400)] flex-shrink-0" />
-                        </Show>
-                        <span class="truncate">{group.name}</span>
-                      </button>
-                    )}
+                  <For each={searchResults()}>
+                    {(item, idx) => {
+                      const focused = () => idx() === focusedIndex();
+                      const rowClass = () => cn(
+                        "w-full text-left px-3 py-2 text-sm flex items-center gap-2 cursor-pointer transition-colors",
+                        focused()
+                          ? "bg-[var(--active)] text-[var(--neutral-100)]"
+                          : "text-[var(--neutral-400)] hover:bg-[var(--hover)]",
+                      );
+                      if (item.kind === "group") {
+                        const grad = hashGradient(item.group.group_id);
+                        return (
+                          <button
+                            onClick={() => selectGroup(item.group.group_id)}
+                            onMouseEnter={() => setFocusedIndex(idx())}
+                            class={rowClass()}
+                          >
+                            <div
+                              class="w-4 h-4 rounded-[3px] flex items-center justify-center text-[9px] font-bold flex-shrink-0"
+                              style={{ background: `linear-gradient(${grad.angle}deg, ${grad.from}, ${grad.to})`, color: "var(--neutral-100)" }}
+                            >
+                              {item.group.name[0]?.toUpperCase()}
+                            </div>
+                            <span class="truncate">{item.group.name}</span>
+                          </button>
+                        );
+                      }
+                      return (
+                        <button
+                          onClick={() => { props.onSelectGroup(item.channel.group_id); props.onSelectChannel(item.channel.channel_id); setOpen(false); }}
+                          onMouseEnter={() => setFocusedIndex(idx())}
+                          class={rowClass()}
+                        >
+                          <span class="text-[var(--neutral-500)] flex-shrink-0">{item.channel.kind === "text" ? "#" : "\u266a"}</span>
+                          <span class="truncate">{item.channel.name}</span>
+                          <span
+                            class="ml-auto text-[10px] px-1.5 py-0.5 rounded text-[var(--neutral-500)] flex-shrink-0"
+                            style={{ background: "var(--neutral-800)" }}
+                          >
+                            {item.groupName}
+                          </span>
+                        </button>
+                      );
+                    }}
                   </For>
                 </Show>
               </Show>
@@ -498,7 +609,7 @@ export function CommandPalette(props: Props) {
                   <For each={filteredCommands()}>
                     {(cmd, idx) => (
                       <button
-                        onClick={() => resolveCommand(cmd)}
+                        onClick={() => activateCommand(cmd)}
                         onMouseEnter={() => setFocusedIndex(idx())}
                         class={cn(
                           "w-full text-left px-3 py-2 text-sm flex items-center cursor-pointer transition-colors",
@@ -508,6 +619,13 @@ export function CommandPalette(props: Props) {
                         )}
                       >
                         <CommandHighlight command={cmd.command} query={commandQuery()} />
+                        <Show when={cmd.shortcut}>
+                          <div class="ml-auto flex items-center gap-0.5 pl-3">
+                            <For each={cmd.shortcut!}>
+                              {(k) => <KeyBadge value={k} size="sm" />}
+                            </For>
+                          </div>
+                        </Show>
                       </button>
                     )}
                   </For>
@@ -518,20 +636,33 @@ export function CommandPalette(props: Props) {
               <Show when={mode() === "args"}>
                 <Show when={argCompletions().length > 0}>
                   <For each={argCompletions()}>
-                    {(opt, idx) => (
-                      <button
-                        onClick={() => confirmArg(opt.value)}
-                        onMouseEnter={() => setFocusedIndex(idx())}
-                        class={cn(
-                          "w-full text-left px-3 py-2 text-sm flex items-center cursor-pointer transition-colors",
-                          idx() === focusedIndex()
-                            ? "bg-[var(--active)] text-[var(--neutral-100)]"
-                            : "text-[var(--neutral-400)] hover:bg-[var(--hover)]",
-                        )}
-                      >
-                        <span class="truncate">{opt.label}</span>
-                      </button>
-                    )}
+                    {(opt, idx) => {
+                      const grad = opt.iconKey ? hashGradient(opt.iconKey) : null;
+                      return (
+                        <button
+                          onClick={() => confirmArg(opt.value)}
+                          onMouseEnter={() => setFocusedIndex(idx())}
+                          class={cn(
+                            "w-full text-left px-3 py-2 text-sm flex items-center gap-2 cursor-pointer transition-colors",
+                            idx() === focusedIndex()
+                              ? "bg-[var(--active)] text-[var(--neutral-100)]"
+                              : "text-[var(--neutral-400)] hover:bg-[var(--hover)]",
+                          )}
+                        >
+                          <Show when={grad}>
+                            {(g) => (
+                              <div
+                                class="w-4 h-4 rounded-[3px] flex items-center justify-center text-[9px] font-bold flex-shrink-0"
+                                style={{ background: `linear-gradient(${g().angle}deg, ${g().from}, ${g().to})`, color: "var(--neutral-100)" }}
+                              >
+                                {opt.iconLabel}
+                              </div>
+                            )}
+                          </Show>
+                          <span class="truncate">{opt.label}</span>
+                        </button>
+                      );
+                    }}
                   </For>
                 </Show>
               </Show>
