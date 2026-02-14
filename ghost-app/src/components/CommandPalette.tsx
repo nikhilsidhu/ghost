@@ -58,6 +58,7 @@ export function CommandPalette() {
   const [activeCommand, setActiveCommand] = createSignal<CommandDef | null>(null);
   const [argIndex, setArgIndex] = createSignal(0);
   const [collectedArgs, setCollectedArgs] = createSignal<Record<string, string>>({});
+  const [cmdWordCount, setCmdWordCount] = createSignal(0);
 
   // Dangerous command confirmation — holds args pending user confirm
   const [pendingExec, setPendingExec] = createSignal<{ cmd: CommandDef; args: Record<string, string> } | null>(null);
@@ -103,6 +104,7 @@ export function CommandPalette() {
       setActiveCommand(null);
       setArgIndex(0);
       setCollectedArgs({});
+      setCmdWordCount(0);
       setQuery("");
       setFocusedIndex(0);
       setPendingExec(null);
@@ -136,6 +138,7 @@ export function CommandPalette() {
 
     batch(() => {
       setActiveCommand(cmd);
+      setCmdWordCount(cmd.command.split(" ").length);
       setArgIndex(idx);
       setCollectedArgs(autoArgs);
       setFocusedIndex(0);
@@ -323,13 +326,19 @@ export function CommandPalette() {
       e.preventDefault();
       const idx = argIndex();
       if (idx === 0) {
-        // Back to command phase — capture name before clearing
-        const cmdName = activeCommand()?.command ?? "";
-        batch(() => {
-          setActiveCommand(null);
-          setQuery("/" + cmdName);
-          setFocusedIndex(0);
-        });
+        const wc = cmdWordCount();
+        if (wc <= 1) {
+          // Last command word pill — exit to command list
+          batch(() => {
+            setActiveCommand(null);
+            setCollectedArgs({});
+            setCmdWordCount(0);
+            setQuery("/");
+            setFocusedIndex(0);
+          });
+        } else {
+          setCmdWordCount(wc - 1);
+        }
       } else {
         // Back to previous arg
         const cmd = activeCommand()!;
@@ -404,17 +413,14 @@ export function CommandPalette() {
           class="fixed inset-0 z-50"
           style={{ background: "var(--palette-overlay)", animation: "overlay-fade 180ms ease-out" }}
         />
-        <div class="fixed inset-0 z-50 flex items-center justify-center">
+        <div class="fixed inset-0 z-50 flex items-start justify-center pt-[18vh]">
           <KDialog.Content
             data-palette-content
-            class="w-full max-w-[40rem] rounded-xl overflow-hidden"
+            class="relative w-full max-w-[40rem] rounded-xl overflow-hidden"
             onKeyDown={handleKeyDown}
             style:max-width="calc(100vw - 3rem)"
             style={{
-              background: "var(--palette-bg)",
-              "backdrop-filter": "blur(16px) saturate(180%)",
-              "-webkit-backdrop-filter": "blur(16px) saturate(180%)",
-              border: "1px solid var(--neutral-700)",
+              background: "radial-gradient(ellipse at 50% 0%, rgba(255,255,255,0.03), transparent 60%), var(--palette-bg)",
               "box-shadow": "var(--palette-shadow)",
               animation: "palette-in 180ms ease-out",
             }}
@@ -423,25 +429,29 @@ export function CommandPalette() {
             <div class="p-3 flex items-center gap-1.5 flex-wrap">
               <Show when={(mode() === "args" || mode() === "confirm") && activeCommand()}>
                 {(() => {
-                  const words = () => activeCommand()!.command.split(" ");
+                  const words = () => activeCommand()!.command.split(" ").slice(0, cmdWordCount());
                   return (
                     <>
                       <For each={words()}>
                         {(word, wordIdx) => (
                           <span
-                            class="group/pill inline-flex items-center h-6 rounded-md text-xs font-medium text-[var(--purple-300)] flex-shrink-0 cursor-pointer transition-all duration-150"
+                            class="group/pill inline-flex items-center h-7 rounded-md text-xs font-medium text-[var(--purple-300)] flex-shrink-0 cursor-pointer transition-all duration-150"
                             style={{ background: "var(--pill-purple)" }}
                             onClick={(e) => {
                               e.stopPropagation();
-                              const prefix = words().slice(0, wordIdx()).join(" ");
-                              batch(() => {
-                                setPendingExec(null);
-                                setActiveCommand(null);
-                                setCollectedArgs({});
-                                setArgIndex(0);
-                                setQuery("/" + prefix);
-                                setFocusedIndex(0);
-                              });
+                              if (wordIdx() === 0) {
+                                batch(() => {
+                                  setPendingExec(null);
+                                  setActiveCommand(null);
+                                  setCollectedArgs({});
+                                  setCmdWordCount(0);
+                                  setArgIndex(0);
+                                  setQuery("/");
+                                  setFocusedIndex(0);
+                                });
+                              } else {
+                                setCmdWordCount(wordIdx());
+                              }
                               inputRef?.focus();
                             }}
                           >
@@ -459,7 +469,7 @@ export function CommandPalette() {
                           const label = () => arg.complete?.("", args()).find((c) => c.value === val())?.label ?? val();
                           return (
                             <span
-                              class="group/pill inline-flex items-center h-6 rounded-md text-xs flex-shrink-0 cursor-pointer transition-all duration-150"
+                              class="group/pill inline-flex items-center h-7 rounded-md text-xs flex-shrink-0 cursor-pointer transition-all duration-150"
                               style={{ background: "var(--pill-ember)" }}
                               onClick={(e) => {
                                 e.stopPropagation();
@@ -496,7 +506,7 @@ export function CommandPalette() {
               <Show
                 when={mode() !== "confirm"}
                 fallback={
-                  <span class="h-8 flex items-center text-sm text-[var(--red-400)]">
+                  <span class="h-7 flex items-center text-sm text-[var(--red-400)]">
                     press <KeyBadge value="Enter" size="sm" /> to confirm or <KeyBadge value="Esc" size="sm" /> to cancel
                   </span>
                 }
@@ -510,13 +520,14 @@ export function CommandPalette() {
                   autocorrect="off"
                   autocapitalize="off"
                   spellcheck={false}
-                  class="h-8 flex-1 min-w-[80px] bg-transparent text-sm text-[var(--neutral-100)] placeholder:text-[var(--neutral-500)] outline-none"
+                  class="h-7 flex-1 min-w-[80px] bg-transparent text-sm text-[var(--neutral-100)] placeholder:text-[var(--neutral-500)] outline-none"
                 />
               </Show>
             </div>
 
             {/* Results list */}
-            <div ref={listRef} class="max-h-64 overflow-y-auto py-1">
+            <Show when={itemCount() > 0}>
+            <div ref={listRef} class="scrollarea max-h-64 overflow-y-auto py-1">
               {/* Search mode */}
               <Show when={mode() === "search"}>
                 <Show
@@ -635,6 +646,7 @@ export function CommandPalette() {
                 </Show>
               </Show>
             </div>
+            </Show>
           </KDialog.Content>
         </div>
       </KDialog.Portal>

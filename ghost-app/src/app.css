@@ -134,9 +134,15 @@
   --pill-ember: color-mix(in srgb, var(--ember-500) 15%, transparent);
 
   /* Palette glass */
-  --palette-overlay: rgba(0, 0, 0, 0.4);
-  --palette-bg: rgba(10, 10, 20, 0.78);
-  --palette-shadow: 0 4px 24px rgba(0, 0, 0, 0.35);
+  --palette-overlay: rgba(0, 0, 0, 0.3);
+  --palette-bg: rgba(20, 19, 32, 0.92);
+  --palette-border: rgba(255, 255, 255, 0.06);
+  --palette-glow: rgba(124, 82, 214, 0.12);
+  --palette-shadow:
+    0 0 0 1px var(--palette-border),
+    0 4px 24px rgba(0, 0, 0, 0.5),
+    0 0 80px -16px var(--palette-glow),
+    inset 0 1px 0 rgba(255, 255, 255, 0.06);
 
   --font-mono: 'Iosevka', 'SF Mono', 'Fira Code', 'JetBrains Mono', monospace;
 
@@ -173,33 +179,61 @@ input, textarea {
   user-select: text;
 }
 
-/* Scrollbar — thin, inset from edges */
-::-webkit-scrollbar {
-  width: 4px;
-  height: 4px;
+/* Scrollbar — auto-hide, inset thumb via transparent border trick */
+.scrollarea::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
 }
-::-webkit-scrollbar-track {
+.scrollarea::-webkit-scrollbar-track {
   background: transparent;
   margin-block: 4px;
 }
-::-webkit-scrollbar-thumb {
-  background: var(--neutral-700);
-  border-radius: 2px;
+.scrollarea::-webkit-scrollbar-thumb {
+  background: transparent;
+  background-clip: padding-box;
+  border: 3px solid transparent;
+  border-radius: 5px;
 }
-::-webkit-scrollbar-thumb:hover {
-  background: var(--neutral-600);
+.scrollarea:hover::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.12);
+  background-clip: padding-box;
+  border: 3px solid transparent;
+}
+.scrollarea:hover::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.25);
+  background-clip: padding-box;
+  border: 3px solid transparent;
+}
+.scrollarea:hover::-webkit-scrollbar-thumb:active {
+  background: rgba(255, 255, 255, 0.35);
+  background-clip: padding-box;
+  border: 3px solid transparent;
+}
+.scrollarea.is-scrolling::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.12);
+  background-clip: padding-box;
+  border: 3px solid transparent;
+}
+.scrollarea::-webkit-scrollbar-corner {
+  background: transparent;
 }
 
-/* Tapered dividers */
+/* Tooltip fade-in */
+@keyframes tooltip-in {
+  from { opacity: 0; transform: scale(0.96); }
+  to { opacity: 1; transform: scale(1); }
+}
+
+/* Tapered dividers — fixed px fades so they clear titlebar at any window size */
 .divider-v {
   width: 1px;
   flex-shrink: 0;
-  background: linear-gradient(to bottom, transparent, var(--neutral-700) 20%, var(--neutral-700) 80%, transparent);
+  background: linear-gradient(to bottom, transparent 36px, var(--neutral-700) 56px, var(--neutral-700) calc(100% - 24px), transparent);
 }
 .divider-h {
   height: 1px;
   flex-shrink: 0;
-  background: linear-gradient(to right, transparent, var(--neutral-700) 15%, var(--neutral-700) 85%, transparent);
+  background: linear-gradient(to right, transparent 12px, var(--neutral-700) 40px, var(--neutral-700) calc(100% - 40px), transparent calc(100% - 12px));
 }
 
 /* New message slide-in */
@@ -221,16 +255,54 @@ input, textarea {
   to { opacity: 1; }
 }
 
+/* Palette glass: gradient border highlight */
+[data-palette-content]::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  padding: 1px;
+  background: linear-gradient(135deg, rgba(166, 128, 255, 0.12), rgba(255, 255, 255, 0.03) 40%, transparent 60%);
+  -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  pointer-events: none;
+  z-index: 1;
+}
+
+/* Palette glass: noise texture */
+[data-palette-content]::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.75' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  opacity: 0.05;
+  mix-blend-mode: soft-light;
+  pointer-events: none;
+  z-index: 1;
+}
+
 /* Active group pulsing glow */
 @keyframes breathe {
   0%, 100% { opacity: 0.35; }
   50% { opacity: 1; }
 }
 
-/* Avatar highlight — radial spot follows the mouse cursor */
+/* Avatar highlight — radial spot follows the mouse cursor + ambient glow */
 .avatar-flare {
   position: relative;
   overflow: hidden;
+  box-shadow: 0 0 6px 1px color-mix(in srgb, var(--glow-color, transparent) 9%, transparent);
+  transition: box-shadow 200ms ease-out;
+}
+.avatar-flare:hover {
+  box-shadow: 0 0 10px 2px color-mix(in srgb, var(--glow-color, transparent) 19%, transparent),
+              0 0 20px 4px color-mix(in srgb, var(--glow-color, transparent) 7%, transparent);
+}
+.avatar-flare.glow-active {
+  box-shadow: 0 0 10px 2px color-mix(in srgb, var(--glow-color, transparent) 19%, transparent),
+              0 0 20px 4px color-mix(in srgb, var(--glow-color, transparent) 7%, transparent);
 }
 .avatar-flare::after {
   content: '';
@@ -253,6 +325,8 @@ input, textarea {
   [data-palette-content],
   [data-palette-overlay],
   .group-glow { animation: none; }
+  [data-palette-content]::before,
+  [data-palette-content]::after { display: none; }
   .avatar-flare::after {
     transition: none;
     /* Static centered highlight on hover instead of mouse tracking */
