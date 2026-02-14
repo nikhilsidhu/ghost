@@ -44,6 +44,20 @@ async fn ws_connection(socket: WebSocket, mailbox_id: [u8; 32], state: AppState)
         _ => return,
     };
 
+    // Detect gap: client asked for entries that have already been swept
+    if last_seen > 0 {
+        let has_gap = match state.storage.min_seq(&mailbox_id) {
+            Ok(Some(min)) => last_seen + 1 < min,
+            Ok(None) => true,
+            Err(_) => false,
+        };
+        if has_gap {
+            if sink.send(Message::text("gap")).await.is_err() {
+                return;
+            }
+        }
+    }
+
     // Replay missed entries
     loop {
         let entries = match state.storage.read_from(&mailbox_id, last_seen, WS_MAX_FANOUT_BATCH) {

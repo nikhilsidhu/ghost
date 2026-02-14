@@ -14,13 +14,17 @@ use ghost_relay::storage::Storage;
 use ghost_relay::{routes, state, udp};
 
 async fn start_server(config: Config) -> String {
+    start_server_with_state(config).await.0
+}
+
+async fn start_server_with_state(config: Config) -> (String, state::AppState) {
     let storage = Storage::open_in_memory().unwrap();
     let st = state::new_state(config, storage);
-    let app = routes::router(st);
+    let app = routes::router(st.clone());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    format!("http://127.0.0.1:{port}")
+    (format!("http://127.0.0.1:{port}"), st)
 }
 
 /// Starts relay with UDP voice loop. Returns (http_base_url, udp_port).
@@ -687,4 +691,66 @@ async fn group_info_overwrite() {
         .await
         .unwrap();
     assert_eq!(resp.bytes().await.unwrap().as_ref(), b"v2");
+}
+
+// --- Gap detection tests ---
+
+#[tokio::test]
+async fn ws_gap_indicator() {
+    let (base, st) = start_server_with_state(test_config()).await;
+    let client = reqwest::Client::new();
+    let mailbox_id = [0xAB; 32];
+    let url = mailbox_url(&base, &mailbox_id);
+    let ws_base = base.replace("http://", "ws://");
+    let mailbox_b64 = URL_SAFE_NO_PAD.encode(mailbox_id);
+    let ws_url = format!("{ws_base}/ws/{mailbox_b64}");
+
+    // Post blobs, then sweep them to simulate TTL expiry
+    for i in 0..3u8 {
+        client.post(&url).body(test_envelope(&[i])).send().await.unwrap();
+    }
+    st.storage.sweep_expired(i64::MAX as u64).unwrap();
+
+    // Connect with last_seen=1 — blobs are gone, should get "gap"
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
+    ws_handshake(&mut ws, 1).await;
+
+    let msg = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let m = ws.next().await.unwrap().unwrap();
+            if let Message::Text(t) = m { break t; }
+        }
+    })
+    .await
+    .expect("timed out waiting for gap indicator");
+    assert_eq!(msg.as_str(), "gap");
+}
+
+#[tokio::test]
+async fn ws_no_gap_on_fresh_subscribe() {
+    let (base, st) = start_server_with_state(test_config()).await;
+    let client = reqwest::Client::new();
+    let mailbox_id = [0xAC; 32];
+    let url = mailbox_url(&base, &mailbox_id);
+    let ws_base = base.replace("http://", "ws://");
+    let mailbox_b64 = URL_SAFE_NO_PAD.encode(mailbox_id);
+    let ws_url = format!("{ws_base}/ws/{mailbox_b64}");
+
+    // Post and sweep
+    client.post(&url).body(test_envelope(&[0])).send().await.unwrap();
+    st.storage.sweep_expired(i64::MAX as u64).unwrap();
+
+    // Connect with last_seen=0 — first subscribe, no gap expected
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
+    ws_handshake(&mut ws, 0).await;
+
+    // Should not receive any text "gap" — only pings should arrive
+    let result = tokio::time::timeout(Duration::from_millis(200), async {
+        loop {
+            let m = ws.next().await.unwrap().unwrap();
+            if let Message::Text(t) = m { return t; }
+        }
+    })
+    .await;
+    assert!(result.is_err(), "should not receive gap on fresh subscribe");
 }
