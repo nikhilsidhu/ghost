@@ -121,21 +121,23 @@ export function Layout() {
 
   // --- Completion providers ---
 
-  const groupCompleter = (q: string) => {
+  const groupCompleter = (q: string, _collected: Record<string, string>) => {
     const lq = q.toLowerCase();
     return groups()
       .filter((g) => !lq || g.name.toLowerCase().includes(lq))
       .map((g) => ({ label: g.name, value: g.group_id, iconKey: g.group_id, iconLabel: g.name[0]?.toUpperCase() }));
   };
 
-  const channelCompleter = (q: string) => {
+  const channelCompleter = (q: string, collected: Record<string, string>) => {
+    const gid = collected.group;
+    const pool = gid ? allChannels().filter((ch) => ch.group_id === gid) : channels();
     const lq = q.toLowerCase();
-    return channels()
+    return pool
       .filter((ch) => !lq || ch.name.toLowerCase().includes(lq))
       .map((ch) => ({ label: `${ch.kind === "text" ? "#" : "\u266a"} ${ch.name}`, value: ch.channel_id }));
   };
 
-  const typeCompleter = () => [
+  const typeCompleter = (_q: string, _collected: Record<string, string>) => [
     { label: "text", value: "text" },
     { label: "voice", value: "voice" },
   ];
@@ -163,7 +165,7 @@ export function Layout() {
           placeholder: "group",
           complete: groupCompleter,
           defaultValue: () => selectedGroupId(),
-          onConfirm: setSelectedGroupId,
+
         },
         { name: "name", placeholder: "channel name" },
         {
@@ -182,7 +184,7 @@ export function Layout() {
       id: "rename-channel",
       command: "rename channel",
       args: [
-        { name: "group", placeholder: "group", complete: groupCompleter, defaultValue: () => selectedGroupId(), onConfirm: setSelectedGroupId },
+        { name: "group", placeholder: "group", complete: groupCompleter, defaultValue: () => selectedGroupId() },
         { name: "channel", placeholder: "channel", complete: channelCompleter },
         { name: "name", placeholder: "new name" },
       ],
@@ -205,7 +207,7 @@ export function Layout() {
       id: "delete-channel",
       command: "delete channel",
       args: [
-        { name: "group", placeholder: "group", complete: groupCompleter, defaultValue: () => selectedGroupId(), onConfirm: setSelectedGroupId },
+        { name: "group", placeholder: "group", complete: groupCompleter, defaultValue: () => selectedGroupId() },
         { name: "channel", placeholder: "channel", complete: channelCompleter },
       ],
       execute: async (args) => {
@@ -222,7 +224,7 @@ export function Layout() {
           placeholder: "group",
           complete: groupCompleter,
           defaultValue: () => selectedGroupId(),
-          onConfirm: setSelectedGroupId,
+
         },
       ],
       execute: async (args) => {

@@ -20,9 +20,8 @@ export interface SelectOption {
 export interface ArgDef {
   name: string;
   placeholder: string;
-  complete?: (query: string) => SelectOption[];
+  complete?: (query: string, collected: Record<string, string>) => SelectOption[];
   defaultValue?: () => string | null;
-  onConfirm?: (value: string) => void;
 }
 
 export interface CommandDef {
@@ -110,6 +109,16 @@ export function CommandPalette(props: Props) {
     return cmd.args[argIndex()] ?? null;
   });
 
+  const runCommand = (cmd: CommandDef, args: Record<string, string>) => {
+    recordUsage(cmd.id);
+    try {
+      const result = cmd.execute(args);
+      if (result instanceof Promise) result.catch((e) => console.error(`command "${cmd.command}" failed:`, e));
+    } catch (e) {
+      console.error(`command "${cmd.command}" failed:`, e);
+    }
+  };
+
   // --- Reset helpers ---
 
   const resetAll = () => {
@@ -125,8 +134,7 @@ export function CommandPalette(props: Props) {
   const activateCommand = (cmd: CommandDef) => {
     if (cmd.args.length === 0) {
       setOpen(false);
-      recordUsage(cmd.id);
-      cmd.execute({});
+      runCommand(cmd, {});
       return;
     }
 
@@ -137,16 +145,14 @@ export function CommandPalette(props: Props) {
       const arg = cmd.args[idx];
       const val = arg.defaultValue?.();
       if (!val || !arg.complete) break;
-      if (!arg.complete("").some((c) => c.value === val)) break;
+      if (!arg.complete("", autoArgs).some((c) => c.value === val)) break;
       autoArgs[arg.name] = val;
-      arg.onConfirm?.(val);
       idx++;
     }
 
     if (idx >= cmd.args.length) {
       setOpen(false);
-      recordUsage(cmd.id);
-      cmd.execute(autoArgs);
+      runCommand(cmd, autoArgs);
       return;
     }
 
@@ -248,7 +254,7 @@ export function CommandPalette(props: Props) {
   const argCompletions = createMemo(() => {
     const arg = currentArg();
     if (!arg?.complete) return [];
-    return arg.complete(query().trim());
+    return arg.complete(query().trim(), collectedArgs());
   });
 
   const itemCount = createMemo(() => {
@@ -301,7 +307,6 @@ export function CommandPalette(props: Props) {
     const trimmed = value.trim();
     if (!trimmed) return;
 
-    arg.onConfirm?.(trimmed);
     const next = argIndex() + 1;
     const newArgs = { ...collectedArgs(), [arg.name]: trimmed };
 
@@ -309,8 +314,7 @@ export function CommandPalette(props: Props) {
       // All args collected — reset state then execute
       resetAll();
       setOpen(false);
-      recordUsage(cmd.id);
-      cmd.execute(newArgs);
+      runCommand(cmd, newArgs);
       return;
     }
 
@@ -462,73 +466,73 @@ export function CommandPalette(props: Props) {
             {/* Input with inline token pills */}
             <div class="p-3 flex items-center gap-1.5 flex-wrap">
               <Show when={mode() === "args" && activeCommand()}>
-                <For each={activeCommand()!.command.split(" ")}>
-                  {(word, wordIdx) => {
-                    const words = () => activeCommand()!.command.split(" ");
-                    return (
-                      <span
-                        class="group/pill inline-flex items-center h-6 rounded-md text-xs font-medium text-[var(--purple-300)] flex-shrink-0 cursor-pointer transition-all duration-150"
-                        style={{ background: "var(--pill-purple)" }}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          // X on word i → back to command mode with words before i as prefix
-                          const prefix = words().slice(0, wordIdx()).join(" ");
-                          batch(() => {
-                            setActiveCommand(null);
-                            setCollectedArgs({});
-                            setArgIndex(0);
-                            setQuery("/" + prefix);
-                            setFocusedIndex(0);
-                          });
-                          inputRef?.focus();
+                {(() => {
+                  const words = () => activeCommand()!.command.split(" ");
+                  return (
+                    <>
+                      <For each={words()}>
+                        {(word, wordIdx) => (
+                          <span
+                            class="group/pill inline-flex items-center h-6 rounded-md text-xs font-medium text-[var(--purple-300)] flex-shrink-0 cursor-pointer transition-all duration-150"
+                            style={{ background: "var(--pill-purple)" }}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              const prefix = words().slice(0, wordIdx()).join(" ");
+                              batch(() => {
+                                setActiveCommand(null);
+                                setCollectedArgs({});
+                                setArgIndex(0);
+                                setQuery("/" + prefix);
+                                setFocusedIndex(0);
+                              });
+                              inputRef?.focus();
+                            }}
+                          >
+                            <span class="px-2">{wordIdx() === 0 ? `/${word}` : word}</span>
+                            <span class="w-0 overflow-hidden group-hover/pill:w-5 transition-all duration-150 flex items-center justify-center">
+                              <X size={12} strokeWidth={2.5} class="text-[var(--purple-400)]" />
+                            </span>
+                          </span>
+                        )}
+                      </For>
+                      <For each={activeCommand()!.args.slice(0, argIndex())}>
+                        {(arg, i) => {
+                          const val = collectedArgs()[arg.name] ?? "";
+                          const label = arg.complete?.("", collectedArgs()).find((c) => c.value === val)?.label ?? val;
+                          return (
+                            <span
+                              class="group/pill inline-flex items-center h-6 rounded-md text-xs flex-shrink-0 cursor-pointer transition-all duration-150"
+                              style={{ background: "var(--pill-ember)" }}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                const cmd = activeCommand()!;
+                                const newArgs: Record<string, string> = {};
+                                for (let j = 0; j < i(); j++) {
+                                  newArgs[cmd.args[j].name] = collectedArgs()[cmd.args[j].name];
+                                }
+                                batch(() => {
+                                  setCollectedArgs(newArgs);
+                                  setArgIndex(i());
+                                  setQuery("");
+                                  setFocusedIndex(0);
+                                });
+                                inputRef?.focus();
+                              }}
+                            >
+                              <span class="inline-flex items-center gap-1 px-2">
+                                <span class="text-[var(--ember-500)]">{arg.name}:</span>
+                                <span class="font-medium text-[var(--ember-300)]">{label}</span>
+                              </span>
+                              <span class="w-0 overflow-hidden group-hover/pill:w-5 transition-all duration-150 flex items-center justify-center">
+                                <X size={12} strokeWidth={2.5} class="text-[var(--ember-400)]" />
+                              </span>
+                            </span>
+                          );
                         }}
-                      >
-                        <span class="px-2">{wordIdx() === 0 ? `/${word}` : word}</span>
-                        <span class="w-0 overflow-hidden group-hover/pill:w-5 transition-all duration-150 flex items-center justify-center">
-                          <X size={12} strokeWidth={2.5} class="text-[var(--purple-400)]" />
-                        </span>
-                      </span>
-                    );
-                  }}
-                </For>
-                <For each={Object.entries(collectedArgs())}>
-                  {([name, val]) => {
-                    const arg = activeCommand()!.args.find((a) => a.name === name);
-                    const label = arg?.complete?.("").find((c) => c.value === val)?.label ?? val;
-                    const argIdx = activeCommand()!.args.findIndex((a) => a.name === name);
-                    return (
-                      <span
-                        class="group/pill inline-flex items-center h-6 rounded-md text-xs flex-shrink-0 cursor-pointer transition-all duration-150"
-                        style={{ background: "var(--pill-ember)" }}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          // Remove this arg and all after it
-                          const cmd = activeCommand()!;
-                          const newArgs: Record<string, string> = {};
-                          for (let j = 0; j < argIdx; j++) {
-                            const n = cmd.args[j].name;
-                            if (collectedArgs()[n] !== undefined) newArgs[n] = collectedArgs()[n];
-                          }
-                          batch(() => {
-                            setCollectedArgs(newArgs);
-                            setArgIndex(argIdx);
-                            setQuery("");
-                            setFocusedIndex(0);
-                          });
-                          inputRef?.focus();
-                        }}
-                      >
-                        <span class="inline-flex items-center gap-1 px-2">
-                          <span class="text-[var(--ember-500)]">{name}:</span>
-                          <span class="font-medium text-[var(--ember-300)]">{label}</span>
-                        </span>
-                        <span class="w-0 overflow-hidden group-hover/pill:w-5 transition-all duration-150 flex items-center justify-center">
-                          <X size={12} strokeWidth={2.5} class="text-[var(--ember-400)]" />
-                        </span>
-                      </span>
-                    );
-                  }}
-                </For>
+                      </For>
+                    </>
+                  );
+                })()}
               </Show>
               <input
                 ref={inputRef}

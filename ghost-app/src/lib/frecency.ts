@@ -8,31 +8,36 @@ interface FrecencyEntry {
 
 type FrecencyStore = Record<string, FrecencyEntry>;
 
-function load(): FrecencyStore {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    return raw ? JSON.parse(raw) : {};
-  } catch {
-    return {};
+// Cached in memory — only read localStorage once
+let cache: FrecencyStore | null = null;
+
+function getStore(): FrecencyStore {
+  if (!cache) {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      cache = raw ? JSON.parse(raw) : {};
+    } catch {
+      cache = {};
+    }
   }
+  return cache!;
 }
 
-function save(store: FrecencyStore) {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(store));
+function persist() {
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(cache));
 }
 
 export function recordUsage(id: string) {
-  const store = load();
+  const store = getStore();
   const entry = store[id] ?? { count: 0, lastUsed: 0 };
   entry.count++;
   entry.lastUsed = Date.now();
   store[id] = entry;
-  save(store);
+  persist();
 }
 
 export function frecencyScore(id: string): number {
-  const store = load();
-  const entry = store[id];
+  const entry = getStore()[id];
   if (!entry) return 0;
   const hoursSince = (Date.now() - entry.lastUsed) / (1000 * 60 * 60);
   return entry.count * Math.exp(-DECAY_RATE * hoursSince);
