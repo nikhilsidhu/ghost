@@ -59,7 +59,7 @@ pub async fn create_group(name: String, state: State<'_, AppState>) -> Result<Gr
 
     if let Some(mid) = mailbox_id {
         let mut relay = state.relay.lock().await;
-        let _ = relay.subscribe(mid).await;
+        let _ = relay.subscribe(mid, 0).await;
     }
 
     Ok(group_dto)
@@ -358,7 +358,7 @@ pub async fn join_by_invite(
     // Subscribe to the new group's mailbox for real-time messages
     {
         let mut relay = state.relay.lock().await;
-        let _ = relay.subscribe(mailbox_id).await;
+        let _ = relay.subscribe(mailbox_id, 0).await;
     }
 
     let client = state.client.lock().await;

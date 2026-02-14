@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use ghost_core::client::GhostClient;
 use ghost_core::identity::Identity;
-use ghost_core::relay::{IncomingBlob, RelayClient};
+use ghost_core::relay::{RelayClient, RelayEvent};
 use tokio::sync::{mpsc, watch, Mutex};
 
 use crate::config::{self, GhostConfig};
@@ -65,7 +65,7 @@ fn load_or_create_seed() -> [u8; 32] {
 
 pub struct SetupResult {
     pub state: AppState,
-    pub inbox_rx: mpsc::Receiver<IncomingBlob>,
+    pub inbox_rx: mpsc::Receiver<RelayEvent>,
     pub voice_cmd_rx: mpsc::Receiver<VoiceCommand>,
     pub voice_state_tx: watch::Sender<VoiceStateEvent>,
 }

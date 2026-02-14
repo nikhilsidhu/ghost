@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use ghost_core::client::GhostClient;
-use ghost_core::relay::{IncomingBlob, RelayClient};
+use ghost_core::relay::{RelayClient, RelayEvent};
 use tauri::{AppHandle, Emitter};
 use tokio::sync::{mpsc, Mutex};
 
@@ -11,7 +11,7 @@ pub async fn run(
     app: AppHandle,
     client: Arc<Mutex<GhostClient>>,
     relay: Arc<Mutex<RelayClient>>,
-    mut inbox: mpsc::Receiver<IncomingBlob>,
+    mut events: mpsc::Receiver<RelayEvent>,
 ) {
     // Subscribe to all existing group mailboxes
     let mailboxes = {
@@ -21,13 +21,22 @@ pub async fn run(
     {
         let mut r = relay.lock().await;
         for (_, mailbox_id) in &mailboxes {
-            if let Err(e) = r.subscribe(*mailbox_id).await {
+            if let Err(e) = r.subscribe(*mailbox_id, 0).await {
                 eprintln!("relay subscribe error: {e}");
             }
         }
     }
 
-    while let Some(blob) = inbox.recv().await {
+    while let Some(event) = events.recv().await {
+        let blob = match event {
+            RelayEvent::Blob(b) => b,
+            RelayEvent::Ack(ack) => {
+                if ack.epoch_mismatch {
+                    eprintln!("epoch mismatch on seq {}", ack.seq);
+                }
+                continue;
+            }
+        };
         let received_at = blob.received_at;
         let result = {
             let mut c = client.lock().await;
