@@ -29,6 +29,7 @@ reqwest = { version = "0.12", features = ["json"] }
 base64 = "0.22"
 futures-util = "0.3"
 serde_json = "1"
+ghost-wire = { path = "../ghost-wire" }
 
 [dev-dependencies]
 tempfile = "3"

@@ -63,32 +63,18 @@ pub async fn join(
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
 
-    if !state.try_reserve(payload.len()) {
-        return Err(RelayError::StorageFull);
-    }
-
     let mut invites = state.invites.write().await;
     let invite = match invites.get_mut(&token) {
         Some(inv) => inv,
-        None => {
-            state.release(payload.len());
-            return Err(RelayError::NotFound);
-        }
+        None => return Err(RelayError::NotFound),
     };
 
     if invite.expires_at <= now {
-        state.release(payload.len());
         return Err(RelayError::Gone("invite expired".into()));
     }
 
-    // Reject stale writes so concurrent joiners don't overwrite each other
     if expected_seq != invite.seq {
-        state.release(payload.len());
         return Err(RelayError::Conflict);
-    }
-
-    if let Some(ref old) = invite.join {
-        state.release(old.len());
     }
     invite.join = Some(payload);
     invite.accept = None;
@@ -144,22 +130,11 @@ pub async fn post_accept(
 ) -> Result<StatusCode> {
     let payload = body.to_vec();
 
-    if !state.try_reserve(payload.len()) {
-        return Err(RelayError::StorageFull);
-    }
-
     let mut invites = state.invites.write().await;
     let invite = match invites.get_mut(&token) {
         Some(inv) => inv,
-        None => {
-            state.release(payload.len());
-            return Err(RelayError::NotFound);
-        }
+        None => return Err(RelayError::NotFound),
     };
-
-    if let Some(ref old) = invite.accept {
-        state.release(old.len());
-    }
     invite.accept = Some(payload);
     let _ = invite.accept_notify.send(());
 

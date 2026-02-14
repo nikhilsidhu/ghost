@@ -3,21 +3,22 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 
 use ghost_core::client::GhostClient;
-use ghost_core::relay::RelayClient;
+use ghost_core::relay::{RelayClient, RelayEvent};
 use ghost_core::wire::{derive_default_channel_id, derive_mls_group_id, group_mailbox_id};
 use ghost_relay::config::Config;
+use ghost_relay::storage::Storage;
 use ghost_relay::{routes, state};
 
 async fn start_relay() -> String {
     let config = Config {
         port: 0,
         max_blob_size: 10 * 1024 * 1024,
-        max_memory: 512 * 1024 * 1024,
         ttl: Duration::from_secs(3600),
         voice_port: 0,
         max_voice_participants: 25,
     };
-    let st = state::new_state(config);
+    let storage = Storage::open_in_memory().unwrap();
+    let st = state::new_state(config, storage);
     let app = routes::router(st);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -50,9 +51,9 @@ async fn encrypted_message_through_relay() {
 
     // Connect both to relay
     let (mut send_relay, _) = RelayClient::new(&relay_url);
-    let (mut recv_relay, mut inbox) = RelayClient::new(&relay_url);
-    send_relay.subscribe(mailbox_id).await.unwrap();
-    recv_relay.subscribe(mailbox_id).await.unwrap();
+    let (mut recv_relay, mut events) = RelayClient::new(&relay_url);
+    send_relay.subscribe(mailbox_id, 0).await.unwrap();
+    recv_relay.subscribe(mailbox_id, 0).await.unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Encrypt, send through relay, receive, decrypt
@@ -68,10 +69,17 @@ async fn encrypted_message_through_relay() {
     assert_eq!(outbound.mailbox_id, mailbox_id);
     send_relay.send(&mailbox_id, outbound.blob).await.unwrap();
 
-    let incoming = tokio::time::timeout(Duration::from_secs(2), inbox.recv())
-        .await
-        .expect("timed out waiting for blob")
-        .expect("inbox closed");
+    let incoming = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match events.recv().await {
+                Some(RelayEvent::Blob(blob)) => break blob,
+                Some(RelayEvent::Ack(_)) => continue,
+                None => panic!("event channel closed"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for blob");
     assert_eq!(incoming.mailbox_id, mailbox_id);
 
     let msg = receiver

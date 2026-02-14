@@ -1,25 +1,30 @@
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::time::Duration;
-use uuid::Uuid;
 
-use crate::constants::MAX_LONG_POLL_MS;
-use crate::error::{RelayError, Result};
-use crate::mailbox::{Blob, Mailbox};
+use crate::constants::{DEFAULT_READ_LIMIT, MAX_LONG_POLL_MS};
+use crate::error::Result;
+use crate::mailbox::Mailbox;
 use crate::state::AppState;
-use crate::util::{decode_mailbox_id, now_millis};
+use crate::util::decode_mailbox_id;
+
+fn is_false(b: &bool) -> bool {
+    !b
+}
 
 #[derive(Serialize)]
 pub(crate) struct PostBlobResponse {
-    blob_id: String,
+    seq: u64,
+    #[serde(skip_serializing_if = "is_false")]
+    epoch_mismatch: bool,
 }
 
 #[derive(Serialize)]
 pub(crate) struct BlobEntry {
-    blob_id: String,
+    seq: u64,
     received_at: u64,
     #[serde(with = "base64_payload")]
     payload: Vec<u8>,
@@ -35,51 +40,29 @@ mod base64_payload {
     }
 }
 
+#[derive(Deserialize)]
+pub(crate) struct BlobQuery {
+    after: Option<u64>,
+}
+
 pub async fn post_blob(
     State(state): State<AppState>,
     Path(mailbox_id): Path<String>,
     body: Bytes,
 ) -> Result<(StatusCode, Json<PostBlobResponse>)> {
     let id = decode_mailbox_id(&mailbox_id)?;
-
-    if body.len() > state.config.max_blob_size {
-        return Err(RelayError::PayloadTooLarge);
-    }
-
-    let blob_id = Uuid::new_v4();
-    let received_at = now_millis();
-    let payload = body.to_vec();
-
-    if !state.try_reserve(payload.len()) {
-        return Err(RelayError::StorageFull);
-    }
-
-    let mut map = state.mailboxes.write().await;
-    let mailbox = map.entry(id).or_insert_with(Mailbox::new);
-
-    // Wake any long-poll or WS subscribers; ignore if none connected
-    let _ = mailbox.tx.send(blob_id);
-
-    mailbox.blobs.push(Blob {
-        id: blob_id,
-        received_at,
-        payload,
-    });
-
-    Ok((
-        StatusCode::CREATED,
-        Json(PostBlobResponse {
-            blob_id: blob_id.to_string(),
-        }),
-    ))
+    let (seq, epoch_mismatch) = state.store_blob(&id, &body).await?;
+    Ok((StatusCode::CREATED, Json(PostBlobResponse { seq, epoch_mismatch })))
 }
 
 pub async fn get_blobs(
     State(state): State<AppState>,
     Path(mailbox_id): Path<String>,
+    Query(query): Query<BlobQuery>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<BlobEntry>>> {
     let id = decode_mailbox_id(&mailbox_id)?;
+    let after_seq = query.after.unwrap_or(0);
 
     let timeout_ms: u64 = headers
         .get("X-Ghost-Long-Poll")
@@ -89,65 +72,36 @@ pub async fn get_blobs(
         .min(MAX_LONG_POLL_MS);
 
     if timeout_ms == 0 {
-        let map = state.mailboxes.read().await;
-        return match map.get(&id) {
-            Some(mailbox) => Ok(Json(to_entries(&mailbox.blobs))),
-            None => Ok(Json(Vec::new())),
-        };
+        let entries = state.storage.read_from(&id, after_seq, DEFAULT_READ_LIMIT)?;
+        return Ok(Json(to_entries(entries)));
     }
 
-    // Must subscribe under the write guard to avoid missing notifications
+    // Subscribe before checking so we don't miss notifications
     let mut rx = {
         let mut map = state.mailboxes.write().await;
         let mailbox = map.entry(id).or_insert_with(Mailbox::new);
-        if !mailbox.blobs.is_empty() {
-            return Ok(Json(to_entries(&mailbox.blobs)));
-        }
-        mailbox.tx.subscribe()
+        mailbox.seq_tx.subscribe()
     };
 
-    let timeout = Duration::from_millis(timeout_ms);
-    let _ = tokio::time::timeout(timeout, rx.recv()).await;
-
-    // Return whatever's in the mailbox now
-    let map = state.mailboxes.read().await;
-    match map.get(&id) {
-        Some(mailbox) => Ok(Json(to_entries(&mailbox.blobs))),
-        None => Ok(Json(Vec::new())),
+    let entries = state.storage.read_from(&id, after_seq, DEFAULT_READ_LIMIT)?;
+    if !entries.is_empty() {
+        return Ok(Json(to_entries(entries)));
     }
+
+    let timeout = Duration::from_millis(timeout_ms);
+    let _ = tokio::time::timeout(timeout, rx.changed()).await;
+
+    let entries = state.storage.read_from(&id, after_seq, DEFAULT_READ_LIMIT)?;
+    Ok(Json(to_entries(entries)))
 }
 
-pub async fn delete_blob(
-    State(state): State<AppState>,
-    Path((mailbox_id, blob_id)): Path<(String, String)>,
-) -> Result<StatusCode> {
-    let id = decode_mailbox_id(&mailbox_id)?;
-    let blob_uuid: Uuid = blob_id
-        .parse()
-        .map_err(|_| RelayError::BadRequest("invalid blob id".into()))?;
-
-    let mut map = state.mailboxes.write().await;
-    let mailbox = map.get_mut(&id).ok_or(RelayError::NotFound)?;
-
-    let pos = mailbox
-        .blobs
-        .iter()
-        .position(|b| b.id == blob_uuid)
-        .ok_or(RelayError::NotFound)?;
-
-    let removed = mailbox.blobs.remove(pos);
-    state.release(removed.payload.len());
-
-    Ok(StatusCode::NO_CONTENT)
-}
-
-fn to_entries(blobs: &[Blob]) -> Vec<BlobEntry> {
-    blobs
-        .iter()
-        .map(|b| BlobEntry {
-            blob_id: b.id.to_string(),
-            received_at: b.received_at,
-            payload: b.payload.clone(),
+fn to_entries(entries: Vec<crate::storage::LogEntry>) -> Vec<BlobEntry> {
+    entries
+        .into_iter()
+        .map(|e| BlobEntry {
+            seq: e.seq,
+            received_at: e.received_at,
+            payload: e.payload,
         })
         .collect()
 }

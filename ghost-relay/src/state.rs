@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -7,6 +6,7 @@ use tokio::sync::{broadcast, watch, RwLock};
 
 use crate::config::Config;
 use crate::mailbox::Mailbox;
+use crate::storage::Storage;
 use crate::voice::{RoutingTable, VoiceChannel};
 
 pub struct Invite {
@@ -27,29 +27,33 @@ pub struct Inner {
     pub voice_udp_port_rx: watch::Receiver<u16>,
     pub config: Config,
     pub start_time: Instant,
-    pub memory_used: AtomicUsize,
+    pub storage: Storage,
 }
 
 impl Inner {
-    /// Try to reserve `size` bytes. Returns false if over limit.
-    pub fn try_reserve(&self, size: usize) -> bool {
-        let prev = self.memory_used.fetch_add(size, Ordering::Relaxed);
-        if prev + size > self.config.max_memory {
-            self.memory_used.fetch_sub(size, Ordering::Relaxed);
-            false
-        } else {
-            true
+    pub async fn store_blob(&self, mailbox_id: &[u8; 32], data: &[u8]) -> crate::error::Result<(u64, bool)> {
+        if data.len() > self.config.max_blob_size {
+            return Err(crate::error::RelayError::PayloadTooLarge);
         }
-    }
-
-    pub fn release(&self, size: usize) {
-        self.memory_used.fetch_sub(size, Ordering::Relaxed);
+        let (envelope_type, epoch) = ghost_wire::decode_envelope(data)
+            .map_err(|e| crate::error::RelayError::BadRequest(format!("envelope: {e}")))?;
+        let relay_epoch = self.storage.get_epoch(mailbox_id)?;
+        let (seq, _) = self.storage.append(mailbox_id, envelope_type as u8, epoch, data)?;
+        if envelope_type == ghost_wire::EnvelopeType::Commit {
+            self.storage.set_epoch(mailbox_id, epoch.saturating_add(1))?;
+        }
+        let epoch_mismatch = epoch != relay_epoch;
+        let map = self.mailboxes.read().await;
+        if let Some(mailbox) = map.get(mailbox_id) {
+            let _ = mailbox.seq_tx.send(seq);
+        }
+        Ok((seq, epoch_mismatch))
     }
 }
 
 pub type AppState = Arc<Inner>;
 
-pub fn new_state(config: Config) -> AppState {
+pub fn new_state(config: Config, storage: Storage) -> AppState {
     let (voice_udp_port, voice_udp_port_rx) = watch::channel(0);
     Arc::new(Inner {
         mailboxes: RwLock::new(HashMap::new()),
@@ -60,6 +64,6 @@ pub fn new_state(config: Config) -> AppState {
         voice_udp_port_rx,
         config,
         start_time: Instant::now(),
-        memory_used: AtomicUsize::new(0),
+        storage,
     })
 }

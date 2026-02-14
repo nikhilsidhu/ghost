@@ -1826,6 +1826,7 @@ dependencies = [
  "ed25519-dalek",
  "futures-util",
  "ghost-relay",
+ "ghost-wire",
  "hex",
  "hkdf",
  "keyring",
@@ -1856,8 +1857,10 @@ dependencies = [
  "bytes",
  "dashmap",
  "futures-util",
+ "ghost-wire",
  "hex",
  "reqwest 0.12.28",
+ "rusqlite",
  "serde",
  "serde_json",
  "smallvec",
@@ -1867,7 +1870,13 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
- "uuid",
+]
+
+[[package]]
+name = "ghost-wire"
+version = "0.1.0"
+dependencies = [
+ "thiserror 1.0.69",
 ]
 
 [[package]]

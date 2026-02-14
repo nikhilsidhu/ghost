@@ -10,6 +10,14 @@ use crate::wire::derive_mls_group_id;
 
 use super::credential::{credential_from_identity, signer_from_identity};
 
+fn wrap_commit(mls_bytes: &[u8], epoch: u64) -> Vec<u8> {
+    let header = ghost_wire::encode_envelope(ghost_wire::EnvelopeType::Commit, epoch);
+    let mut out = Vec::with_capacity(ghost_wire::ENVELOPE_HEADER_SIZE + mls_bytes.len());
+    out.extend_from_slice(&header);
+    out.extend_from_slice(mls_bytes);
+    out
+}
+
 // Serialize an outbound MLS message and re-parse it as an inbound message.
 // Needed because OpenMLS uses separate types for sent vs received messages.
 fn outbound_to_inbound(msg: &MlsMessageOut) -> std::result::Result<MlsMessageIn, GhostError> {
@@ -92,41 +100,51 @@ impl GhostGroup {
         }))
     }
 
-    /// Add someone to this group. Returns a commit (broadcast to existing members)
-    /// and a welcome (sent to the new member so they can join).
+    /// Add someone to this group. Returns envelope-wrapped commit bytes
+    /// (broadcast to existing members) and a welcome (sent to the new member).
     pub fn add_member(
         &mut self,
         provider: &GhostProvider,
         key_package: KeyPackage,
-    ) -> Result<(MlsMessageOut, MlsMessageOut)> {
+    ) -> Result<(Vec<u8>, MlsMessageOut)> {
         let (commit, welcome, _group_info) = self
             .mls_group
             .add_members(provider, &self.signer, &[key_package])
             .map_err(|e| GhostError::Mls(format!("add member: {e}")))?;
 
+        let epoch = self.epoch();
+        let commit_bytes = commit
+            .to_bytes()
+            .map_err(|e| GhostError::Mls(format!("serialize commit: {e}")))?;
+
         self.mls_group
             .merge_pending_commit(provider)
             .map_err(|e| GhostError::Mls(format!("merge add commit: {e}")))?;
 
-        Ok((commit, welcome))
+        Ok((wrap_commit(&commit_bytes, epoch), welcome))
     }
 
-    /// Kick a member from the group by their leaf position in the MLS tree.
+    /// Kick a member from the group. Returns envelope-wrapped commit bytes.
     pub fn remove_member(
         &mut self,
         provider: &GhostProvider,
         member: LeafNodeIndex,
-    ) -> Result<MlsMessageOut> {
+    ) -> Result<Vec<u8>> {
         let (commit, _welcome, _group_info) = self
             .mls_group
             .remove_members(provider, &self.signer, &[member])
             .map_err(|e| GhostError::Mls(format!("remove member: {e}")))?;
 
+        let epoch = self.epoch();
+        let commit_bytes = commit
+            .to_bytes()
+            .map_err(|e| GhostError::Mls(format!("serialize commit: {e}")))?;
+
         self.mls_group
             .merge_pending_commit(provider)
             .map_err(|e| GhostError::Mls(format!("merge remove commit: {e}")))?;
 
-        Ok(commit)
+        Ok(wrap_commit(&commit_bytes, epoch))
     }
 
     /// Encrypt a plaintext message so only group members can read it.
@@ -226,6 +244,10 @@ impl GhostGroup {
         self.mls_group.group_id().as_slice()
     }
 
+    pub fn epoch(&self) -> u64 {
+        self.mls_group.epoch().as_u64()
+    }
+
     pub fn members(&self) -> impl Iterator<Item = Member> + '_ {
         self.mls_group.members()
     }
@@ -272,7 +294,9 @@ impl GhostGroup {
             .to_bytes()
             .map_err(|e| GhostError::Mls(format!("serialize commit: {e}")))?;
 
-        Ok((Self { mls_group, signer }, commit_bytes))
+        let group = Self { mls_group, signer };
+        let commit_epoch = group.epoch().saturating_sub(1);
+        Ok((group, wrap_commit(&commit_bytes, commit_epoch)))
     }
 }
 

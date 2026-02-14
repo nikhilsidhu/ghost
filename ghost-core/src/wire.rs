@@ -339,13 +339,17 @@ pub enum InboundMessage {
 }
 
 /// Process an inbound blob that could be an application message or a commit.
-/// App messages are returned; commits are merged into the group automatically.
+/// Strips the envelope header, then decrypts. App messages are returned;
+/// commits are merged into the group automatically.
 pub fn open_any(
     group: &mut GhostGroup,
     provider: &GhostProvider,
     blob: &[u8],
 ) -> Result<InboundMessage> {
-    let processed = group.process_message_bytes(provider, blob)?;
+    ghost_wire::decode_envelope(blob)
+        .map_err(|e| GhostError::Format(format!("envelope: {e}")))?;
+    let mls_bytes = ghost_wire::envelope_payload(blob);
+    let processed = group.process_message_bytes(provider, mls_bytes)?;
     let credential = processed.credential().clone();
 
     match processed.into_content() {
@@ -374,7 +378,7 @@ pub struct Outbound {
     pub blob: Vec<u8>,
 }
 
-/// Serialize an ApplicationMessage and MLS-encrypt it into transport bytes.
+/// Serialize an ApplicationMessage, MLS-encrypt it, and prepend an envelope header.
 pub fn seal(
     group: &mut GhostGroup,
     provider: &GhostProvider,
@@ -382,18 +386,26 @@ pub fn seal(
 ) -> Result<Vec<u8>> {
     let plaintext = msg.to_bytes();
     let mls_out = group.encrypt(provider, &plaintext)?;
-    mls_out
+    let mls_bytes = mls_out
         .to_bytes()
-        .map_err(|e| GhostError::Mls(format!("serialize ciphertext: {e}")))
+        .map_err(|e| GhostError::Mls(format!("serialize ciphertext: {e}")))?;
+    let header = ghost_wire::encode_envelope(ghost_wire::EnvelopeType::Application, group.epoch());
+    let mut out = Vec::with_capacity(ghost_wire::ENVELOPE_HEADER_SIZE + mls_bytes.len());
+    out.extend_from_slice(&header);
+    out.extend_from_slice(&mls_bytes);
+    Ok(out)
 }
 
-/// MLS-decrypt transport bytes and deserialize into an ApplicationMessage.
+/// Strip envelope header, MLS-decrypt, and deserialize into an ApplicationMessage.
 pub fn open(
     group: &mut GhostGroup,
     provider: &GhostProvider,
     blob: &[u8],
 ) -> Result<ApplicationMessage> {
-    let processed = group.process_message_bytes(provider, blob)?;
+    ghost_wire::decode_envelope(blob)
+        .map_err(|e| GhostError::Format(format!("envelope: {e}")))?;
+    let mls_bytes = ghost_wire::envelope_payload(blob);
+    let processed = group.process_message_bytes(provider, mls_bytes)?;
 
     // Extract the MLS-authenticated sender fingerprint before consuming the message
     let mls_credential = processed.credential().clone();
