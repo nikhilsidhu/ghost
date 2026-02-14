@@ -10,10 +10,12 @@ use tokio::net::{TcpListener, UdpSocket};
 use tokio_tungstenite::tungstenite::Message;
 
 use ghost_relay::config::Config;
+use ghost_relay::storage::Storage;
 use ghost_relay::{routes, state, udp};
 
 async fn start_server(config: Config) -> String {
-    let st = state::new_state(config);
+    let storage = Storage::open_in_memory().unwrap();
+    let st = state::new_state(config, storage);
     let app = routes::router(st);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -23,7 +25,8 @@ async fn start_server(config: Config) -> String {
 
 /// Starts relay with UDP voice loop. Returns (http_base_url, udp_port).
 async fn start_server_with_voice(config: Config) -> (String, u16) {
-    let st = state::new_state(config);
+    let storage = Storage::open_in_memory().unwrap();
+    let st = state::new_state(config, storage);
     let mut voice_rx = st.voice_udp_port_rx.clone();
     tokio::spawn(udp::run(st.clone()));
     let app = routes::router(st);
@@ -39,7 +42,6 @@ fn test_config() -> Config {
     Config {
         port: 0,
         max_blob_size: 1024,
-        max_memory: 4096,
         ttl: Duration::from_secs(3600),
         voice_port: 0,
         max_voice_participants: 25,
@@ -48,6 +50,15 @@ fn test_config() -> Config {
 
 fn mailbox_url(base: &str, id: &[u8; 32]) -> String {
     format!("{base}/box/{}", URL_SAFE_NO_PAD.encode(id))
+}
+
+/// Build a valid envelope-wrapped payload for testing.
+fn test_envelope(payload: &[u8]) -> Vec<u8> {
+    let header = ghost_wire::encode_envelope(ghost_wire::EnvelopeType::Application, 0);
+    let mut out = Vec::with_capacity(header.len() + payload.len());
+    out.extend_from_slice(&header);
+    out.extend_from_slice(payload);
+    out
 }
 
 #[tokio::test]
@@ -60,31 +71,39 @@ async fn health() {
 }
 
 #[tokio::test]
-async fn blob_post_get_delete() {
+async fn blob_post_and_get() {
     let base = start_server(test_config()).await;
     let client = reqwest::Client::new();
     let url = mailbox_url(&base, &[0x01; 32]);
 
     // POST
-    let resp = client.post(&url).body(b"hello".to_vec()).send().await.unwrap();
+    let resp = client.post(&url).body(test_envelope(b"hello")).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
-    let blob_id = resp.json::<Value>().await.unwrap()["blob_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["seq"], 1);
 
     // GET returns it
     let blobs: Vec<Value> = client.get(&url).send().await.unwrap().json().await.unwrap();
     assert_eq!(blobs.len(), 1);
-    assert_eq!(blobs[0]["blob_id"], blob_id);
+    assert_eq!(blobs[0]["seq"], 1);
 
-    // DELETE
-    let resp = client.delete(format!("{url}/{blob_id}")).send().await.unwrap();
-    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    // POST another
+    let resp = client.post(&url).body(test_envelope(b"world")).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["seq"], 2);
 
-    // GET returns empty
-    let blobs: Vec<Value> = client.get(&url).send().await.unwrap().json().await.unwrap();
-    assert!(blobs.is_empty());
+    // GET with after=1 returns only second
+    let blobs: Vec<Value> = client
+        .get(format!("{url}?after=1"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(blobs.len(), 1);
+    assert_eq!(blobs[0]["seq"], 2);
 }
 
 #[tokio::test]
@@ -105,7 +124,7 @@ async fn long_poll_wakeup() {
     });
 
     tokio::time::sleep(Duration::from_millis(50)).await;
-    client.post(&url).body(b"wake".to_vec()).send().await.unwrap();
+    client.post(&url).body(test_envelope(b"wake")).send().await.unwrap();
 
     let resp = handle.await.unwrap();
     let blobs: Vec<Value> = resp.json().await.unwrap();
@@ -124,10 +143,10 @@ async fn ws_fanout() {
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // A sends a binary blob
-    ws_a.send(Message::Binary(b"from-a".to_vec().into())).await.unwrap();
+    // A sends an envelope-wrapped blob
+    ws_a.send(Message::Binary(test_envelope(b"from-a").into())).await.unwrap();
 
-    // B receives: 16-byte UUID + 8-byte timestamp + payload (skip pings)
+    // B receives: 8-byte seq + 8-byte timestamp + envelope payload
     let data = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             let m = ws_b.next().await.unwrap().unwrap();
@@ -136,7 +155,18 @@ async fn ws_fanout() {
     })
     .await
     .expect("timed out waiting for fan-out");
-    assert_eq!(&data[24..], b"from-a");
+    // 16-byte frame header + 10-byte envelope header + "from-a"
+    assert_eq!(&data[26..], b"from-a");
+}
+
+#[tokio::test]
+async fn invalid_envelope_rejected() {
+    let base = start_server(test_config()).await;
+    let client = reqwest::Client::new();
+    let url = mailbox_url(&base, &[0x06; 32]);
+
+    let resp = client.post(&url).body(b"not an envelope".to_vec()).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -147,21 +177,6 @@ async fn blob_size_limit() {
 
     let resp = client.post(&url).body(vec![0u8; 2048]).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
-}
-
-#[tokio::test]
-async fn memory_limit() {
-    let mut config = test_config();
-    config.max_memory = 100;
-    let base = start_server(config).await;
-    let client = reqwest::Client::new();
-    let url = mailbox_url(&base, &[0x05; 32]);
-
-    let resp = client.post(&url).body(vec![0u8; 80]).send().await.unwrap();
-    assert_eq!(resp.status(), StatusCode::CREATED);
-
-    let resp = client.post(&url).body(vec![0u8; 80]).send().await.unwrap();
-    assert_eq!(resp.status(), StatusCode::INSUFFICIENT_STORAGE);
 }
 
 #[tokio::test]
