@@ -13,6 +13,16 @@ use thiserror::Error;
 pub const ENVELOPE_VERSION: u8 = 0x01;
 pub const ENVELOPE_HEADER_SIZE: usize = 10;
 
+// WS frame: [seq: u64 BE][received_at: u64 BE][payload...]
+pub const WS_SEQ_SIZE: usize = 8;
+pub const WS_TIMESTAMP_SIZE: usize = 8;
+pub const WS_FRAME_HEADER_SIZE: usize = WS_SEQ_SIZE + WS_TIMESTAMP_SIZE;
+
+// Voice packet: [version(1)][channel_id(32)][sender_fp(32)][seq(4)][epoch(8)][payload_len(2)][payload...]
+pub const VOICE_VERSION: u8 = 1;
+pub const VOICE_HEADER_SIZE: usize = 79;
+pub const VOICE_MAX_PACKET: usize = 1500;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum EnvelopeType {

@@ -20,9 +20,7 @@ pub async fn run(
         let mut r = relay.lock().await;
         for (_, mailbox_id) in &mailboxes {
             let seq = c.store().get_last_seen_seq(mailbox_id).unwrap_or(0);
-            if let Err(e) = r.subscribe(*mailbox_id, seq).await {
-                eprintln!("relay subscribe error: {e}");
-            }
+            r.subscribe(*mailbox_id, seq);
         }
     }
 

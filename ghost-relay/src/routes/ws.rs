@@ -4,7 +4,9 @@ use axum::response::{IntoResponse, Response};
 use futures_util::{SinkExt, StreamExt};
 use std::time::Duration;
 
-use crate::constants::{WS_FRAME_HEADER_SIZE, WS_MAX_FANOUT_BATCH, WS_PING_INTERVAL_SECS};
+use ghost_wire::WS_FRAME_HEADER_SIZE;
+
+use crate::constants::{WS_MAX_FANOUT_BATCH, WS_PING_INTERVAL_SECS};
 use crate::mailbox::Mailbox;
 use crate::state::AppState;
 use crate::util::decode_mailbox_id;

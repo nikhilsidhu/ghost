@@ -10,10 +10,8 @@ pub const OPUS_FRAME_MS: u32 = 20;
 pub const OPUS_FRAME_SIZE: usize = (OPUS_SAMPLE_RATE * OPUS_FRAME_MS / 1000) as usize; // 960
 pub const DENOISE_FRAME_SIZE: usize = 480; // nnnoiseless expects this
 
-// Voice packet header — must match relay
-pub const VOICE_VERSION: u8 = 1;
-pub const VOICE_HEADER_SIZE: usize = 79;
-pub const VOICE_MAX_PACKET: usize = 1500;
+// Voice packet header — re-exported from ghost-wire
+pub use ghost_wire::{VOICE_HEADER_SIZE, VOICE_MAX_PACKET, VOICE_VERSION};
 
 // Volume normalizer
 pub const AGC_TARGET_RMS: f32 = 0.1;

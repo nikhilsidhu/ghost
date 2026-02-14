@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 
 use tokio::net::UdpSocket;
 
-use crate::constants::{VOICE_HEADER_SIZE, VOICE_MAX_PACKET, VOICE_VERSION};
+use ghost_wire::{VOICE_HEADER_SIZE, VOICE_MAX_PACKET, VOICE_VERSION};
 use crate::state::AppState;
 
 fn parse_header(buf: &[u8]) -> Option<([u8; 32], [u8; 32], usize)> {

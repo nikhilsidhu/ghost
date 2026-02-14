@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::Duration;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -7,11 +8,12 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 
+use ghost_wire::{WS_FRAME_HEADER_SIZE, WS_SEQ_SIZE};
+
 use crate::error::{GhostError, Result};
 
-const SEQ_SIZE: usize = 8;
-const TIMESTAMP_SIZE: usize = 8;
-const FRAME_HEADER_SIZE: usize = SEQ_SIZE + TIMESTAMP_SIZE;
+const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 pub struct IncomingBlob {
     pub mailbox_id: [u8; 32],
@@ -60,15 +62,14 @@ impl RelayClient {
         (client, event_rx)
     }
 
-    pub async fn subscribe(&mut self, mailbox_id: [u8; 32], last_seen_seq: u64) -> Result<()> {
+    /// Subscribe to a mailbox. The connection is established in the background
+    /// with automatic reconnection on failure.
+    pub fn subscribe(&mut self, mailbox_id: [u8; 32], last_seen_seq: u64) {
         let url = format!(
             "{}/ws/{}",
             self.ws_base_url,
             URL_SAFE_NO_PAD.encode(mailbox_id)
         );
-        let (ws, _) = tokio_tungstenite::connect_async(&url)
-            .await
-            .map_err(|e| GhostError::Network(e.to_string()))?;
 
         if let Some(old) = self.connections.remove(&mailbox_id) {
             old.task.abort();
@@ -76,10 +77,9 @@ impl RelayClient {
 
         let (outbox_tx, outbox_rx) = mpsc::channel(64);
         let event_tx = self.event_tx.clone();
-        let task = tokio::spawn(ws_loop(ws, mailbox_id, last_seen_seq, event_tx, outbox_rx));
+        let task = tokio::spawn(ws_task(url, mailbox_id, last_seen_seq, event_tx, outbox_rx));
         self.connections
             .insert(mailbox_id, WsHandle { outbox: outbox_tx, task });
-        Ok(())
     }
 
     pub fn unsubscribe(&mut self, mailbox_id: &[u8; 32]) {
@@ -204,61 +204,90 @@ impl Drop for RelayClient {
     }
 }
 
-type WsStream =
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
-
-async fn ws_loop(
-    ws: WsStream,
+/// Persistent task that maintains a WebSocket connection with automatic reconnection.
+async fn ws_task(
+    url: String,
     mailbox_id: [u8; 32],
-    last_seen_seq: u64,
+    initial_last_seen: u64,
     event_tx: mpsc::Sender<RelayEvent>,
     mut outbox_rx: mpsc::Receiver<Vec<u8>>,
 ) {
-    let (mut sink, mut stream) = ws.split();
-
-    // Handshake: send last_seen_seq so the relay replays missed entries
-    let handshake = last_seen_seq.to_be_bytes().to_vec();
-    if sink.send(Message::Binary(handshake.into())).await.is_err() {
-        return;
-    }
+    let mut last_seen = initial_last_seen;
+    let mut backoff = INITIAL_BACKOFF;
+    let mut first_attempt = true;
 
     loop {
-        tokio::select! {
-            blob = outbox_rx.recv() => {
-                match blob {
-                    Some(data) => {
-                        if sink.send(Message::Binary(data.into())).await.is_err() {
-                            break;
+        if !first_attempt {
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(MAX_BACKOFF);
+        }
+        first_attempt = false;
+
+        let ws = match tokio_tungstenite::connect_async(&url).await {
+            Ok((ws, _)) => ws,
+            Err(_) => continue,
+        };
+
+        let (mut sink, mut stream) = ws.split();
+
+        // Handshake: send last_seen_seq so the relay replays missed entries
+        if sink
+            .send(Message::Binary(last_seen.to_be_bytes().to_vec().into()))
+            .await
+            .is_err()
+        {
+            continue;
+        }
+
+        let mut got_message = false;
+
+        loop {
+            tokio::select! {
+                blob = outbox_rx.recv() => {
+                    match blob {
+                        Some(data) => {
+                            if sink.send(Message::Binary(data.into())).await.is_err() {
+                                break; // reconnect
+                            }
                         }
+                        None => return, // unsubscribed, exit task
                     }
-                    None => break,
                 }
-            }
-            msg = stream.next() => {
-                match msg {
-                    Some(Ok(Message::Binary(data))) => {
-                        if data.len() < FRAME_HEADER_SIZE {
-                            continue;
+                msg = stream.next() => {
+                    match msg {
+                        Some(Ok(Message::Binary(data))) => {
+                            if data.len() < WS_FRAME_HEADER_SIZE {
+                                continue;
+                            }
+                            let seq = u64::from_be_bytes(data[..WS_SEQ_SIZE].try_into().unwrap());
+                            let received_at = u64::from_be_bytes(
+                                data[WS_SEQ_SIZE..WS_FRAME_HEADER_SIZE].try_into().unwrap(),
+                            );
+                            let payload = data[WS_FRAME_HEADER_SIZE..].to_vec();
+                            last_seen = seq;
+                            if !got_message {
+                                got_message = true;
+                                backoff = INITIAL_BACKOFF;
+                            }
+                            let _ = event_tx.send(RelayEvent::Blob(IncomingBlob {
+                                mailbox_id,
+                                seq,
+                                received_at,
+                                payload,
+                            })).await;
                         }
-                        let seq = u64::from_be_bytes(data[..SEQ_SIZE].try_into().unwrap());
-                        let received_at = u64::from_be_bytes(
-                            data[SEQ_SIZE..FRAME_HEADER_SIZE].try_into().unwrap(),
-                        );
-                        let payload = data[FRAME_HEADER_SIZE..].to_vec();
-                        let _ = event_tx.send(RelayEvent::Blob(IncomingBlob {
-                            mailbox_id,
-                            seq,
-                            received_at,
-                            payload,
-                        })).await;
-                    }
-                    Some(Ok(Message::Text(text))) => {
-                        if let Some(ack) = parse_ack(&text) {
-                            let _ = event_tx.send(RelayEvent::Ack(ack)).await;
+                        Some(Ok(Message::Text(text))) => {
+                            if !got_message {
+                                got_message = true;
+                                backoff = INITIAL_BACKOFF;
+                            }
+                            if let Some(ack) = parse_ack(&text) {
+                                let _ = event_tx.send(RelayEvent::Ack(ack)).await;
+                            }
                         }
+                        Some(Ok(Message::Close(_))) | None => break, // reconnect
+                        _ => {}
                     }
-                    Some(Ok(Message::Close(_))) | None => break,
-                    _ => {}
                 }
             }
         }

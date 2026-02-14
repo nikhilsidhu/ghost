@@ -1796,6 +1796,7 @@ dependencies = [
  "dirs",
  "futures-util",
  "ghost-core",
+ "ghost-wire",
  "hex",
  "nnnoiseless",
  "objc2-app-kit",

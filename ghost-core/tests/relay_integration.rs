@@ -52,8 +52,8 @@ async fn encrypted_message_through_relay() {
     // Connect both to relay
     let (mut send_relay, _) = RelayClient::new(&relay_url);
     let (mut recv_relay, mut events) = RelayClient::new(&relay_url);
-    send_relay.subscribe(mailbox_id, 0).await.unwrap();
-    recv_relay.subscribe(mailbox_id, 0).await.unwrap();
+    send_relay.subscribe(mailbox_id, 0);
+    recv_relay.subscribe(mailbox_id, 0);
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Encrypt, send through relay, receive, decrypt

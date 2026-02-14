@@ -429,7 +429,7 @@ fn build_voice_packet(
     payload: &[u8],
 ) -> Vec<u8> {
     [
-        &[ghost_relay::constants::VOICE_VERSION][..],
+        &[ghost_wire::VOICE_VERSION][..],
         channel_id,
         sender_fp,
         &sequence.to_be_bytes(),
