@@ -1,4 +1,4 @@
-import { createSignal, createEffect, on, onMount, Show } from "solid-js";
+import { createSignal, createEffect, on, onMount, Show, For } from "solid-js";
 import type { Identity, Group, Channel, Member } from "../lib/types";
 import {
   getIdentity, listGroups, listChannels, listMembers,
@@ -13,7 +13,7 @@ import { MemberPanel } from "./MemberPanel";
 import { CommandPalette, type CommandDef } from "./CommandPalette";
 import { InviteDialog } from "./InviteDialog";
 import { ShortcutOverlay } from "./ShortcutOverlay";
-import { shortcuts as shortcutDefs, formatHint } from "../lib/shortcuts";
+import { shortcuts as shortcutDefs } from "../lib/shortcuts";
 
 export function Layout() {
   const [identity, setIdentity] = createSignal<Identity | null>(null);
@@ -209,15 +209,28 @@ export function Layout() {
           when={selectedGroup()}
           fallback={
             <div class="flex-1 flex items-center justify-center">
-              <div class="text-center">
-                <span class="text-sm block text-[var(--neutral-400)]">
-                  select a group
-                </span>
-                <span class="text-[10px] block mt-3 text-[var(--neutral-600)]">
-                  {shortcutDefs.map((s) => formatHint(s)).join(" \u00b7 ")}
-                </span>
+              <div class="flex flex-col items-center gap-5">
+                <span class="text-sm text-[var(--neutral-400)]">select a group</span>
+                <div class="flex flex-col gap-2.5">
+                  <For each={shortcutDefs}>
+                    {(s) => (
+                      <div class="flex items-center gap-3">
+                        <div class="flex items-center gap-1 w-[76px] justify-end">
+                          <For each={s.keys}>
+                            {(k) => (
+                              <kbd class="inline-flex items-center justify-center min-w-[22px] h-[22px] px-1.5 rounded text-[11px] font-medium bg-[var(--neutral-800)] text-[var(--neutral-400)] border border-[var(--neutral-700)]">
+                                {k === "Cmd" ? "\u2318" : k}
+                              </kbd>
+                            )}
+                          </For>
+                        </div>
+                        <span class="text-xs text-[var(--neutral-500)]">{s.label.toLowerCase()}</span>
+                      </div>
+                    )}
+                  </For>
+                </div>
                 <button
-                  class="mt-4 px-3 py-1.5 rounded-md text-xs text-[var(--neutral-400)] hover:bg-[var(--hover)] cursor-pointer"
+                  class="mt-1 px-3 py-1.5 rounded-md text-xs text-[var(--neutral-400)] hover:bg-[var(--hover)] cursor-pointer"
                   style={{ border: "1px solid var(--neutral-700)" }}
                   onClick={async () => {
                     try {
