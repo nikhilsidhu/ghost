@@ -5,12 +5,13 @@ import { cn } from "../../lib/cn";
 interface TooltipProps {
   label: string;
   placement?: "top" | "right" | "bottom" | "left";
+  gutter?: number;
   children: JSX.Element;
 }
 
 export function Tooltip(props: TooltipProps) {
   return (
-    <KTooltip placement={props.placement ?? "right"} gutter={8} openDelay={400}>
+    <KTooltip placement={props.placement ?? "right"} gutter={props.gutter ?? 12} openDelay={400}>
       <KTooltip.Trigger as="div">
         {props.children}
       </KTooltip.Trigger>

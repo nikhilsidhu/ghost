@@ -23,6 +23,16 @@ const [inviteLink, setInviteLink] = createSignal<string | null>(null);
 const [showInfo, setShowInfo] = createSignal(false);
 const [desiredChannelKind, setDesiredChannelKind] = createSignal<string>("text");
 
+// --- Call state ---
+
+const [isInCall, setIsInCall] = createSignal(false);
+const [isMuted, setIsMuted] = createSignal(false);
+const [isDeafened, setIsDeafened] = createSignal(false);
+
+const toggleMute = () => { setIsMuted((v) => !v); setIsDeafened(false); };
+const toggleDeafen = () => { setIsDeafened((v) => !v); setIsMuted(false); };
+const endCall = () => { setIsInCall(false); setIsMuted(false); setIsDeafened(false); };
+
 // --- Derived ---
 
 const selectedGroup = () => groups().find((g) => g.group_id === selectedGroupId());
@@ -122,4 +132,5 @@ export {
   selectGroup, selectChannel, updateIdentity, initialize, seedAndRefresh,
   refreshGroups, refreshChannels, refreshPins, refreshAllChannels,
   setInviteLink, setShowInfo, setDesiredChannelKind,
+  isInCall, isMuted, isDeafened, toggleMute, toggleDeafen, endCall, setIsInCall,
 };

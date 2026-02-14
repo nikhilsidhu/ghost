@@ -6,11 +6,12 @@ import { Avatar } from "./ui/avatar";
 import { Tooltip } from "./ui/tooltip";
 import { ScrollArea } from "./ui/scroll-area";
 import { cn } from "../lib/cn";
-import { AudioLines, Settings } from "lucide-solid";
+import { AudioLines, Settings, Mic, MicOff, Headphones, HeadphoneOff, PhoneOff } from "lucide-solid";
 import { channelPrefix } from "../lib/constants";
 import {
   identity, groups, selectedGroupId, channels, selectedChannelId,
   selectedGroup, selectGroup, selectChannel,
+  isInCall, isMuted, isDeafened, toggleMute, toggleDeafen, endCall,
 } from "../lib/store";
 import { handleCreateChannel } from "../lib/commands";
 import {
@@ -168,18 +169,69 @@ export function Sidebar() {
           </DragOverlay>
         </DragDropProvider>
 
-        {/* Bottom dock */}
-        <div class="flex-shrink-0 flex flex-col items-center pb-2">
-          <div class="divider-h w-8 mb-2" />
+        {/* Bottom dock — each item uses the same --size-lg cell as group icons */}
+        <div class="flex-shrink-0 flex flex-col items-center pb-3 group/dock">
+          <div class="w-[var(--size-lg)] py-2 flex items-center justify-center">
+            <div class="h-px w-[var(--size-md)] rounded-full" style={{ background: "var(--neutral-700)" }} />
+          </div>
 
-          <Tooltip label="settings">
-            <button
-              class="w-[var(--size-md)] h-[var(--size-md)] rounded-lg flex items-center justify-center cursor-pointer opacity-50 hover:opacity-100 mb-1.5"
-            >
-              <Settings size={16} class="text-[var(--neutral-300)]" />
-            </button>
-          </Tooltip>
+          {/* Mute — pinned when active, hover-revealed otherwise */}
+          <div class={cn(
+            "overflow-hidden transition-all duration-200 w-[var(--size-lg)] flex items-center justify-center",
+            isMuted()
+              ? "max-h-[var(--size-lg)] opacity-100"
+              : "max-h-0 opacity-0 group-hover/dock:max-h-[var(--size-lg)] group-hover/dock:opacity-100",
+          )}>
+            <Tooltip label={isMuted() ? "unmute" : "mute"}>
+              <button
+                class={cn(
+                  "w-[var(--size-lg)] h-[var(--size-md)] rounded-lg flex items-center justify-center cursor-pointer transition-all duration-150",
+                  isMuted() ? "opacity-100 hover:brightness-125" : "opacity-50 hover:opacity-100",
+                )}
+                onClick={toggleMute}
+              >
+                {isMuted()
+                  ? <MicOff size={18} class="text-[var(--amber-400)]" />
+                  : <Mic size={18} class="text-[var(--neutral-300)]" />}
+              </button>
+            </Tooltip>
+          </div>
 
+          {/* Deafen — pinned when active, hover-revealed otherwise */}
+          <div class={cn(
+            "overflow-hidden transition-all duration-200 w-[var(--size-lg)] flex items-center justify-center",
+            isDeafened()
+              ? "max-h-[var(--size-lg)] opacity-100"
+              : "max-h-0 opacity-0 group-hover/dock:max-h-[var(--size-lg)] group-hover/dock:opacity-100",
+          )}>
+            <Tooltip label={isDeafened() ? "undeafen" : "deafen"}>
+              <button
+                class={cn(
+                  "w-[var(--size-lg)] h-[var(--size-md)] rounded-lg flex items-center justify-center cursor-pointer transition-all duration-150",
+                  isDeafened() ? "opacity-100 hover:brightness-125" : "opacity-50 hover:opacity-100",
+                )}
+                onClick={toggleDeafen}
+              >
+                {isDeafened()
+                  ? <HeadphoneOff size={18} class="text-[var(--amber-400)]" />
+                  : <Headphones size={18} class="text-[var(--neutral-300)]" />}
+              </button>
+            </Tooltip>
+          </div>
+
+          {/* End call — persistent when in call */}
+          <Show when={isInCall()}>
+            <Tooltip label="end call">
+              <button
+                class="w-[var(--size-lg)] h-[var(--size-lg)] flex items-center justify-center cursor-pointer opacity-80 hover:opacity-100 transition-all duration-150"
+                onClick={endCall}
+              >
+                <PhoneOff size={18} class="text-[var(--red-400)]" />
+              </button>
+            </Tooltip>
+          </Show>
+
+          {/* User avatar */}
           <Show when={identity()}>
             {(id) => {
               const [copied, setCopied] = createSignal(false);
@@ -189,9 +241,9 @@ export function Sidebar() {
                 setTimeout(() => setCopied(false), 1200);
               };
               return (
-                <Tooltip label={copied() ? "copied!" : id().fingerprint_short}>
+                <Tooltip label={copied() ? "copied!" : id().display_name}>
                   <button
-                    class="flex flex-col items-center gap-0.5 cursor-pointer hover:opacity-80"
+                    class="w-[var(--size-lg)] h-[var(--size-lg)] flex items-center justify-center cursor-pointer hover:opacity-80"
                     onClick={copyFp}
                   >
                     <Avatar
@@ -199,14 +251,20 @@ export function Sidebar() {
                       label={id().display_name}
                       class="w-[var(--size-md)] h-[var(--size-md)] text-sm"
                     />
-                    <span class="text-[9px] text-[var(--neutral-500)] truncate max-w-[40px] leading-tight">
-                      {copied() ? "copied" : id().display_name}
-                    </span>
                   </button>
                 </Tooltip>
               );
             }}
           </Show>
+
+          {/* Settings */}
+          <Tooltip label="settings">
+            <button
+              class="w-[var(--size-lg)] h-[var(--size-md)] flex items-center justify-center cursor-pointer opacity-50 hover:opacity-100 transition-all duration-150 group/settings"
+            >
+              <Settings size={20} class="text-[var(--neutral-300)] transition-transform duration-500 ease-out group-hover/settings:rotate-90" />
+            </button>
+          </Tooltip>
         </div>
       </div>
 
@@ -221,7 +279,7 @@ export function Sidebar() {
           >
             <div class="h-7 flex-shrink-0" />
 
-            <div class="h-[var(--size-lg)] flex items-center px-3 flex-shrink-0">
+            <div class="h-[var(--size-lg)] flex items-center justify-center px-3 flex-shrink-0">
               <span class="text-base font-semibold text-[var(--neutral-100)] truncate">
                 {group().name}
               </span>
@@ -234,7 +292,7 @@ export function Sidebar() {
             >
               <DragDropSensors />
               <ScrollArea class="flex-1">
-                <div>
+                <div class="pt-2">
                   <div class="flex items-center justify-between px-3 py-1">
                     <button
                       class="flex items-center gap-1 text-xs uppercase tracking-wider text-[var(--neutral-500)] cursor-pointer hover:text-[var(--neutral-400)]"
