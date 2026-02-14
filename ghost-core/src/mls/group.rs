@@ -294,7 +294,6 @@ impl GhostGroup {
             .to_bytes()
             .map_err(|e| GhostError::Mls(format!("serialize commit: {e}")))?;
 
-        // epoch() is post-merge; the commit targeted epoch - 1
         let group = Self { mls_group, signer };
         let commit_epoch = group.epoch().saturating_sub(1);
         Ok((group, wrap_commit(&commit_bytes, commit_epoch)))
