@@ -143,6 +143,7 @@ body {
   background: var(--neutral-950);
   color: var(--neutral-100);
   font-family: var(--font-mono);
+  font-weight: 450;
   -webkit-font-smoothing: antialiased;
 }
 
