@@ -6,7 +6,7 @@ import { Avatar } from "./ui/avatar";
 import { Tooltip } from "./ui/tooltip";
 import { ScrollArea } from "./ui/scroll-area";
 import { cn } from "../lib/cn";
-import { AudioLines, Settings, Mic, MicOff, Headphones, HeadphoneOff, PhoneOff } from "lucide-solid";
+import { AudioLines, Settings, X, Mic, MicOff, Headphones, HeadphoneOff, PhoneOff } from "lucide-solid";
 import { channelPrefix } from "../lib/constants";
 import {
   identity, groups, selectedGroupId, channels, selectedChannelId,
@@ -287,7 +287,7 @@ export function Sidebar() {
                 onClick={toggleDeafen}
               >
                 {isDeafened()
-                  ? <HeadphoneOff size={18} class="text-[var(--amber-400)]" />
+                  ? <HeadphoneOff size={18} class="text-[var(--cyan-400)]" />
                   : <Headphones size={18} class="text-[var(--neutral-300)]" />}
               </button>
             </Tooltip>
@@ -340,16 +340,28 @@ export function Sidebar() {
               )}
               onClick={toggleSettings}
             >
-              <Settings size={20} class={cn(
-                "text-[var(--neutral-300)] transition-transform duration-200",
-                settingsOpen() ? "rotate-90" : "group-hover/settings:rotate-90",
-              )} />
+              <div
+                class="relative w-5 h-5"
+                style={{
+                  transform: settingsOpen() ? "rotate(180deg)" : "rotate(0deg)",
+                  transition: "transform 300ms var(--ease-out)",
+                }}
+              >
+                <Settings size={20} class={cn(
+                  "absolute inset-0 text-[var(--neutral-300)] transition-opacity duration-200",
+                  settingsOpen() ? "opacity-0" : "opacity-100",
+                )} />
+                <X size={20} class={cn(
+                  "absolute inset-0 text-[var(--neutral-300)] transition-opacity duration-200",
+                  settingsOpen() ? "opacity-100" : "opacity-0",
+                )} />
+              </div>
             </button>
           </Tooltip>
         </div>
       </div>
 
-      <div class="divider-v" />
+      <div class="divider-v" style={{ "will-change": "transform" }} />
 
       {/* Panel swap zone */}
       <div
@@ -359,24 +371,30 @@ export function Sidebar() {
           transition: "width 300ms var(--ease-out)",
         }}
       >
-        {/* Settings panel — slides in from the left */}
+        {/* Settings panel — slides down after channel exits up */}
         <div
           class={cn(
             "absolute inset-0",
-            settingsOpen() ? "opacity-100 translate-x-0" : "opacity-0 -translate-x-3 pointer-events-none",
+            settingsOpen() ? "opacity-100" : "opacity-0 pointer-events-none",
           )}
-          style={{ transition: "opacity 300ms var(--ease-out), transform 300ms var(--ease-out)" }}
+          style={{
+            transform: settingsOpen() ? "translateY(0)" : "translateY(-2rem)",
+            transition: "opacity 300ms var(--ease-out), transform 300ms var(--ease-out)",
+          }}
         >
           <SettingsPanel onClose={toggleSettings} />
         </div>
 
-        {/* Channel panel */}
+        {/* Channel panel — slides up when settings opens */}
         <div
           class={cn(
             "absolute inset-0",
-            !settingsOpen() && selectedGroup() ? "opacity-100 translate-x-0" : "opacity-0 translate-x-3 pointer-events-none",
+            !settingsOpen() && selectedGroup() ? "opacity-100" : "opacity-0 pointer-events-none",
           )}
-          style={{ transition: "opacity 300ms var(--ease-out), transform 300ms var(--ease-out)" }}
+          style={{
+            transform: settingsOpen() ? "translateY(-2rem)" : "translateY(0)",
+            transition: "opacity 300ms var(--ease-out), transform 300ms var(--ease-out)",
+          }}
         >
           <Show when={selectedGroup()}>
             {(group) => (

@@ -6,7 +6,7 @@ import { hashGradient } from "../lib/gradients";
 import { Avatar } from "./ui/avatar";
 import { cn } from "../lib/cn";
 import { ChevronDown, SendHorizonal } from "lucide-solid";
-import { selectedGroupId, selectedChannelId, members } from "../lib/store";
+import { selectedGroupId, selectedChannelId, members, settingsOpen } from "../lib/store";
 
 const PAGE_SIZE = 50;
 const SCROLL_BOTTOM_THRESHOLD = 80;
@@ -128,6 +128,11 @@ export function MessageView() {
         ref={containerRef}
         class="scrollarea flex-1 overflow-y-auto px-4 py-2"
         onScroll={updateNearBottom}
+        style={{
+          transform: settingsOpen() ? "translateY(-2rem)" : "translateY(0)",
+          opacity: settingsOpen() ? "0" : "1",
+          transition: "transform 300ms var(--ease-out), opacity 200ms var(--ease-out)",
+        }}
       >
         <Show when={hasMore()}>
           <button
@@ -204,7 +209,14 @@ export function MessageView() {
       <Show when={error()}>
         <div class="px-4 py-1 text-xs text-[var(--red-400)]">{error()}</div>
       </Show>
-      <div class="flex-shrink-0 px-4 py-3">
+      <div
+        class="flex-shrink-0 px-4 py-3"
+        style={{
+          transform: settingsOpen() ? "translateY(100%)" : "translateY(0)",
+          opacity: settingsOpen() ? "0" : "1",
+          transition: "transform 300ms var(--ease-out), opacity 300ms var(--ease-out)",
+        }}
+      >
         <div
           class="flex items-center gap-2 rounded-lg px-3"
           style={{

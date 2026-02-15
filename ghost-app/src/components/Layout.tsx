@@ -57,26 +57,36 @@ export function Layout() {
             </div>
           }
         >
-          <Show when={!settingsOpen()}>
-            <Show
-              when={selectedChannelId()}
-              fallback={
-                <div class="flex-1 flex items-center justify-center">
+          <Show
+            when={selectedChannelId()}
+            fallback={
+              <div class="flex-1 flex items-center justify-center">
+                <Show when={!settingsOpen()}>
                   <div class="text-center">
                     <span class="text-sm text-[var(--neutral-400)]">select a channel</span>
                     <span class="text-xs block mt-1 text-[var(--neutral-600)]">from the sidebar</span>
                   </div>
-                </div>
-              }
-            >
-              <GroupView />
-            </Show>
+                </Show>
+              </div>
+            }
+          >
+            <GroupView />
           </Show>
         </Show>
       </main>
-      <Show when={selectedGroup() && !settingsOpen()}>
+      <Show when={selectedGroup()}>
         <div class="divider-v" />
-        <MemberPanel />
+        <div
+          class="overflow-hidden flex-shrink-0"
+          style={{
+            width: settingsOpen() ? "0px" : "224px",
+            opacity: settingsOpen() ? "0" : "1",
+            transform: settingsOpen() ? "translateX(2rem)" : "translateX(0)",
+            transition: "width 300ms var(--ease-out), opacity 300ms var(--ease-out), transform 300ms var(--ease-out)",
+          }}
+        >
+          <MemberPanel />
+        </div>
       </Show>
       <CommandPalette />
       <InviteDialog link={inviteLink()} onClose={() => setInviteLink(null)} />

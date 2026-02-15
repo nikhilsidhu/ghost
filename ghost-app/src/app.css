@@ -233,7 +233,7 @@ input, textarea {
 .divider-v {
   width: 1px;
   flex-shrink: 0;
-  background: linear-gradient(to bottom, transparent 36px, var(--neutral-700) 56px, var(--neutral-700) calc(100% - 24px), transparent);
+  background: linear-gradient(to bottom, transparent 36px, var(--neutral-700) 56px, var(--neutral-700) calc(100% - 40px), transparent calc(100% - 20px));
 }
 .divider-h {
   height: 1px;
