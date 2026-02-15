@@ -26,7 +26,7 @@ export function ScrollArea(props: ScrollAreaProps) {
   return (
     <div
       ref={ref}
-      class={cn("scrollarea overflow-y-auto", local.class)}
+      class={cn("scrollarea overflow-y-auto overflow-x-hidden", local.class)}
       {...rest}
     >
       {local.children}

@@ -1,4 +1,4 @@
-import { createSignal, createEffect, on, For, Show } from "solid-js";
+import { createSignal, createEffect, on, onCleanup, For, Show } from "solid-js";
 import type { JSX } from "solid-js";
 import type { Group, Channel } from "../lib/types";
 import { hashGradient } from "../lib/gradients";
@@ -11,9 +11,13 @@ import { channelPrefix } from "../lib/constants";
 import {
   identity, groups, selectedGroupId, channels, selectedChannelId,
   selectedGroup, selectGroup, selectChannel,
+  settingsOpen, settingsCategory, setSettingsCategory, toggleSettings,
   isInCall, isMuted, isDeafened, toggleMute, toggleDeafen, endCall,
 } from "../lib/store";
+import { sections } from "../lib/settings-registry";
+import "../lib/settings";
 import { handleCreateChannel } from "../lib/commands";
+import { SettingsPanel } from "./SettingsPanel";
 import {
   DragDropProvider,
   DragDropSensors,
@@ -26,6 +30,10 @@ import {
 import type { DragEvent } from "@thisbeyond/solid-dnd";
 
 export function Sidebar() {
+  const onEscape = (e: KeyboardEvent) => { if (e.key === "Escape" && settingsOpen()) toggleSettings(); };
+  window.addEventListener("keydown", onEscape);
+  onCleanup(() => window.removeEventListener("keydown", onEscape));
+
   const [textCollapsed, setTextCollapsed] = createSignal(false);
   const [voiceCollapsed, setVoiceCollapsed] = createSignal(false);
   const [groupOrder, setGroupOrder] = createSignal<string[]>([]);
@@ -127,61 +135,125 @@ export function Sidebar() {
         class="w-[var(--size-lg)] flex-shrink-0 flex flex-col"
         style={{ background: "var(--neutral-950)" }}
       >
-        <div class="h-7 flex-shrink-0" />
-
-        {/* Scrollable group icons */}
-        <DragDropProvider
-          collisionDetector={closestCenter}
-          onDragStart={onGroupDragStart}
-          onDragEnd={onGroupDragEnd}
-        >
-          <DragDropSensors />
-          <ScrollArea class="flex-1 w-full">
-            <SortableProvider ids={groupOrder()}>
-              <div class="flex flex-col items-center py-3">
-                <For each={orderedGroups()}>
-                  {(g) => <GroupIcon group={g} isActive={g.group_id === selectedGroupId()} onClick={handleGroupClick} />}
-                </For>
-              </div>
-            </SortableProvider>
-          </ScrollArea>
-          <DragOverlay>
-            {(() => {
-              const id = activeGroupId();
-              if (!id) return null;
-              const g = groups().find((x) => x.group_id === id);
-              if (!g) return null;
-              const grad = hashGradient(g.group_id);
-              return (
-                <div class="w-[var(--size-lg)] h-[var(--size-lg)] flex items-center justify-center">
-                  <div
-                    class="w-[var(--size-md)] h-[var(--size-md)] rounded-[14%] flex items-center justify-center text-sm font-semibold opacity-80"
-                    style={{
-                      background: `linear-gradient(${grad.angle}deg, ${grad.from}, ${grad.to})`,
-                      color: "var(--neutral-100)",
-                    }}
-                  >
-                    {g.name[0]?.toUpperCase()}
+        {/* Swap zone: group icons ↔ settings icons */}
+        <div class="flex-1 w-full relative overflow-hidden">
+          {/* Group icons */}
+          <div
+            class={cn(
+              "absolute inset-0",
+              settingsOpen() && "pointer-events-none",
+            )}
+            style={{
+              transform: settingsOpen() ? "translateY(-100%)" : "translateY(0)",
+              transition: `transform ${150 + orderedGroups().length * 25}ms var(--ease-out)`,
+            }}
+          >
+            <DragDropProvider
+              collisionDetector={closestCenter}
+              onDragStart={onGroupDragStart}
+              onDragEnd={onGroupDragEnd}
+            >
+              <DragDropSensors />
+              <ScrollArea class="h-full w-full scrollbar-none">
+                <SortableProvider ids={groupOrder()}>
+                  <div class="flex flex-col items-center pt-6 pb-3">
+                    <For each={orderedGroups()}>
+                      {(g) => (
+                        <GroupIcon group={g} isActive={g.group_id === selectedGroupId()} onClick={handleGroupClick} />
+                      )}
+                    </For>
                   </div>
-                </div>
-              );
-            })()}
-          </DragOverlay>
-        </DragDropProvider>
+                </SortableProvider>
+              </ScrollArea>
+              <DragOverlay>
+                {(() => {
+                  const id = activeGroupId();
+                  if (!id) return null;
+                  const g = groups().find((x) => x.group_id === id);
+                  if (!g) return null;
+                  const grad = hashGradient(g.group_id);
+                  return (
+                    <div class="w-[var(--size-lg)] h-[var(--size-lg)] flex items-center justify-center">
+                      <div
+                        class="w-[var(--size-md)] h-[var(--size-md)] rounded-[14%] flex items-center justify-center text-sm font-semibold opacity-80"
+                        style={{
+                          background: `linear-gradient(${grad.angle}deg, ${grad.from}, ${grad.to})`,
+                          color: "var(--neutral-100)",
+                        }}
+                      >
+                        {g.name[0]?.toLowerCase()}
+                      </div>
+                    </div>
+                  );
+                })()}
+              </DragOverlay>
+            </DragDropProvider>
+          </div>
+
+          {/* Settings icons */}
+          <div
+            class={cn(
+              "absolute inset-0",
+              !settingsOpen() && "pointer-events-none",
+            )}
+            style={{
+              transform: settingsOpen() ? "translateY(0)" : "translateY(-100%)",
+              transition: `transform ${150 + sections().length * 25}ms var(--ease-out)`,
+            }}
+          >
+            <div class="flex flex-col items-center pt-6 pb-3">
+              <For each={sections()}>
+                {(section) => {
+                  const active = () => settingsCategory() === section.id;
+                  return (
+                    <Tooltip label={section.label}>
+                      <button
+                        class="w-[var(--size-lg)] h-[var(--size-lg)] flex items-center justify-center cursor-pointer"
+                        onClick={() => setSettingsCategory(section.id)}
+                      >
+                        <div
+                          class={cn(
+                            "w-[var(--size-md)] h-[var(--size-md)] rounded-lg flex items-center justify-center transition-all duration-200",
+                            active()
+                              ? "bg-[var(--neutral-800)] text-[var(--neutral-100)]"
+                              : "text-[var(--neutral-500)] hover:text-[var(--neutral-300)] hover:bg-[var(--neutral-800)]/50",
+                          )}
+                        >
+                          <section.icon size={20} />
+                        </div>
+                      </button>
+                    </Tooltip>
+                  );
+                }}
+              </For>
+            </div>
+          </div>
+
+          {/* Top fade overlay — masks icons sliding under traffic lights */}
+          <div
+            class="absolute top-0 left-0 right-0 h-8 pointer-events-none z-10"
+            style={{ background: "linear-gradient(to top, transparent, var(--neutral-950))" }}
+          />
+
+          {/* Bottom fade overlay */}
+          <div
+            class="absolute bottom-0 left-0 right-0 h-8 pointer-events-none"
+            style={{ background: "linear-gradient(to bottom, transparent, var(--neutral-950))" }}
+          />
+        </div>
 
         {/* Bottom dock — each item uses the same --size-lg cell as group icons */}
-        <div class="flex-shrink-0 flex flex-col items-center pb-3 group/dock">
-          <div class="w-[var(--size-lg)] py-2 flex items-center justify-center">
-            <div class="h-px w-[var(--size-md)] rounded-full" style={{ background: "var(--neutral-700)" }} />
-          </div>
+        <div class="flex-shrink-0 flex flex-col items-center pb-3 pt-2 group/dock">
 
           {/* Mute — pinned when active, hover-revealed otherwise */}
           <div class={cn(
-            "overflow-hidden transition-all duration-200 w-[var(--size-lg)] flex items-center justify-center",
+            "overflow-hidden w-[var(--size-lg)] flex items-center justify-center",
             isMuted()
-              ? "max-h-[var(--size-lg)] opacity-100"
-              : "max-h-0 opacity-0 group-hover/dock:max-h-[var(--size-lg)] group-hover/dock:opacity-100",
-          )}>
+              ? "max-h-[var(--size-lg)]"
+              : "max-h-0 group-hover/dock:max-h-[var(--size-lg)]",
+          )}
+          style={{ transition: "max-height 200ms var(--ease-out)" }}
+          >
             <Tooltip label={isMuted() ? "unmute" : "mute"}>
               <button
                 class={cn(
@@ -199,11 +271,13 @@ export function Sidebar() {
 
           {/* Deafen — pinned when active, hover-revealed otherwise */}
           <div class={cn(
-            "overflow-hidden transition-all duration-200 w-[var(--size-lg)] flex items-center justify-center",
+            "overflow-hidden w-[var(--size-lg)] flex items-center justify-center",
             isDeafened()
-              ? "max-h-[var(--size-lg)] opacity-100"
-              : "max-h-0 opacity-0 group-hover/dock:max-h-[var(--size-lg)] group-hover/dock:opacity-100",
-          )}>
+              ? "max-h-[var(--size-lg)]"
+              : "max-h-0 group-hover/dock:max-h-[var(--size-lg)]",
+          )}
+          style={{ transition: "max-height 200ms var(--ease-out)" }}
+          >
             <Tooltip label={isDeafened() ? "undeafen" : "deafen"}>
               <button
                 class={cn(
@@ -260,9 +334,16 @@ export function Sidebar() {
           {/* Settings */}
           <Tooltip label="settings">
             <button
-              class="w-[var(--size-lg)] h-[var(--size-md)] flex items-center justify-center cursor-pointer opacity-50 hover:opacity-100 transition-all duration-150 group/settings"
+              class={cn(
+                "w-[var(--size-lg)] h-[var(--size-md)] flex items-center justify-center cursor-pointer transition-all duration-150 group/settings",
+                settingsOpen() ? "opacity-100" : "opacity-50 hover:opacity-100",
+              )}
+              onClick={toggleSettings}
             >
-              <Settings size={20} class="text-[var(--neutral-300)] transition-transform duration-500 ease-out group-hover/settings:rotate-90" />
+              <Settings size={20} class={cn(
+                "text-[var(--neutral-300)] transition-transform duration-200",
+                settingsOpen() ? "rotate-90" : "group-hover/settings:rotate-90",
+              )} />
             </button>
           </Tooltip>
         </div>
@@ -270,113 +351,141 @@ export function Sidebar() {
 
       <div class="divider-v" />
 
-      {/* Channel panel */}
-      <Show when={selectedGroup()}>
-        {(group) => (
-          <div
-            class="w-52 flex-shrink-0 flex flex-col min-h-0"
-            style={{ background: "var(--neutral-950)" }}
-          >
-            <div class="h-7 flex-shrink-0" />
+      {/* Panel swap zone */}
+      <div
+        class="relative flex-shrink-0"
+        style={{
+          width: settingsOpen() ? "320px" : selectedGroup() ? "208px" : "0px",
+          transition: "width 300ms var(--ease-out)",
+        }}
+      >
+        {/* Settings panel — slides in from the left */}
+        <div
+          class={cn(
+            "absolute inset-0",
+            settingsOpen() ? "opacity-100 translate-x-0" : "opacity-0 -translate-x-3 pointer-events-none",
+          )}
+          style={{ transition: "opacity 300ms var(--ease-out), transform 300ms var(--ease-out)" }}
+        >
+          <SettingsPanel onClose={toggleSettings} />
+        </div>
 
-            <div class="h-[var(--size-lg)] flex items-center justify-center px-3 flex-shrink-0">
-              <span class="text-base font-semibold text-[var(--neutral-100)] truncate">
-                {group().name}
-              </span>
-            </div>
+        {/* Channel panel */}
+        <div
+          class={cn(
+            "absolute inset-0",
+            !settingsOpen() && selectedGroup() ? "opacity-100 translate-x-0" : "opacity-0 translate-x-3 pointer-events-none",
+          )}
+          style={{ transition: "opacity 300ms var(--ease-out), transform 300ms var(--ease-out)" }}
+        >
+          <Show when={selectedGroup()}>
+            {(group) => (
+              <div
+                class="w-full h-full flex flex-col min-h-0"
+                style={{ background: "var(--neutral-950)" }}
+              >
+                <div class="h-7 flex-shrink-0" />
 
-            <DragDropProvider
-              collisionDetector={closestCenter}
-              onDragStart={onChannelDragStart}
-              onDragEnd={onChannelDragEnd}
-            >
-              <DragDropSensors />
-              <ScrollArea class="flex-1">
-                <div class="pt-2">
-                  <div class="flex items-center justify-between px-3 py-1">
-                    <button
-                      class="flex items-center gap-1 text-xs uppercase tracking-wider text-[var(--neutral-500)] cursor-pointer hover:text-[var(--neutral-400)]"
-                      onClick={() => setTextCollapsed((v) => !v)}
-                    >
-                      <span class="text-[10px]">{textCollapsed() ? "\u25b8" : "\u25be"}</span>
-                      text channels
-                    </button>
-                    <button
-                      class="w-[var(--size-sm)] h-[var(--size-sm)] flex items-center justify-center rounded-md text-sm leading-none text-[var(--neutral-500)] hover:text-[var(--neutral-200)] cursor-pointer hover:bg-[var(--hover)]"
-                      onClick={() => handleCreateChannel("text")}
-                    >
-                      +
-                    </button>
-                  </div>
-                  <Show when={!textCollapsed()}>
-                    <div class="px-2">
-                      <SortableProvider ids={textChannels().map((c) => c.channel_id)}>
-                        <For each={textChannels()}>
-                          {(ch) => (
-                            <ChannelItem
-                              channel={ch}
-                              isSelected={ch.channel_id === selectedChannelId()}
-                              onSelect={selectChannel}
-                              icon={<span class="text-[var(--neutral-500)]">#</span>}
-                            />
-                          )}
-                        </For>
-                      </SortableProvider>
-                    </div>
-                  </Show>
+                <div class="h-[var(--size-lg)] flex items-center px-4 flex-shrink-0 -mt-1">
+                  <span class="text-base font-semibold text-[var(--neutral-100)] truncate lowercase">
+                    {group().name}
+                  </span>
                 </div>
 
-                <div class="mt-2">
-                  <div class="flex items-center justify-between px-3 py-1">
-                    <button
-                      class="flex items-center gap-1 text-xs uppercase tracking-wider text-[var(--neutral-500)] cursor-pointer hover:text-[var(--neutral-400)]"
-                      onClick={() => setVoiceCollapsed((v) => !v)}
-                    >
-                      <span class="text-[10px]">{voiceCollapsed() ? "\u25b8" : "\u25be"}</span>
-                      voice channels
-                    </button>
-                    <button
-                      class="w-[var(--size-sm)] h-[var(--size-sm)] flex items-center justify-center rounded-md text-sm leading-none text-[var(--neutral-500)] hover:text-[var(--neutral-200)] cursor-pointer hover:bg-[var(--hover)]"
-                      onClick={() => handleCreateChannel("voice")}
-                    >
-                      +
-                    </button>
-                  </div>
-                  <Show when={!voiceCollapsed()}>
-                    <div class="px-2">
-                      <SortableProvider ids={voiceChannels().map((c) => c.channel_id)}>
-                        <For each={voiceChannels()}>
-                          {(ch) => (
-                            <ChannelItem
-                              channel={ch}
-                              isSelected={ch.channel_id === selectedChannelId()}
-                              onSelect={selectChannel}
-                              icon={<AudioLines size={14} class="text-[var(--neutral-500)] flex-shrink-0" />}
-                            />
-                          )}
-                        </For>
-                      </SortableProvider>
+                <DragDropProvider
+                  collisionDetector={closestCenter}
+                  onDragStart={onChannelDragStart}
+                  onDragEnd={onChannelDragEnd}
+                >
+                  <DragDropSensors />
+                  <ScrollArea class="flex-1">
+                    <div class="pt-2">
+                      <div class="flex items-center justify-between px-3 py-1">
+                        <button
+                          class="flex items-center gap-1 text-sm font-medium text-[var(--neutral-500)] cursor-pointer hover:text-[var(--neutral-400)]"
+                          onClick={() => setTextCollapsed((v) => !v)}
+                        >
+                          <span class="text-[10px]">{textCollapsed() ? "\u25b8" : "\u25be"}</span>
+                          text channels
+                        </button>
+                        <button
+                          class="w-6 h-6 flex items-center justify-center rounded-md text-sm leading-none text-[var(--neutral-500)] hover:text-[var(--neutral-200)] cursor-pointer hover:bg-[var(--hover)]"
+                          onClick={() => handleCreateChannel("text")}
+                        >
+                          +
+                        </button>
+                      </div>
+                      <Show when={!textCollapsed()}>
+                        <div class="px-2">
+                          <SortableProvider ids={textChannels().map((c) => c.channel_id)}>
+                            <For each={textChannels()}>
+                              {(ch) => (
+                                <ChannelItem
+                                  channel={ch}
+                                  isSelected={ch.channel_id === selectedChannelId()}
+                                  onSelect={selectChannel}
+                                  icon={<span class="text-[var(--neutral-500)]">#</span>}
+                                />
+                              )}
+                            </For>
+                          </SortableProvider>
+                        </div>
+                      </Show>
                     </div>
-                  </Show>
-                </div>
-              </ScrollArea>
-              <DragOverlay>
-                {(() => {
-                  const id = activeChannelId();
-                  if (!id) return null;
-                  const ch = channels().find((c) => c.channel_id === id);
-                  if (!ch) return null;
-                  return (
-                    <div class="flex items-center gap-2 px-2 py-1.5 rounded-md text-sm text-[var(--neutral-200)] bg-[var(--neutral-800)] opacity-80">
-                      {channelPrefix(ch.kind)} {ch.name}
+
+                    <div class="mt-2">
+                      <div class="flex items-center justify-between px-3 py-1">
+                        <button
+                          class="flex items-center gap-1 text-sm font-medium text-[var(--neutral-500)] cursor-pointer hover:text-[var(--neutral-400)]"
+                          onClick={() => setVoiceCollapsed((v) => !v)}
+                        >
+                          <span class="text-[10px]">{voiceCollapsed() ? "\u25b8" : "\u25be"}</span>
+                          voice channels
+                        </button>
+                        <button
+                          class="w-6 h-6 flex items-center justify-center rounded-md text-sm leading-none text-[var(--neutral-500)] hover:text-[var(--neutral-200)] cursor-pointer hover:bg-[var(--hover)]"
+                          onClick={() => handleCreateChannel("voice")}
+                        >
+                          +
+                        </button>
+                      </div>
+                      <Show when={!voiceCollapsed()}>
+                        <div class="px-2">
+                          <SortableProvider ids={voiceChannels().map((c) => c.channel_id)}>
+                            <For each={voiceChannels()}>
+                              {(ch) => (
+                                <ChannelItem
+                                  channel={ch}
+                                  isSelected={ch.channel_id === selectedChannelId()}
+                                  onSelect={selectChannel}
+                                  icon={<AudioLines size={14} class="text-[var(--neutral-500)] flex-shrink-0" />}
+                                />
+                              )}
+                            </For>
+                          </SortableProvider>
+                        </div>
+                      </Show>
                     </div>
-                  );
-                })()}
-              </DragOverlay>
-            </DragDropProvider>
-          </div>
-        )}
-      </Show>
+                  </ScrollArea>
+                  <DragOverlay>
+                    {(() => {
+                      const id = activeChannelId();
+                      if (!id) return null;
+                      const ch = channels().find((c) => c.channel_id === id);
+                      if (!ch) return null;
+                      return (
+                        <div class="flex items-center gap-2 px-2 py-1.5 rounded-md text-sm text-[var(--neutral-200)] bg-[var(--neutral-800)] opacity-80">
+                          {channelPrefix(ch.kind)} {ch.name}
+                        </div>
+                      );
+                    })()}
+                  </DragOverlay>
+                </DragDropProvider>
+              </div>
+            )}
+          </Show>
+        </div>
+      </div>
     </div>
   );
 }
@@ -420,7 +529,7 @@ function GroupIcon(props: { group: Group; isActive: boolean; onClick: (id: strin
                 : "opacity-60 scale-95 hover:opacity-90 hover:scale-100",
             )}
           >
-            {props.group.name[0]?.toUpperCase()}
+            {props.group.name[0]?.toLowerCase()}
             {/* Unread dot */}
             <Show when={!props.isActive && props.group.has_unread}>
               <div
@@ -458,7 +567,7 @@ function ChannelItem(props: {
     <button
       ref={sortable.ref}
       class={cn(
-        "w-full flex items-center gap-2 px-2 py-1.5 rounded-md text-sm cursor-pointer",
+        "w-full flex items-center gap-2 px-2 py-1.5 rounded-md text-sm text-left cursor-pointer",
         props.isSelected
           ? "bg-[var(--active)] text-[var(--neutral-100)]"
           : props.channel.unread_count > 0

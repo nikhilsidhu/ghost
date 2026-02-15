@@ -22,6 +22,14 @@ const [allChannels, setAllChannels] = createSignal<Channel[]>([]);
 const [inviteLink, setInviteLink] = createSignal<string | null>(null);
 const [showInfo, setShowInfo] = createSignal(false);
 const [desiredChannelKind, setDesiredChannelKind] = createSignal<string>("text");
+const [settingsOpen, setSettingsOpen] = createSignal(false);
+const [settingsCategory, setSettingsCategory] = createSignal("profile");
+
+const toggleSettings = () => {
+  const opening = !settingsOpen();
+  setSettingsOpen(opening);
+  if (opening) setSettingsCategory("profile");
+};
 
 // --- Call state ---
 
@@ -132,5 +140,6 @@ export {
   selectGroup, selectChannel, updateIdentity, initialize, seedAndRefresh,
   refreshGroups, refreshChannels, refreshPins, refreshAllChannels,
   setInviteLink, setShowInfo, setDesiredChannelKind,
+  settingsOpen, settingsCategory, setSettingsCategory, toggleSettings,
   isInCall, isMuted, isDeafened, toggleMute, toggleDeafen, endCall, setIsInCall,
 };

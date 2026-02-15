@@ -2,7 +2,7 @@ import { onMount, Show, For } from "solid-js";
 import "../lib/commands";
 import {
   selectedGroup, selectedChannelId,
-  inviteLink, showInfo,
+  inviteLink, showInfo, settingsOpen,
   initialize, seedAndRefresh,
   setInviteLink, setShowInfo,
 } from "../lib/store";
@@ -27,7 +27,7 @@ export function Layout() {
       <div class="divider-v" />
       <main class="flex-1 flex flex-col min-w-0 pt-7">
         <Show
-          when={selectedGroup()}
+          when={selectedGroup() || settingsOpen()}
           fallback={
             <div class="flex-1 flex items-center justify-center">
               <div class="flex flex-col items-center gap-5">
@@ -57,22 +57,24 @@ export function Layout() {
             </div>
           }
         >
-          <Show
-            when={selectedChannelId()}
-            fallback={
-              <div class="flex-1 flex items-center justify-center">
-                <div class="text-center">
-                  <span class="text-sm text-[var(--neutral-400)]">select a channel</span>
-                  <span class="text-xs block mt-1 text-[var(--neutral-600)]">from the sidebar</span>
+          <Show when={!settingsOpen()}>
+            <Show
+              when={selectedChannelId()}
+              fallback={
+                <div class="flex-1 flex items-center justify-center">
+                  <div class="text-center">
+                    <span class="text-sm text-[var(--neutral-400)]">select a channel</span>
+                    <span class="text-xs block mt-1 text-[var(--neutral-600)]">from the sidebar</span>
+                  </div>
                 </div>
-              </div>
-            }
-          >
-            <GroupView />
+              }
+            >
+              <GroupView />
+            </Show>
           </Show>
         </Show>
       </main>
-      <Show when={selectedGroup()}>
+      <Show when={selectedGroup() && !settingsOpen()}>
         <div class="divider-v" />
         <MemberPanel />
       </Show>

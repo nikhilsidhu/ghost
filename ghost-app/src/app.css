@@ -154,6 +154,9 @@
 
   /* Derived: left indent for grouped messages (px-2 + avatar + gap-3) */
   --msg-indent: calc(var(--size-md) + 20px);
+
+  /* Easing — easeOutQuart (Linear's sidebar curve) */
+  --ease-out: cubic-bezier(0.165, 0.84, 0.44, 1);
 }
 
 * {
@@ -217,6 +220,8 @@ input, textarea {
 .scrollarea::-webkit-scrollbar-corner {
   background: transparent;
 }
+.scrollbar-none::-webkit-scrollbar { display: none; }
+.scrollbar-none { scrollbar-width: none; }
 
 /* Tooltip fade-in */
 @keyframes tooltip-in {

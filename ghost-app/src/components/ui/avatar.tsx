@@ -30,7 +30,7 @@ export function Avatar(props: AvatarProps) {
       onMouseMove={onFlareMove}
       onMouseLeave={onFlareLeave}
     >
-      {props.children ?? props.label[0]?.toUpperCase()}
+      {props.children ?? props.label[0]?.toLowerCase()}
     </div>
   );
 }

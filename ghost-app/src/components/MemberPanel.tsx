@@ -11,7 +11,7 @@ export function MemberPanel() {
     >
       <div class="h-7 flex-shrink-0" />
       <div class="h-10 flex-shrink-0 flex items-center px-3">
-        <span class="text-xs uppercase tracking-wider text-[var(--neutral-500)]">
+        <span class="text-sm font-medium text-[var(--neutral-500)]">
           members — {members().length}
         </span>
       </div>
