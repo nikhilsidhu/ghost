@@ -43,11 +43,14 @@ export function hashGradient(key: string): Gradient {
 export function onFlareMove(e: MouseEvent) {
   const el = e.currentTarget as HTMLElement;
   const rect = el.getBoundingClientRect();
-  el.style.setProperty("--flare-x", `${((e.clientX - rect.left) / rect.width) * 100}%`);
-  el.style.setProperty("--flare-y", `${((e.clientY - rect.top) / rect.height) * 100}%`);
+  const px = (e.clientX - rect.left) / rect.width;
+  const py = (e.clientY - rect.top) / rect.height;
+  el.style.setProperty("--flare-x", `${px * 100}%`);
+  el.style.setProperty("--flare-y", `${py * 100}%`);
   el.style.setProperty("--flare-opacity", "1");
 }
 
 export function onFlareLeave(e: MouseEvent) {
-  (e.currentTarget as HTMLElement).style.setProperty("--flare-opacity", "0");
+  const el = e.currentTarget as HTMLElement;
+  el.style.setProperty("--flare-opacity", "0");
 }

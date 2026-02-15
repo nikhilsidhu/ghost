@@ -138,7 +138,7 @@ export function Sidebar() {
           <DragDropSensors />
           <ScrollArea class="flex-1 w-full">
             <SortableProvider ids={groupOrder()}>
-              <div class="flex flex-col items-center">
+              <div class="flex flex-col items-center py-3">
                 <For each={orderedGroups()}>
                   {(g) => <GroupIcon group={g} isActive={g.group_id === selectedGroupId()} onClick={handleGroupClick} />}
                 </For>
@@ -417,7 +417,7 @@ function GroupIcon(props: { group: Group; isActive: boolean; onClick: (id: strin
               "relative w-[var(--size-md)] h-[var(--size-md)] text-sm transition-all duration-200",
               props.isActive || props.group.has_unread
                 ? "opacity-100 scale-100"
-                : "opacity-60 scale-95 group-hover/gi:opacity-90 group-hover/gi:scale-100",
+                : "opacity-60 scale-95 hover:opacity-90 hover:scale-100",
             )}
           >
             {props.group.name[0]?.toUpperCase()}

@@ -288,13 +288,38 @@ input, textarea {
   0%, 100% { opacity: 0.35; }
   50% { opacity: 1; }
 }
+@keyframes vapor-breathe {
+  0%, 100% { transform: translateZ(0) scale(1); }
+  50% { transform: translateZ(0) scale(1.12); }
+}
 
 /* Avatar highlight — radial spot follows the mouse cursor + ambient glow */
 .avatar-flare {
   position: relative;
-  overflow: hidden;
   box-shadow: 0 0 6px 1px color-mix(in srgb, var(--glow-color, transparent) 9%, transparent);
   transition: box-shadow 200ms ease-out;
+}
+/* Colored ambient glow — follows cursor, extends hover detection zone */
+.avatar-flare::before {
+  content: '';
+  position: absolute;
+  inset: -10px;
+  border-radius: inherit;
+  background: radial-gradient(
+    circle at var(--flare-x, 50%) var(--flare-y, 50%),
+    color-mix(in srgb, var(--glow-color, transparent) 30%, transparent) 0%,
+    color-mix(in srgb, var(--glow-color, transparent) 10%, transparent) 45%,
+    transparent 80%
+  );
+  filter: blur(6px);
+  opacity: var(--flare-opacity, 0);
+  transition: opacity 200ms ease-out;
+  animation: vapor-breathe 4s ease-in-out infinite paused;
+  transform: translateZ(0);
+  will-change: transform;
+}
+.avatar-flare:hover::before {
+  animation-play-state: running;
 }
 .avatar-flare:hover {
   box-shadow: 0 0 10px 2px color-mix(in srgb, var(--glow-color, transparent) 19%, transparent),
@@ -327,9 +352,12 @@ input, textarea {
   .group-glow { animation: none; }
   [data-palette-content]::before,
   [data-palette-content]::after { display: none; }
+  .avatar-flare::before {
+    animation: none;
+    transition: none;
+  }
   .avatar-flare::after {
     transition: none;
-    /* Static centered highlight on hover instead of mouse tracking */
     background: radial-gradient(circle at 50% 50%, rgba(255, 255, 255, 0.10) 0%, transparent 70%);
   }
 }
