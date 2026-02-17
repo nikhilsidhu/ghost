@@ -121,15 +121,14 @@ export function MessageView() {
   };
 
   return (
-    <div class="flex-1 flex flex-col min-h-0 relative pr-1">
+    <div class="flex-1 flex flex-col min-h-0 relative pr-1 overflow-hidden">
       <div
         ref={containerRef}
         class="scrollarea flex-1 overflow-y-auto px-4 py-2"
         onScroll={updateNearBottom}
         style={{
-          transform: settingsOpen() ? "translateY(-2rem)" : "translateY(0)",
-          opacity: settingsOpen() ? "0" : "1",
-          transition: "transform var(--duration-slow) var(--ease-out), opacity var(--duration-mid) var(--ease-out)",
+          transform: settingsOpen() ? "translateY(-100%)" : "translateY(0)",
+          transition: "transform var(--duration-slow) var(--ease-out)",
         }}
       >
         <Show when={hasMore()}>
@@ -213,8 +212,7 @@ export function MessageView() {
         class="flex-shrink-0 px-4 py-3"
         style={{
           transform: settingsOpen() ? "translateY(100%)" : "translateY(0)",
-          opacity: settingsOpen() ? "0" : "1",
-          transition: "transform var(--duration-slow) var(--ease-out), opacity var(--duration-slow) var(--ease-out)",
+          transition: "transform var(--duration-slow) var(--ease-out)",
         }}
       >
         <div
