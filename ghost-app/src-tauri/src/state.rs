@@ -5,6 +5,7 @@ use ghost_core::client::GhostClient;
 use ghost_core::relay::RelayClient;
 use tokio::sync::Mutex;
 
+use crate::config::GhostConfig;
 use crate::voice_task::VoiceHandle;
 
 pub struct AppState {
@@ -13,5 +14,6 @@ pub struct AppState {
     pub relay_url: String,
     pub http: reqwest::Client,
     pub config_path: PathBuf,
+    pub config: Mutex<GhostConfig>,
     pub voice: VoiceHandle,
 }

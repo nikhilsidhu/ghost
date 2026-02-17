@@ -206,23 +206,31 @@ export function Sidebar() {
                 {(section) => {
                   const active = () => settingsCategory() === section.id;
                   return (
-                    <Tooltip label={section.label}>
-                      <button
-                        class="w-[var(--size-lg)] h-[var(--size-lg)] flex items-center justify-center cursor-pointer"
-                        onClick={() => setSettingsCategory(section.id)}
-                      >
-                        <div
+                    <div class="relative flex items-center justify-center w-full group/si">
+                      {/* Left indicator — tall bar when active, short pill on hover */}
+                      <div
+                        class={cn(
+                          "absolute left-0 w-[3px] rounded-r-full transition-all duration-200",
+                          active()
+                            ? "top-1 bottom-1 opacity-100"
+                            : "top-[38%] bottom-[38%] opacity-0 group-hover/si:opacity-100",
+                        )}
+                        style={{ background: "var(--neutral-400)" }}
+                      />
+                      <Tooltip label={section.label}>
+                        <button
                           class={cn(
-                            "w-[var(--size-md)] h-[var(--size-md)] rounded-lg flex items-center justify-center transition-all duration-200",
+                            "w-[var(--size-lg)] h-[var(--size-lg)] flex items-center justify-center cursor-pointer transition-all duration-200",
                             active()
-                              ? "bg-[var(--neutral-800)] text-[var(--neutral-100)]"
-                              : "text-[var(--neutral-500)] hover:text-[var(--neutral-300)] hover:bg-[var(--neutral-800)]/50",
+                              ? "opacity-100 text-[var(--neutral-100)]"
+                              : "opacity-50 hover:opacity-90 text-[var(--neutral-400)]",
                           )}
+                          onClick={() => setSettingsCategory(section.id)}
                         >
                           <section.icon size={20} />
-                        </div>
-                      </button>
-                    </Tooltip>
+                        </button>
+                      </Tooltip>
+                    </div>
                   );
                 }}
               </For>
@@ -268,8 +276,6 @@ export function Sidebar() {
               </button>
             </Tooltip>
           </div>
-
-          {/* Deafen — pinned when active, hover-revealed otherwise */}
           <div class={cn(
             "overflow-hidden w-[var(--size-lg)] flex items-center justify-center",
             isDeafened()

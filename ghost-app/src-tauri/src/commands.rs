@@ -6,7 +6,6 @@ use tauri::State;
 
 use ghost_core::storage::{Channel, ChannelKind, Group, Member, MemberRole, StoredMessage};
 
-use crate::config::GhostConfig;
 use crate::constants::{DEFAULT_PAGE_SIZE, INVITE_EXPIRY_MS, SEQ_HEADER};
 use crate::dto::{ChannelDto, ConfigDto, GroupDto, IdentityDto, InviteDto, MemberDto, MessageDto};
 use crate::state::AppState;
@@ -371,10 +370,10 @@ pub async fn join_by_invite(
 
 #[tauri::command]
 pub async fn get_config(state: State<'_, AppState>) -> Result<ConfigDto, String> {
-    let cfg = GhostConfig::load(&state.config_path);
+    let cfg = state.config.lock().await;
     Ok(ConfigDto {
-        display_name: cfg.display_name,
-        relay_url: cfg.relay_url,
+        display_name: cfg.display_name.clone(),
+        relay_url: cfg.relay_url.clone(),
     })
 }
 
@@ -383,7 +382,7 @@ pub async fn set_display_name(
     name: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let mut cfg = GhostConfig::load(&state.config_path);
+    let mut cfg = state.config.lock().await;
     cfg.display_name = Some(name.clone());
     cfg.save(&state.config_path)?;
 
@@ -397,7 +396,7 @@ pub async fn set_relay_url(
     url: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let mut cfg = GhostConfig::load(&state.config_path);
+    let mut cfg = state.config.lock().await;
     cfg.relay_url = Some(url);
     cfg.save(&state.config_path)?;
     Ok(())

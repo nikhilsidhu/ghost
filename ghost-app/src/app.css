@@ -350,6 +350,10 @@ input, textarea {
   transition: opacity 150ms ease-out;
 }
 
+/* Compact mode — tighten message rows */
+:root.compact .group\/msg { padding-top: 1px; padding-bottom: 1px; }
+:root.compact .group\/msg.mt-2 { margin-top: 0.25rem; }
+
 @media (prefers-reduced-motion: reduce) {
   .msg-new,
   [data-palette-content],

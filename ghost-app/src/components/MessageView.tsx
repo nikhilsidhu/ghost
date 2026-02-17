@@ -7,10 +7,11 @@ import { Avatar } from "./ui/avatar";
 import { cn } from "../lib/cn";
 import { ChevronDown, SendHorizonal } from "lucide-solid";
 import { selectedGroupId, selectedChannelId, members, settingsOpen } from "../lib/store";
+import { showTimestamps } from "./settings/AppearanceSettings";
+import { enterSends } from "./settings/MessagesSettings";
 
 const PAGE_SIZE = 50;
 const SCROLL_BOTTOM_THRESHOLD = 80;
-const GROUP_WINDOW_MS = 5 * 60 * 1000;
 
 const formatTime = (ts: number) => {
   const d = new Date(ts);
@@ -48,12 +49,9 @@ export function MessageView() {
     setNearBottom(nb);
   };
 
-  // Group consecutive messages from same sender within 5min
   const isGrouped = (msgs: Message[], idx: number) => {
     if (idx === 0) return false;
-    const prev = msgs[idx - 1];
-    const cur = msgs[idx];
-    return prev.sender_fp === cur.sender_fp && cur.timestamp - prev.timestamp < GROUP_WINDOW_MS;
+    return msgs[idx - 1].sender_fp === msgs[idx].sender_fp;
   };
 
   createEffect(on(selectedChannelId, (cid) => {
@@ -171,9 +169,11 @@ export function MessageView() {
                         >
                           {name()}
                         </span>
-                        <span class="text-xs text-[var(--neutral-600)]">
-                          {formatTime(msg.timestamp)}
-                        </span>
+                        <Show when={showTimestamps()}>
+                          <span class="text-xs text-[var(--neutral-600)]">
+                            {formatTime(msg.timestamp)}
+                          </span>
+                        </Show>
                       </div>
                       <div class="text-sm text-[var(--neutral-300)] break-words leading-relaxed">
                         {msg.content}
@@ -230,7 +230,12 @@ export function MessageView() {
             placeholder="send a message..."
             value={inputText()}
             onInput={(e) => setInputText(e.currentTarget.value)}
-            onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); handleSend(); } }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                const send = enterSends() ? !e.shiftKey : e.shiftKey;
+                if (send) { e.preventDefault(); handleSend(); }
+              }
+            }}
           />
           <button
             class="w-7 h-7 flex items-center justify-center rounded-md cursor-pointer transition-colors duration-150"

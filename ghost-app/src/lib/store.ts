@@ -6,6 +6,20 @@ import {
   listPinnedGroups, markChannelRead, seedTestData,
 } from "./api";
 
+// Backend settings (relay URL, display name) live in ~/.ghost/config.toml.
+const SETTING_PREFIX = "ghost:";
+
+export function createSetting<T>(key: string, defaultValue: T): [() => T, (v: T) => void] {
+  const stored = localStorage.getItem(SETTING_PREFIX + key);
+  const initial: T = stored !== null ? JSON.parse(stored) : defaultValue;
+  const [value, setValue] = createSignal<T>(initial);
+  const set = (v: T) => {
+    setValue(() => v);
+    localStorage.setItem(SETTING_PREFIX + key, JSON.stringify(v));
+  };
+  return [value, set];
+}
+
 // --- Data ---
 
 const [identity, setIdentity] = createSignal<Identity | null>(null);
@@ -23,12 +37,12 @@ const [inviteLink, setInviteLink] = createSignal<string | null>(null);
 const [showInfo, setShowInfo] = createSignal(false);
 const [desiredChannelKind, setDesiredChannelKind] = createSignal<string>("text");
 const [settingsOpen, setSettingsOpen] = createSignal(false);
-const [settingsCategory, setSettingsCategory] = createSignal("profile");
+const [settingsCategory, setSettingsCategory] = createSignal("appearance");
 
 const toggleSettings = () => {
   const opening = !settingsOpen();
   setSettingsOpen(opening);
-  if (opening) setSettingsCategory("profile");
+  if (opening) setSettingsCategory("appearance");
 };
 
 // --- Call state ---

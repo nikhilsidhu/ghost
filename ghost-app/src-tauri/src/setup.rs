@@ -102,6 +102,7 @@ pub fn initialize() -> SetupResult {
         relay_url,
         http: reqwest::Client::new(),
         config_path: cfg_path,
+        config: Mutex::new(cfg),
         voice: VoiceHandle {
             cmd_tx: voice_cmd_tx,
             state_rx: voice_state_rx,

@@ -1,7 +1,12 @@
-import { User, Palette, Headphones, Shield } from "lucide-solid";
+import { Palette, Mail, WifiPen, MonitorSpeaker, BellRing, HatGlasses, Rat } from "lucide-solid";
 import { registerSettings } from "./settings-registry";
-
-const Placeholder = () => null;
+import AppearanceSettings from "../components/settings/AppearanceSettings";
+import MessagesSettings from "../components/settings/MessagesSettings";
+import NetworkSettings from "../components/settings/NetworkSettings";
+import AudiovisualSettings from "../components/settings/AudiovisualSettings";
+import NotificationsSettings from "../components/settings/NotificationsSettings";
+import PrivacySettings from "../components/settings/PrivacySettings";
+import DevSettings from "../components/settings/DevSettings";
 
 const cleanups: (() => void)[] = [];
 
@@ -10,33 +15,57 @@ if (import.meta.hot) {
 }
 
 cleanups.push(registerSettings({
-  id: "profile",
-  label: "profile",
-  icon: User,
-  order: 0,
-  render: Placeholder,
-}));
-
-cleanups.push(registerSettings({
   id: "appearance",
   label: "appearance",
   icon: Palette,
-  order: 10,
-  render: Placeholder,
+  order: 0,
+  render: AppearanceSettings,
 }));
 
 cleanups.push(registerSettings({
-  id: "audio",
-  label: "audio",
-  icon: Headphones,
+  id: "messages",
+  label: "messages",
+  icon: Mail,
+  order: 10,
+  render: MessagesSettings,
+}));
+
+cleanups.push(registerSettings({
+  id: "network",
+  label: "network",
+  icon: WifiPen,
   order: 20,
-  render: Placeholder,
+  render: NetworkSettings,
+}));
+
+cleanups.push(registerSettings({
+  id: "audiovisual",
+  label: "audiovisual",
+  icon: MonitorSpeaker,
+  order: 30,
+  render: AudiovisualSettings,
+}));
+
+cleanups.push(registerSettings({
+  id: "notifications",
+  label: "notifications",
+  icon: BellRing,
+  order: 40,
+  render: NotificationsSettings,
 }));
 
 cleanups.push(registerSettings({
   id: "privacy",
   label: "privacy",
-  icon: Shield,
-  order: 30,
-  render: Placeholder,
+  icon: HatGlasses,
+  order: 50,
+  render: PrivacySettings,
+}));
+
+cleanups.push(registerSettings({
+  id: "dev",
+  label: "dev",
+  icon: Rat,
+  order: 100,
+  render: DevSettings,
 }));
