@@ -129,7 +129,7 @@ export function MessageView() {
         style={{
           transform: settingsOpen() ? "translateY(-2rem)" : "translateY(0)",
           opacity: settingsOpen() ? "0" : "1",
-          transition: "transform 300ms var(--ease-out), opacity 200ms var(--ease-out)",
+          transition: "transform var(--duration-slow) var(--ease-out), opacity var(--duration-mid) var(--ease-out)",
         }}
       >
         <Show when={hasMore()}>
@@ -214,7 +214,7 @@ export function MessageView() {
         style={{
           transform: settingsOpen() ? "translateY(100%)" : "translateY(0)",
           opacity: settingsOpen() ? "0" : "1",
-          transition: "transform 300ms var(--ease-out), opacity 300ms var(--ease-out)",
+          transition: "transform var(--duration-slow) var(--ease-out), opacity var(--duration-slow) var(--ease-out)",
         }}
       >
         <div

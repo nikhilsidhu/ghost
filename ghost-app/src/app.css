@@ -155,6 +155,11 @@
   /* Derived: left indent for grouped messages (px-2 + avatar + gap-3) */
   --msg-indent: calc(var(--size-md) + 20px);
 
+  /* Animation timing */
+  --duration-fast: 150ms;
+  --duration-mid: 200ms;
+  --duration-slow: 300ms;
+
   /* Easing — easeOutQuart (Linear's sidebar curve) */
   --ease-out: cubic-bezier(0.165, 0.84, 0.44, 1);
 }
@@ -247,7 +252,7 @@ input, textarea {
   to { opacity: 1; transform: translateY(0); }
 }
 .msg-new {
-  animation: msg-in 180ms ease-out;
+  animation: msg-in var(--duration-fast) ease-out;
 }
 
 /* Command palette slide-up */
@@ -302,7 +307,7 @@ input, textarea {
 .avatar-flare {
   position: relative;
   box-shadow: 0 0 6px 1px color-mix(in srgb, var(--glow-color, transparent) 9%, transparent);
-  transition: box-shadow 200ms ease-out;
+  transition: box-shadow var(--duration-mid) ease-out;
 }
 /* Colored ambient glow — follows cursor, extends hover detection zone */
 .avatar-flare::before {
@@ -318,7 +323,7 @@ input, textarea {
   );
   filter: blur(6px);
   opacity: var(--flare-opacity, 0);
-  transition: opacity 200ms ease-out;
+  transition: opacity var(--duration-mid) ease-out;
   animation: vapor-breathe 4s ease-in-out infinite paused;
   transform: translateZ(0);
   will-change: transform;
@@ -347,7 +352,7 @@ input, textarea {
     transparent 68%
   );
   opacity: var(--flare-opacity, 0);
-  transition: opacity 150ms ease-out;
+  transition: opacity var(--duration-fast) ease-out;
 }
 
 /* Compact mode — tighten message rows */

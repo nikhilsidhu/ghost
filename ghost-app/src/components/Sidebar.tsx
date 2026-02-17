@@ -7,7 +7,7 @@ import { Tooltip } from "./ui/tooltip";
 import { ScrollArea } from "./ui/scroll-area";
 import { cn } from "../lib/cn";
 import { AudioLines, Settings, X, Mic, MicOff, Headphones, HeadphoneOff, PhoneOff } from "lucide-solid";
-import { channelPrefix } from "../lib/constants";
+import { channelPrefix, slideDuration } from "../lib/constants";
 import {
   identity, groups, selectedGroupId, channels, selectedChannelId,
   selectedGroup, selectGroup, selectChannel,
@@ -145,7 +145,7 @@ export function Sidebar() {
             )}
             style={{
               transform: settingsOpen() ? "translateY(-100%)" : "translateY(0)",
-              transition: `transform ${150 + orderedGroups().length * 25}ms var(--ease-out)`,
+              transition: `transform ${slideDuration(orderedGroups().length)} var(--ease-out)`,
             }}
           >
             <DragDropProvider
@@ -198,7 +198,7 @@ export function Sidebar() {
             )}
             style={{
               transform: settingsOpen() ? "translateY(0)" : "translateY(-100%)",
-              transition: `transform ${150 + sections().length * 25}ms var(--ease-out)`,
+              transition: `transform ${slideDuration(sections().length)} var(--ease-out)`,
             }}
           >
             <div class="flex flex-col items-center pt-6 pb-3">
@@ -260,7 +260,7 @@ export function Sidebar() {
               ? "max-h-[var(--size-lg)]"
               : "max-h-0 group-hover/dock:max-h-[var(--size-lg)]",
           )}
-          style={{ transition: "max-height 200ms var(--ease-out)" }}
+          style={{ transition: "max-height var(--duration-mid) var(--ease-out)" }}
           >
             <Tooltip label={isMuted() ? "unmute" : "mute"}>
               <button
@@ -282,7 +282,7 @@ export function Sidebar() {
               ? "max-h-[var(--size-lg)]"
               : "max-h-0 group-hover/dock:max-h-[var(--size-lg)]",
           )}
-          style={{ transition: "max-height 200ms var(--ease-out)" }}
+          style={{ transition: "max-height var(--duration-mid) var(--ease-out)" }}
           >
             <Tooltip label={isDeafened() ? "undeafen" : "deafen"}>
               <button
@@ -350,7 +350,7 @@ export function Sidebar() {
                 class="relative w-5 h-5"
                 style={{
                   transform: settingsOpen() ? "rotate(180deg)" : "rotate(0deg)",
-                  transition: "transform 300ms var(--ease-out)",
+                  transition: "transform var(--duration-slow) var(--ease-out)",
                 }}
               >
                 <Settings size={20} class={cn(
@@ -371,35 +371,35 @@ export function Sidebar() {
 
       {/* Panel swap zone */}
       <div
-        class="relative flex-shrink-0"
+        class="relative flex-shrink-0 overflow-hidden"
         style={{
           width: settingsOpen() ? "320px" : selectedGroup() ? "208px" : "0px",
-          transition: "width 300ms var(--ease-out)",
+          transition: `width ${slideDuration(settingsOpen() ? sections().length : orderedGroups().length)} var(--ease-out)`,
         }}
       >
-        {/* Settings panel — slides down after channel exits up */}
+        {/* Settings panel — slides down from top, synced with settings icons */}
         <div
           class={cn(
             "absolute inset-0",
-            settingsOpen() ? "opacity-100" : "opacity-0 pointer-events-none",
+            !settingsOpen() && "pointer-events-none",
           )}
           style={{
-            transform: settingsOpen() ? "translateY(0)" : "translateY(-2rem)",
-            transition: "opacity 300ms var(--ease-out), transform 300ms var(--ease-out)",
+            transform: settingsOpen() ? "translateY(0)" : "translateY(-100%)",
+            transition: `transform ${slideDuration(sections().length)} var(--ease-out)`,
           }}
         >
           <SettingsPanel onClose={toggleSettings} />
         </div>
 
-        {/* Channel panel — slides up when settings opens */}
+        {/* Channel panel — slides up when settings opens, synced with group icons */}
         <div
           class={cn(
             "absolute inset-0",
-            !settingsOpen() && selectedGroup() ? "opacity-100" : "opacity-0 pointer-events-none",
+            (settingsOpen() || !selectedGroup()) && "pointer-events-none",
           )}
           style={{
-            transform: settingsOpen() ? "translateY(-2rem)" : "translateY(0)",
-            transition: "opacity 300ms var(--ease-out), transform 300ms var(--ease-out)",
+            transform: settingsOpen() ? "translateY(-100%)" : "translateY(0)",
+            transition: `transform ${slideDuration(orderedGroups().length)} var(--ease-out)`,
           }}
         >
           <Show when={selectedGroup()}>

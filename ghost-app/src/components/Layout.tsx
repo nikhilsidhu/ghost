@@ -82,7 +82,7 @@ export function Layout() {
             width: settingsOpen() ? "0px" : "224px",
             opacity: settingsOpen() ? "0" : "1",
             transform: settingsOpen() ? "translateX(2rem)" : "translateX(0)",
-            transition: "width 300ms var(--ease-out), opacity 300ms var(--ease-out), transform 300ms var(--ease-out)",
+            transition: "width var(--duration-slow) var(--ease-out), opacity var(--duration-slow) var(--ease-out), transform var(--duration-slow) var(--ease-out)",
           }}
         >
           <MemberPanel />

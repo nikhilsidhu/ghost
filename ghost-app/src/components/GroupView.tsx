@@ -9,7 +9,7 @@ export function GroupView() {
         style={{
           transform: settingsOpen() ? "translateY(-100%)" : "translateY(0)",
           opacity: settingsOpen() ? "0" : "1",
-          transition: "transform 300ms var(--ease-out), opacity 300ms var(--ease-out)",
+          transition: "transform var(--duration-slow) var(--ease-out), opacity var(--duration-slow) var(--ease-out)",
         }}
       >
         <div class="h-14 flex-shrink-0 flex items-center px-4">

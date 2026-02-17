@@ -447,7 +447,7 @@ export function CommandPalette() {
         <KDialog.Overlay
           data-palette-overlay
           class="fixed inset-0 z-50"
-          style={{ background: "var(--palette-overlay)", animation: "overlay-fade 180ms ease-out" }}
+          style={{ background: "var(--palette-overlay)", animation: "overlay-fade var(--duration-fast) ease-out" }}
         />
         <div class="fixed inset-0 z-50 flex items-start justify-center pt-[18vh]">
           <KDialog.Content
@@ -457,7 +457,7 @@ export function CommandPalette() {
             style={{
               background: "radial-gradient(ellipse at 50% 0%, rgba(255,255,255,0.03), transparent 60%), var(--palette-bg)",
               "box-shadow": "var(--palette-shadow)",
-              animation: "palette-in 180ms ease-out",
+              animation: "palette-in var(--duration-fast) ease-out",
             }}
           >
             {/* Input with inline token pills */}
