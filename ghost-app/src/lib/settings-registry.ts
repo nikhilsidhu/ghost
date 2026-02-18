@@ -7,6 +7,7 @@ export interface SettingsSection {
   icon: Component<{ size?: number; class?: string }>;
   order: number;
   render: Component;
+  preview?: Component;
 }
 
 const [sections, setSections] = createSignal<SettingsSection[]>([]);

@@ -7,6 +7,8 @@ import { Avatar } from "./ui/avatar";
 import { cn } from "../lib/cn";
 import { ChevronDown, SendHorizonal } from "lucide-solid";
 import { selectedGroupId, selectedChannelId, members, settingsOpen } from "../lib/store";
+import { slideDuration } from "../lib/constants";
+import { sections } from "../lib/settings-registry";
 import { showTimestamps } from "./settings/AppearanceSettings";
 import { enterSends } from "./settings/MessagesSettings";
 
@@ -121,15 +123,11 @@ export function MessageView() {
   };
 
   return (
-    <div class="flex-1 flex flex-col min-h-0 relative pr-1 overflow-hidden">
+    <div class="flex-1 flex flex-col min-h-0 relative pr-1">
       <div
         ref={containerRef}
         class="scrollarea flex-1 overflow-y-auto px-4 py-2"
         onScroll={updateNearBottom}
-        style={{
-          transform: settingsOpen() ? "translateY(-100%)" : "translateY(0)",
-          transition: "transform var(--duration-slow) var(--ease-out)",
-        }}
       >
         <Show when={hasMore()}>
           <button
@@ -211,8 +209,9 @@ export function MessageView() {
       <div
         class="flex-shrink-0 px-4 py-3"
         style={{
-          transform: settingsOpen() ? "translateY(100%)" : "translateY(0)",
-          transition: "transform var(--duration-slow) var(--ease-out)",
+          // 200vh counteracts the parent layer's translateY(-100%) and pushes below viewport
+          transform: settingsOpen() ? "translateY(200vh)" : "translateY(0)",
+          transition: `transform ${slideDuration(sections().length)} var(--ease-out)`,
         }}
       >
         <div

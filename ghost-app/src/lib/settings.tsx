@@ -1,6 +1,7 @@
 import { Palette, Mail, WifiPen, MonitorSpeaker, BellRing, HatGlasses, Rat } from "lucide-solid";
 import { registerSettings } from "./settings-registry";
 import AppearanceSettings from "../components/settings/AppearanceSettings";
+import AppearancePreview from "../components/settings/AppearancePreview";
 import MessagesSettings from "../components/settings/MessagesSettings";
 import NetworkSettings from "../components/settings/NetworkSettings";
 import AudiovisualSettings from "../components/settings/AudiovisualSettings";
@@ -20,6 +21,7 @@ cleanups.push(registerSettings({
   icon: Palette,
   order: 0,
   render: AppearanceSettings,
+  preview: AppearancePreview,
 }));
 
 cleanups.push(registerSettings({
