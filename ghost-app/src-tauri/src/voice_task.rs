@@ -57,12 +57,20 @@ pub struct VoiceSpeakingEvent {
     pub speaking: bool,
 }
 
+#[derive(Clone, Serialize)]
+pub struct VoiceMuteStateEvent {
+    pub fingerprint: String,
+    pub muted: bool,
+    pub deafened: bool,
+}
+
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ClientMsg {
     Join { fingerprint: String },
     Leave,
     Speaking { speaking: bool },
+    MuteState { muted: bool, deafened: bool },
 }
 
 #[derive(Deserialize)]
@@ -73,6 +81,7 @@ enum ServerMsg {
     Joined { fingerprint: String },
     Left { fingerprint: String },
     Speaking { fingerprint: String, speaking: bool },
+    MuteState { fingerprint: String, muted: bool, deafened: bool },
     Error { message: String },
 }
 
@@ -351,6 +360,10 @@ pub async fn run(
                         }
                         let _ = state_tx.send(state.clone());
                         let _ = app.emit("voice-state", &state);
+                        if let Some(ref mut sink) = ws {
+                            let msg = serde_json::to_string(&ClientMsg::MuteState { muted: state.muted, deafened: state.deafened }).unwrap();
+                            let _ = sink.send(Message::Text(msg.into())).await;
+                        }
                     }
                     VoiceCommand::SetDeafened(deafened) => {
                         state.deafened = deafened;
@@ -362,6 +375,10 @@ pub async fn run(
                         }
                         let _ = state_tx.send(state.clone());
                         let _ = app.emit("voice-state", &state);
+                        if let Some(ref mut sink) = ws {
+                            let msg = serde_json::to_string(&ClientMsg::MuteState { muted: state.muted, deafened: state.deafened }).unwrap();
+                            let _ = sink.send(Message::Text(msg.into())).await;
+                        }
                     }
                 }
             }
@@ -397,10 +414,12 @@ pub async fn run(
                                 if let Some(ref mut p) = pending {
                                     p.participant_fps = participants.clone();
                                 }
-                                if let (Some(port), Some(p)) = (assigned_port, pending.take()) {
-                                    match start_audio(&client, &p.group_id, &p.channel_id, &p.fingerprint, &p.relay_url, port, &p.participant_fps, &state).await {
-                                        Ok(session) => { audio = Some(session); }
-                                        Err(e) => emit_error(&app, &format!("audio start: {e}")),
+                                if let Some(port) = assigned_port {
+                                    if let Some(p) = pending.take() {
+                                        match start_audio(&client, &p.group_id, &p.channel_id, &p.fingerprint, &p.relay_url, port, &p.participant_fps, &state).await {
+                                            Ok(session) => { audio = Some(session); }
+                                            Err(e) => emit_error(&app, &format!("audio start: {e}")),
+                                        }
                                     }
                                 }
                             }
@@ -459,6 +478,9 @@ pub async fn run(
                             }
                             ServerMsg::Speaking { fingerprint, speaking } => {
                                 let _ = app.emit("voice-speaking", &VoiceSpeakingEvent { fingerprint, speaking });
+                            }
+                            ServerMsg::MuteState { fingerprint, muted, deafened } => {
+                                let _ = app.emit("voice-mute-state", &VoiceMuteStateEvent { fingerprint, muted, deafened });
                             }
                             ServerMsg::Error { message } => {
                                 emit_error(&app, &format!("server: {message}"));

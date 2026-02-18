@@ -12,6 +12,7 @@ pub enum VoiceEvent {
     Joined { fingerprint: [u8; 32] },
     Left { fingerprint: [u8; 32] },
     Speaking { fingerprint: [u8; 32], speaking: bool },
+    MuteState { fingerprint: [u8; 32], muted: bool, deafened: bool },
 }
 
 pub struct Participant {
@@ -19,6 +20,8 @@ pub struct Participant {
     pub udp_addr: Option<SocketAddr>,
     pub last_udp: Instant,
     pub speaking: bool,
+    pub muted: bool,
+    pub deafened: bool,
 }
 
 pub struct VoiceChannel {

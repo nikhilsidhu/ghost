@@ -17,6 +17,7 @@ enum ClientMsg {
     Join { fingerprint: String },
     Leave,
     Speaking { speaking: bool },
+    MuteState { muted: bool, deafened: bool },
 }
 
 #[derive(Serialize)]
@@ -27,6 +28,7 @@ enum ServerMsg {
     Joined { fingerprint: String },
     Left { fingerprint: String },
     Speaking { fingerprint: String, speaking: bool },
+    MuteState { fingerprint: String, muted: bool, deafened: bool },
     Error { message: String },
 }
 
@@ -65,7 +67,7 @@ async fn voice_connection(socket: WebSocket, channel_id: [u8; 32], state: AppSta
                                     }
                                 };
 
-                                let (participants_list, rx) = {
+                                let (participants_list, initial_mute, rx) = {
                                     let mut channels = state.voice_channels.write().await;
                                     let channel = channels
                                         .entry(channel_id)
@@ -80,6 +82,12 @@ async fn voice_connection(socket: WebSocket, channel_id: [u8; 32], state: AppSta
                                         continue;
                                     }
 
+                                    // Collect mute states before adding self
+                                    let mute_states: Vec<_> = channel.participants.iter()
+                                        .filter(|p| p.muted || p.deafened)
+                                        .map(|p| (hex::encode(p.fingerprint), p.muted, p.deafened))
+                                        .collect();
+
                                     // Remove stale entry if re-joining
                                     channel.participants.retain(|p| p.fingerprint != fp);
                                     channel.participants.push(Participant {
@@ -87,6 +95,8 @@ async fn voice_connection(socket: WebSocket, channel_id: [u8; 32], state: AppSta
                                         udp_addr: None,
                                         last_udp: std::time::Instant::now(),
                                         speaking: false,
+                                        muted: false,
+                                        deafened: false,
                                     });
 
                                     let list: Vec<String> = channel
@@ -100,7 +110,7 @@ async fn voice_connection(socket: WebSocket, channel_id: [u8; 32], state: AppSta
                                     });
 
                                     let rx = channel.notify.subscribe();
-                                    (list, rx)
+                                    (list, mute_states, rx)
                                 };
 
                                 fingerprint = Some(fp);
@@ -109,9 +119,18 @@ async fn voice_connection(socket: WebSocket, channel_id: [u8; 32], state: AppSta
                                 let _ = send_json(&mut sink, &ServerMsg::Participants {
                                     list: participants_list,
                                 }).await;
+                                let udp_port = *state.voice_udp_port_rx.borrow();
                                 let _ = send_json(&mut sink, &ServerMsg::Assigned {
-                                    port: state.config.voice_port,
+                                    port: udp_port,
                                 }).await;
+                                // Send current mute states of existing participants
+                                for (fp_hex, muted, deafened) in &initial_mute {
+                                    let _ = send_json(&mut sink, &ServerMsg::MuteState {
+                                        fingerprint: fp_hex.clone(),
+                                        muted: *muted,
+                                        deafened: *deafened,
+                                    }).await;
+                                }
                             }
                             Ok(ClientMsg::Leave) => {
                                 break;
@@ -126,6 +145,22 @@ async fn voice_connection(socket: WebSocket, channel_id: [u8; 32], state: AppSta
                                         let _ = channel.notify.send(VoiceEvent::Speaking {
                                             fingerprint: fp,
                                             speaking,
+                                        });
+                                    }
+                                }
+                            }
+                            Ok(ClientMsg::MuteState { muted, deafened }) => {
+                                if let Some(fp) = fingerprint {
+                                    let mut channels = state.voice_channels.write().await;
+                                    if let Some(channel) = channels.get_mut(&channel_id) {
+                                        if let Some(p) = channel.participants.iter_mut().find(|p| p.fingerprint == fp) {
+                                            p.muted = muted;
+                                            p.deafened = deafened;
+                                        }
+                                        let _ = channel.notify.send(VoiceEvent::MuteState {
+                                            fingerprint: fp,
+                                            muted,
+                                            deafened,
                                         });
                                     }
                                 }
@@ -167,6 +202,15 @@ async fn voice_connection(socket: WebSocket, channel_id: [u8; 32], state: AppSta
                             let _ = send_json(&mut sink, &ServerMsg::Speaking {
                                 fingerprint: hex::encode(fp),
                                 speaking,
+                            }).await;
+                        }
+                    }
+                    Ok(VoiceEvent::MuteState { fingerprint: fp, muted, deafened }) => {
+                        if fingerprint.map_or(true, |own| own != fp) {
+                            let _ = send_json(&mut sink, &ServerMsg::MuteState {
+                                fingerprint: hex::encode(fp),
+                                muted,
+                                deafened,
                             }).await;
                         }
                     }

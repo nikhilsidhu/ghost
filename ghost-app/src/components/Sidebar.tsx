@@ -13,6 +13,7 @@ import {
   selectedGroup, selectGroup, selectChannel,
   settingsOpen, settingsCategory, setSettingsCategory, toggleSettings,
   joinVoiceChannel, isInVoiceChannel, endCall,
+  voiceParticipants, voiceParticipantChannelId,
 } from "../lib/store";
 import { sections } from "../lib/settings-registry";
 import "../lib/settings";
@@ -435,7 +436,7 @@ export function Sidebar() {
                                         else joinVoiceChannel(gid, ch.channel_id);
                                       }}
                                     />
-                                    <Show when={active()}>
+                                    <Show when={active() || (voiceParticipantChannelId() === ch.channel_id && voiceParticipants().length > 0)}>
                                       <VoiceParticipantList />
                                     </Show>
                                   </>

@@ -1,4 +1,4 @@
-import { For } from "solid-js";
+import { For, Show } from "solid-js";
 import type { JSX } from "solid-js";
 import type { Channel } from "../lib/types";
 import { Avatar } from "./ui/avatar";
@@ -7,7 +7,7 @@ import { cn } from "../lib/cn";
 import { AudioLines, Mic, MicOff, Headphones, HeadphoneOff, PhoneOff } from "lucide-solid";
 import {
   isInCall, isMuted, isDeafened, toggleMute, toggleDeafen, endCall,
-  voiceParticipants, members, isSpeaking,
+  voiceParticipants, members, isSpeaking, voiceMuteStates,
 } from "../lib/store";
 import {
   createSortable,
@@ -126,6 +126,7 @@ export function VoiceParticipantList() {
         {(fp) => {
           const member = () => memberMap().get(fp);
           const speaking = () => isSpeaking(fp);
+          const muteState = () => voiceMuteStates().get(fp);
           const name = () => member()?.display_name ?? fp.slice(0, FALLBACK_NAME_LEN);
           return (
             <div class="flex items-center gap-2 px-2 py-1 rounded-md">
@@ -136,11 +137,17 @@ export function VoiceParticipantList() {
                 <Avatar hashKey={fp} label={name()} class="w-5 h-5 text-[9px]" />
               </div>
               <span class={cn(
-                "text-sm truncate",
+                "text-sm truncate flex-1",
                 speaking() ? "text-[var(--neutral-100)]" : "text-[var(--neutral-400)]",
               )}>
                 {name()}
               </span>
+              <Show when={muteState()?.deafened}>
+                <HeadphoneOff size={12} class="flex-shrink-0 text-[var(--neutral-600)]" />
+              </Show>
+              <Show when={muteState()?.muted && !muteState()?.deafened}>
+                <MicOff size={12} class="flex-shrink-0 text-[var(--neutral-600)]" />
+              </Show>
             </div>
           );
         }}

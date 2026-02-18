@@ -68,3 +68,8 @@ export const setVoiceMuted = (muted: boolean) =>
 
 export const setVoiceDeafened = (deafened: boolean) =>
   invoke<void>("set_deafened", { deafened });
+
+// Audio testing
+export const startMicTest = () => invoke<void>("start_mic_test");
+export const stopMicTest = () => invoke<void>("stop_mic_test");
+export const playTestTone = () => invoke<void>("play_test_tone");

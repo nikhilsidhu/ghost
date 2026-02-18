@@ -66,3 +66,9 @@ export interface VoiceSpeaking {
   fingerprint: string;
   speaking: boolean;
 }
+
+export interface VoiceMuteState {
+  fingerprint: string;
+  muted: boolean;
+  deafened: boolean;
+}

@@ -5,6 +5,7 @@ use rand::RngCore;
 use tauri::State;
 
 use ghost_core::storage::{Channel, ChannelKind, Group, Member, MemberRole, StoredMessage};
+use ghost_core::wire::{encode_channel_op, encode_member_announce, ChannelOpPayload};
 
 use crate::constants::{DEFAULT_PAGE_SIZE, INVITE_EXPIRY_MS, SEQ_HEADER};
 use crate::dto::{ChannelDto, ConfigDto, GroupDto, IdentityDto, InviteDto, MemberDto, MessageDto};
@@ -184,23 +185,37 @@ pub async fn create_channel(
         "voice" => ChannelKind::Voice,
         _ => ChannelKind::Text,
     };
-    let client = state.client.lock().await;
-    let position = client
-        .store()
-        .list_channels(&gid)
-        .map_err(|e| e.to_string())?
-        .len() as i32;
-    let channel = Channel {
-        channel_id,
-        group_id: gid,
-        name,
-        kind,
-        position,
+
+    let outbound = {
+        let mut client = state.client.lock().await;
+        let position = client
+            .store()
+            .list_channels(&gid)
+            .map_err(|e| e.to_string())?
+            .len() as i32;
+        let channel = Channel {
+            channel_id,
+            group_id: gid,
+            name: name.clone(),
+            kind,
+            position,
+        };
+        client
+            .store()
+            .insert_channel(&channel)
+            .map_err(|e| e.to_string())?;
+
+        let op = ChannelOpPayload::Create { channel_id, name, kind, position };
+        client
+            .send_control(&gid, encode_channel_op(&op))
+            .map_err(|e| e.to_string())?
     };
-    client
-        .store()
-        .insert_channel(&channel)
-        .map_err(|e| e.to_string())?;
+
+    let relay = state.relay.lock().await;
+    let _ = relay.send(&outbound.mailbox_id, outbound.blob).await;
+
+    let client = state.client.lock().await;
+    let channel = client.store().get_channel(&channel_id).map_err(|e| e.to_string())?;
     Ok(ChannelDto::from_channel(&channel, 0))
 }
 
@@ -211,11 +226,24 @@ pub async fn rename_channel(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let cid = parse_id(&channel_id)?;
-    let client = state.client.lock().await;
-    client
-        .store()
-        .rename_channel(&cid, &name)
-        .map_err(|e| e.to_string())
+
+    let outbound = {
+        let mut client = state.client.lock().await;
+        let channel = client.store().get_channel(&cid).map_err(|e| e.to_string())?;
+        client
+            .store()
+            .rename_channel(&cid, &name)
+            .map_err(|e| e.to_string())?;
+
+        let op = ChannelOpPayload::Rename { channel_id: cid, name };
+        client
+            .send_control(&channel.group_id, encode_channel_op(&op))
+            .map_err(|e| e.to_string())?
+    };
+
+    let relay = state.relay.lock().await;
+    let _ = relay.send(&outbound.mailbox_id, outbound.blob).await;
+    Ok(())
 }
 
 #[tauri::command]
@@ -224,11 +252,24 @@ pub async fn delete_channel(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let cid = parse_id(&channel_id)?;
-    let client = state.client.lock().await;
-    client
-        .store()
-        .delete_channel(&cid)
-        .map_err(|e| e.to_string())
+
+    let outbound = {
+        let mut client = state.client.lock().await;
+        let channel = client.store().get_channel(&cid).map_err(|e| e.to_string())?;
+        client
+            .store()
+            .delete_channel(&cid)
+            .map_err(|e| e.to_string())?;
+
+        let op = ChannelOpPayload::Delete { channel_id: cid };
+        client
+            .send_control(&channel.group_id, encode_channel_op(&op))
+            .map_err(|e| e.to_string())?
+    };
+
+    let relay = state.relay.lock().await;
+    let _ = relay.send(&outbound.mailbox_id, outbound.blob).await;
+    Ok(())
 }
 
 #[tauri::command]
@@ -323,7 +364,9 @@ pub async fn join_by_invite(
     // Broadcast the external commit so existing members see us
     let mailbox_b64 =
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mailbox_id);
-    state
+    #[derive(serde::Deserialize)]
+    struct PostBlobResp { seq: u64 }
+    let commit_resp = state
         .http
         .post(format!("{}/box/{}", relay_url, mailbox_b64))
         .body(commit_bytes)
@@ -332,6 +375,8 @@ pub async fn join_by_invite(
         .map_err(|e| format!("broadcast commit: {e}"))?
         .error_for_status()
         .map_err(|e| format!("broadcast commit: {e}"))?;
+    let commit_seq = commit_resp.json::<PostBlobResp>().await
+        .map(|r| r.seq).unwrap_or(0);
 
     // Refresh the invite payload with fresh GroupInfo for the next joiner
     let updated_payload = {
@@ -354,10 +399,25 @@ pub async fn join_by_invite(
         return Err(format!("refresh invite: HTTP {}", resp.status()));
     }
 
-    // Subscribe to the new group's mailbox for real-time messages
+    // Subscribe from the commit seq so we don't replay stale messages
+    let announce = {
+        let mut client = state.client.lock().await;
+        let _ = client.store().set_last_seen_seq(&mailbox_id, commit_seq);
+        let name = client.identity().display_name.clone();
+        match client.send_control(&group_id, encode_member_announce(&name)) {
+            Ok(out) => Some(out),
+            Err(e) => {
+                eprintln!("send_control failed: {e}");
+                None
+            }
+        }
+    };
     {
         let mut relay = state.relay.lock().await;
-        relay.subscribe(mailbox_id, 0);
+        relay.subscribe(mailbox_id, commit_seq);
+        if let Some(outbound) = announce {
+            let _ = relay.send(&outbound.mailbox_id, outbound.blob).await;
+        }
     }
 
     let client = state.client.lock().await;
@@ -610,4 +670,20 @@ pub async fn seed_test_data(state: State<'_, AppState>) -> Result<(), String> {
     store.pin_group(&g1, now).map_err(|e| e.to_string())?;
 
     Ok(())
+}
+
+#[tauri::command]
+pub async fn start_mic_test(app: tauri::AppHandle) -> Result<(), String> {
+    crate::audio_test::start_mic_test(app)
+}
+
+#[tauri::command]
+pub async fn stop_mic_test() -> Result<(), String> {
+    crate::audio_test::stop_mic_test();
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn play_test_tone() -> Result<(), String> {
+    crate::audio_test::play_test_tone()
 }

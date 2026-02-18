@@ -66,6 +66,16 @@ impl GhostStore {
         Ok(members)
     }
 
+    pub fn update_member_name(&self, group_id: &[u8; 32], fingerprint: &[u8; 32], name: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE members SET display_name = ?1 WHERE group_id = ?2 AND fingerprint = ?3",
+                rusqlite::params![name, group_id.as_slice(), fingerprint.as_slice()],
+            )
+            .map_err(|e| GhostError::Database(format!("update member name: {e}")))?;
+        Ok(())
+    }
+
     pub fn remove_member(&self, group_id: &[u8; 32], fingerprint: &[u8; 32]) -> Result<()> {
         self.conn
             .execute(

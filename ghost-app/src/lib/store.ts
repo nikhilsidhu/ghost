@@ -1,6 +1,6 @@
 import { createSignal } from "solid-js";
 import { listen } from "@tauri-apps/api/event";
-import type { Identity, Group, Channel, Member, Message, VoiceState, VoiceParticipants, VoiceSpeaking } from "./types";
+import type { Identity, Group, Channel, Member, Message, VoiceState, VoiceParticipants, VoiceSpeaking, VoiceMuteState } from "./types";
 import {
   getIdentity, listGroups, listChannels, listMembers,
   listPinnedGroups, markChannelRead, seedTestData,
@@ -56,6 +56,10 @@ const [isDeafened, setIsDeafened] = createSignal(false);
 const [voiceParticipants, setVoiceParticipants] = createSignal<string[]>([]);
 const [speakingSet, setSpeakingSet] = createSignal<Set<string>>(new Set());
 const [voiceError, setVoiceError] = createSignal<string | null>(null);
+// Persists after disconnect so we can still show who's in the channel
+const [voiceParticipantChannelId, setVoiceParticipantChannelId] = createSignal<string | null>(null);
+// Per-participant mute/deafen state from relay
+const [voiceMuteStates, setVoiceMuteStates] = createSignal<Map<string, { muted: boolean; deafened: boolean }>>(new Map());
 
 const isInCall = voiceConnected;
 
@@ -98,6 +102,12 @@ const refreshChannels = async () => {
 
 const refreshPins = async () => {
   setPinnedGroupIds(new Set(await listPinnedGroups()));
+};
+
+const refreshMembers = async () => {
+  const gid = selectedGroupId();
+  if (!gid) return;
+  setMembers(await listMembers(gid));
 };
 
 // --- Actions ---
@@ -147,6 +157,15 @@ const initialize = async () => {
   await refreshPins();
   await refreshAllChannels();
 
+  listen<string>("sync", (event) => {
+    const gid = event.payload;
+    if (gid === selectedGroupId()) {
+      refreshChannels();
+      refreshMembers();
+    }
+    refreshGroups();
+  });
+
   listen<Message>("message", (event) => {
     const msg = event.payload;
     if (msg.channel_id === selectedChannelId()) return;
@@ -167,8 +186,21 @@ const initialize = async () => {
     setVoiceChannelId(s.channel_id);
     setIsMuted(s.muted);
     setIsDeafened(s.deafened);
-    if (!s.connected) {
-      setVoiceParticipants([]);
+    if (s.channel_id) setVoiceParticipantChannelId(s.channel_id);
+    if (s.connected) {
+      // Update self mute state in the per-participant map
+      const selfFp = identity()?.fingerprint;
+      if (selfFp) {
+        setVoiceMuteStates(prev => {
+          const next = new Map(prev);
+          next.set(selfFp, { muted: s.muted, deafened: s.deafened });
+          return next;
+        });
+      }
+    } else {
+      // Remove self from participants but keep others visible
+      const selfFp = identity()?.fingerprint;
+      if (selfFp) setVoiceParticipants(prev => prev.filter(fp => fp !== selfFp));
       setSpeakingSet(new Set<string>());
     }
   });
@@ -182,6 +214,15 @@ const initialize = async () => {
     setSpeakingSet((prev) => {
       const next = new Set(prev);
       if (speaking) next.add(fingerprint); else next.delete(fingerprint);
+      return next;
+    });
+  });
+
+  listen<VoiceMuteState>("voice-mute-state", (event) => {
+    const { fingerprint, muted, deafened } = event.payload;
+    setVoiceMuteStates(prev => {
+      const next = new Map(prev);
+      next.set(fingerprint, { muted, deafened });
       return next;
     });
   });
@@ -205,4 +246,5 @@ export {
   isInCall, isMuted, isDeafened, toggleMute, toggleDeafen, endCall,
   voiceChannelId, voiceGroupId, voiceParticipants, speakingSet, voiceError,
   joinVoiceChannel, isSpeaking, isInVoiceChannel,
+  voiceParticipantChannelId, voiceMuteStates,
 };

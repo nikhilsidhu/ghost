@@ -331,6 +331,97 @@ impl InvitePayload {
     }
 }
 
+// --- Channel operation payloads (carried in Metadata messages) ---
+
+pub enum ChannelOpPayload {
+    Create { channel_id: [u8; 32], name: String, kind: ChannelKind, position: i32 },
+    Rename { channel_id: [u8; 32], name: String },
+    Delete { channel_id: [u8; 32] },
+}
+
+const CHANNEL_OP_CREATE: u8 = 0x01;
+const CHANNEL_OP_RENAME: u8 = 0x02;
+const CHANNEL_OP_DELETE: u8 = 0x03;
+
+pub fn encode_channel_op(op: &ChannelOpPayload) -> Vec<u8> {
+    let mut buf = Vec::new();
+    match op {
+        ChannelOpPayload::Create { channel_id, name, kind, position } => {
+            buf.push(CHANNEL_OP_CREATE);
+            buf.extend_from_slice(channel_id);
+            buf.push(kind.to_byte());
+            buf.extend_from_slice(&position.to_be_bytes());
+            write_string(&mut buf, name);
+        }
+        ChannelOpPayload::Rename { channel_id, name } => {
+            buf.push(CHANNEL_OP_RENAME);
+            buf.extend_from_slice(channel_id);
+            write_string(&mut buf, name);
+        }
+        ChannelOpPayload::Delete { channel_id } => {
+            buf.push(CHANNEL_OP_DELETE);
+            buf.extend_from_slice(channel_id);
+        }
+    }
+    buf
+}
+
+pub fn decode_channel_op(data: &[u8]) -> Result<ChannelOpPayload> {
+    let mut pos = 0;
+    let op = read_u8(data, &mut pos)?;
+    match op {
+        CHANNEL_OP_CREATE => {
+            let channel_id = read_blob32(data, &mut pos)?;
+            let kind = ChannelKind::from_byte(read_u8(data, &mut pos)?)?;
+            let position = read_i32(data, &mut pos)?;
+            let name = read_string(data, &mut pos)?;
+            Ok(ChannelOpPayload::Create { channel_id, name, kind, position })
+        }
+        CHANNEL_OP_RENAME => {
+            let channel_id = read_blob32(data, &mut pos)?;
+            let name = read_string(data, &mut pos)?;
+            Ok(ChannelOpPayload::Rename { channel_id, name })
+        }
+        CHANNEL_OP_DELETE => {
+            let channel_id = read_blob32(data, &mut pos)?;
+            Ok(ChannelOpPayload::Delete { channel_id })
+        }
+        _ => Err(GhostError::Format(format!("unknown channel op: {op:#04x}"))),
+    }
+}
+
+// --- Member announce payload (carried in Metadata messages) ---
+
+const MEMBER_ANNOUNCE: u8 = 0x10;
+
+pub fn encode_member_announce(display_name: &str) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.push(MEMBER_ANNOUNCE);
+    write_string(&mut buf, display_name);
+    buf
+}
+
+/// Decode a Metadata payload, returning either a channel op or a member announce name.
+pub fn decode_metadata(data: &[u8]) -> Result<MetadataPayload> {
+    let tag = *data.first().ok_or_else(|| GhostError::Format("empty metadata".into()))?;
+    match tag {
+        CHANNEL_OP_CREATE | CHANNEL_OP_RENAME | CHANNEL_OP_DELETE => {
+            Ok(MetadataPayload::ChannelOp(decode_channel_op(data)?))
+        }
+        MEMBER_ANNOUNCE => {
+            let mut pos = 1;
+            let name = read_string(data, &mut pos)?;
+            Ok(MetadataPayload::MemberAnnounce { display_name: name })
+        }
+        _ => Err(GhostError::Format(format!("unknown metadata tag: {tag:#04x}"))),
+    }
+}
+
+pub enum MetadataPayload {
+    ChannelOp(ChannelOpPayload),
+    MemberAnnounce { display_name: String },
+}
+
 // --- open_any: handle both app messages and commits from the relay ---
 
 pub enum InboundMessage {

@@ -1,7 +1,10 @@
 use std::sync::Arc;
 
 use ghost_core::client::{GhostClient, ReceiveResult};
+use ghost_core::crypto::MessageType;
 use ghost_core::relay::{RelayClient, RelayEvent};
+use ghost_core::storage::{Channel, Member, MemberRole};
+use ghost_core::wire::{decode_metadata, ChannelOpPayload, MetadataPayload};
 use tauri::{AppHandle, Emitter};
 use tokio::sync::{mpsc, Mutex};
 
@@ -39,6 +42,36 @@ pub async fn run(
                 };
 
                 match result {
+                    Some((group_id, Ok(ReceiveResult::Message(msg)))) if msg.message_type == MessageType::Metadata => {
+                        match decode_metadata(&msg.content) {
+                            Ok(payload) => {
+                                let c = client.lock().await;
+                                match payload {
+                                    MetadataPayload::ChannelOp(ChannelOpPayload::Create { channel_id, name, kind, position }) => {
+                                        let _ = c.store().insert_channel(&Channel {
+                                            channel_id,
+                                            group_id,
+                                            name,
+                                            kind,
+                                            position,
+                                        });
+                                    }
+                                    MetadataPayload::ChannelOp(ChannelOpPayload::Rename { channel_id, name }) => {
+                                        let _ = c.store().rename_channel(&channel_id, &name);
+                                    }
+                                    MetadataPayload::ChannelOp(ChannelOpPayload::Delete { channel_id }) => {
+                                        let _ = c.store().delete_channel(&channel_id);
+                                    }
+                                    MetadataPayload::MemberAnnounce { display_name } => {
+                                        let _ = c.store().update_member_name(&group_id, &msg.sender_fp, &display_name);
+                                    }
+                                }
+                                let _ = c.store().set_last_seen_seq(&mailbox_id, seq);
+                            }
+                            Err(e) => eprintln!("decode metadata: {e}"),
+                        }
+                        let _ = app.emit("sync", hex::encode(group_id));
+                    }
                     Some((_, Ok(ReceiveResult::Message(msg)))) => {
                         let dto = MessageDto::from_incoming(&msg, received_at);
                         let _ = app.emit("message", &dto);
@@ -48,25 +81,51 @@ pub async fn run(
                     Some((group_id, Ok(ReceiveResult::CommitProcessed))) => {
                         let c = client.lock().await;
                         let _ = c.store().set_last_seen_seq(&mailbox_id, seq);
+                        // Add any new MLS members we don't have in the store yet
+                        if let Ok(mls_fps) = c.mls_member_fingerprints(&group_id) {
+                            let stored: std::collections::HashSet<[u8; 32]> = c.store()
+                                .list_members(&group_id)
+                                .unwrap_or_default()
+                                .iter()
+                                .map(|m| m.fingerprint)
+                                .collect();
+                            for fp in mls_fps {
+                                if !stored.contains(&fp) {
+                                    let _ = c.store().insert_member(&Member {
+                                        group_id,
+                                        fingerprint: fp,
+                                        display_name: hex::encode(&fp[..8]),
+                                        role: MemberRole::Member,
+                                        joined_at: received_at,
+                                    });
+                                }
+                            }
+                        }
                         // Upload fresh GroupInfo so other clients can recover
                         if let Ok(gi) = c.export_group_info(&group_id) {
                             let r = relay.lock().await;
                             let _ = r.put_group_info(&mailbox_id, gi).await;
                         }
+                        let _ = app.emit("sync", hex::encode(group_id));
                     }
                     Some((_, Ok(ReceiveResult::Skipped))) => {
                         let c = client.lock().await;
                         let _ = c.store().set_last_seen_seq(&mailbox_id, seq);
                     }
-                    Some((_, Err(e))) => eprintln!("relay receive error: {e}"),
+                    Some((_, Err(e))) => {
+                        let msg = e.to_string();
+                        if msg.contains("epoch") || msg.contains("Epoch") {
+                            // Stale message from wrong epoch — skip and advance seq
+                            let c = client.lock().await;
+                            let _ = c.store().set_last_seen_seq(&mailbox_id, seq);
+                        } else {
+                            eprintln!("relay receive error: {e}");
+                        }
+                    }
                     None => {}
                 }
             }
-            RelayEvent::Ack(ack) => {
-                if ack.epoch_mismatch {
-                    eprintln!("epoch mismatch on seq {}", ack.seq);
-                }
-            }
+            RelayEvent::Ack(_) => {}
             RelayEvent::Gap { mailbox_id } => {
                 handle_gap(&client, &relay, &mailbox_id).await;
             }
@@ -114,13 +173,12 @@ async fn handle_gap(
         }
     }
 
-    // Upload fresh GroupInfo and reset seq
+    // Upload fresh GroupInfo
     {
         let c = client.lock().await;
         if let Ok(gi) = c.export_group_info(&group_id) {
             let r = relay.lock().await;
             let _ = r.put_group_info(mailbox_id, gi).await;
         }
-        let _ = c.store().set_last_seen_seq(mailbox_id, 0);
     }
 }

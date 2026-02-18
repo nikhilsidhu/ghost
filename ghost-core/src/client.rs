@@ -201,6 +201,35 @@ impl GhostClient {
         Ok((Outbound { mailbox_id, blob }, message_id))
     }
 
+    /// Send a control message (e.g. channel ops). MLS-encrypted but not stored locally.
+    pub fn send_control(
+        &mut self,
+        group_id: &[u8; 32],
+        content: Vec<u8>,
+    ) -> Result<Outbound> {
+        let group = self.groups.get_mut(group_id).ok_or_else(|| {
+            GhostError::GroupNotLoaded(hex::encode(&group_id[..8]))
+        })?;
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        let msg = ApplicationMessage::new(
+            MessageType::Metadata,
+            [0u8; 32],
+            self.identity.fingerprint,
+            now,
+            vec![],
+            content,
+        )?;
+
+        let blob = seal(group, &self.provider, &msg)?;
+        let mailbox_id = group_mailbox_id(group.group_id());
+        Ok(Outbound { mailbox_id, blob })
+    }
+
     /// Decrypt a blob and store the message. Uses relay-stamped arrival time if
     /// provided, otherwise falls back to local clock.
     pub fn receive_blob(
@@ -511,6 +540,22 @@ impl GhostClient {
         self.mailbox_map.get(mailbox_id).copied()
     }
 
+    /// Extract fingerprints of all MLS group members (from credentials).
+    pub fn mls_member_fingerprints(&self, group_id: &[u8; 32]) -> Result<Vec<[u8; 32]>> {
+        let group = self.groups.get(group_id).ok_or_else(|| {
+            GhostError::GroupNotLoaded(hex::encode(&group_id[..8]))
+        })?;
+        let mut fps = Vec::new();
+        for member in group.members() {
+            if let Ok(bc) = openmls::prelude::BasicCredential::try_from(member.credential) {
+                if let Ok(fp) = <[u8; 32]>::try_from(bc.identity().as_ref()) {
+                    fps.push(fp);
+                }
+            }
+        }
+        Ok(fps)
+    }
+
     /// Process an inbound blob — could be an app message, a commit, or a self-message.
     pub fn receive_any(
         &mut self,
@@ -529,24 +574,27 @@ impl GhostClient {
 
         match inbound {
             InboundMessage::Application(msg) => {
-                let recv_ts = received_at.unwrap_or_else(|| {
-                    SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap()
-                        .as_millis() as u64
-                });
+                // Control messages (Metadata) aren't chat — don't persist them
+                if msg.message_type != MessageType::Metadata {
+                    let recv_ts = received_at.unwrap_or_else(|| {
+                        SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap()
+                            .as_millis() as u64
+                    });
 
-                self.store.insert_message(&StoredMessage {
-                    message_id: msg.message_id,
-                    channel_id: msg.channel_id,
-                    sender_fp: msg.sender_fp,
-                    message_type: msg.message_type as u8,
-                    timestamp: msg.timestamp,
-                    received_at: recv_ts,
-                    content: msg.content.clone(),
-                    expires_at: None,
-                    references: msg.references.clone(),
-                })?;
+                    self.store.insert_message(&StoredMessage {
+                        message_id: msg.message_id,
+                        channel_id: msg.channel_id,
+                        sender_fp: msg.sender_fp,
+                        message_type: msg.message_type as u8,
+                        timestamp: msg.timestamp,
+                        received_at: recv_ts,
+                        content: msg.content.clone(),
+                        expires_at: None,
+                        references: msg.references.clone(),
+                    })?;
+                }
 
                 Ok(ReceiveResult::Message(msg))
             }

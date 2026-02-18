@@ -1,6 +1,7 @@
 use tauri::Manager;
 
 mod audio;
+mod audio_test;
 mod commands;
 mod config;
 mod constants;
@@ -78,6 +79,9 @@ fn main() {
             commands::set_muted,
             commands::set_deafened,
             commands::seed_test_data,
+            commands::start_mic_test,
+            commands::stop_mic_test,
+            commands::play_test_tone,
         ])
         .run(tauri::generate_context!())
         .expect("error while running ghost");

@@ -52,7 +52,6 @@ export { commands, providers, triggeredCommandId };
 export function registerCommand(cmd: CommandDef): () => void {
   setCommands((prev) => {
     if (prev.some((c) => c.id === cmd.id)) {
-      console.warn(`registry: command "${cmd.id}" already registered, replacing`);
       return prev.map((c) => (c.id === cmd.id ? cmd : c));
     }
     return [...prev, cmd];

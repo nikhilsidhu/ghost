@@ -12,9 +12,11 @@ pub struct UdpTransport {
 
 impl UdpTransport {
     pub async fn connect(relay_host: &str, port: u16) -> Result<Self, String> {
-        let addr: SocketAddr = format!("{relay_host}:{port}")
-            .parse()
-            .map_err(|e| format!("parse relay addr: {e}"))?;
+        let addr: SocketAddr = tokio::net::lookup_host(format!("{relay_host}:{port}"))
+            .await
+            .map_err(|e| format!("resolve relay addr: {e}"))?
+            .next()
+            .ok_or("relay addr resolved to nothing")?;
 
         let socket = UdpSocket::bind("0.0.0.0:0")
             .await
