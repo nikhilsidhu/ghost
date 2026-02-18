@@ -34,7 +34,7 @@ pub struct InboundFrame {
 }
 
 // Per-sender jitter buffer. Gates initial playback on target_depth, then
-// keeps playing continuously using Opus PLC for missing frames.
+// keeps playing continuously using loss concealment (PLC) for missing frames.
 
 struct JitterBuffer {
     buffer: BTreeMap<u32, Vec<u8>>,
@@ -47,7 +47,6 @@ struct JitterBuffer {
     consecutive_misses: u32,
     decoder: opus::Decoder,
 }
-
 
 impl JitterBuffer {
     fn new() -> Result<Self, String> {
@@ -97,9 +96,9 @@ impl JitterBuffer {
         self.next_seq = seq.wrapping_add(1);
 
         if let Some(encrypted) = self.buffer.remove(&seq) {
-            self.on_time_count += 1;
-            self.consecutive_misses = 0;
             if let Ok(opus_bytes) = decrypt_voice_frame(key, seq, &encrypted) {
+                self.on_time_count += 1;
+                self.consecutive_misses = 0;
                 let _ = self.decoder.decode_float(&opus_bytes, out, false);
                 self.adapt_depth();
                 return true;
@@ -110,8 +109,7 @@ impl JitterBuffer {
         self.late_count += 1;
         self.consecutive_misses += 1;
 
-        // Too many consecutive misses — sender likely paused (VAD off).
-        // Reset so we re-sync to the sender's actual sequence on resume.
+        // Too many consecutive misses — sender likely paused.
         if self.consecutive_misses > JITTER_MAX_PLC_RUN {
             self.playing = false;
             self.initialized = false;
@@ -120,7 +118,18 @@ impl JitterBuffer {
             return false;
         }
 
-        // Short gap — use PLC to fill
+        // Try FEC recovery: if the next packet is available, decode it with
+        // fec=true to recover a rough version of this missing frame
+        let next_seq = seq.wrapping_add(1);
+        if let Some(next_encrypted) = self.buffer.get(&next_seq) {
+            if let Ok(next_opus) = decrypt_voice_frame(key, next_seq, next_encrypted) {
+                let _ = self.decoder.decode_float(&next_opus, out, true);
+                self.adapt_depth();
+                return true;
+            }
+        }
+
+        // No FEC available — fall back to loss concealment (empty decode)
         let _ = self.decoder.decode_float(&[], out, false);
         self.adapt_depth();
         true
@@ -178,32 +187,37 @@ pub fn build_packet(
     channel_id: &[u8; 32],
     sender_fp: &[u8; 32],
     sequence: u32,
-    epoch: u64,
     payload: &[u8],
 ) -> Vec<u8> {
     let mut pkt = Vec::with_capacity(VOICE_HEADER_SIZE + payload.len());
-    pkt.push(VOICE_VERSION);
+    pkt.extend_from_slice(&(VOICE_HEADER_SIZE as u16).to_be_bytes());
     pkt.extend_from_slice(channel_id);
     pkt.extend_from_slice(sender_fp);
+    pkt.push(0x00); // flags
     pkt.extend_from_slice(&sequence.to_be_bytes());
-    pkt.extend_from_slice(&epoch.to_be_bytes());
     pkt.extend_from_slice(&(payload.len() as u16).to_be_bytes());
     pkt.extend_from_slice(payload);
     pkt
 }
 
-pub fn parse_header(buf: &[u8]) -> Option<([u8; 32], [u8; 32], u32, usize)> {
-    if buf.len() < VOICE_HEADER_SIZE || buf[0] != VOICE_VERSION {
+/// Returns (channel_id, sender_fp, sequence, payload_len, header_len).
+/// Payload starts at buf[header_len..header_len + payload_len].
+pub fn parse_header(buf: &[u8]) -> Option<([u8; 32], [u8; 32], u32, usize, usize)> {
+    if buf.len() < VOICE_HEADER_SIZE {
         return None;
     }
-    let channel_id: [u8; 32] = buf[1..33].try_into().ok()?;
-    let sender_fp: [u8; 32] = buf[33..65].try_into().ok()?;
-    let sequence = u32::from_be_bytes(buf[65..69].try_into().ok()?);
-    let payload_len = u16::from_be_bytes(buf[77..79].try_into().ok()?) as usize;
-    if buf.len() < VOICE_HEADER_SIZE + payload_len {
+    let header_len = u16::from_be_bytes(buf[0..2].try_into().ok()?) as usize;
+    if header_len < VOICE_HEADER_SIZE || buf.len() < header_len {
         return None;
     }
-    Some((channel_id, sender_fp, sequence, payload_len))
+    let channel_id: [u8; 32] = buf[2..34].try_into().ok()?;
+    let sender_fp: [u8; 32] = buf[34..66].try_into().ok()?;
+    let sequence = u32::from_be_bytes(buf[67..71].try_into().ok()?);
+    let payload_len = u16::from_be_bytes(buf[71..73].try_into().ok()?) as usize;
+    if buf.len() < header_len + payload_len {
+        return None;
+    }
+    Some((channel_id, sender_fp, sequence, payload_len, header_len))
 }
 
 struct SampleRateConverter {
@@ -231,6 +245,12 @@ impl SampleRateConverter {
     }
 
     fn process(&mut self, input: &[f32]) -> &[f32] {
+        debug_assert!(
+            input.len() <= self.input_buf[0].len(),
+            "resampler input {} exceeds buffer {}",
+            input.len(),
+            self.input_buf[0].len(),
+        );
         let len = input.len().min(self.input_buf[0].len());
         self.input_buf[0][..len].copy_from_slice(&input[..len]);
         let (_, out_len) = self
@@ -254,6 +274,8 @@ impl AudioPipeline {
         own_key: [u8; 32],
         channel_id: [u8; 32],
         peer_keys: HashMap<[u8; 32], [u8; 32]>,
+        input_device_name: Option<String>,
+        output_device_name: Option<String>,
     ) -> Result<Self, String> {
         let controls = Arc::new(AudioControls::new());
         let peer_keys = Arc::new(Mutex::new(peer_keys));
@@ -275,6 +297,8 @@ impl AudioPipeline {
                     own_key,
                     channel_id,
                     peer_keys_clone,
+                    input_device_name,
+                    output_device_name,
                 ) {
                     eprintln!("voice audio thread failed: {e}");
                 }
@@ -327,25 +351,60 @@ fn pick_config(
     })
 }
 
-fn run_audio_thread(
-    controls: Arc<AudioControls>,
-    outbound_tx: mpsc::Sender<Vec<u8>>,
-    mut inbound_rx: mpsc::Receiver<InboundFrame>,
-    own_fp: [u8; 32],
-    own_key: [u8; 32],
-    channel_id: [u8; 32],
-    peer_keys: Arc<Mutex<HashMap<[u8; 32], [u8; 32]>>>,
-) -> Result<(), String> {
-    let host = cpal::default_host();
+fn find_device_by_name(
+    mut devices: impl Iterator<Item = cpal::Device>,
+    name: &str,
+) -> Option<cpal::Device> {
+    devices.find(|d| d.name().ok().as_deref() == Some(name))
+}
 
-    // --- Capture ---
-    let input_device = host.default_input_device().ok_or("no input device")?;
+pub fn resolve_device(
+    host: &cpal::Host,
+    name: &Option<String>,
+    direction: &str,
+) -> Result<cpal::Device, String> {
+    match name {
+        Some(name) => {
+            let devices = if direction == "input" {
+                host.input_devices().map_err(|e| format!("{direction} devices: {e}"))?
+            } else {
+                host.output_devices().map_err(|e| format!("{direction} devices: {e}"))?
+            };
+            find_device_by_name(devices, name)
+                .ok_or_else(|| format!("{direction} device '{name}' not found"))
+        }
+        None => {
+            if direction == "input" {
+                host.default_input_device()
+            } else {
+                host.default_output_device()
+            }
+            .ok_or_else(|| format!("no {direction} device"))
+        }
+    }
+}
+
+struct AudioStreams {
+    _capture: cpal::Stream,
+    _playback: cpal::Stream,
+    capture_cons: ringbuf::HeapCons<f32>,
+    playback_prod: ringbuf::HeapProd<f32>,
+    input_rate: u32,
+    output_rate: u32,
+}
+
+fn setup_streams(
+    host: &cpal::Host,
+    input_device_name: &Option<String>,
+    output_device_name: &Option<String>,
+) -> Result<AudioStreams, String> {
+    let input_device = resolve_device(host, input_device_name, "input")?;
     let input_config = pick_config(
         input_device.supported_input_configs().map_err(|e| format!("input configs: {e}"))?,
     )?;
     let input_rate = input_config.sample_rate.0;
 
-    let (mut capture_prod, mut capture_cons) = HeapRb::<f32>::new(RING_CAPACITY).split();
+    let (mut capture_prod, capture_cons) = HeapRb::<f32>::new(RING_CAPACITY).split();
 
     let capture_stream = input_device
         .build_input_stream(
@@ -358,8 +417,7 @@ fn run_audio_thread(
         )
         .map_err(|e| format!("build input stream: {e}"))?;
 
-    // --- Playback ---
-    let output_device = host.default_output_device().ok_or("no output device")?;
+    let output_device = resolve_device(host, output_device_name, "output")?;
     let output_config = pick_config(
         output_device.supported_output_configs().map_err(|e| format!("output configs: {e}"))?,
     )?;
@@ -368,7 +426,8 @@ fn run_audio_thread(
     let (mut playback_prod, mut playback_cons) = HeapRb::<f32>::new(RING_CAPACITY).split();
 
     // Pre-fill with 40ms of silence so the output callback has headroom for timing jitter
-    let prefill = 2 * OPUS_FRAME_SIZE * output_rate as usize / OPUS_SAMPLE_RATE as usize;
+    let numerator = 2 * OPUS_FRAME_SIZE * output_rate as usize;
+    let prefill = (numerator + OPUS_SAMPLE_RATE as usize - 1) / OPUS_SAMPLE_RATE as usize;
     playback_prod.push_slice(&vec![0.0f32; prefill]);
 
     let playback_stream = output_device
@@ -377,7 +436,6 @@ fn run_audio_thread(
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                 let read = playback_cons.pop_slice(data);
                 if read < data.len() {
-                    // Fade to silence from last real sample instead of hard zero-fill
                     let last = if read > 0 { data[read - 1] } else { 0.0 };
                     let gap = data.len() - read;
                     for (i, s) in data[read..].iter_mut().enumerate() {
@@ -401,37 +459,126 @@ fn run_audio_thread(
         output_rate,
     );
 
-    // --- Processing loop ---
+    Ok(AudioStreams {
+        _capture: capture_stream,
+        _playback: playback_stream,
+        capture_cons,
+        playback_prod,
+        input_rate,
+        output_rate,
+    })
+}
+
+fn create_encoder() -> Result<opus::Encoder, String> {
     let mut encoder = opus::Encoder::new(OPUS_SAMPLE_RATE, opus::Channels::Mono, opus::Application::Voip)
         .map_err(|e| format!("opus encoder: {e}"))?;
-    let _ = encoder.set_bitrate(opus::Bitrate::Bits(OPUS_BITRATE));
-    let _ = encoder.set_vbr(true);
-    let _ = encoder.set_complexity(OPUS_COMPLEXITY);
-    let _ = encoder.set_inband_fec(true);
-    let _ = encoder.set_packet_loss_perc(OPUS_EXPECTED_LOSS_PCT);
+    encoder.set_bitrate(opus::Bitrate::Bits(OPUS_BITRATE)).map_err(|e| format!("opus bitrate: {e}"))?;
+    encoder.set_vbr(true).map_err(|e| format!("opus vbr: {e}"))?;
+    encoder.set_complexity(OPUS_COMPLEXITY).map_err(|e| format!("opus complexity: {e}"))?;
+    encoder.set_inband_fec(true).map_err(|e| format!("opus fec: {e}"))?;
+    encoder.set_packet_loss_perc(OPUS_EXPECTED_LOSS_PCT).map_err(|e| format!("opus loss pct: {e}"))?;
+    Ok(encoder)
+}
 
+// Denoise a 960-sample frame in 480-sample chunks, return max voice-activity probability
+fn denoise_frame(
+    denoiser: &mut nnnoiseless::DenoiseState,
+    frame: &mut [f32],
+    denoise_in: &mut [f32; DENOISE_FRAME_SIZE],
+    denoise_out: &mut [f32; DENOISE_FRAME_SIZE],
+) -> f32 {
+    let mut max_vad: f32 = 0.0;
+    for chunk_start in (0..OPUS_FRAME_SIZE).step_by(DENOISE_FRAME_SIZE) {
+        if chunk_start + DENOISE_FRAME_SIZE > OPUS_FRAME_SIZE {
+            break;
+        }
+        for i in 0..DENOISE_FRAME_SIZE {
+            denoise_in[i] = frame[chunk_start + i] * DENOISE_SAMPLE_SCALE;
+        }
+        let vad = denoiser.process_frame(denoise_out, denoise_in);
+        max_vad = max_vad.max(vad);
+        for i in 0..DENOISE_FRAME_SIZE {
+            frame[chunk_start + i] = denoise_out[i] / DENOISE_SAMPLE_SCALE;
+        }
+    }
+    max_vad
+}
+
+// Mix all ready jitter buffers into mix_buf, return true if any audio was mixed
+fn mix_playback(
+    jitter_buffers: &mut HashMap<[u8; 32], JitterBuffer>,
+    peer_keys: &Mutex<HashMap<[u8; 32], [u8; 32]>>,
+    mix_buf: &mut [f32],
+    decode_buf: &mut [f32],
+) -> bool {
+    mix_buf.fill(0.0);
+    let mut any_audio = false;
+
+    let keys = peer_keys.lock().unwrap();
+    let fps: Vec<[u8; 32]> = jitter_buffers.keys().copied().collect();
+    for fp in &fps {
+        let jb = jitter_buffers.get_mut(fp).unwrap();
+        if !jb.ready() {
+            continue;
+        }
+        if let Some(key) = keys.get(fp) {
+            if jb.pop_frame(key, decode_buf) {
+                any_audio = true;
+                for i in 0..OPUS_FRAME_SIZE {
+                    mix_buf[i] += decode_buf[i];
+                }
+            }
+        }
+    }
+    drop(keys);
+
+    if any_audio {
+        for s in mix_buf.iter_mut() {
+            *s = s.clamp(-1.0, 1.0);
+        }
+    }
+
+    any_audio
+}
+
+fn run_audio_thread(
+    controls: Arc<AudioControls>,
+    outbound_tx: mpsc::Sender<Vec<u8>>,
+    mut inbound_rx: mpsc::Receiver<InboundFrame>,
+    own_fp: [u8; 32],
+    own_key: [u8; 32],
+    channel_id: [u8; 32],
+    peer_keys: Arc<Mutex<HashMap<[u8; 32], [u8; 32]>>>,
+    input_device_name: Option<String>,
+    output_device_name: Option<String>,
+) -> Result<(), String> {
+    let host = cpal::default_host();
+
+    let mut streams = setup_streams(&host, &input_device_name, &output_device_name)?;
+
+    let mut encoder = create_encoder()?;
     let mut denoiser = nnnoiseless::DenoiseState::new();
     let mut denoise_primed = false;
     let mut agc = Agc::new();
     let mut sequence: u32 = 0;
     let mut vad_hangover: u32 = 0;
 
-    let needs_capture_resample = input_rate != OPUS_SAMPLE_RATE;
-    let needs_playback_resample = output_rate != OPUS_SAMPLE_RATE;
+    let needs_capture_resample = streams.input_rate != OPUS_SAMPLE_RATE;
+    let needs_playback_resample = streams.output_rate != OPUS_SAMPLE_RATE;
 
     let capture_device_frame = if needs_capture_resample {
-        (input_rate as usize * OPUS_FRAME_MS as usize) / 1000
+        (streams.input_rate as usize * OPUS_FRAME_MS as usize) / 1000
     } else {
         OPUS_FRAME_SIZE
     };
 
     let mut capture_resampler = if needs_capture_resample {
-        Some(SampleRateConverter::new(input_rate, OPUS_SAMPLE_RATE, capture_device_frame)?)
+        Some(SampleRateConverter::new(streams.input_rate, OPUS_SAMPLE_RATE, capture_device_frame)?)
     } else {
         None
     };
     let mut playback_resampler = if needs_playback_resample {
-        Some(SampleRateConverter::new(OPUS_SAMPLE_RATE, output_rate, OPUS_FRAME_SIZE)?)
+        Some(SampleRateConverter::new(OPUS_SAMPLE_RATE, streams.output_rate, OPUS_FRAME_SIZE)?)
     } else {
         None
     };
@@ -441,20 +588,44 @@ fn run_audio_thread(
     let mut encode_buf = [0u8; VOICE_MAX_PACKET];
     let mut denoise_in = [0.0f32; DENOISE_FRAME_SIZE];
     let mut denoise_out = [0.0f32; DENOISE_FRAME_SIZE];
+    let mut resample_accum: Vec<f32> = Vec::with_capacity(OPUS_FRAME_SIZE * 2);
     let mut jitter_buffers: HashMap<[u8; 32], JitterBuffer> = HashMap::new();
     let mut mix_buf = vec![0.0f32; OPUS_FRAME_SIZE];
     let mut decode_buf = vec![0.0f32; OPUS_FRAME_SIZE];
-    let tick = std::time::Duration::from_millis(OPUS_FRAME_MS as u64);
+    let frame_timeout = std::time::Duration::from_millis(OPUS_FRAME_MS as u64);
+
+    // Diagnostics: counts over a 2-second window
+    let mut diag_ticks: u32 = 0;
+    let mut diag_frames_sent: u32 = 0;
+    let mut diag_frames_recv: u32 = 0;
+    let mut diag_capture_empty: u32 = 0;
 
     loop {
-        let frame_start = std::time::Instant::now();
-
-        if outbound_tx.is_closed() {
-            break;
+        // Drive the loop from the capture device clock: block until a full
+        // device frame is available. Timeout at one frame period so playback
+        // mixing still runs during Bluetooth burst gaps.
+        {
+            let deadline = std::time::Instant::now() + frame_timeout;
+            loop {
+                if outbound_tx.is_closed() {
+                    break;
+                }
+                if streams.capture_cons.occupied_len() >= capture_device_frame {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            if outbound_tx.is_closed() {
+                break;
+            }
         }
 
         // --- Drain received frames into per-sender jitter buffers ---
         while let Ok(frame) = inbound_rx.try_recv() {
+            diag_frames_recv += 1;
             let jb = jitter_buffers
                 .entry(frame.sender_fp)
                 .or_insert_with(|| JitterBuffer::new().expect("jitter buffer init"));
@@ -462,63 +633,54 @@ fn run_audio_thread(
             jb.insert(frame.sequence, frame.encrypted_payload);
         }
 
-        // --- Capture: process ALL available frames to stay current ---
+        // --- Capture: drain device samples, resample, accumulate exact 960-sample frames ---
+        let mut got_capture = false;
         loop {
-            if capture_cons.occupied_len() < capture_device_frame {
+            if streams.capture_cons.occupied_len() < capture_device_frame {
                 break;
             }
-            capture_cons.pop_slice(&mut capture_buf);
+            got_capture = true;
+            streams.capture_cons.pop_slice(&mut capture_buf);
 
-            frame_48k.fill(0.0);
             if let Some(ref mut rs) = capture_resampler {
                 let resampled = rs.process(&capture_buf[..capture_device_frame]);
-                let n = resampled.len().min(OPUS_FRAME_SIZE);
-                frame_48k[..n].copy_from_slice(&resampled[..n]);
+                resample_accum.extend_from_slice(resampled);
             } else {
-                frame_48k.copy_from_slice(&capture_buf[..OPUS_FRAME_SIZE]);
+                resample_accum.extend_from_slice(&capture_buf[..OPUS_FRAME_SIZE]);
             }
+        }
+
+        // Process complete 960-sample frames from the accumulator
+        while resample_accum.len() >= OPUS_FRAME_SIZE {
+            frame_48k.copy_from_slice(&resample_accum[..OPUS_FRAME_SIZE]);
+            resample_accum.drain(..OPUS_FRAME_SIZE);
 
             let muted = controls.muted.load(Ordering::Relaxed);
             if !muted {
-                let mut max_vad: f32 = 0.0;
-                for chunk_start in (0..OPUS_FRAME_SIZE).step_by(DENOISE_FRAME_SIZE) {
-                    if chunk_start + DENOISE_FRAME_SIZE > OPUS_FRAME_SIZE {
-                        break;
-                    }
-                    for i in 0..DENOISE_FRAME_SIZE {
-                        denoise_in[i] = frame_48k[chunk_start + i] * DENOISE_SAMPLE_SCALE;
-                    }
-                    let vad = denoiser.process_frame(&mut denoise_out, &denoise_in);
-                    max_vad = max_vad.max(vad);
-                    for i in 0..DENOISE_FRAME_SIZE {
-                        frame_48k[chunk_start + i] = denoise_out[i] / DENOISE_SAMPLE_SCALE;
-                    }
-                }
+                let max_vad = denoise_frame(
+                    &mut denoiser, &mut frame_48k, &mut denoise_in, &mut denoise_out,
+                );
 
-                // First denoise output has fade-in artifacts — skip it
+                // First frame primes the denoiser state — discard its output
                 if !denoise_primed {
                     denoise_primed = true;
                     continue;
                 }
 
-                // VAD with hangover to avoid clipping word endings
                 if max_vad > VAD_THRESHOLD {
                     vad_hangover = VAD_HANGOVER_FRAMES;
                 } else if vad_hangover > 0 {
                     vad_hangover -= 1;
                 }
-                let transmit = vad_hangover > 0;
-                controls.speaking.store(transmit, Ordering::Relaxed);
+                controls.speaking.store(vad_hangover > 0, Ordering::Relaxed);
 
-                if transmit {
-                    // AGC only during speech — prevents gain pumping up during silence
-                    agc.process(&mut frame_48k);
-                    if let Ok(len) = encoder.encode_float(&frame_48k, &mut encode_buf) {
-                        if let Ok(encrypted) = encrypt_voice_frame(&own_key, sequence, &encode_buf[..len]) {
-                            let pkt = build_packet(&channel_id, &own_fp, sequence, 0, &encrypted);
-                            let _ = outbound_tx.try_send(pkt);
-                            sequence = sequence.wrapping_add(1);
-                        }
+                agc.process(&mut frame_48k);
+                if let Ok(len) = encoder.encode_float(&frame_48k, &mut encode_buf) {
+                    if let Ok(encrypted) = encrypt_voice_frame(&own_key, sequence, &encode_buf[..len]) {
+                        let pkt = build_packet(&channel_id, &own_fp, sequence, &encrypted);
+                        let _ = outbound_tx.try_send(pkt);
+                        sequence = sequence.wrapping_add(1);
+                        diag_frames_sent += 1;
                     }
                 }
             } else {
@@ -527,59 +689,63 @@ fn run_audio_thread(
             }
         }
 
-        // --- Playback: always push a frame so output callback never starves ---
+        // --- Playback: mix jitter buffers and push to output ring ---
         let deafened = controls.deafened.load(Ordering::Relaxed);
-        mix_buf.fill(0.0);
-        let mut any_audio = false;
-
         if !deafened {
+            mix_playback(&mut jitter_buffers, &peer_keys, &mut mix_buf, &mut decode_buf);
+        } else {
+            mix_buf.fill(0.0);
+        }
+
+        if let Some(ref mut rs) = playback_resampler {
+            let resampled = rs.process(&mix_buf);
+            streams.playback_prod.push_slice(resampled);
+        } else {
+            streams.playback_prod.push_slice(&mix_buf);
+        }
+
+        // Drain excess jitter buffer depth to prevent latency buildup.
+        // The sender may produce frames faster than our tick rate (Bluetooth
+        // clock drift). Pop+decode extra frames to keep the decoder state in
+        // sync but discard the audio, capping latency at ~JITTER_MAX_DEPTH frames.
+        {
             let keys = peer_keys.lock().unwrap();
-            let fps: Vec<[u8; 32]> = jitter_buffers.keys().copied().collect();
-            for fp in &fps {
-                let jb = jitter_buffers.get_mut(fp).unwrap();
-                if !jb.ready() {
-                    continue;
-                }
-                if let Some(key) = keys.get(fp) {
-                    if jb.pop_frame(key, &mut decode_buf) {
-                        any_audio = true;
-                        for i in 0..OPUS_FRAME_SIZE {
-                            mix_buf[i] += decode_buf[i];
-                        }
+            for (fp, jb) in jitter_buffers.iter_mut() {
+                if jb.buffer.len() > JITTER_MAX_DEPTH as usize {
+                    if let Some(key) = keys.get(fp) {
+                        jb.pop_frame(key, &mut decode_buf);
                     }
                 }
             }
-            drop(keys);
-
-            // Soft-clip the mix
-            if any_audio {
-                for s in mix_buf.iter_mut() {
-                    *s = s.clamp(-1.0, 1.0);
-                }
-            }
-        }
-
-        // Always push to playback ring — silence when no peers, mixed audio otherwise
-        if let Some(ref mut rs) = playback_resampler {
-            let resampled = rs.process(&mix_buf);
-            playback_prod.push_slice(resampled);
-        } else {
-            playback_prod.push_slice(&mix_buf);
         }
 
         jitter_buffers.retain(|_, jb| !jb.is_stale());
 
-        let elapsed = frame_start.elapsed();
-        if elapsed < tick {
-            let remaining = tick - elapsed;
-            // Sleep most of the duration, then spin-wait for the last ~1ms for precision
-            if remaining > std::time::Duration::from_millis(1) {
-                std::thread::sleep(remaining - std::time::Duration::from_millis(1));
-            }
-            while frame_start.elapsed() < tick {
-                std::hint::spin_loop();
-            }
+        if !got_capture {
+            diag_capture_empty += 1;
         }
+
+        diag_ticks += 1;
+        if diag_ticks >= 100 {
+            let cap_fill = streams.capture_cons.occupied_len();
+            let play_fill = streams.playback_prod.vacant_len();
+            let play_used = RING_CAPACITY - play_fill;
+            let jb_info: Vec<String> = jitter_buffers
+                .values()
+                .map(|jb| format!("d{}m{}", jb.buffer.len(), jb.consecutive_misses))
+                .collect();
+            eprintln!(
+                "voice diag: sent={} recv={} cap_empty={}/{} cap_ring={} play_ring={} jb=[{}]",
+                diag_frames_sent, diag_frames_recv, diag_capture_empty, diag_ticks,
+                cap_fill, play_used,
+                jb_info.join(","),
+            );
+            diag_ticks = 0;
+            diag_frames_sent = 0;
+            diag_frames_recv = 0;
+            diag_capture_empty = 0;
+        }
+
     }
 
     Ok(())

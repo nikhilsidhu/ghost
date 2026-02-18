@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 pub struct GhostConfig {
     pub display_name: Option<String>,
     pub relay_url: Option<String>,
+    pub input_device: Option<String>,
+    pub output_device: Option<String>,
 }
 
 impl GhostConfig {

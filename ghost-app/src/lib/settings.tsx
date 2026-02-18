@@ -16,10 +16,18 @@ if (import.meta.hot) {
 }
 
 cleanups.push(registerSettings({
+  id: "audiovisual",
+  label: "audiovisual",
+  icon: MonitorSpeaker,
+  order: 0,
+  render: AudiovisualSettings,
+}));
+
+cleanups.push(registerSettings({
   id: "appearance",
   label: "appearance",
   icon: Palette,
-  order: 0,
+  order: 10,
   render: AppearanceSettings,
   preview: AppearancePreview,
 }));
@@ -28,7 +36,7 @@ cleanups.push(registerSettings({
   id: "messages",
   label: "messages",
   icon: Mail,
-  order: 10,
+  order: 20,
   render: MessagesSettings,
 }));
 
@@ -36,16 +44,8 @@ cleanups.push(registerSettings({
   id: "network",
   label: "network",
   icon: WifiPen,
-  order: 20,
-  render: NetworkSettings,
-}));
-
-cleanups.push(registerSettings({
-  id: "audiovisual",
-  label: "audiovisual",
-  icon: MonitorSpeaker,
   order: 30,
-  render: AudiovisualSettings,
+  render: NetworkSettings,
 }));
 
 cleanups.push(registerSettings({

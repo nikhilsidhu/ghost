@@ -6,6 +6,7 @@ import {
   listPinnedGroups, markChannelRead, seedTestData,
   joinVoice, leaveVoice, setVoiceMuted, setVoiceDeafened,
 } from "./api";
+import { sections } from "./settings-registry";
 
 // Backend settings (relay URL, display name) live in ~/.ghost/config.toml.
 const SETTING_PREFIX = "ghost:";
@@ -38,12 +39,12 @@ const [inviteLink, setInviteLink] = createSignal<string | null>(null);
 const [showInfo, setShowInfo] = createSignal(false);
 const [desiredChannelKind, setDesiredChannelKind] = createSignal<string>("text");
 const [settingsOpen, setSettingsOpen] = createSignal(false);
-const [settingsCategory, setSettingsCategory] = createSignal("appearance");
+const [settingsCategory, setSettingsCategory] = createSignal("");
 
 const toggleSettings = () => {
   const opening = !settingsOpen();
   setSettingsOpen(opening);
-  if (opening) setSettingsCategory("appearance");
+  if (opening) setSettingsCategory(sections()[0]?.id ?? "");
 };
 
 // --- Voice state (driven by backend events) ---

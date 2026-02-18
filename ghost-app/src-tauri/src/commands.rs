@@ -434,6 +434,8 @@ pub async fn get_config(state: State<'_, AppState>) -> Result<ConfigDto, String>
     Ok(ConfigDto {
         display_name: cfg.display_name.clone(),
         relay_url: cfg.relay_url.clone(),
+        input_device: cfg.input_device.clone(),
+        output_device: cfg.output_device.clone(),
     })
 }
 
@@ -472,13 +474,15 @@ pub async fn join_voice(
         let client = state.client.lock().await;
         hex::encode(client.fingerprint())
     };
-    let relay_url = {
+    let (relay_url, input_device, output_device) = {
         let cfg = state.config.lock().await;
-        cfg.relay_url
+        let url = cfg
+            .relay_url
             .as_deref()
             .filter(|u| !u.is_empty())
             .map(String::from)
-            .unwrap_or_else(|| state.relay_url.clone())
+            .unwrap_or_else(|| state.relay_url.clone());
+        (url, cfg.input_device.clone(), cfg.output_device.clone())
     };
     state
         .voice
@@ -488,6 +492,8 @@ pub async fn join_voice(
             channel_id,
             relay_url,
             fingerprint,
+            input_device,
+            output_device,
         })
         .await
         .map_err(|_| "voice task not running".to_string())
@@ -673,8 +679,12 @@ pub async fn seed_test_data(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub async fn start_mic_test(app: tauri::AppHandle) -> Result<(), String> {
-    crate::audio_test::start_mic_test(app)
+pub async fn start_mic_test(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let cfg = state.config.lock().await;
+    crate::audio_test::start_mic_test(app, cfg.input_device.clone(), cfg.output_device.clone())
 }
 
 #[tauri::command]
@@ -684,6 +694,64 @@ pub async fn stop_mic_test() -> Result<(), String> {
 }
 
 #[tauri::command]
-pub async fn play_test_tone() -> Result<(), String> {
-    crate::audio_test::play_test_tone()
+pub async fn play_test_tone(state: State<'_, AppState>) -> Result<(), String> {
+    let cfg = state.config.lock().await;
+    crate::audio_test::play_test_tone(cfg.output_device.clone())
+}
+
+#[tauri::command]
+pub async fn list_audio_devices() -> Result<AudioDevicesDto, String> {
+    use cpal::traits::{DeviceTrait, HostTrait};
+    let host = cpal::default_host();
+
+    let default_in = host.default_input_device().and_then(|d| d.name().ok());
+    let default_out = host.default_output_device().and_then(|d| d.name().ok());
+
+    let mut inputs = Vec::new();
+    if let Ok(devices) = host.input_devices() {
+        for d in devices {
+            if let Ok(name) = d.name() {
+                inputs.push(name);
+            }
+        }
+    }
+
+    let mut outputs = Vec::new();
+    if let Ok(devices) = host.output_devices() {
+        for d in devices {
+            if let Ok(name) = d.name() {
+                outputs.push(name);
+            }
+        }
+    }
+
+    Ok(AudioDevicesDto { inputs, outputs, default_input: default_in, default_output: default_out })
+}
+
+#[derive(serde::Serialize)]
+pub struct AudioDevicesDto {
+    pub inputs: Vec<String>,
+    pub outputs: Vec<String>,
+    pub default_input: Option<String>,
+    pub default_output: Option<String>,
+}
+
+#[tauri::command]
+pub async fn set_input_device(
+    name: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let mut cfg = state.config.lock().await;
+    cfg.input_device = name;
+    cfg.save(&state.config_path)
+}
+
+#[tauri::command]
+pub async fn set_output_device(
+    name: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let mut cfg = state.config.lock().await;
+    cfg.output_device = name;
+    cfg.save(&state.config_path)
 }

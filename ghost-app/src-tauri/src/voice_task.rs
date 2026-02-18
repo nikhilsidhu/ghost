@@ -30,6 +30,8 @@ pub enum VoiceCommand {
         channel_id: String,
         relay_url: String,
         fingerprint: String,
+        input_device: Option<String>,
+        output_device: Option<String>,
     },
     Leave,
     SetMuted(bool),
@@ -176,6 +178,8 @@ struct PendingAudioStart {
     relay_url: String,
     fingerprint: String,
     participant_fps: Vec<String>,
+    input_device: Option<String>,
+    output_device: Option<String>,
 }
 
 /// Derive voice encryption keys for a set of participant fingerprints.
@@ -210,6 +214,8 @@ async fn start_audio(
     port: u16,
     participant_fps: &[String],
     voice_state: &VoiceStateEvent,
+    input_device: Option<String>,
+    output_device: Option<String>,
 ) -> Result<AudioSession, String> {
     let group_id: [u8; 32] = hex::decode(group_id_hex)
         .map_err(|e| format!("bad group_id: {e}"))?
@@ -239,7 +245,7 @@ async fn start_audio(
         .collect();
     let peer_keys = derive_peer_keys(client, &group_id, &channel_id, &peer_fps).await?;
 
-    let mut pipeline = AudioPipeline::start(own_fp, own_key, channel_id, peer_keys)?;
+    let mut pipeline = AudioPipeline::start(own_fp, own_key, channel_id, peer_keys, input_device, output_device)?;
     pipeline.controls.muted.store(voice_state.muted, Ordering::Relaxed);
     pipeline.controls.deafened.store(voice_state.deafened, Ordering::Relaxed);
 
@@ -289,7 +295,7 @@ pub async fn run(
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else { break };
                 match cmd {
-                    VoiceCommand::Join { group_id, channel_id, relay_url, fingerprint } => {
+                    VoiceCommand::Join { group_id, channel_id, relay_url, fingerprint, input_device, output_device } => {
                         disconnect(&app, &mut ws, &mut ws_read, &mut state, &state_tx, &mut participants, &mut audio).await;
                         pending = None;
                         assigned_port = None;
@@ -337,6 +343,8 @@ pub async fn run(
                             relay_url,
                             fingerprint,
                             participant_fps: Vec::new(),
+                            input_device,
+                            output_device,
                         });
                         let _ = state_tx.send(state.clone());
                         let _ = app.emit("voice-state", &state);
@@ -416,7 +424,7 @@ pub async fn run(
                                 }
                                 if let Some(port) = assigned_port {
                                     if let Some(p) = pending.take() {
-                                        match start_audio(&client, &p.group_id, &p.channel_id, &p.fingerprint, &p.relay_url, port, &p.participant_fps, &state).await {
+                                        match start_audio(&client, &p.group_id, &p.channel_id, &p.fingerprint, &p.relay_url, port, &p.participant_fps, &state, p.input_device, p.output_device).await {
                                             Ok(session) => { audio = Some(session); }
                                             Err(e) => emit_error(&app, &format!("audio start: {e}")),
                                         }
@@ -431,7 +439,7 @@ pub async fn run(
 
                                 if let Some(p) = pending.take() {
                                     if !p.participant_fps.is_empty() {
-                                        match start_audio(&client, &p.group_id, &p.channel_id, &p.fingerprint, &p.relay_url, port, &p.participant_fps, &state).await {
+                                        match start_audio(&client, &p.group_id, &p.channel_id, &p.fingerprint, &p.relay_url, port, &p.participant_fps, &state, p.input_device, p.output_device).await {
                                             Ok(session) => { audio = Some(session); }
                                             Err(e) => emit_error(&app, &format!("audio start: {e}")),
                                         }

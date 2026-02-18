@@ -1,13 +1,38 @@
-import { createSignal, onCleanup, Show } from "solid-js";
+import { createSignal, createEffect, on, onMount, Show } from "solid-js";
 import { listen } from "@tauri-apps/api/event";
-import { startMicTest, stopMicTest, playTestTone } from "../../lib/api";
-import { SettingGroup } from "./controls";
+import { startMicTest, stopMicTest, playTestTone, listAudioDevices, setInputDevice, setOutputDevice, getConfig } from "../../lib/api";
+import { settingsOpen, settingsCategory } from "../../lib/store";
+import { SettingGroup, SettingSelect } from "./controls";
 import { cn } from "../../lib/cn";
 
 export default function AudiovisualSettings() {
   const [micTesting, setMicTesting] = createSignal(false);
   const [micLevel, setMicLevel] = createSignal(0);
   const [tonePlaying, setTonePlaying] = createSignal(false);
+
+  const [inputDevices, setInputDevices] = createSignal<{ value: string; label: string }[]>([]);
+  const [outputDevices, setOutputDevices] = createSignal<{ value: string; label: string }[]>([]);
+  const [selectedInput, setSelectedInput] = createSignal("default");
+  const [selectedOutput, setSelectedOutput] = createSignal("default");
+
+  onMount(async () => {
+    const [devices, config] = await Promise.all([listAudioDevices(), getConfig()]);
+
+    const defaultInLabel = devices.default_input ? `default (${devices.default_input})` : "default";
+    const defaultOutLabel = devices.default_output ? `default (${devices.default_output})` : "default";
+
+    setInputDevices([
+      { value: "default", label: defaultInLabel },
+      ...devices.inputs.map((name) => ({ value: name, label: name })),
+    ]);
+    setOutputDevices([
+      { value: "default", label: defaultOutLabel },
+      ...devices.outputs.map((name) => ({ value: name, label: name })),
+    ]);
+
+    setSelectedInput(config.input_device ?? "default");
+    setSelectedOutput(config.output_device ?? "default");
+  });
 
   let unlisten: (() => void) | null = null;
 
@@ -38,13 +63,49 @@ export default function AudiovisualSettings() {
     }
   };
 
-  onCleanup(() => {
-    if (micTesting()) stopMicTest().catch(() => {});
-    if (unlisten) unlisten();
-  });
+  // Stop mic test when leaving audiovisual tab or closing settings
+  createEffect(on(
+    () => settingsOpen() && settingsCategory() === "audiovisual",
+    (active) => {
+      if (!active && micTesting()) {
+        stopMicTest().catch(() => {});
+        setMicTesting(false);
+        setMicLevel(0);
+        if (unlisten) { unlisten(); unlisten = null; }
+      }
+    },
+    { defer: true },
+  ));
+
+  const handleInputChange = async (v: string) => {
+    setSelectedInput(v);
+    await setInputDevice(v === "default" ? null : v);
+  };
+
+  const handleOutputChange = async (v: string) => {
+    setSelectedOutput(v);
+    await setOutputDevice(v === "default" ? null : v);
+  };
 
   return (
     <div>
+      <SettingGroup label="devices">
+        <SettingSelect
+          label="input device"
+          description="microphone used for voice chat"
+          value={selectedInput()}
+          options={inputDevices()}
+          onChange={handleInputChange}
+        />
+        <SettingSelect
+          label="output device"
+          description="speakers used for voice chat"
+          value={selectedOutput()}
+          options={outputDevices()}
+          onChange={handleOutputChange}
+        />
+      </SettingGroup>
+
       <SettingGroup label="microphone">
         <div class="py-3 border-b border-[var(--neutral-800)] last:border-b-0">
           <div class="flex items-center justify-between gap-4">

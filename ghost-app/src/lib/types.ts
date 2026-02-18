@@ -37,6 +37,15 @@ export interface Invite {
 export interface Config {
   display_name: string | null;
   relay_url: string | null;
+  input_device: string | null;
+  output_device: string | null;
+}
+
+export interface AudioDevices {
+  inputs: string[];
+  outputs: string[];
+  default_input: string | null;
+  default_output: string | null;
 }
 
 export interface Message {

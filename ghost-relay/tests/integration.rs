@@ -429,15 +429,15 @@ fn build_voice_packet(
     channel_id: &[u8; 32],
     sender_fp: &[u8; 32],
     sequence: u32,
-    epoch: u64,
     payload: &[u8],
 ) -> Vec<u8> {
+    let header_len = ghost_wire::VOICE_HEADER_SIZE as u16;
     [
-        &[ghost_wire::VOICE_VERSION][..],
+        &header_len.to_be_bytes()[..],
         channel_id,
         sender_fp,
+        &[0x00], // flags
         &sequence.to_be_bytes(),
-        &epoch.to_be_bytes(),
         &(payload.len() as u16).to_be_bytes(),
         payload,
     ]
@@ -553,12 +553,12 @@ async fn voice_udp_forwarding() {
 
     // A sends initial UDP packet to register its address
     let sock_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let pkt_a = build_voice_packet(&channel_id, &fp_a, 1, 0, b"opus-from-a");
+    let pkt_a = build_voice_packet(&channel_id, &fp_a, 1, b"opus-from-a");
     sock_a.send_to(&pkt_a, relay_addr).await.unwrap();
 
     // B sends initial UDP packet to register its address
     let sock_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let pkt_b = build_voice_packet(&channel_id, &fp_b, 1, 0, b"opus-from-b");
+    let pkt_b = build_voice_packet(&channel_id, &fp_b, 1, b"opus-from-b");
     sock_b.send_to(&pkt_b, relay_addr).await.unwrap();
 
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -571,7 +571,7 @@ async fn voice_udp_forwarding() {
     {}
 
     // A sends another packet — B should receive it
-    let pkt_a2 = build_voice_packet(&channel_id, &fp_a, 2, 0, b"frame-2");
+    let pkt_a2 = build_voice_packet(&channel_id, &fp_a, 2, b"frame-2");
     sock_a.send_to(&pkt_a2, relay_addr).await.unwrap();
 
     let (len, _) = tokio::time::timeout(Duration::from_secs(2), sock_b.recv_from(&mut recv_buf))
@@ -580,8 +580,9 @@ async fn voice_udp_forwarding() {
         .unwrap();
 
     // Verify header and payload match what A sent
-    assert_eq!(&recv_buf[33..65], &fp_a);
-    assert_eq!(&recv_buf[79..len], b"frame-2");
+    assert_eq!(&recv_buf[34..66], &fp_a);
+    let hdr = ghost_wire::VOICE_HEADER_SIZE;
+    assert_eq!(&recv_buf[hdr..len], b"frame-2");
 
     // A should NOT receive its own packet back
     let result = tokio::time::timeout(Duration::from_millis(200), sock_a.recv_from(&mut recv_buf)).await;

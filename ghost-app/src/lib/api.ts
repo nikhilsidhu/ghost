@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Identity, Group, Channel, Member, Message, Invite, Config } from "./types";
+import type { Identity, Group, Channel, Member, Message, Invite, Config, AudioDevices } from "./types";
 
 export const getIdentity = () => invoke<Identity>("get_identity");
 
@@ -68,6 +68,13 @@ export const setVoiceMuted = (muted: boolean) =>
 
 export const setVoiceDeafened = (deafened: boolean) =>
   invoke<void>("set_deafened", { deafened });
+
+// Audio devices
+export const listAudioDevices = () => invoke<AudioDevices>("list_audio_devices");
+export const setInputDevice = (name: string | null) =>
+  invoke<void>("set_input_device", { name });
+export const setOutputDevice = (name: string | null) =>
+  invoke<void>("set_output_device", { name });
 
 // Audio testing
 export const startMicTest = () => invoke<void>("start_mic_test");

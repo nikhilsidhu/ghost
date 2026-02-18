@@ -4,7 +4,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
 use crate::audio::{parse_header, InboundFrame};
-use crate::constants::{VOICE_HEADER_SIZE, VOICE_MAX_PACKET};
+use crate::constants::VOICE_MAX_PACKET;
 
 pub struct UdpTransport {
     socket: UdpSocket,
@@ -51,7 +51,7 @@ impl UdpTransport {
                 }
             };
 
-            let (_channel_id, sender_fp, sequence, payload_len) =
+            let (_channel_id, sender_fp, sequence, payload_len, header_len) =
                 match parse_header(&buf[..len]) {
                     Some(h) => h,
                     None => continue,
@@ -61,7 +61,7 @@ impl UdpTransport {
                 continue;
             }
 
-            let payload = buf[VOICE_HEADER_SIZE..VOICE_HEADER_SIZE + payload_len].to_vec();
+            let payload = buf[header_len..header_len + payload_len].to_vec();
             let _ = inbound_tx
                 .try_send(InboundFrame {
                     sender_fp,
