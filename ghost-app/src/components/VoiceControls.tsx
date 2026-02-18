@@ -1,13 +1,16 @@
 import { For, Show } from "solid-js";
 import type { JSX } from "solid-js";
-import type { Channel } from "../lib/types";
+import type { Channel, VoiceQuality } from "../lib/types";
 import { Avatar } from "./ui/avatar";
 import { Tooltip } from "./ui/tooltip";
+import { HoverCard as KHoverCard } from "@kobalte/core/hover-card";
 import { cn } from "../lib/cn";
-import { AudioLines, Mic, MicOff, Headphones, HeadphoneOff, PhoneOff } from "lucide-solid";
+import {
+  AudioLines, Mic, MicOff, Headphones, HeadphoneOff, PhoneOff, Signal,
+} from "lucide-solid";
 import {
   isInCall, isMuted, isDeafened, toggleMute, toggleDeafen, endCall,
-  voiceParticipants, members, isSpeaking, voiceMuteStates,
+  voiceParticipants, members, isSpeaking, voiceMuteStates, voiceQuality,
 } from "../lib/store";
 import {
   createSortable,
@@ -112,7 +115,103 @@ export function VoiceChannelItem(props: {
         props.active ? "text-[var(--emerald-400)]" : "text-[var(--neutral-500)]",
       )} />
       <span class="flex-1 truncate">{props.channel.name}</span>
+      <Show when={props.active && voiceQuality()}>
+        <CallQualityIndicator />
+      </Show>
     </button>
+  );
+}
+
+type QualityLevel = "good" | "fair" | "poor";
+
+const LOSS_FAIR = 2;
+const LOSS_POOR = 10;
+const PING_FAIR = 150;
+const PING_POOR = 300;
+const JITTER_FAIR = 2;
+const JITTER_POOR = 4;
+
+function qualityLevel(q: VoiceQuality): QualityLevel {
+  const ping = q.ping_ms ?? 0;
+  const jitterOver = q.jitter_depth - q.jitter_target;
+  if (q.packet_loss > LOSS_POOR || ping > PING_POOR || jitterOver > JITTER_POOR) return "poor";
+  if (q.packet_loss > LOSS_FAIR || ping > PING_FAIR || jitterOver > JITTER_FAIR) return "fair";
+  return "good";
+}
+
+const QUALITY_COLOR: Record<QualityLevel, string> = {
+  good: "text-[var(--emerald-400)]",
+  fair: "text-[var(--amber-400)]",
+  poor: "text-[var(--red-400)]",
+};
+
+function StatRow(props: { label: string; value: string; color?: string }) {
+  return (
+    <div class="flex justify-between gap-4">
+      <span class="text-[var(--neutral-500)]">{props.label}</span>
+      <span class={props.color ?? "text-[var(--neutral-200)]"}>{props.value}</span>
+    </div>
+  );
+}
+
+export function CallQualityIndicator(props: { size?: number }) {
+  const sz = () => props.size ?? 16;
+  const q = voiceQuality;
+  const level = () => q() ? qualityLevel(q()!) : "good" as QualityLevel;
+  const color = () => QUALITY_COLOR[level()];
+
+  const pingColor = () => {
+    const ms = q()?.ping_ms;
+    if (ms == null) return "text-[var(--neutral-500)]";
+    if (ms <= PING_FAIR) return "text-[var(--emerald-400)]";
+    if (ms <= PING_POOR) return "text-[var(--amber-400)]";
+    return "text-[var(--red-400)]";
+  };
+
+  const lossColor = () => {
+    const loss = q()?.packet_loss ?? 0;
+    if (loss <= LOSS_FAIR) return "text-[var(--emerald-400)]";
+    if (loss <= LOSS_POOR) return "text-[var(--amber-400)]";
+    return "text-[var(--red-400)]";
+  };
+
+  return (
+    <KHoverCard openDelay={200} closeDelay={200} placement="right" gutter={28}>
+      <KHoverCard.Trigger
+        as="span"
+        class={cn("inline-flex items-center justify-center flex-shrink-0 cursor-pointer w-4 h-4", color())}
+        onClick={(e: MouseEvent) => e.stopPropagation()}
+      >
+        <Signal size={sz()} />
+      </KHoverCard.Trigger>
+      <KHoverCard.Portal>
+        <KHoverCard.Content
+          class={cn(
+            "z-50 px-2.5 py-1.5 rounded-md text-xs",
+            "text-[var(--neutral-100)] border border-[var(--neutral-700)]",
+            "animate-[tooltip-in_120ms_ease-out]",
+          )}
+          style={{ background: "var(--neutral-800)", "box-shadow": "var(--shadow-float)" }}
+        >
+          <div class="flex flex-col gap-0.5 min-w-[120px]">
+            <div class="flex justify-between gap-4">
+              <span class="text-[var(--neutral-500)]">Quality</span>
+              <span class={color()}><Signal size={14} /></span>
+            </div>
+            <StatRow
+              label="Relay"
+              value={q()?.ping_ms != null ? `${q()!.ping_ms} ms` : "—"}
+              color={pingColor()}
+            />
+            <StatRow
+              label="Loss"
+              value={q() ? `${q()!.packet_loss.toFixed(1)}%` : "—"}
+              color={lossColor()}
+            />
+          </div>
+        </KHoverCard.Content>
+      </KHoverCard.Portal>
+    </KHoverCard>
   );
 }
 

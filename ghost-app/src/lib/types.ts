@@ -81,3 +81,15 @@ export interface VoiceMuteState {
   muted: boolean;
   deafened: boolean;
 }
+
+export interface VoiceQuality {
+  packet_loss: number;
+  jitter_depth: number;
+  jitter_target: number;
+  ping_ms: number | null;
+}
+
+export interface DevSession {
+  relay_url: string;
+  token: string;
+}

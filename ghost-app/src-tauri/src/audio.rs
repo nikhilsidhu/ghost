@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -15,6 +15,10 @@ pub struct AudioControls {
     pub muted: AtomicBool,
     pub deafened: AtomicBool,
     pub speaking: AtomicBool,
+    // Shared with voice_task for the quality indicator
+    pub packet_loss_pct: AtomicU32,
+    pub jitter_depth: AtomicU32,
+    pub jitter_target: AtomicU32,
 }
 
 impl AudioControls {
@@ -23,6 +27,9 @@ impl AudioControls {
             muted: AtomicBool::new(false),
             deafened: AtomicBool::new(false),
             speaking: AtomicBool::new(false),
+            packet_loss_pct: AtomicU32::new(0),
+            jitter_depth: AtomicU32::new(0),
+            jitter_target: AtomicU32::new(0),
         }
     }
 }
@@ -46,6 +53,9 @@ struct JitterBuffer {
     on_time_count: u32,
     consecutive_misses: u32,
     decoder: opus::Decoder,
+    // Reset every 2s when metrics are read
+    quality_frames: u32,
+    quality_missing: u32,
 }
 
 impl JitterBuffer {
@@ -62,6 +72,8 @@ impl JitterBuffer {
             on_time_count: 0,
             consecutive_misses: 0,
             decoder,
+            quality_frames: 0,
+            quality_missing: 0,
         })
     }
 
@@ -92,6 +104,7 @@ impl JitterBuffer {
 
     fn pop_frame(&mut self, key: &[u8; 32], out: &mut [f32]) -> bool {
         self.playing = true;
+        self.quality_frames += 1;
         let seq = self.next_seq;
         self.next_seq = seq.wrapping_add(1);
 
@@ -106,6 +119,7 @@ impl JitterBuffer {
         }
 
         // Missing or decrypt failed
+        self.quality_missing += 1;
         self.late_count += 1;
         self.consecutive_misses += 1;
 
@@ -177,7 +191,7 @@ impl DriftResampler {
 
         // Adaptive clamp: widen range for large corrections
         let max_step = if self.smoothed_error.abs() > 3.0 { 0.05 } else { 0.02 };
-        let step = (1.0 + self.smoothed_error * 0.002).clamp(1.0 - max_step, 1.0 + max_step);
+        let step = (1.0 + self.smoothed_error * 0.005).clamp(1.0 - max_step, 1.0 + max_step);
 
         while self.pos < input.len() as f64 {
             let idx = self.pos as usize;
@@ -439,7 +453,6 @@ fn setup_streams(
     playback_shared: Arc<Mutex<PlaybackShared>>,
     peer_keys: Arc<Mutex<HashMap<[u8; 32], [u8; 32]>>>,
     controls: Arc<AudioControls>,
-    stream_error: Arc<AtomicBool>,
 ) -> Result<AudioStreams, String> {
     let input_device = resolve_device(host, input_device_name, "input")?;
     let input_config = pick_config(
@@ -455,13 +468,7 @@ fn setup_streams(
             move |data: &[f32], _: &cpal::InputCallbackInfo| {
                 capture_prod.push_slice(data);
             },
-            {
-                let flag = stream_error.clone();
-                move |err| {
-                    eprintln!("voice capture error: {err}");
-                    flag.store(true, Ordering::Relaxed);
-                }
-            },
+            move |err| { eprintln!("voice capture error: {err}"); },
             None,
         )
         .map_err(|e| format!("build input stream: {e}"))?;
@@ -528,13 +535,7 @@ fn setup_streams(
                 data.copy_from_slice(&residual[..data.len()]);
                 residual.drain(..data.len());
             },
-            {
-                let flag = stream_error.clone();
-                move |err| {
-                    eprintln!("voice playback error: {err}");
-                    flag.store(true, Ordering::Relaxed);
-                }
-            },
+            move |err| { eprintln!("voice playback error: {err}"); },
             None,
         )
         .map_err(|e| format!("build output stream: {e}"))?;
@@ -647,11 +648,12 @@ fn run_audio_thread(
         jitter_buffers: HashMap::new(),
     }));
 
-    let stream_error = Arc::new(AtomicBool::new(false));
+    let device_watcher = crate::device_watcher::DeviceWatcher::new()
+        .map_err(|e| format!("device watcher: {e}"))?;
+
     let mut streams = setup_streams(
         &host, &input_device_name, &output_device_name,
         playback_shared.clone(), peer_keys.clone(), controls.clone(),
-        stream_error.clone(),
     )?;
 
     let mut encoder = create_encoder()?;
@@ -788,73 +790,79 @@ fn run_audio_thread(
                 .values()
                 .map(|jb| format!("d{}m{}", jb.buffer.len(), jb.consecutive_misses))
                 .collect();
+            // Aggregate quality metrics across all active jitter buffers
+            let mut q_frames: u32 = 0;
+            let mut q_missing: u32 = 0;
+            let mut max_depth: u32 = 0;
+            let mut max_target: u32 = 0;
+            for jb in shared.jitter_buffers.values_mut() {
+                q_frames += jb.quality_frames;
+                q_missing += jb.quality_missing;
+                max_depth = max_depth.max(jb.buffer.len() as u32);
+                max_target = max_target.max(jb.target_depth);
+                jb.quality_frames = 0;
+                jb.quality_missing = 0;
+            }
             shared.jitter_buffers.retain(|_, jb| !jb.is_stale());
             drop(shared);
+            let loss_pct = if q_frames > 0 {
+                (q_missing as f32 / q_frames as f32) * 100.0
+            } else {
+                0.0
+            };
+            controls.packet_loss_pct.store(loss_pct.to_bits(), Ordering::Relaxed);
+            controls.jitter_depth.store(max_depth, Ordering::Relaxed);
+            controls.jitter_target.store(max_target, Ordering::Relaxed);
             eprintln!(
                 "voice diag: sent={} recv={} cap_empty={}/{} cap_ring={} jb=[{}]",
                 diag_frames_sent, diag_frames_recv, diag_capture_empty, diag_ticks,
                 cap_fill, jb_info.join(","),
             );
-            // Detect dead streams: error callback fired, or capture starved for a full window
-            let device_dead = stream_error.swap(false, Ordering::Relaxed)
-                || (diag_capture_empty == diag_ticks && diag_frames_sent == 0);
 
             diag_ticks = 0;
             diag_frames_sent = 0;
             diag_frames_recv = 0;
             diag_capture_empty = 0;
+        }
 
-            if device_dead {
-                eprintln!("voice: audio device lost, attempting reconnect...");
-                drop(streams);
-                resample_accum.clear();
+        // OS notified us the default device changed — recreate streams on the new device
+        if device_watcher.try_recv().is_some() {
+            // Drain any duplicate events (input+output often fire together)
+            while device_watcher.try_recv().is_some() {}
+            eprintln!("voice: audio device changed, switching...");
+            drop(streams);
+            resample_accum.clear();
 
-                // Retry until a device is available or the channel closes
-                loop {
-                    if outbound_tx.is_closed() { return Ok(()); }
-                    std::thread::sleep(std::time::Duration::from_millis(500));
-
-                    // Try user's preferred device first, fall back to system default
-                    let result = setup_streams(
-                        &host, &input_device_name, &output_device_name,
-                        playback_shared.clone(), peer_keys.clone(), controls.clone(),
-                        stream_error.clone(),
-                    ).or_else(|_| setup_streams(
-                        &host, &None, &None,
-                        playback_shared.clone(), peer_keys.clone(), controls.clone(),
-                        stream_error.clone(),
-                    ));
-
-                    match result {
-                        Ok(new_streams) => {
-                            // Reconfigure capture pipeline for the new device's sample rate
-                            capture_device_frame = if new_streams.input_rate != OPUS_SAMPLE_RATE {
-                                (new_streams.input_rate as usize * OPUS_FRAME_MS as usize) / 1000
-                            } else {
-                                OPUS_FRAME_SIZE
-                            };
-                            capture_resampler = if new_streams.input_rate != OPUS_SAMPLE_RATE {
-                                match SampleRateConverter::new(
-                                    new_streams.input_rate, OPUS_SAMPLE_RATE, capture_device_frame,
-                                ) {
-                                    Ok(r) => Some(r),
-                                    Err(e) => {
-                                        eprintln!("voice: resampler init failed: {e}");
-                                        continue;
-                                    }
-                                }
-                            } else {
-                                None
-                            };
-                            capture_buf.resize(capture_device_frame, 0.0);
-                            denoise_primed = false;
-                            streams = new_streams;
-                            break;
+            match setup_streams(
+                &host, &input_device_name, &output_device_name,
+                playback_shared.clone(), peer_keys.clone(), controls.clone(),
+            ) {
+                Ok(new_streams) => {
+                    capture_device_frame = if new_streams.input_rate != OPUS_SAMPLE_RATE {
+                        (new_streams.input_rate as usize * OPUS_FRAME_MS as usize) / 1000
+                    } else {
+                        OPUS_FRAME_SIZE
+                    };
+                    capture_resampler = if new_streams.input_rate != OPUS_SAMPLE_RATE {
+                        match SampleRateConverter::new(
+                            new_streams.input_rate, OPUS_SAMPLE_RATE, capture_device_frame,
+                        ) {
+                            Ok(r) => Some(r),
+                            Err(e) => {
+                                eprintln!("voice: resampler init failed on new device: {e}");
+                                return Err(e);
+                            }
                         }
-                        Err(e) => {
-                            eprintln!("voice: reconnect failed ({e}), retrying...");
-                        }
-                    }
+                    } else {
+                        None
+                    };
+                    capture_buf.resize(capture_device_frame, 0.0);
+                    denoise_primed = false;
+                    streams = new_streams;
+                }
+                Err(e) => {
+                    eprintln!("voice: failed to open new device: {e}");
+                    return Err(e);
                 }
             }
         }

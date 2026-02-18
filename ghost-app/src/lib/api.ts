@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Identity, Group, Channel, Member, Message, Invite, Config, AudioDevices } from "./types";
+import type { Identity, Group, Channel, Member, Message, Invite, Config, AudioDevices, DevSession } from "./types";
 
 export const getIdentity = () => invoke<Identity>("get_identity");
 
@@ -80,3 +80,7 @@ export const setOutputDevice = (name: string | null) =>
 export const startMicTest = () => invoke<void>("start_mic_test");
 export const stopMicTest = () => invoke<void>("stop_mic_test");
 export const playTestTone = () => invoke<void>("play_test_tone");
+
+// Dev testing
+export const createDevSession = () => invoke<Group>("create_dev_session");
+export const readDevSession = () => invoke<DevSession | null>("read_dev_session");

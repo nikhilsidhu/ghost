@@ -5,6 +5,7 @@ mod audio_test;
 mod commands;
 mod config;
 mod constants;
+mod device_watcher;
 mod dto;
 mod relay_task;
 mod setup;
@@ -85,6 +86,8 @@ fn main() {
             commands::start_mic_test,
             commands::stop_mic_test,
             commands::play_test_tone,
+            commands::create_dev_session,
+            commands::read_dev_session,
         ])
         .run(tauri::generate_context!())
         .expect("error while running ghost");

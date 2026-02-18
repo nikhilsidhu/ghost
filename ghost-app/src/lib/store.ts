@@ -1,10 +1,11 @@
 import { createSignal } from "solid-js";
 import { listen } from "@tauri-apps/api/event";
-import type { Identity, Group, Channel, Member, Message, VoiceState, VoiceParticipants, VoiceSpeaking, VoiceMuteState } from "./types";
+import type { Identity, Group, Channel, Member, Message, VoiceState, VoiceParticipants, VoiceSpeaking, VoiceMuteState, VoiceQuality } from "./types";
 import {
   getIdentity, listGroups, listChannels, listMembers,
   listPinnedGroups, markChannelRead, seedTestData,
   joinVoice, leaveVoice, setVoiceMuted, setVoiceDeafened,
+  createDevSession, readDevSession, joinByInvite,
 } from "./api";
 import { sections } from "./settings-registry";
 
@@ -61,6 +62,8 @@ const [voiceError, setVoiceError] = createSignal<string | null>(null);
 const [voiceParticipantChannelId, setVoiceParticipantChannelId] = createSignal<string | null>(null);
 // Per-participant mute/deafen state from relay
 const [voiceMuteStates, setVoiceMuteStates] = createSignal<Map<string, { muted: boolean; deafened: boolean }>>(new Map());
+// Call quality metrics from audio pipeline
+const [voiceQuality, setVoiceQuality] = createSignal<VoiceQuality | null>(null);
 
 const isInCall = voiceConnected;
 
@@ -152,6 +155,27 @@ const seedAndRefresh = async () => {
   await refreshPins();
 };
 
+const startDevSession = async () => {
+  const group = await createDevSession();
+  await refreshGroups();
+  await selectGroup(group.group_id);
+};
+
+// Poll for a dev session file and auto-join if this instance has no groups yet
+const tryDevJoin = async (): Promise<boolean> => {
+  if (groups().length > 0) return true;
+  const session = await readDevSession();
+  if (!session) return false;
+  try {
+    const group = await joinByInvite(session.relay_url, session.token);
+    await refreshGroups();
+    await selectGroup(group.group_id);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
 const initialize = async () => {
   await updateIdentity();
   await refreshGroups();
@@ -203,6 +227,7 @@ const initialize = async () => {
       const selfFp = identity()?.fingerprint;
       if (selfFp) setVoiceParticipants(prev => prev.filter(fp => fp !== selfFp));
       setSpeakingSet(new Set<string>());
+      setVoiceQuality(null);
     }
   });
 
@@ -228,11 +253,25 @@ const initialize = async () => {
     });
   });
 
+  listen<VoiceQuality>("voice-quality", (event) => {
+    setVoiceQuality(event.payload);
+  });
+
   listen<string>("voice-error", (event) => {
     console.error("voice:", event.payload);
     setVoiceError(event.payload);
     setTimeout(() => setVoiceError(null), 5000);
   });
+
+  // Dev mode: poll for a dev session file and auto-join
+  if (import.meta.env.DEV) {
+    const joined = await tryDevJoin();
+    if (!joined) {
+      const interval = setInterval(async () => {
+        if (await tryDevJoin()) clearInterval(interval);
+      }, 3000);
+    }
+  }
 };
 
 export {
@@ -240,12 +279,12 @@ export {
   pinnedGroupIds, selectedChannelId, allChannels,
   inviteLink, showInfo, desiredChannelKind,
   selectedGroup, selectedChannelName,
-  selectGroup, selectChannel, updateIdentity, initialize, seedAndRefresh,
+  selectGroup, selectChannel, updateIdentity, initialize, seedAndRefresh, startDevSession,
   refreshGroups, refreshChannels, refreshPins, refreshAllChannels,
   setInviteLink, setShowInfo, setDesiredChannelKind,
   settingsOpen, settingsCategory, setSettingsCategory, toggleSettings,
   isInCall, isMuted, isDeafened, toggleMute, toggleDeafen, endCall,
   voiceChannelId, voiceGroupId, voiceParticipants, speakingSet, voiceError,
   joinVoiceChannel, isSpeaking, isInVoiceChannel,
-  voiceParticipantChannelId, voiceMuteStates,
+  voiceParticipantChannelId, voiceMuteStates, voiceQuality,
 };

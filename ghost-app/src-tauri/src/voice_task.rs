@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
@@ -18,6 +18,7 @@ use crate::udp_transport::UdpTransport;
 const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const WS_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const SPEAKING_POLL_MS: u64 = 100;
+const QUALITY_POLL_MS: u64 = 2000;
 
 type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
@@ -64,6 +65,14 @@ pub struct VoiceMuteStateEvent {
     pub fingerprint: String,
     pub muted: bool,
     pub deafened: bool,
+}
+
+#[derive(Clone, Serialize)]
+pub struct VoiceQualityEvent {
+    pub packet_loss: f32,
+    pub jitter_depth: u32,
+    pub jitter_target: u32,
+    pub ping_ms: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -289,6 +298,9 @@ pub async fn run(
 
     let mut pending: Option<PendingAudioStart> = None;
     let mut assigned_port: Option<u16> = None;
+    let mut quality_timer = tokio::time::interval(Duration::from_millis(QUALITY_POLL_MS));
+    let mut ping_sent_at: Option<Instant> = None;
+    let mut last_ping_ms: Option<u32> = None;
 
     loop {
         tokio::select! {
@@ -412,6 +424,11 @@ pub async fn run(
                         continue;
                     }
                 };
+                if let Message::Pong(_) = &msg {
+                    if let Some(sent) = ping_sent_at.take() {
+                        last_ping_ms = Some(sent.elapsed().as_millis() as u32);
+                    }
+                }
                 if let Message::Text(text) = msg {
                     match serde_json::from_str::<ServerMsg>(text.as_str()) {
                         Ok(server_msg) => match server_msg {
@@ -508,6 +525,26 @@ pub async fn run(
                             let msg = serde_json::to_string(&ClientMsg::Speaking { speaking }).unwrap();
                             let _ = sink.send(Message::Text(msg.into())).await;
                         }
+                    }
+                }
+            }
+            // Poll quality metrics from audio pipeline and measure relay ping
+            _ = quality_timer.tick() => {
+                if let Some(ref session) = audio {
+                    let c = &session.pipeline.controls;
+                    let loss = f32::from_bits(c.packet_loss_pct.load(Ordering::Relaxed));
+                    let depth = c.jitter_depth.load(Ordering::Relaxed);
+                    let target = c.jitter_target.load(Ordering::Relaxed);
+                    let _ = app.emit("voice-quality", &VoiceQualityEvent {
+                        packet_loss: loss,
+                        jitter_depth: depth,
+                        jitter_target: target,
+                        ping_ms: last_ping_ms,
+                    });
+                    // Send WS ping for next RTT measurement
+                    if let Some(ref mut sink) = ws {
+                        ping_sent_at = Some(Instant::now());
+                        let _ = sink.send(Message::Ping(vec![].into())).await;
                     }
                 }
             }

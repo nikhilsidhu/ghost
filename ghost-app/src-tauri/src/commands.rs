@@ -678,6 +678,124 @@ pub async fn seed_test_data(state: State<'_, AppState>) -> Result<(), String> {
     Ok(())
 }
 
+// Dev session file for multi-instance testing — instance 1 writes this, others read and auto-join
+const DEV_SESSION_PATH: &str = "/tmp/ghost-dev-session.json";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct DevSession {
+    relay_url: String,
+    token: String,
+}
+
+#[tauri::command]
+pub async fn create_dev_session(state: State<'_, AppState>) -> Result<GroupDto, String> {
+    // Create group
+    let (group_id, mailbox_id) = {
+        let mut client = state.client.lock().await;
+        let gid = client
+            .create_group("dev", now_millis())
+            .map_err(|e| e.to_string())?;
+        let mid = client.mailbox_id_for_group(&gid);
+
+        // Create default channels
+        let mut general_id = [0u8; 32];
+        let mut voice_id = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut general_id);
+        rand::rngs::OsRng.fill_bytes(&mut voice_id);
+        let position = client
+            .store()
+            .list_channels(&gid)
+            .map_err(|e| e.to_string())?
+            .len() as i32;
+        client
+            .store()
+            .insert_channel(&Channel {
+                channel_id: general_id,
+                group_id: gid,
+                name: "general".into(),
+                kind: ChannelKind::Text,
+                position,
+            })
+            .map_err(|e| e.to_string())?;
+        client
+            .store()
+            .insert_channel(&Channel {
+                channel_id: voice_id,
+                group_id: gid,
+                name: "voice".into(),
+                kind: ChannelKind::Voice,
+                position: position + 1,
+            })
+            .map_err(|e| e.to_string())?;
+
+        (gid, mid)
+    };
+
+    // Subscribe to mailbox
+    if let Some(mid) = mailbox_id {
+        let mut relay = state.relay.lock().await;
+        relay.subscribe(mid, 0);
+    }
+
+    // Create invite and upload to relay
+    let (token, payload_bytes) = {
+        let client = state.client.lock().await;
+        client.create_invite(&group_id).map_err(|e| e.to_string())?
+    };
+
+    let expires_at = now_millis() + INVITE_EXPIRY_MS;
+    state
+        .http
+        .post(format!("{}/invite", state.relay_url))
+        .json(&serde_json::json!({ "token": token, "expires_at": expires_at }))
+        .send()
+        .await
+        .map_err(|e| format!("register invite: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("register invite: {e}"))?;
+
+    state
+        .http
+        .post(format!("{}/invite/{}/join", state.relay_url, token))
+        .header(SEQ_HEADER, "0")
+        .body(payload_bytes)
+        .send()
+        .await
+        .map_err(|e| format!("upload invite payload: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("upload invite payload: {e}"))?;
+
+    // Write session file so other instances can auto-join
+    let session = DevSession {
+        relay_url: state.relay_url.clone(),
+        token,
+    };
+    std::fs::write(
+        DEV_SESSION_PATH,
+        serde_json::to_string(&session).unwrap(),
+    )
+    .map_err(|e| format!("write dev session: {e}"))?;
+
+    let client = state.client.lock().await;
+    let group = client
+        .store()
+        .get_group(&group_id)
+        .map_err(|e| e.to_string())?;
+    Ok(GroupDto::from_group(&group, false))
+}
+
+#[tauri::command]
+pub async fn read_dev_session() -> Result<Option<DevSession>, String> {
+    match std::fs::read_to_string(DEV_SESSION_PATH) {
+        Ok(content) => {
+            let session: DevSession =
+                serde_json::from_str(&content).map_err(|e| e.to_string())?;
+            Ok(Some(session))
+        }
+        Err(_) => Ok(None),
+    }
+}
+
 #[tauri::command]
 pub async fn start_mic_test(
     app: tauri::AppHandle,
