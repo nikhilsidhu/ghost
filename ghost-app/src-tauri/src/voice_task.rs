@@ -76,10 +76,8 @@ enum ServerMsg {
     Error { message: String },
 }
 
-#[allow(dead_code)] // state_rx will be read by UI commands in the next commit
 pub struct VoiceHandle {
     pub cmd_tx: mpsc::Sender<VoiceCommand>,
-    pub state_rx: watch::Receiver<VoiceStateEvent>,
 }
 
 /// Active audio session dropped on disconnect to stop everything.
@@ -131,16 +129,10 @@ async fn disconnect(
         })
         .await;
     }
-    *ws = None;
-    *ws_read = None;
-    *audio = None;
-    *state = VoiceStateEvent::default();
-    participants.clear();
-    let _ = state_tx.send(state.clone());
-    let _ = app.emit("voice-state", &state);
+    reset(app, ws, ws_read, state, state_tx, participants, audio);
 }
 
-/// Resets local state without notifying the relay (connection already gone).
+/// Resets local state (preserves mute/deafen) without notifying the relay.
 fn reset(
     app: &AppHandle,
     ws: &mut Option<WsSink>,
@@ -153,7 +145,11 @@ fn reset(
     *ws = None;
     *ws_read = None;
     *audio = None;
-    *state = VoiceStateEvent::default();
+    *state = VoiceStateEvent {
+        muted: state.muted,
+        deafened: state.deafened,
+        ..VoiceStateEvent::default()
+    };
     participants.clear();
     let _ = state_tx.send(state.clone());
     let _ = app.emit("voice-state", &state);
@@ -204,6 +200,7 @@ async fn start_audio(
     relay_url: &str,
     port: u16,
     participant_fps: &[String],
+    voice_state: &VoiceStateEvent,
 ) -> Result<AudioSession, String> {
     let group_id: [u8; 32] = hex::decode(group_id_hex)
         .map_err(|e| format!("bad group_id: {e}"))?
@@ -234,6 +231,8 @@ async fn start_audio(
     let peer_keys = derive_peer_keys(client, &group_id, &channel_id, &peer_fps).await?;
 
     let mut pipeline = AudioPipeline::start(own_fp, own_key, channel_id, peer_keys)?;
+    pipeline.controls.muted.store(voice_state.muted, Ordering::Relaxed);
+    pipeline.controls.deafened.store(voice_state.deafened, Ordering::Relaxed);
 
     let host = relay_host(relay_url)?;
     let transport = Arc::new(UdpTransport::connect(&host, port).await?);
@@ -319,8 +318,8 @@ pub async fn run(
                             connected: true,
                             group_id: Some(group_id.clone()),
                             channel_id: Some(channel_id.clone()),
-                            muted: false,
-                            deafened: false,
+                            muted: state.muted,
+                            deafened: state.deafened,
                             udp_port: None,
                         };
                         pending = Some(PendingAudioStart {
@@ -339,6 +338,13 @@ pub async fn run(
                         assigned_port = None;
                     }
                     VoiceCommand::SetMuted(muted) => {
+                        // unmuting while deafened also undeafens
+                        if !muted && state.deafened {
+                            state.deafened = false;
+                            if let Some(ref session) = audio {
+                                session.pipeline.controls.deafened.store(false, Ordering::Relaxed);
+                            }
+                        }
                         state.muted = muted;
                         if let Some(ref session) = audio {
                             session.pipeline.controls.muted.store(muted, Ordering::Relaxed);
@@ -348,7 +354,10 @@ pub async fn run(
                     }
                     VoiceCommand::SetDeafened(deafened) => {
                         state.deafened = deafened;
+                        // deafen controls both: on → mute+deafen, off → unmute+undeafen
+                        state.muted = deafened;
                         if let Some(ref session) = audio {
+                            session.pipeline.controls.muted.store(deafened, Ordering::Relaxed);
                             session.pipeline.controls.deafened.store(deafened, Ordering::Relaxed);
                         }
                         let _ = state_tx.send(state.clone());
@@ -389,7 +398,7 @@ pub async fn run(
                                     p.participant_fps = participants.clone();
                                 }
                                 if let (Some(port), Some(p)) = (assigned_port, pending.take()) {
-                                    match start_audio(&client, &p.group_id, &p.channel_id, &p.fingerprint, &p.relay_url, port, &p.participant_fps).await {
+                                    match start_audio(&client, &p.group_id, &p.channel_id, &p.fingerprint, &p.relay_url, port, &p.participant_fps, &state).await {
                                         Ok(session) => { audio = Some(session); }
                                         Err(e) => emit_error(&app, &format!("audio start: {e}")),
                                     }
@@ -403,7 +412,7 @@ pub async fn run(
 
                                 if let Some(p) = pending.take() {
                                     if !p.participant_fps.is_empty() {
-                                        match start_audio(&client, &p.group_id, &p.channel_id, &p.fingerprint, &p.relay_url, port, &p.participant_fps).await {
+                                        match start_audio(&client, &p.group_id, &p.channel_id, &p.fingerprint, &p.relay_url, port, &p.participant_fps, &state).await {
                                             Ok(session) => { audio = Some(session); }
                                             Err(e) => emit_error(&app, &format!("audio start: {e}")),
                                         }

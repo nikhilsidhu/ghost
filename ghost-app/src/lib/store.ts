@@ -1,9 +1,10 @@
 import { createSignal } from "solid-js";
 import { listen } from "@tauri-apps/api/event";
-import type { Identity, Group, Channel, Member, Message } from "./types";
+import type { Identity, Group, Channel, Member, Message, VoiceState, VoiceParticipants, VoiceSpeaking } from "./types";
 import {
   getIdentity, listGroups, listChannels, listMembers,
   listPinnedGroups, markChannelRead, seedTestData,
+  joinVoice, leaveVoice, setVoiceMuted, setVoiceDeafened,
 } from "./api";
 
 // Backend settings (relay URL, display name) live in ~/.ghost/config.toml.
@@ -45,15 +46,29 @@ const toggleSettings = () => {
   if (opening) setSettingsCategory("appearance");
 };
 
-// --- Call state ---
+// --- Voice state (driven by backend events) ---
 
-const [isInCall, setIsInCall] = createSignal(false);
+const [voiceConnected, setVoiceConnected] = createSignal(false);
+const [voiceGroupId, setVoiceGroupId] = createSignal<string | null>(null);
+const [voiceChannelId, setVoiceChannelId] = createSignal<string | null>(null);
 const [isMuted, setIsMuted] = createSignal(false);
 const [isDeafened, setIsDeafened] = createSignal(false);
+const [voiceParticipants, setVoiceParticipants] = createSignal<string[]>([]);
+const [speakingSet, setSpeakingSet] = createSignal<Set<string>>(new Set());
+const [voiceError, setVoiceError] = createSignal<string | null>(null);
 
-const toggleMute = () => { setIsMuted((v) => !v); setIsDeafened(false); };
-const toggleDeafen = () => { setIsDeafened((v) => !v); setIsMuted(false); };
-const endCall = () => { setIsInCall(false); setIsMuted(false); setIsDeafened(false); };
+const isInCall = voiceConnected;
+
+const toggleMute = () => { setVoiceMuted(!isMuted()).catch(() => {}); };
+const toggleDeafen = () => { setVoiceDeafened(!isDeafened()).catch(() => {}); };
+const endCall = () => { leaveVoice().catch(() => {}); };
+
+const joinVoiceChannel = (groupId: string, channelId: string) => {
+  joinVoice(groupId, channelId).catch(() => {});
+};
+
+const isSpeaking = (fingerprint: string) => speakingSet().has(fingerprint);
+const isInVoiceChannel = (channelId: string) => voiceChannelId() === channelId;
 
 // --- Derived ---
 
@@ -144,6 +159,38 @@ const initialize = async () => {
       refreshGroups();
     }
   });
+
+  listen<VoiceState>("voice-state", (event) => {
+    const s = event.payload;
+    setVoiceConnected(s.connected);
+    setVoiceGroupId(s.group_id);
+    setVoiceChannelId(s.channel_id);
+    setIsMuted(s.muted);
+    setIsDeafened(s.deafened);
+    if (!s.connected) {
+      setVoiceParticipants([]);
+      setSpeakingSet(new Set<string>());
+    }
+  });
+
+  listen<VoiceParticipants>("voice-participants", (event) => {
+    setVoiceParticipants(event.payload.participants);
+  });
+
+  listen<VoiceSpeaking>("voice-speaking", (event) => {
+    const { fingerprint, speaking } = event.payload;
+    setSpeakingSet((prev) => {
+      const next = new Set(prev);
+      if (speaking) next.add(fingerprint); else next.delete(fingerprint);
+      return next;
+    });
+  });
+
+  listen<string>("voice-error", (event) => {
+    console.error("voice:", event.payload);
+    setVoiceError(event.payload);
+    setTimeout(() => setVoiceError(null), 5000);
+  });
 };
 
 export {
@@ -155,5 +202,7 @@ export {
   refreshGroups, refreshChannels, refreshPins, refreshAllChannels,
   setInviteLink, setShowInfo, setDesiredChannelKind,
   settingsOpen, settingsCategory, setSettingsCategory, toggleSettings,
-  isInCall, isMuted, isDeafened, toggleMute, toggleDeafen, endCall, setIsInCall,
+  isInCall, isMuted, isDeafened, toggleMute, toggleDeafen, endCall,
+  voiceChannelId, voiceGroupId, voiceParticipants, speakingSet, voiceError,
+  joinVoiceChannel, isSpeaking, isInVoiceChannel,
 };

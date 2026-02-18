@@ -56,3 +56,15 @@ export const setRelayUrl = (url: string) =>
   invoke<void>("set_relay_url", { url });
 
 export const seedTestData = () => invoke<void>("seed_test_data");
+
+// Voice
+export const joinVoice = (groupId: string, channelId: string) =>
+  invoke<void>("join_voice", { groupId, channelId });
+
+export const leaveVoice = () => invoke<void>("leave_voice");
+
+export const setVoiceMuted = (muted: boolean) =>
+  invoke<void>("set_muted", { muted });
+
+export const setVoiceDeafened = (deafened: boolean) =>
+  invoke<void>("set_deafened", { deafened });

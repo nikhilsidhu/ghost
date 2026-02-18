@@ -6,18 +6,19 @@ import { Avatar } from "./ui/avatar";
 import { Tooltip } from "./ui/tooltip";
 import { ScrollArea } from "./ui/scroll-area";
 import { cn } from "../lib/cn";
-import { AudioLines, Settings, X, Mic, MicOff, Headphones, HeadphoneOff, PhoneOff } from "lucide-solid";
+import { Settings, X } from "lucide-solid";
 import { channelPrefix, slideDuration } from "../lib/constants";
 import {
   identity, groups, selectedGroupId, channels, selectedChannelId,
   selectedGroup, selectGroup, selectChannel,
   settingsOpen, settingsCategory, setSettingsCategory, toggleSettings,
-  isInCall, isMuted, isDeafened, toggleMute, toggleDeafen, endCall,
+  joinVoiceChannel, isInVoiceChannel, endCall,
 } from "../lib/store";
 import { sections } from "../lib/settings-registry";
 import "../lib/settings";
 import { handleCreateChannel } from "../lib/commands";
 import { SettingsPanel } from "./SettingsPanel";
+import { VoiceDock, VoiceChannelItem, VoiceParticipantList } from "./VoiceControls";
 import {
   DragDropProvider,
   DragDropSensors,
@@ -253,63 +254,7 @@ export function Sidebar() {
         {/* Bottom dock — each item uses the same --size-lg cell as group icons */}
         <div class="flex-shrink-0 flex flex-col items-center pb-3 pt-2 group/dock">
 
-          {/* Mute — pinned when active, hover-revealed otherwise */}
-          <div class={cn(
-            "overflow-hidden w-[var(--size-lg)] flex items-center justify-center",
-            isMuted()
-              ? "max-h-[var(--size-lg)]"
-              : "max-h-0 group-hover/dock:max-h-[var(--size-lg)]",
-          )}
-          style={{ transition: "max-height var(--duration-mid) var(--ease-out)" }}
-          >
-            <Tooltip label={isMuted() ? "unmute" : "mute"}>
-              <button
-                class={cn(
-                  "w-[var(--size-lg)] h-[var(--size-md)] rounded-lg flex items-center justify-center cursor-pointer transition-all duration-150",
-                  isMuted() ? "opacity-100 hover:brightness-125" : "opacity-50 hover:opacity-100",
-                )}
-                onClick={toggleMute}
-              >
-                {isMuted()
-                  ? <MicOff size={18} class="text-[var(--amber-400)]" />
-                  : <Mic size={18} class="text-[var(--neutral-300)]" />}
-              </button>
-            </Tooltip>
-          </div>
-          <div class={cn(
-            "overflow-hidden w-[var(--size-lg)] flex items-center justify-center",
-            isDeafened()
-              ? "max-h-[var(--size-lg)]"
-              : "max-h-0 group-hover/dock:max-h-[var(--size-lg)]",
-          )}
-          style={{ transition: "max-height var(--duration-mid) var(--ease-out)" }}
-          >
-            <Tooltip label={isDeafened() ? "undeafen" : "deafen"}>
-              <button
-                class={cn(
-                  "w-[var(--size-lg)] h-[var(--size-md)] rounded-lg flex items-center justify-center cursor-pointer transition-all duration-150",
-                  isDeafened() ? "opacity-100 hover:brightness-125" : "opacity-50 hover:opacity-100",
-                )}
-                onClick={toggleDeafen}
-              >
-                {isDeafened()
-                  ? <HeadphoneOff size={18} class="text-[var(--cyan-400)]" />
-                  : <Headphones size={18} class="text-[var(--neutral-300)]" />}
-              </button>
-            </Tooltip>
-          </div>
-
-          {/* End call — persistent when in call */}
-          <Show when={isInCall()}>
-            <Tooltip label="end call">
-              <button
-                class="w-[var(--size-lg)] h-[var(--size-lg)] flex items-center justify-center cursor-pointer opacity-80 hover:opacity-100 transition-all duration-150"
-                onClick={endCall}
-              >
-                <PhoneOff size={18} class="text-[var(--red-400)]" />
-              </button>
-            </Tooltip>
-          </Show>
+          <VoiceDock />
 
           {/* User avatar */}
           <Show when={identity()}>
@@ -477,14 +422,25 @@ export function Sidebar() {
                         <div class="px-2">
                           <SortableProvider ids={voiceChannels().map((c) => c.channel_id)}>
                             <For each={voiceChannels()}>
-                              {(ch) => (
-                                <ChannelItem
-                                  channel={ch}
-                                  isSelected={ch.channel_id === selectedChannelId()}
-                                  onSelect={selectChannel}
-                                  icon={<AudioLines size={14} class="text-[var(--neutral-500)] flex-shrink-0" />}
-                                />
-                              )}
+                              {(ch) => {
+                                const active = () => isInVoiceChannel(ch.channel_id);
+                                const gid = selectedGroupId()!;
+                                return (
+                                  <>
+                                    <VoiceChannelItem
+                                      channel={ch}
+                                      active={active()}
+                                      onToggle={() => {
+                                        if (active()) endCall();
+                                        else joinVoiceChannel(gid, ch.channel_id);
+                                      }}
+                                    />
+                                    <Show when={active()}>
+                                      <VoiceParticipantList />
+                                    </Show>
+                                  </>
+                                );
+                              }}
                             </For>
                           </SortableProvider>
                         </div>
@@ -615,3 +571,4 @@ function ChannelItem(props: {
     </button>
   );
 }
+

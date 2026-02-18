@@ -48,3 +48,21 @@ export interface Message {
   received_at: number;
   content: string;
 }
+
+export interface VoiceState {
+  connected: boolean;
+  group_id: string | null;
+  channel_id: string | null;
+  muted: boolean;
+  deafened: boolean;
+  udp_port: number | null;
+}
+
+export interface VoiceParticipants {
+  participants: string[];
+}
+
+export interface VoiceSpeaking {
+  fingerprint: string;
+  speaking: boolean;
+}

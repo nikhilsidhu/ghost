@@ -412,13 +412,21 @@ pub async fn join_voice(
         let client = state.client.lock().await;
         hex::encode(client.fingerprint())
     };
+    let relay_url = {
+        let cfg = state.config.lock().await;
+        cfg.relay_url
+            .as_deref()
+            .filter(|u| !u.is_empty())
+            .map(String::from)
+            .unwrap_or_else(|| state.relay_url.clone())
+    };
     state
         .voice
         .cmd_tx
         .send(VoiceCommand::Join {
             group_id,
             channel_id,
-            relay_url: state.relay_url.clone(),
+            relay_url,
             fingerprint,
         })
         .await

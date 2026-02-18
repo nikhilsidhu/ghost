@@ -87,14 +87,16 @@ pub fn initialize() -> SetupResult {
     // Config file takes priority, then env var, then default
     let relay_url = cfg
         .relay_url
-        .clone()
+        .as_deref()
+        .filter(|u| !u.is_empty())
+        .map(String::from)
         .or_else(|| std::env::var("GHOST_RELAY_URL").ok())
         .unwrap_or_else(|| "http://localhost:7700".into());
 
     let (relay, inbox_rx) = RelayClient::new(&relay_url);
 
     let (voice_cmd_tx, voice_cmd_rx) = mpsc::channel(VOICE_CMD_CHANNEL_SIZE);
-    let (voice_state_tx, voice_state_rx) = watch::channel(VoiceStateEvent::default());
+    let (voice_state_tx, _voice_state_rx) = watch::channel(VoiceStateEvent::default());
 
     let state = AppState {
         client: Arc::new(Mutex::new(client)),
@@ -105,7 +107,6 @@ pub fn initialize() -> SetupResult {
         config: Mutex::new(cfg),
         voice: VoiceHandle {
             cmd_tx: voice_cmd_tx,
-            state_rx: voice_state_rx,
         },
     };
 
