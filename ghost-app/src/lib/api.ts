@@ -76,6 +76,12 @@ export const setInputDevice = (name: string | null) =>
 export const setOutputDevice = (name: string | null) =>
   invoke<void>("set_output_device", { name });
 
+// Voice processing
+export const setNoiseSuppression = (mode: string) =>
+  invoke<void>("set_noise_suppression", { mode });
+export const setAgc = (mode: string) =>
+  invoke<void>("set_agc", { mode });
+
 // Audio testing
 export const startMicTest = () => invoke<void>("start_mic_test");
 export const stopMicTest = () => invoke<void>("stop_mic_test");

@@ -1,6 +1,6 @@
 import { createSignal, createEffect, on, onMount, Show } from "solid-js";
 import { listen } from "@tauri-apps/api/event";
-import { startMicTest, stopMicTest, playTestTone, listAudioDevices, setInputDevice, setOutputDevice, getConfig } from "../../lib/api";
+import { startMicTest, stopMicTest, playTestTone, listAudioDevices, setInputDevice, setOutputDevice, setNoiseSuppression, setAgc, getConfig } from "../../lib/api";
 import { settingsOpen, settingsCategory } from "../../lib/store";
 import { SettingGroup, SettingSelect } from "./controls";
 import { cn } from "../../lib/cn";
@@ -14,6 +14,8 @@ export default function AudiovisualSettings() {
   const [outputDevices, setOutputDevices] = createSignal<{ value: string; label: string }[]>([]);
   const [selectedInput, setSelectedInput] = createSignal("default");
   const [selectedOutput, setSelectedOutput] = createSignal("default");
+  const [selectedNs, setSelectedNs] = createSignal("nnnoiseless");
+  const [selectedAgc, setSelectedAgc] = createSignal("auto");
 
   onMount(async () => {
     const [devices, config] = await Promise.all([listAudioDevices(), getConfig()]);
@@ -32,6 +34,8 @@ export default function AudiovisualSettings() {
 
     setSelectedInput(config.input_device ?? "default");
     setSelectedOutput(config.output_device ?? "default");
+    setSelectedNs(config.noise_suppression);
+    setSelectedAgc(config.agc);
   });
 
   let unlisten: (() => void) | null = null;
@@ -87,6 +91,16 @@ export default function AudiovisualSettings() {
     await setOutputDevice(v === "default" ? null : v);
   };
 
+  const handleNsChange = async (v: string) => {
+    setSelectedNs(v);
+    await setNoiseSuppression(v);
+  };
+
+  const handleAgcChange = async (v: string) => {
+    setSelectedAgc(v);
+    await setAgc(v);
+  };
+
   return (
     <div>
       <SettingGroup label="devices">
@@ -103,6 +117,29 @@ export default function AudiovisualSettings() {
           value={selectedOutput()}
           options={outputDevices()}
           onChange={handleOutputChange}
+        />
+      </SettingGroup>
+
+      <SettingGroup label="voice processing">
+        <SettingSelect
+          label="noise suppression"
+          description="reduces background noise during calls"
+          value={selectedNs()}
+          options={[
+            { value: "nnnoiseless", label: "nnnoiseless" },
+            { value: "off", label: "off" },
+          ]}
+          onChange={handleNsChange}
+        />
+        <SettingSelect
+          label="auto gain control"
+          description="normalizes microphone volume automatically"
+          value={selectedAgc()}
+          options={[
+            { value: "auto", label: "auto" },
+            { value: "off", label: "off" },
+          ]}
+          onChange={handleAgcChange}
         />
       </SettingGroup>
 

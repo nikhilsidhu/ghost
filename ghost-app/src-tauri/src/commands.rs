@@ -431,11 +431,21 @@ pub async fn join_by_invite(
 #[tauri::command]
 pub async fn get_config(state: State<'_, AppState>) -> Result<ConfigDto, String> {
     let cfg = state.config.lock().await;
+    let ns = match cfg.noise_suppression.as_deref() {
+        Some("off") => "off",
+        _ => "nnnoiseless",
+    };
+    let agc = match cfg.agc.as_deref() {
+        Some("off") => "off",
+        _ => "auto",
+    };
     Ok(ConfigDto {
         display_name: cfg.display_name.clone(),
         relay_url: cfg.relay_url.clone(),
         input_device: cfg.input_device.clone(),
         output_device: cfg.output_device.clone(),
+        noise_suppression: ns.to_string(),
+        agc: agc.to_string(),
     })
 }
 
@@ -474,7 +484,7 @@ pub async fn join_voice(
         let client = state.client.lock().await;
         hex::encode(client.fingerprint())
     };
-    let (relay_url, input_device, output_device) = {
+    let (relay_url, input_device, output_device, ns_mode, agc_mode) = {
         let cfg = state.config.lock().await;
         let url = cfg
             .relay_url
@@ -482,7 +492,7 @@ pub async fn join_voice(
             .filter(|u| !u.is_empty())
             .map(String::from)
             .unwrap_or_else(|| state.relay_url.clone());
-        (url, cfg.input_device.clone(), cfg.output_device.clone())
+        (url, cfg.input_device.clone(), cfg.output_device.clone(), cfg.noise_suppression_mode(), cfg.agc_mode())
     };
     state
         .voice
@@ -494,6 +504,8 @@ pub async fn join_voice(
             fingerprint,
             input_device,
             output_device,
+            ns_mode: ns_mode as u8,
+            agc_mode: agc_mode as u8,
         })
         .await
         .map_err(|_| "voice task not running".to_string())
@@ -872,4 +884,44 @@ pub async fn set_output_device(
     let mut cfg = state.config.lock().await;
     cfg.output_device = name;
     cfg.save(&state.config_path)
+}
+
+#[tauri::command]
+pub async fn set_noise_suppression(
+    mode: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let ns = match mode.as_str() {
+        "off" => crate::audio::NoiseSuppressionMode::Off,
+        _ => crate::audio::NoiseSuppressionMode::Nnnoiseless,
+    };
+    let mut cfg = state.config.lock().await;
+    cfg.noise_suppression = Some(mode);
+    cfg.save(&state.config_path)?;
+    state
+        .voice
+        .cmd_tx
+        .send(VoiceCommand::SetNoiseSuppression(ns as u8))
+        .await
+        .map_err(|_| "voice task not running".to_string())
+}
+
+#[tauri::command]
+pub async fn set_agc(
+    mode: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let agc = match mode.as_str() {
+        "off" => crate::audio::AgcMode::Off,
+        _ => crate::audio::AgcMode::Auto,
+    };
+    let mut cfg = state.config.lock().await;
+    cfg.agc = Some(mode);
+    cfg.save(&state.config_path)?;
+    state
+        .voice
+        .cmd_tx
+        .send(VoiceCommand::SetAgc(agc as u8))
+        .await
+        .map_err(|_| "voice task not running".to_string())
 }

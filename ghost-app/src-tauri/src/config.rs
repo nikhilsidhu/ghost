@@ -9,9 +9,25 @@ pub struct GhostConfig {
     pub relay_url: Option<String>,
     pub input_device: Option<String>,
     pub output_device: Option<String>,
+    pub noise_suppression: Option<String>,
+    pub agc: Option<String>,
 }
 
 impl GhostConfig {
+    pub fn noise_suppression_mode(&self) -> crate::audio::NoiseSuppressionMode {
+        match self.noise_suppression.as_deref() {
+            Some("off") => crate::audio::NoiseSuppressionMode::Off,
+            _ => crate::audio::NoiseSuppressionMode::Nnnoiseless,
+        }
+    }
+
+    pub fn agc_mode(&self) -> crate::audio::AgcMode {
+        match self.agc.as_deref() {
+            Some("off") => crate::audio::AgcMode::Off,
+            _ => crate::audio::AgcMode::Auto,
+        }
+    }
+
     pub fn load(path: &Path) -> Self {
         fs::read_to_string(path)
             .ok()

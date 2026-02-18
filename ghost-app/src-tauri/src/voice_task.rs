@@ -33,10 +33,14 @@ pub enum VoiceCommand {
         fingerprint: String,
         input_device: Option<String>,
         output_device: Option<String>,
+        ns_mode: u8,
+        agc_mode: u8,
     },
     Leave,
     SetMuted(bool),
     SetDeafened(bool),
+    SetNoiseSuppression(u8),
+    SetAgc(u8),
 }
 
 #[derive(Clone, Serialize, Default)]
@@ -189,6 +193,8 @@ struct PendingAudioStart {
     participant_fps: Vec<String>,
     input_device: Option<String>,
     output_device: Option<String>,
+    ns_mode: u8,
+    agc_mode: u8,
 }
 
 /// Derive voice encryption keys for a set of participant fingerprints.
@@ -307,7 +313,7 @@ pub async fn run(
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else { break };
                 match cmd {
-                    VoiceCommand::Join { group_id, channel_id, relay_url, fingerprint, input_device, output_device } => {
+                    VoiceCommand::Join { group_id, channel_id, relay_url, fingerprint, input_device, output_device, ns_mode, agc_mode } => {
                         disconnect(&app, &mut ws, &mut ws_read, &mut state, &state_tx, &mut participants, &mut audio).await;
                         pending = None;
                         assigned_port = None;
@@ -357,6 +363,8 @@ pub async fn run(
                             participant_fps: Vec::new(),
                             input_device,
                             output_device,
+                            ns_mode,
+                            agc_mode,
                         });
                         let _ = state_tx.send(state.clone());
                         let _ = app.emit("voice-state", &state);
@@ -398,6 +406,16 @@ pub async fn run(
                         if let Some(ref mut sink) = ws {
                             let msg = serde_json::to_string(&ClientMsg::MuteState { muted: state.muted, deafened: state.deafened }).unwrap();
                             let _ = sink.send(Message::Text(msg.into())).await;
+                        }
+                    }
+                    VoiceCommand::SetNoiseSuppression(mode) => {
+                        if let Some(ref session) = audio {
+                            session.pipeline.controls.noise_suppression.store(mode, Ordering::Relaxed);
+                        }
+                    }
+                    VoiceCommand::SetAgc(mode) => {
+                        if let Some(ref session) = audio {
+                            session.pipeline.controls.agc.store(mode, Ordering::Relaxed);
                         }
                     }
                 }
@@ -442,7 +460,11 @@ pub async fn run(
                                 if let Some(port) = assigned_port {
                                     if let Some(p) = pending.take() {
                                         match start_audio(&client, &p.group_id, &p.channel_id, &p.fingerprint, &p.relay_url, port, &p.participant_fps, &state, p.input_device, p.output_device).await {
-                                            Ok(session) => { audio = Some(session); }
+                                            Ok(session) => {
+                                                session.pipeline.controls.noise_suppression.store(p.ns_mode, Ordering::Relaxed);
+                                                session.pipeline.controls.agc.store(p.agc_mode, Ordering::Relaxed);
+                                                audio = Some(session);
+                                            }
                                             Err(e) => emit_error(&app, &format!("audio start: {e}")),
                                         }
                                     }
@@ -457,7 +479,11 @@ pub async fn run(
                                 if let Some(p) = pending.take() {
                                     if !p.participant_fps.is_empty() {
                                         match start_audio(&client, &p.group_id, &p.channel_id, &p.fingerprint, &p.relay_url, port, &p.participant_fps, &state, p.input_device, p.output_device).await {
-                                            Ok(session) => { audio = Some(session); }
+                                            Ok(session) => {
+                                                session.pipeline.controls.noise_suppression.store(p.ns_mode, Ordering::Relaxed);
+                                                session.pipeline.controls.agc.store(p.agc_mode, Ordering::Relaxed);
+                                                audio = Some(session);
+                                            }
                                             Err(e) => emit_error(&app, &format!("audio start: {e}")),
                                         }
                                     } else {

@@ -43,6 +43,9 @@ pub const JITTER_EARLY_THRESHOLD: u32 = 20; // decrease depth when <1/20 are lat
 // Volume normalizer ignores signals below this (silence/noise floor)
 pub const AGC_SILENCE_FLOOR: f32 = 1e-6;
 
+// Speech detection threshold when nnnoiseless is off (volume-based fallback)
+pub const ENERGY_VAD_SPEECH_RMS: f32 = 0.035;
+
 // nnnoiseless operates on i16-range floats
 pub const DENOISE_SAMPLE_SCALE: f32 = i16::MAX as f32;
 

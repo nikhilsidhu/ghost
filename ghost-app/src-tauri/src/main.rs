@@ -83,6 +83,8 @@ fn main() {
             commands::list_audio_devices,
             commands::set_input_device,
             commands::set_output_device,
+            commands::set_noise_suppression,
+            commands::set_agc,
             commands::start_mic_test,
             commands::stop_mic_test,
             commands::play_test_tone,

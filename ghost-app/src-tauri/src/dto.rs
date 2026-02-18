@@ -129,6 +129,8 @@ pub struct ConfigDto {
     pub relay_url: Option<String>,
     pub input_device: Option<String>,
     pub output_device: Option<String>,
+    pub noise_suppression: String,
+    pub agc: String,
 }
 
 impl From<&Member> for MemberDto {

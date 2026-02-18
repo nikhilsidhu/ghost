@@ -39,6 +39,8 @@ export interface Config {
   relay_url: string | null;
   input_device: string | null;
   output_device: string | null;
+  noise_suppression: string;
+  agc: string;
 }
 
 export interface AudioDevices {

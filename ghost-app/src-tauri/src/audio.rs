@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -11,6 +11,38 @@ use tokio::sync::mpsc;
 
 use crate::constants::*;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum NoiseSuppressionMode {
+    Off = 0,
+    Nnnoiseless = 1,
+}
+
+impl From<u8> for NoiseSuppressionMode {
+    fn from(v: u8) -> Self {
+        match v {
+            0 => Self::Off,
+            _ => Self::Nnnoiseless,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum AgcMode {
+    Off = 0,
+    Auto = 1,
+}
+
+impl From<u8> for AgcMode {
+    fn from(v: u8) -> Self {
+        match v {
+            0 => Self::Off,
+            _ => Self::Auto,
+        }
+    }
+}
+
 pub struct AudioControls {
     pub muted: AtomicBool,
     pub deafened: AtomicBool,
@@ -19,6 +51,8 @@ pub struct AudioControls {
     pub packet_loss_pct: AtomicU32,
     pub jitter_depth: AtomicU32,
     pub jitter_target: AtomicU32,
+    pub noise_suppression: AtomicU8,
+    pub agc: AtomicU8,
 }
 
 impl AudioControls {
@@ -30,6 +64,8 @@ impl AudioControls {
             packet_loss_pct: AtomicU32::new(0),
             jitter_depth: AtomicU32::new(0),
             jitter_target: AtomicU32::new(0),
+            noise_suppression: AtomicU8::new(NoiseSuppressionMode::Nnnoiseless as u8),
+            agc: AtomicU8::new(AgcMode::Auto as u8),
         }
     }
 }
@@ -594,6 +630,12 @@ fn denoise_frame(
     max_vad
 }
 
+// Detect speech by volume when nnnoiseless is off (returns 1.0 if loud enough, else 0.0)
+fn energy_vad(samples: &[f32]) -> f32 {
+    let rms = (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt();
+    if rms >= ENERGY_VAD_SPEECH_RMS { 1.0 } else { 0.0 }
+}
+
 // Mix all ready jitter buffers into mix_buf, return true if any audio was mixed
 fn mix_playback(
     jitter_buffers: &mut HashMap<[u8; 32], JitterBuffer>,
@@ -681,6 +723,7 @@ fn run_audio_thread(
     let mut denoise_in = [0.0f32; DENOISE_FRAME_SIZE];
     let mut denoise_out = [0.0f32; DENOISE_FRAME_SIZE];
     let mut resample_accum: Vec<f32> = Vec::with_capacity(OPUS_FRAME_SIZE * 2);
+    let mut last_ns_mode = NoiseSuppressionMode::Nnnoiseless;
     let frame_timeout = std::time::Duration::from_millis(OPUS_FRAME_MS as u64);
 
     let mut diag_ticks: u32 = 0;
@@ -745,14 +788,28 @@ fn run_audio_thread(
 
             let muted = controls.muted.load(Ordering::Relaxed);
             if !muted {
-                let max_vad = denoise_frame(
-                    &mut denoiser, &mut frame_48k, &mut denoise_in, &mut denoise_out,
-                );
+                let ns_mode = NoiseSuppressionMode::from(controls.noise_suppression.load(Ordering::Relaxed));
+                let agc_mode = AgcMode::from(controls.agc.load(Ordering::Relaxed));
 
-                if !denoise_primed {
-                    denoise_primed = true;
-                    continue;
+                // Reset denoise state when switching back to nnnoiseless
+                if ns_mode == NoiseSuppressionMode::Nnnoiseless && last_ns_mode != NoiseSuppressionMode::Nnnoiseless {
+                    denoise_primed = false;
                 }
+                last_ns_mode = ns_mode;
+
+                let max_vad = match ns_mode {
+                    NoiseSuppressionMode::Nnnoiseless => {
+                        let vad = denoise_frame(
+                            &mut denoiser, &mut frame_48k, &mut denoise_in, &mut denoise_out,
+                        );
+                        if !denoise_primed {
+                            denoise_primed = true;
+                            continue;
+                        }
+                        vad
+                    }
+                    NoiseSuppressionMode::Off => energy_vad(&frame_48k),
+                };
 
                 if max_vad > VAD_THRESHOLD {
                     vad_hangover = VAD_HANGOVER_FRAMES;
@@ -761,7 +818,9 @@ fn run_audio_thread(
                 }
                 controls.speaking.store(vad_hangover > 0, Ordering::Relaxed);
 
-                agc.process(&mut frame_48k);
+                if agc_mode == AgcMode::Auto {
+                    agc.process(&mut frame_48k);
+                }
                 if let Ok(len) = encoder.encode_float(&frame_48k, &mut encode_buf) {
                     if let Ok(encrypted) = encrypt_voice_frame(&own_key, sequence, &encode_buf[..len]) {
                         let pkt = build_packet(&channel_id, &own_fp, sequence, &encrypted);
