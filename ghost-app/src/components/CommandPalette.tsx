@@ -455,7 +455,7 @@ export function CommandPalette() {
             class="relative w-full max-w-[40rem] rounded-xl overflow-hidden"
             style:max-width="calc(100vw - 3rem)"
             style={{
-              background: "radial-gradient(ellipse at 50% 0%, rgba(255,255,255,0.03), transparent 60%), var(--palette-bg)",
+              background: "radial-gradient(ellipse at 50% 0%, var(--palette-highlight), transparent 60%), var(--palette-bg)",
               "box-shadow": "var(--palette-shadow)",
               animation: "palette-in var(--duration-fast) ease-out",
             }}

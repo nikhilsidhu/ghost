@@ -9,10 +9,7 @@ export function SettingsPanel(props: { onClose: () => void }) {
   const activeSection = () => sections().find((s) => s.id === settingsCategory());
 
   return (
-    <div
-      class="w-full h-full flex flex-col min-h-0"
-      style={{ background: "var(--neutral-950)" }}
-    >
+    <div class="w-full h-full flex flex-col min-h-0 bg-[var(--neutral-950)]">
       <div class="h-7 flex-shrink-0" />
 
       <div class="h-[var(--size-lg)] flex items-center justify-between px-4 flex-shrink-0 -mt-1">

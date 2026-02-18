@@ -16,7 +16,7 @@ createEffect(() => document.documentElement.classList.toggle("compact", compact(
 
 export default function AppearanceSettings() {
   return (
-    <div class="px-4">
+    <div class="pb-4">
       <SettingGroup label="text">
         <SettingSelect
           label="font size"

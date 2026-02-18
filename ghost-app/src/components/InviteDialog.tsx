@@ -17,12 +17,12 @@ function QrCode(props: { data: string; size: number }) {
       width={props.size}
       height={props.size}
       class="rounded-lg"
-      style={{ background: "white" }}
+      style={{ background: "var(--neutral-50)" }}
     >
       {matrix().data.map((row, y) =>
         row.map((cell, x) =>
           cell ? (
-            <rect x={x} y={y} width={1} height={1} fill="#1c1917" />
+            <rect x={x} y={y} width={1} height={1} fill="var(--neutral-950)" />
           ) : null,
         ),
       )}

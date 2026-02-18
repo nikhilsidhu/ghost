@@ -24,7 +24,7 @@ export function Tooltip(props: TooltipProps) {
           )}
           style={{
             background: "var(--neutral-800)",
-            "box-shadow": "0 4px 12px rgba(0, 0, 0, 0.4)",
+            "box-shadow": "var(--shadow-float)",
           }}
         >
           {props.label}

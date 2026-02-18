@@ -129,6 +129,9 @@
   --active: #24163e;       /* same as purple-900, for selected items */
   --accent-hover: #3a2464; /* same as purple-800, for accent button hovers */
 
+  /* Floating surface shadow (dropdowns, tooltips, popovers) */
+  --shadow-float: 0 4px 12px rgba(0, 0, 0, 0.4);
+
   /* Token pill backgrounds */
   --pill-purple: color-mix(in srgb, var(--purple-400) 15%, transparent);
   --pill-ember: color-mix(in srgb, var(--ember-500) 15%, transparent);
@@ -138,6 +141,7 @@
   --palette-bg: rgba(20, 19, 32, 0.92);
   --palette-border: rgba(255, 255, 255, 0.06);
   --palette-glow: rgba(124, 82, 214, 0.12);
+  --palette-highlight: rgba(255, 255, 255, 0.03);
   --palette-shadow:
     0 0 0 1px var(--palette-border),
     0 4px 24px rgba(0, 0, 0, 0.5),
@@ -274,6 +278,7 @@ input, textarea {
   padding: 1px;
   background: linear-gradient(135deg, rgba(166, 128, 255, 0.12), rgba(255, 255, 255, 0.03) 40%, transparent 60%);
   -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+  mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
   -webkit-mask-composite: xor;
   mask-composite: exclude;
   pointer-events: none;

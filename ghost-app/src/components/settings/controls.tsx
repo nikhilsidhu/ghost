@@ -5,15 +5,28 @@ import { Check, Copy, ChevronDown } from "lucide-solid";
 const DEBOUNCE_MS = 600;
 const FLASH_MS = 1500;
 
+// Toggle geometry — thumb slides inside track with TOGGLE_INSET padding
+const TOGGLE_W = 32;
+const TOGGLE_THUMB = 12;
+const TOGGLE_INSET = 3;
+const TOGGLE_ON = TOGGLE_W - TOGGLE_THUMB - TOGGLE_INSET;
+
 // --- Layout ---
 
-export function SettingGroup(props: { label: string; children: JSX.Element }) {
+export function SettingGroup(props: { label?: string; footer?: string; children: JSX.Element }) {
   return (
-    <div class="mt-6 first:mt-0">
-      <div class="text-[11px] font-medium text-[var(--neutral-500)] tracking-wide mb-1">
-        {props.label}
+    <div class="mt-4 first:mt-2 mx-2">
+      <Show when={props.label}>
+        <div class="text-xs text-[var(--neutral-500)] mb-1.5 px-3">
+          {props.label}
+        </div>
+      </Show>
+      <div class="rounded-lg bg-[var(--neutral-900)] px-3">
+        {props.children}
       </div>
-      {props.children}
+      <Show when={props.footer}>
+        <div class="text-xs text-[var(--neutral-500)] mt-1.5 px-3">{props.footer}</div>
+      </Show>
     </div>
   );
 }
@@ -40,15 +53,15 @@ function ToggleSwitch(props: { checked: boolean; onChange: (v: boolean) => void;
       aria-checked={props.checked}
       disabled={props.disabled}
       class={cn(
-        "relative w-8 h-[18px] rounded-full transition-colors duration-200 cursor-pointer flex-shrink-0",
+        "relative w-8 h-[18px] rounded-full transition-colors duration-[var(--duration-mid)] cursor-pointer flex-shrink-0",
         props.checked ? "bg-[var(--purple-500)]" : "bg-[var(--neutral-600)]",
         props.disabled && "opacity-50 cursor-not-allowed",
       )}
       onClick={() => !props.disabled && props.onChange(!props.checked)}
     >
       <div
-        class="absolute top-[3px] w-3 h-3 rounded-full bg-white transition-transform duration-200"
-        style={{ transform: props.checked ? "translateX(17px)" : "translateX(3px)" }}
+        class="absolute top-[3px] w-3 h-3 rounded-full bg-[var(--neutral-50)] transition-transform duration-[var(--duration-mid)]"
+        style={{ transform: `translateX(${props.checked ? TOGGLE_ON : TOGGLE_INSET}px)` }}
       />
     </button>
   );
@@ -182,12 +195,8 @@ export function SettingSelect(props: {
           </button>
           <Show when={open()}>
             <div
-              class="absolute right-0 top-full mt-1 min-w-full rounded-md py-1 z-50"
-              style={{
-                background: "var(--neutral-800)",
-                border: "1px solid var(--neutral-700)",
-                "box-shadow": "0 4px 12px rgba(0,0,0,0.4)",
-              }}
+              class="absolute right-0 top-full mt-1 min-w-full rounded-md py-1 z-50 bg-[var(--neutral-800)] border border-[var(--neutral-700)]"
+              style={{ "box-shadow": "var(--shadow-float)" }}
             >
               <For each={props.options}>
                 {(o) => (

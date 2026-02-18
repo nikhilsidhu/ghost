@@ -1,6 +1,6 @@
 import { createSignal, onMount } from "solid-js";
 import { getConfig, setRelayUrl } from "../../lib/api";
-import { SettingInput } from "./controls";
+import { SettingGroup, SettingInput } from "./controls";
 
 export default function NetworkSettings() {
   const [relay, setRelay] = createSignal("");
@@ -11,13 +11,15 @@ export default function NetworkSettings() {
   });
 
   return (
-    <div class="px-4">
-      <SettingInput
-        label="relay url"
-        description="server used for message delivery"
-        value={relay()}
-        onSave={(v) => setRelayUrl(v)}
-      />
+    <div class="pb-4">
+      <SettingGroup>
+        <SettingInput
+          label="relay url"
+          description="server used for message delivery"
+          value={relay()}
+          onSave={(v) => setRelayUrl(v)}
+        />
+      </SettingGroup>
     </div>
   );
 }
