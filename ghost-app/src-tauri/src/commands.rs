@@ -449,6 +449,8 @@ pub async fn get_config(state: State<'_, AppState>) -> Result<ConfigDto, String>
         noise_suppression: ns.to_string(),
         agc: agc.to_string(),
         input_mode: input_mode.to_string(),
+        vad_threshold: cfg.vad_threshold.unwrap_or(crate::constants::VAD_THRESHOLD),
+        input_gain: cfg.input_gain.unwrap_or(1.0),
     })
 }
 
@@ -487,7 +489,7 @@ pub async fn join_voice(
         let client = state.client.lock().await;
         hex::encode(client.fingerprint())
     };
-    let (relay_url, input_device, output_device, ns_mode, agc_mode) = {
+    let (relay_url, input_device, output_device, ns_mode, agc_mode, vad_threshold, input_gain, input_mode) = {
         let cfg = state.config.lock().await;
         let url = cfg
             .relay_url
@@ -495,7 +497,14 @@ pub async fn join_voice(
             .filter(|u| !u.is_empty())
             .map(String::from)
             .unwrap_or_else(|| state.relay_url.clone());
-        (url, cfg.input_device.clone(), cfg.output_device.clone(), cfg.noise_suppression_mode(), cfg.agc_mode())
+        let vad = cfg.vad_threshold.unwrap_or(crate::constants::VAD_THRESHOLD);
+        let gain = cfg.input_gain.unwrap_or(1.0);
+        let mode = if cfg.input_mode.as_deref() == Some("push_to_talk") {
+            crate::audio::INPUT_MODE_PTT
+        } else {
+            crate::audio::INPUT_MODE_VA
+        };
+        (url, cfg.input_device.clone(), cfg.output_device.clone(), cfg.noise_suppression_mode(), cfg.agc_mode(), vad, gain, mode)
     };
     state
         .voice
@@ -509,6 +518,9 @@ pub async fn join_voice(
             output_device,
             ns_mode: ns_mode as u8,
             agc_mode: agc_mode as u8,
+            vad_threshold: vad_threshold.to_bits(),
+            input_gain: input_gain.to_bits(),
+            input_mode,
         })
         .await
         .map_err(|_| "voice task not running".to_string())
@@ -934,13 +946,64 @@ pub async fn set_input_mode(
     mode: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    match mode.as_str() {
-        "voice_activity" | "push_to_talk" => {}
+    let mode_u8 = match mode.as_str() {
+        "voice_activity" => crate::audio::INPUT_MODE_VA,
+        "push_to_talk" => crate::audio::INPUT_MODE_PTT,
         _ => return Err(format!("unknown input mode: {mode}")),
-    }
+    };
     let mut cfg = state.config.lock().await;
     cfg.input_mode = Some(mode);
-    cfg.save(&state.config_path)
+    cfg.save(&state.config_path)?;
+    // Also push to audio pipeline if active
+    let _ = state.voice.cmd_tx.send(VoiceCommand::SetInputMode(mode_u8)).await;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn set_ptt_active(
+    active: bool,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    state
+        .voice
+        .cmd_tx
+        .send(VoiceCommand::SetPttActive(active))
+        .await
+        .map_err(|_| "voice task not running".to_string())
+}
+
+#[tauri::command]
+pub async fn set_vad_threshold(
+    value: f32,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let clamped = value.clamp(0.0, 1.0);
+    let mut cfg = state.config.lock().await;
+    cfg.vad_threshold = Some(clamped);
+    cfg.save(&state.config_path)?;
+    state
+        .voice
+        .cmd_tx
+        .send(VoiceCommand::SetVadThreshold(clamped.to_bits()))
+        .await
+        .map_err(|_| "voice task not running".to_string())
+}
+
+#[tauri::command]
+pub async fn set_input_gain(
+    value: f32,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let clamped = value.clamp(0.0, 2.0);
+    let mut cfg = state.config.lock().await;
+    cfg.input_gain = Some(clamped);
+    cfg.save(&state.config_path)?;
+    state
+        .voice
+        .cmd_tx
+        .send(VoiceCommand::SetInputGain(clamped.to_bits()))
+        .await
+        .map_err(|_| "voice task not running".to_string())
 }
 
 #[tauri::command]

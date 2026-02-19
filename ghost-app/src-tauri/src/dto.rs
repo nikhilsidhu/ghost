@@ -132,6 +132,8 @@ pub struct ConfigDto {
     pub noise_suppression: String,
     pub agc: String,
     pub input_mode: String,
+    pub vad_threshold: f32,
+    pub input_gain: f32,
 }
 
 #[derive(Serialize)]

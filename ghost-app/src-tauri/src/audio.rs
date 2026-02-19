@@ -43,6 +43,10 @@ impl From<u8> for AgcMode {
     }
 }
 
+// 0 = voice activity, 1 = push to talk
+pub const INPUT_MODE_VA: u8 = 0;
+pub const INPUT_MODE_PTT: u8 = 1;
+
 pub struct AudioControls {
     pub muted: AtomicBool,
     pub deafened: AtomicBool,
@@ -53,6 +57,10 @@ pub struct AudioControls {
     pub jitter_target: AtomicU32,
     pub noise_suppression: AtomicU8,
     pub agc: AtomicU8,
+    pub vad_threshold: AtomicU32,
+    pub input_gain: AtomicU32,
+    pub input_mode: AtomicU8,
+    pub ptt_active: AtomicBool,
 }
 
 impl AudioControls {
@@ -66,6 +74,10 @@ impl AudioControls {
             jitter_target: AtomicU32::new(0),
             noise_suppression: AtomicU8::new(NoiseSuppressionMode::Nnnoiseless as u8),
             agc: AtomicU8::new(AgcMode::Auto as u8),
+            vad_threshold: AtomicU32::new(VAD_THRESHOLD.to_bits()),
+            input_gain: AtomicU32::new(1.0f32.to_bits()),
+            input_mode: AtomicU8::new(INPUT_MODE_VA),
+            ptt_active: AtomicBool::new(false),
         }
     }
 }
@@ -787,7 +799,19 @@ fn run_audio_thread(
             resample_accum.drain(..OPUS_FRAME_SIZE);
 
             let muted = controls.muted.load(Ordering::Relaxed);
-            if !muted {
+            let mode = controls.input_mode.load(Ordering::Relaxed);
+            let ptt_active = controls.ptt_active.load(Ordering::Relaxed);
+            // User mute always overrides. In PTT mode, only transmit while key held.
+            let transmit = !muted && (mode == INPUT_MODE_VA || ptt_active);
+
+            if transmit {
+                let gain = f32::from_bits(controls.input_gain.load(Ordering::Relaxed));
+                if gain != 1.0 {
+                    for s in frame_48k.iter_mut() {
+                        *s = (*s * gain).clamp(-1.0, 1.0);
+                    }
+                }
+
                 let ns_mode = NoiseSuppressionMode::from(controls.noise_suppression.load(Ordering::Relaxed));
                 let agc_mode = AgcMode::from(controls.agc.load(Ordering::Relaxed));
 
@@ -811,12 +835,19 @@ fn run_audio_thread(
                     NoiseSuppressionMode::Off => energy_vad(&frame_48k),
                 };
 
-                if max_vad > VAD_THRESHOLD {
-                    vad_hangover = VAD_HANGOVER_FRAMES;
-                } else if vad_hangover > 0 {
-                    vad_hangover -= 1;
+                if mode == INPUT_MODE_PTT {
+                    // PTT: always speaking while key held
+                    controls.speaking.store(true, Ordering::Relaxed);
+                } else {
+                    // VA: VAD hangover controls speaking indicator
+                    let vad_thresh = f32::from_bits(controls.vad_threshold.load(Ordering::Relaxed));
+                    if max_vad > vad_thresh {
+                        vad_hangover = VAD_HANGOVER_FRAMES;
+                    } else if vad_hangover > 0 {
+                        vad_hangover -= 1;
+                    }
+                    controls.speaking.store(vad_hangover > 0, Ordering::Relaxed);
                 }
-                controls.speaking.store(vad_hangover > 0, Ordering::Relaxed);
 
                 if agc_mode == AgcMode::Auto {
                     agc.process(&mut frame_48k);

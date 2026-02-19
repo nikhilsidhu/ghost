@@ -85,6 +85,14 @@ export const setAgc = (mode: string) =>
 // Input mode
 export const setInputMode = (mode: string) =>
   invoke<void>("set_input_mode", { mode });
+export const setPttActive = (active: boolean) =>
+  invoke<void>("set_ptt_active", { active });
+
+// Voice tuning
+export const setVadThreshold = (value: number) =>
+  invoke<void>("set_vad_threshold", { value });
+export const setInputGain = (value: number) =>
+  invoke<void>("set_input_gain", { value });
 
 // Audio testing
 export const startMicTest = () => invoke<void>("start_mic_test");

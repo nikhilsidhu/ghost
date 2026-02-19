@@ -1,6 +1,6 @@
 import { createSignal, createEffect, Show, For, onCleanup, type JSX } from "solid-js";
 import { cn } from "../../lib/cn";
-import { Check, Copy, ChevronDown } from "lucide-solid";
+import { Check, Copy, ChevronDown, RotateCcw } from "lucide-solid";
 
 const DEBOUNCE_MS = 600;
 const FLASH_MS = 1500;
@@ -262,6 +262,88 @@ export function SettingSegmented(props: {
         </div>
       </div>
       {props.children}
+    </SettingRow>
+  );
+}
+
+// --- Slider ---
+
+export function SettingSlider(props: {
+  label: string;
+  description?: string;
+  value: number;
+  min: number;
+  max: number;
+  step: number;
+  displayValue?: string;
+  defaultValue?: number;
+  onChange: (v: number) => void;
+  onChangeEnd?: (v: number) => void;
+  disabled?: boolean;
+}) {
+  const pct = () => ((props.value - props.min) / (props.max - props.min)) * 100;
+  const defaultPct = () =>
+    props.defaultValue != null
+      ? ((props.defaultValue - props.min) / (props.max - props.min)) * 100
+      : null;
+  const isDefault = () =>
+    props.defaultValue == null || Math.abs(props.value - props.defaultValue) < props.step * 0.5;
+
+  const reset = () => {
+    if (props.defaultValue != null) {
+      props.onChange(props.defaultValue);
+      props.onChangeEnd?.(props.defaultValue);
+    }
+  };
+
+  return (
+    <SettingRow disabled={props.disabled}>
+      <div class="flex items-center justify-between gap-4">
+        <div class="min-w-0">
+          <div class="text-sm text-[var(--neutral-200)]">{props.label}</div>
+          <Show when={props.description}>
+            <div class="text-xs text-[var(--neutral-500)] mt-0.5">{props.description}</div>
+          </Show>
+        </div>
+        <div class="flex items-center gap-2 flex-shrink-0">
+          <Show when={!isDefault()}>
+            <button
+              class="text-[var(--neutral-500)] hover:text-[var(--neutral-300)] cursor-pointer transition-colors duration-150"
+              onClick={reset}
+            >
+              <RotateCcw size={11} />
+            </button>
+          </Show>
+          <Show when={props.displayValue}>
+            <span class="text-xs text-[var(--neutral-400)] tabular-nums">{props.displayValue}</span>
+          </Show>
+        </div>
+      </div>
+      <div class="mt-2 relative h-5 flex items-center">
+        <div class="absolute inset-x-0 h-1.5 rounded-full bg-[var(--neutral-800)]">
+          <div
+            class="h-full rounded-full bg-[var(--purple-500)]"
+            style={{ width: `${pct()}%` }}
+          />
+        </div>
+        <Show when={defaultPct() != null}>
+          <div
+            class="absolute w-0.5 h-2.5 rounded-full bg-[var(--neutral-600)] pointer-events-none z-[1]"
+            style={{ left: `${defaultPct()}%`, transform: "translateX(-50%)" }}
+          />
+        </Show>
+        <input
+          type="range"
+          min={props.min}
+          max={props.max}
+          step={props.step}
+          value={props.value}
+          disabled={props.disabled}
+          class="slider-input absolute inset-x-0 w-full h-5 appearance-none bg-transparent cursor-pointer z-[2]"
+          onInput={(e) => props.onChange(parseFloat(e.currentTarget.value))}
+          onChange={(e) => props.onChangeEnd?.(parseFloat(e.currentTarget.value))}
+        />
+      </div>
     </SettingRow>
   );
 }

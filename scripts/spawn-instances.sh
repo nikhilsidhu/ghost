@@ -30,7 +30,7 @@ sleep 1
 # Instance 1 — default config, default data dir
 echo "starting instance 1..."
 cd "$ROOT/ghost-app"
-npx tauri dev &
+VITE_GHOST_INSTANCE=1 npx tauri dev &
 
 # Instances 2..N — each gets a unique data dir, vite port, tauri port, and identifier
 for i in $(seq 2 "$N"); do
@@ -40,7 +40,7 @@ for i in $(seq 2 "$N"); do
     mkdir -p "$DATA_DIR"
 
     echo "starting instance $i (vite=$VITE_PORT, data=$DATA_DIR)..."
-    GHOST_DATA_DIR="$DATA_DIR" npx tauri dev \
+    GHOST_DATA_DIR="$DATA_DIR" VITE_GHOST_INSTANCE="$i" npx tauri dev \
         --config "{\"identifier\":\"com.ghost.app.dev$i\",\"build\":{\"devUrl\":\"http://localhost:$VITE_PORT\",\"beforeDevCommand\":\"npx vite --port $VITE_PORT\"}}" \
         --port "$TAURI_PORT" &
 done

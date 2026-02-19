@@ -7,7 +7,7 @@ use crate::audio::{parse_header, InboundFrame};
 use crate::constants::VOICE_MAX_PACKET;
 
 pub struct UdpTransport {
-    socket: UdpSocket,
+    pub(crate) socket: UdpSocket,
 }
 
 impl UdpTransport {
@@ -30,13 +30,6 @@ impl UdpTransport {
     }
 
     /// Sends encoded packets from the audio pipeline to the relay.
-    pub async fn send_loop(&self, mut outbound_rx: mpsc::Receiver<Vec<u8>>) {
-        while let Some(pkt) = outbound_rx.recv().await {
-            if let Err(e) = self.socket.send(&pkt).await {
-                eprintln!("voice udp send: {e}");
-            }
-        }
-    }
 
     /// Receives packets from the relay and forwards them to the audio pipeline,
     /// skipping our own packets.

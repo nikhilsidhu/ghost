@@ -1,10 +1,12 @@
 import { createSignal, createEffect, on, onMount, Show } from "solid-js";
 import { listen } from "@tauri-apps/api/event";
-import { startMicTest, stopMicTest, playTestTone, listAudioDevices, setInputDevice, setOutputDevice, setNoiseSuppression, setAgc, setInputMode, getConfig, getKeybinds } from "../../lib/api";
-import { settingsOpen, settingsCategory, setSettingsCategory } from "../../lib/store";
+import { startMicTest, stopMicTest, playTestTone, listAudioDevices, setInputDevice, setOutputDevice, setNoiseSuppression, setAgc, setInputMode, setVadThreshold, setInputGain, getConfig, getKeybinds } from "../../lib/api";
+import { settingsOpen, settingsCategory, setSettingsCategory, setIsPttMode } from "../../lib/store";
 import { setInputMode as setKeybindInputMode } from "../../lib/keybinds";
-import { SettingGroup, SettingSelect, SettingSegmented } from "./controls";
+import { SettingGroup, SettingSelect, SettingSegmented, SettingSlider } from "./controls";
 import { cn } from "../../lib/cn";
+
+const VAD_DEBOUNCE_MS = 200;
 
 export default function AudiovisualSettings() {
   const [micTesting, setMicTesting] = createSignal(false);
@@ -19,6 +21,11 @@ export default function AudiovisualSettings() {
   const [selectedAgc, setSelectedAgc] = createSignal("auto");
   const [selectedInputMode, setSelectedInputMode] = createSignal("voice_activity");
   const [pttKeyBound, setPttKeyBound] = createSignal(false);
+  const [vadThreshold, setVadThresholdLocal] = createSignal(0.85);
+  const [inputGainLocal, setInputGainLocal] = createSignal(1.0);
+
+  let vadTimer: ReturnType<typeof setTimeout> | null = null;
+  let gainTimer: ReturnType<typeof setTimeout> | null = null;
 
   onMount(async () => {
     const [devices, config, keybinds] = await Promise.all([listAudioDevices(), getConfig(), getKeybinds()]);
@@ -41,6 +48,8 @@ export default function AudiovisualSettings() {
     setSelectedAgc(config.agc);
     setSelectedInputMode(config.input_mode);
     setPttKeyBound(!!keybinds.push_to_talk);
+    setVadThresholdLocal(config.vad_threshold);
+    setInputGainLocal(config.input_gain);
   });
 
   let unlisten: (() => void) | null = null;
@@ -67,7 +76,6 @@ export default function AudiovisualSettings() {
     try {
       await playTestTone();
     } finally {
-      // Tone plays for 2s on the backend
       setTimeout(() => setTonePlaying(false), 2100);
     }
   };
@@ -108,8 +116,21 @@ export default function AudiovisualSettings() {
 
   const handleInputModeChange = async (v: string) => {
     setSelectedInputMode(v);
+    setIsPttMode(v === "push_to_talk");
     setKeybindInputMode(v);
     await setInputMode(v);
+  };
+
+  const handleVadChange = (v: number) => {
+    setVadThresholdLocal(v);
+    if (vadTimer) clearTimeout(vadTimer);
+    vadTimer = setTimeout(() => setVadThreshold(v).catch(() => {}), VAD_DEBOUNCE_MS);
+  };
+
+  const handleGainChange = (v: number) => {
+    setInputGainLocal(v);
+    if (gainTimer) clearTimeout(gainTimer);
+    gainTimer = setTimeout(() => setInputGain(v).catch(() => {}), VAD_DEBOUNCE_MS);
   };
 
   return (
@@ -154,6 +175,30 @@ export default function AudiovisualSettings() {
             </div>
           </Show>
         </SettingSegmented>
+        <Show when={selectedInputMode() === "voice_activity"}>
+          <SettingSlider
+            label="input sensitivity"
+            description="how loud you need to be to activate"
+            value={vadThreshold()}
+            min={0}
+            max={1}
+            step={0.01}
+            defaultValue={0.85}
+            displayValue={`${Math.round(vadThreshold() * 100)}%`}
+            onChange={handleVadChange}
+          />
+        </Show>
+        <SettingSlider
+          label="input volume"
+          description="pre-processing microphone gain"
+          value={inputGainLocal()}
+          min={0}
+          max={2}
+          step={0.01}
+          defaultValue={1.0}
+          displayValue={`${Math.round(inputGainLocal() * 100)}%`}
+          onChange={handleGainChange}
+        />
         <SettingSelect
           label="noise suppression"
           description="reduces background noise during calls"

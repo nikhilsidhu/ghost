@@ -1,4 +1,4 @@
-import { For, Show } from "solid-js";
+import { createSignal, createEffect, For, Show } from "solid-js";
 import type { JSX } from "solid-js";
 import type { Channel, VoiceQuality } from "../lib/types";
 import { Avatar } from "./ui/avatar";
@@ -9,8 +9,8 @@ import {
   AudioLines, Mic, MicOff, Headphones, HeadphoneOff, PhoneOff, Signal,
 } from "lucide-solid";
 import {
-  isInCall, isMuted, isDeafened, toggleMute, toggleDeafen, endCall,
-  voiceParticipants, members, isSpeaking, voiceMuteStates, voiceQuality,
+  isInCall, isMuted, isDeafened, isPttMode, isPttKeyHeld, pttMuteAttempt, toggleMute, toggleDeafen, endCall,
+  voiceParticipants, members, isSpeaking, voiceMuteStates, voiceQuality, identity,
 } from "../lib/store";
 import {
   createSortable,
@@ -22,16 +22,69 @@ const FALLBACK_NAME_LEN = 8;
 
 // Mute, deafen, end-call buttons for the activity bar dock
 export function VoiceDock() {
+  const [shaking, setShaking] = createSignal(false);
+  const [pttHint, setPttHint] = createSignal(false);
+
+  // Watch for blocked mute attempts in PTT mode
+  createEffect(() => {
+    const attempt = pttMuteAttempt();
+    if (attempt > 0) {
+      setShaking(true);
+      setPttHint(true);
+      setTimeout(() => setShaking(false), 400);
+      setTimeout(() => setPttHint(false), 2000);
+    }
+  });
+
+  const selfSpeaking = () => isSpeaking(identity()?.fingerprint ?? "");
+  // PTT transmitting = key held; VA transmitting = not muted
+  const micOn = () => isPttMode() ? isPttKeyHeld() : !isMuted();
+
+  const micIcon = () => {
+    if (!micOn()) return <MicOff size={ICON_SIZE} class="text-[var(--amber-400)]" />;
+    const speaking = selfSpeaking();
+    return (
+      <span class="relative inline-flex items-center justify-center">
+        {/* Blurred duplicate behind = smooth icon-shaped glow */}
+        <Mic
+          size={ICON_SIZE}
+          class={cn(
+            "absolute text-[var(--emerald-400)] transition-opacity duration-150",
+            speaking ? "opacity-60" : "opacity-0",
+          )}
+          style={{ filter: "blur(5px)" }}
+        />
+        <Mic
+          size={ICON_SIZE}
+          class={cn(
+            "relative transition-colors duration-75",
+            speaking ? "text-[var(--emerald-400)]" : "text-[var(--neutral-300)]",
+          )}
+        />
+      </span>
+    );
+  };
+
   return (
     <>
-      <DockButton
-        active={isMuted()}
-        label={isMuted() ? "unmute" : "mute"}
-        onClick={toggleMute}
-        activeIcon={<MicOff size={ICON_SIZE} class="text-[var(--amber-400)]" />}
-        inactiveIcon={<Mic size={ICON_SIZE} class="text-[var(--neutral-300)]" />}
-        hoverReveal
-      />
+      <div class="relative">
+        <DockButton
+          active={isInCall() || isPttMode()}
+          label={isPttMode() ? "push to talk" : isMuted() ? "unmute" : "mute"}
+          onClick={toggleMute}
+          activeIcon={micIcon()}
+          inactiveIcon={<Mic size={ICON_SIZE} class="text-[var(--neutral-300)]" />}
+          shake={shaking()}
+        />
+        <Show when={pttHint()}>
+          <div
+            class="absolute left-full top-1/2 -translate-y-1/2 ml-2 px-2 py-1 rounded text-xs whitespace-nowrap text-[var(--neutral-300)] bg-[var(--neutral-800)] border border-[var(--neutral-700)] z-50 animate-[tooltip-in_120ms_ease-out]"
+            style={{ "box-shadow": "var(--shadow-float)" }}
+          >
+            hold keybind to talk
+          </div>
+        </Show>
+      </div>
       <DockButton
         active={isDeafened()}
         label={isDeafened() ? "undeafen" : "deafen"}
@@ -60,6 +113,7 @@ function DockButton(props: {
   inactiveIcon: JSX.Element;
   hoverReveal?: boolean;
   activeOpacity?: string;
+  shake?: boolean;
 }) {
   return (
     <div class={cn(
@@ -79,6 +133,7 @@ function DockButton(props: {
             props.active
               ? `${props.activeOpacity ?? "opacity-100"} hover:brightness-125`
               : "opacity-50 hover:opacity-100",
+            props.shake && "animate-[shake_300ms_ease-in-out]",
           )}
           onClick={props.onClick}
         >

@@ -17,6 +17,8 @@ pub struct GhostConfig {
     pub noise_suppression: Option<String>,
     pub agc: Option<String>,
     pub input_mode: Option<String>,
+    pub vad_threshold: Option<f32>,
+    pub input_gain: Option<f32>,
     pub keybinds: Option<KeybindConfig>,
 }
 

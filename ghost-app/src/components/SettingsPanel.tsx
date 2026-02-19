@@ -28,9 +28,19 @@ export function SettingsPanel(props: { onClose: () => void }) {
             <div class="h-[var(--size-lg)] flex items-center px-4 flex-shrink-0">
               <span class="text-sm text-[var(--neutral-400)]">{section().label}</span>
             </div>
-            <ScrollArea class="flex-1 min-h-0 pb-6">
-              <Dynamic component={section().render} />
-            </ScrollArea>
+            <div class="relative flex-1 min-h-0">
+              <ScrollArea class="h-full pb-6">
+                <Dynamic component={section().render} />
+              </ScrollArea>
+              <div
+                class="absolute top-0 left-0 right-0 h-4 pointer-events-none z-10"
+                style={{ background: "linear-gradient(to top, transparent, var(--neutral-950))" }}
+              />
+              <div
+                class="absolute bottom-0 left-0 right-0 h-6 pointer-events-none z-10"
+                style={{ background: "linear-gradient(to bottom, transparent, var(--neutral-950))" }}
+              />
+            </div>
           </>
         )}
       </Show>

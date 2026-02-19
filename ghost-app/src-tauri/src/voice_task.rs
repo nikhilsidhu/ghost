@@ -35,12 +35,19 @@ pub enum VoiceCommand {
         output_device: Option<String>,
         ns_mode: u8,
         agc_mode: u8,
+        vad_threshold: u32,
+        input_gain: u32,
+        input_mode: u8,
     },
     Leave,
     SetMuted(bool),
     SetDeafened(bool),
     SetNoiseSuppression(u8),
     SetAgc(u8),
+    SetVadThreshold(u32),
+    SetInputGain(u32),
+    SetInputMode(u8),
+    SetPttActive(bool),
 }
 
 #[derive(Clone, Serialize, Default)]
@@ -107,6 +114,7 @@ pub struct VoiceHandle {
 /// Active audio session dropped on disconnect to stop everything.
 struct AudioSession {
     pipeline: AudioPipeline,
+    own_fp: [u8; 32],
     udp_send_task: JoinHandle<()>,
     udp_recv_task: JoinHandle<()>,
 }
@@ -195,6 +203,18 @@ struct PendingAudioStart {
     output_device: Option<String>,
     ns_mode: u8,
     agc_mode: u8,
+    vad_threshold: u32,
+    input_gain: u32,
+    input_mode: u8,
+}
+
+fn apply_pending_settings(p: &PendingAudioStart, session: &AudioSession) {
+    let c = &session.pipeline.controls;
+    c.noise_suppression.store(p.ns_mode, Ordering::Relaxed);
+    c.agc.store(p.agc_mode, Ordering::Relaxed);
+    c.vad_threshold.store(p.vad_threshold, Ordering::Relaxed);
+    c.input_gain.store(p.input_gain, Ordering::Relaxed);
+    c.input_mode.store(p.input_mode, Ordering::Relaxed);
 }
 
 /// Derive voice encryption keys for a set of participant fingerprints.
@@ -267,7 +287,14 @@ async fn start_audio(
     let host = relay_host(relay_url)?;
     let transport = Arc::new(UdpTransport::connect(&host, port).await?);
 
-    let outbound_rx = pipeline
+    // Send a registration packet so the relay learns our UDP address even
+    // before we transmit any audio (needed for PTT-only clients to receive).
+    let reg_pkt = crate::audio::build_packet(&channel_id, &own_fp, 0, &[]);
+    if let Err(e) = transport.socket.send(&reg_pkt).await {
+        eprintln!("voice udp registration send: {e}");
+    }
+
+    let mut outbound_rx = pipeline
         .outbound_rx
         .take()
         .ok_or("outbound_rx already taken")?;
@@ -275,7 +302,11 @@ async fn start_audio(
 
     let transport_send = transport.clone();
     let udp_send_task = tokio::spawn(async move {
-        transport_send.send_loop(outbound_rx).await;
+        while let Some(pkt) = outbound_rx.recv().await {
+            if let Err(e) = transport_send.socket.send(&pkt).await {
+                eprintln!("voice udp send: {e}");
+            }
+        }
     });
     let udp_recv_task = tokio::spawn(async move {
         transport.recv_loop(inbound_tx, own_fp).await;
@@ -283,6 +314,7 @@ async fn start_audio(
 
     Ok(AudioSession {
         pipeline,
+        own_fp,
         udp_send_task,
         udp_recv_task,
     })
@@ -313,7 +345,7 @@ pub async fn run(
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else { break };
                 match cmd {
-                    VoiceCommand::Join { group_id, channel_id, relay_url, fingerprint, input_device, output_device, ns_mode, agc_mode } => {
+                    VoiceCommand::Join { group_id, channel_id, relay_url, fingerprint, input_device, output_device, ns_mode, agc_mode, vad_threshold, input_gain, input_mode } => {
                         disconnect(&app, &mut ws, &mut ws_read, &mut state, &state_tx, &mut participants, &mut audio).await;
                         pending = None;
                         assigned_port = None;
@@ -365,6 +397,9 @@ pub async fn run(
                             output_device,
                             ns_mode,
                             agc_mode,
+                            vad_threshold,
+                            input_gain,
+                            input_mode,
                         });
                         let _ = state_tx.send(state.clone());
                         let _ = app.emit("voice-state", &state);
@@ -413,9 +448,42 @@ pub async fn run(
                             session.pipeline.controls.noise_suppression.store(mode, Ordering::Relaxed);
                         }
                     }
+                    VoiceCommand::SetVadThreshold(bits) => {
+                        if let Some(ref session) = audio {
+                            session.pipeline.controls.vad_threshold.store(bits, Ordering::Relaxed);
+                        }
+                    }
+                    VoiceCommand::SetInputGain(bits) => {
+                        if let Some(ref session) = audio {
+                            session.pipeline.controls.input_gain.store(bits, Ordering::Relaxed);
+                        }
+                    }
                     VoiceCommand::SetAgc(mode) => {
                         if let Some(ref session) = audio {
                             session.pipeline.controls.agc.store(mode, Ordering::Relaxed);
+                        }
+                    }
+                    VoiceCommand::SetInputMode(mode) => {
+                        if let Some(ref session) = audio {
+                            session.pipeline.controls.input_mode.store(mode, Ordering::Relaxed);
+                        }
+                        // Switching to PTT clears mute so PTT gating takes over
+                        if mode == crate::audio::INPUT_MODE_PTT && state.muted {
+                            state.muted = false;
+                            if let Some(ref session) = audio {
+                                session.pipeline.controls.muted.store(false, Ordering::Relaxed);
+                            }
+                            let _ = state_tx.send(state.clone());
+                            let _ = app.emit("voice-state", &state);
+                            if let Some(ref mut sink) = ws {
+                                let msg = serde_json::to_string(&ClientMsg::MuteState { muted: state.muted, deafened: state.deafened }).unwrap();
+                                let _ = sink.send(Message::Text(msg.into())).await;
+                            }
+                        }
+                    }
+                    VoiceCommand::SetPttActive(active) => {
+                        if let Some(ref session) = audio {
+                            session.pipeline.controls.ptt_active.store(active, Ordering::Relaxed);
                         }
                     }
                 }
@@ -459,10 +527,9 @@ pub async fn run(
                                 }
                                 if let Some(port) = assigned_port {
                                     if let Some(p) = pending.take() {
-                                        match start_audio(&client, &p.group_id, &p.channel_id, &p.fingerprint, &p.relay_url, port, &p.participant_fps, &state, p.input_device, p.output_device).await {
+                                        match start_audio(&client, &p.group_id, &p.channel_id, &p.fingerprint, &p.relay_url, port, &p.participant_fps, &state, p.input_device.clone(), p.output_device.clone()).await {
                                             Ok(session) => {
-                                                session.pipeline.controls.noise_suppression.store(p.ns_mode, Ordering::Relaxed);
-                                                session.pipeline.controls.agc.store(p.agc_mode, Ordering::Relaxed);
+                                                apply_pending_settings(&p, &session);
                                                 audio = Some(session);
                                             }
                                             Err(e) => emit_error(&app, &format!("audio start: {e}")),
@@ -478,10 +545,9 @@ pub async fn run(
 
                                 if let Some(p) = pending.take() {
                                     if !p.participant_fps.is_empty() {
-                                        match start_audio(&client, &p.group_id, &p.channel_id, &p.fingerprint, &p.relay_url, port, &p.participant_fps, &state, p.input_device, p.output_device).await {
+                                        match start_audio(&client, &p.group_id, &p.channel_id, &p.fingerprint, &p.relay_url, port, &p.participant_fps, &state, p.input_device.clone(), p.output_device.clone()).await {
                                             Ok(session) => {
-                                                session.pipeline.controls.noise_suppression.store(p.ns_mode, Ordering::Relaxed);
-                                                session.pipeline.controls.agc.store(p.agc_mode, Ordering::Relaxed);
+                                                apply_pending_settings(&p, &session);
                                                 audio = Some(session);
                                             }
                                             Err(e) => emit_error(&app, &format!("audio start: {e}")),
@@ -541,12 +607,15 @@ pub async fn run(
                     }
                 }
             }
-            // Poll local speaking state and send Speaking messages to relay
+            // Poll local speaking state and send Speaking messages to relay + frontend
             _ = speaking_timer.tick() => {
                 if let Some(ref session) = audio {
                     let speaking = session.pipeline.controls.speaking.load(Ordering::Relaxed);
                     if speaking != last_speaking {
                         last_speaking = speaking;
+                        // Emit locally so the frontend can show self-speaking indicator
+                        let fp_hex = hex::encode(session.own_fp);
+                        let _ = app.emit("voice-speaking", &VoiceSpeakingEvent { fingerprint: fp_hex, speaking });
                         if let Some(ref mut sink) = ws {
                             let msg = serde_json::to_string(&ClientMsg::Speaking { speaking }).unwrap();
                             let _ = sink.send(Message::Text(msg.into())).await;

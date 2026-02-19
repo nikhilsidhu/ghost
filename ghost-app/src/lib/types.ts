@@ -42,6 +42,8 @@ export interface Config {
   noise_suppression: string;
   agc: string;
   input_mode: string;
+  vad_threshold: number;
+  input_gain: number;
 }
 
 export interface AudioDevices {

@@ -5,9 +5,9 @@ import {
   getIdentity, listGroups, listChannels, listMembers,
   listPinnedGroups, markChannelRead, seedTestData,
   joinVoice, leaveVoice, setVoiceMuted, setVoiceDeafened,
-  createDevSession, readDevSession, joinByInvite,
+  createDevSession, readDevSession, joinByInvite, getConfig,
 } from "./api";
-import { initKeybinds } from "./keybinds";
+import { initKeybinds, onPttActiveChange } from "./keybinds";
 import { sections } from "./settings-registry";
 
 // Backend settings (relay URL, display name) live in ~/.ghost/config.toml.
@@ -67,8 +67,18 @@ const [voiceMuteStates, setVoiceMuteStates] = createSignal<Map<string, { muted: 
 const [voiceQuality, setVoiceQuality] = createSignal<VoiceQuality | null>(null);
 
 const isInCall = voiceConnected;
+const [isPttMode, setIsPttMode] = createSignal(false);
+const [isPttKeyHeld, setIsPttKeyHeld] = createSignal(false);
+// Bumped to trigger shake animation when user clicks mute in PTT mode
+const [pttMuteAttempt, setPttMuteAttempt] = createSignal(0);
 
-const toggleMute = () => { setVoiceMuted(!isMuted()).catch(() => {}); };
+const toggleMute = () => {
+  if (isPttMode()) {
+    setPttMuteAttempt((n) => n + 1);
+    return;
+  }
+  setVoiceMuted(!isMuted()).catch(() => {});
+};
 const toggleDeafen = () => { setVoiceDeafened(!isDeafened()).catch(() => {}); };
 const endCall = () => { leaveVoice().catch(() => {}); };
 
@@ -264,7 +274,9 @@ const initialize = async () => {
     setTimeout(() => setVoiceError(null), 5000);
   });
 
+  onPttActiveChange((active) => setIsPttKeyHeld(active));
   initKeybinds().catch((e) => console.error("keybinds init failed:", e));
+  getConfig().then((c) => setIsPttMode(c.input_mode === "push_to_talk")).catch(() => {});
 
   // Dev mode: poll for a dev session file and auto-join
   if (import.meta.env.DEV) {
@@ -286,7 +298,7 @@ export {
   refreshGroups, refreshChannels, refreshPins, refreshAllChannels,
   setInviteLink, setShowInfo, setDesiredChannelKind,
   settingsOpen, settingsCategory, setSettingsCategory, toggleSettings,
-  isInCall, isMuted, isDeafened, toggleMute, toggleDeafen, endCall,
+  isInCall, isMuted, isDeafened, isPttMode, setIsPttMode, isPttKeyHeld, pttMuteAttempt, toggleMute, toggleDeafen, endCall,
   voiceChannelId, voiceGroupId, voiceParticipants, speakingSet, voiceError,
   joinVoiceChannel, isSpeaking, isInVoiceChannel,
   voiceParticipantChannelId, voiceMuteStates, voiceQuality,
