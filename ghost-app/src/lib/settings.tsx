@@ -1,10 +1,11 @@
-import { Palette, Mail, WifiPen, MonitorSpeaker, BellRing, HatGlasses, Rat } from "lucide-solid";
+import { Palette, Mail, WifiPen, MonitorSpeaker, BellRing, HatGlasses, Rat, Keyboard } from "lucide-solid";
 import { registerSettings } from "./settings-registry";
 import AppearanceSettings from "../components/settings/AppearanceSettings";
 import AppearancePreview from "../components/settings/AppearancePreview";
 import MessagesSettings from "../components/settings/MessagesSettings";
 import NetworkSettings from "../components/settings/NetworkSettings";
 import AudiovisualSettings from "../components/settings/AudiovisualSettings";
+import KeybindsSettings from "../components/settings/KeybindsSettings";
 import NotificationsSettings from "../components/settings/NotificationsSettings";
 import PrivacySettings from "../components/settings/PrivacySettings";
 import DevSettings from "../components/settings/DevSettings";
@@ -21,6 +22,14 @@ cleanups.push(registerSettings({
   icon: MonitorSpeaker,
   order: 0,
   render: AudiovisualSettings,
+}));
+
+cleanups.push(registerSettings({
+  id: "keybinds",
+  label: "keybinds",
+  icon: Keyboard,
+  order: 5,
+  render: KeybindsSettings,
 }));
 
 cleanups.push(registerSettings({

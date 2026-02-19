@@ -131,6 +131,12 @@ pub struct ConfigDto {
     pub output_device: Option<String>,
     pub noise_suppression: String,
     pub agc: String,
+    pub input_mode: String,
+}
+
+#[derive(Serialize)]
+pub struct KeybindConfigDto {
+    pub push_to_talk: Option<String>,
 }
 
 impl From<&Member> for MemberDto {

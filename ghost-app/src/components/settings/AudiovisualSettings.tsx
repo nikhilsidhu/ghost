@@ -1,8 +1,9 @@
 import { createSignal, createEffect, on, onMount, Show } from "solid-js";
 import { listen } from "@tauri-apps/api/event";
-import { startMicTest, stopMicTest, playTestTone, listAudioDevices, setInputDevice, setOutputDevice, setNoiseSuppression, setAgc, getConfig } from "../../lib/api";
-import { settingsOpen, settingsCategory } from "../../lib/store";
-import { SettingGroup, SettingSelect } from "./controls";
+import { startMicTest, stopMicTest, playTestTone, listAudioDevices, setInputDevice, setOutputDevice, setNoiseSuppression, setAgc, setInputMode, getConfig, getKeybinds } from "../../lib/api";
+import { settingsOpen, settingsCategory, setSettingsCategory } from "../../lib/store";
+import { setInputMode as setKeybindInputMode } from "../../lib/keybinds";
+import { SettingGroup, SettingSelect, SettingSegmented } from "./controls";
 import { cn } from "../../lib/cn";
 
 export default function AudiovisualSettings() {
@@ -16,9 +17,11 @@ export default function AudiovisualSettings() {
   const [selectedOutput, setSelectedOutput] = createSignal("default");
   const [selectedNs, setSelectedNs] = createSignal("nnnoiseless");
   const [selectedAgc, setSelectedAgc] = createSignal("auto");
+  const [selectedInputMode, setSelectedInputMode] = createSignal("voice_activity");
+  const [pttKeyBound, setPttKeyBound] = createSignal(false);
 
   onMount(async () => {
-    const [devices, config] = await Promise.all([listAudioDevices(), getConfig()]);
+    const [devices, config, keybinds] = await Promise.all([listAudioDevices(), getConfig(), getKeybinds()]);
 
     const defaultInLabel = devices.default_input ? `default (${devices.default_input})` : "default";
     const defaultOutLabel = devices.default_output ? `default (${devices.default_output})` : "default";
@@ -36,6 +39,8 @@ export default function AudiovisualSettings() {
     setSelectedOutput(config.output_device ?? "default");
     setSelectedNs(config.noise_suppression);
     setSelectedAgc(config.agc);
+    setSelectedInputMode(config.input_mode);
+    setPttKeyBound(!!keybinds.push_to_talk);
   });
 
   let unlisten: (() => void) | null = null;
@@ -101,6 +106,12 @@ export default function AudiovisualSettings() {
     await setAgc(v);
   };
 
+  const handleInputModeChange = async (v: string) => {
+    setSelectedInputMode(v);
+    setKeybindInputMode(v);
+    await setInputMode(v);
+  };
+
   return (
     <div>
       <SettingGroup label="devices">
@@ -121,6 +132,28 @@ export default function AudiovisualSettings() {
       </SettingGroup>
 
       <SettingGroup label="voice processing">
+        <SettingSegmented
+          label="input mode"
+          description="how your microphone activates"
+          value={selectedInputMode()}
+          options={[
+            { value: "voice_activity", label: "voice activity" },
+            { value: "push_to_talk", label: "push to talk" },
+          ]}
+          onChange={handleInputModeChange}
+        >
+          <Show when={selectedInputMode() === "push_to_talk" && !pttKeyBound()}>
+            <div class="text-xs text-[var(--amber-400)] mt-2">
+              no key bound —{" "}
+              <button
+                class="underline cursor-pointer hover:text-[var(--amber-300)]"
+                onClick={() => setSettingsCategory("keybinds")}
+              >
+                set in keybinds
+              </button>
+            </div>
+          </Show>
+        </SettingSegmented>
         <SettingSelect
           label="noise suppression"
           description="reduces background noise during calls"

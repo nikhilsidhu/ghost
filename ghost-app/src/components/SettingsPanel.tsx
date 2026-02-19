@@ -28,7 +28,7 @@ export function SettingsPanel(props: { onClose: () => void }) {
             <div class="h-[var(--size-lg)] flex items-center px-4 flex-shrink-0">
               <span class="text-sm text-[var(--neutral-400)]">{section().label}</span>
             </div>
-            <ScrollArea class="flex-1">
+            <ScrollArea class="flex-1 min-h-0 pb-6">
               <Dynamic component={section().render} />
             </ScrollArea>
           </>

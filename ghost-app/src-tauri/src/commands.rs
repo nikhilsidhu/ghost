@@ -8,7 +8,8 @@ use ghost_core::storage::{Channel, ChannelKind, Group, Member, MemberRole, Store
 use ghost_core::wire::{encode_channel_op, encode_member_announce, ChannelOpPayload};
 
 use crate::constants::{DEFAULT_PAGE_SIZE, INVITE_EXPIRY_MS, SEQ_HEADER};
-use crate::dto::{ChannelDto, ConfigDto, GroupDto, IdentityDto, InviteDto, MemberDto, MessageDto};
+use crate::config::KeybindConfig;
+use crate::dto::{ChannelDto, ConfigDto, GroupDto, IdentityDto, InviteDto, KeybindConfigDto, MemberDto, MessageDto};
 use crate::state::AppState;
 use crate::voice_task::VoiceCommand;
 
@@ -439,6 +440,7 @@ pub async fn get_config(state: State<'_, AppState>) -> Result<ConfigDto, String>
         Some("off") => "off",
         _ => "auto",
     };
+    let input_mode = cfg.input_mode.as_deref().unwrap_or("voice_activity");
     Ok(ConfigDto {
         display_name: cfg.display_name.clone(),
         relay_url: cfg.relay_url.clone(),
@@ -446,6 +448,7 @@ pub async fn get_config(state: State<'_, AppState>) -> Result<ConfigDto, String>
         output_device: cfg.output_device.clone(),
         noise_suppression: ns.to_string(),
         agc: agc.to_string(),
+        input_mode: input_mode.to_string(),
     })
 }
 
@@ -924,4 +927,42 @@ pub async fn set_agc(
         .send(VoiceCommand::SetAgc(agc as u8))
         .await
         .map_err(|_| "voice task not running".to_string())
+}
+
+#[tauri::command]
+pub async fn set_input_mode(
+    mode: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    match mode.as_str() {
+        "voice_activity" | "push_to_talk" => {}
+        _ => return Err(format!("unknown input mode: {mode}")),
+    }
+    let mut cfg = state.config.lock().await;
+    cfg.input_mode = Some(mode);
+    cfg.save(&state.config_path)
+}
+
+#[tauri::command]
+pub async fn get_keybinds(state: State<'_, AppState>) -> Result<KeybindConfigDto, String> {
+    let cfg = state.config.lock().await;
+    let kb = cfg.keybinds.clone().unwrap_or_default();
+    Ok(KeybindConfigDto {
+        push_to_talk: kb.push_to_talk,
+    })
+}
+
+#[tauri::command]
+pub async fn set_keybind(
+    action: String,
+    shortcut: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let mut cfg = state.config.lock().await;
+    let kb = cfg.keybinds.get_or_insert_with(KeybindConfig::default);
+    match action.as_str() {
+        "push_to_talk" => kb.push_to_talk = shortcut,
+        _ => return Err(format!("unknown keybind action: {action}")),
+    }
+    cfg.save(&state.config_path)
 }

@@ -319,7 +319,7 @@ export function Sidebar() {
       <div
         class="relative flex-shrink-0 overflow-hidden"
         style={{
-          width: settingsOpen() ? "320px" : selectedGroup() ? "208px" : "0px",
+          width: settingsOpen() ? "380px" : selectedGroup() ? "208px" : "0px",
           transition: `width ${slideDuration(settingsOpen() ? sections().length : orderedGroups().length)} var(--ease-out)`,
         }}
       >

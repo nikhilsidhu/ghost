@@ -7,6 +7,7 @@ import {
   joinVoice, leaveVoice, setVoiceMuted, setVoiceDeafened,
   createDevSession, readDevSession, joinByInvite,
 } from "./api";
+import { initKeybinds } from "./keybinds";
 import { sections } from "./settings-registry";
 
 // Backend settings (relay URL, display name) live in ~/.ghost/config.toml.
@@ -262,6 +263,8 @@ const initialize = async () => {
     setVoiceError(event.payload);
     setTimeout(() => setVoiceError(null), 5000);
   });
+
+  initKeybinds().catch((e) => console.error("keybinds init failed:", e));
 
   // Dev mode: poll for a dev session file and auto-join
   if (import.meta.env.DEV) {

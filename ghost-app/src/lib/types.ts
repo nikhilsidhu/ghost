@@ -41,6 +41,7 @@ export interface Config {
   output_device: string | null;
   noise_suppression: string;
   agc: string;
+  input_mode: string;
 }
 
 export interface AudioDevices {
@@ -94,4 +95,8 @@ export interface VoiceQuality {
 export interface DevSession {
   relay_url: string;
   token: string;
+}
+
+export interface KeybindConfig {
+  push_to_talk: string | null;
 }

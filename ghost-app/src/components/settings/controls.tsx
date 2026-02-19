@@ -221,6 +221,51 @@ export function SettingSelect(props: {
   );
 }
 
+// --- Segmented control ---
+
+export function SettingSegmented(props: {
+  label: string;
+  description?: string;
+  value: string;
+  options: { value: string; label: string }[];
+  onChange: (v: string) => void;
+  disabled?: boolean;
+  children?: JSX.Element;
+}) {
+  return (
+    <SettingRow disabled={props.disabled}>
+      <div class="flex items-center justify-between gap-4">
+        <div class="min-w-0">
+          <div class="text-sm text-[var(--neutral-200)]">{props.label}</div>
+          <Show when={props.description}>
+            <div class="text-xs text-[var(--neutral-500)] mt-0.5">{props.description}</div>
+          </Show>
+        </div>
+        <div class="flex rounded-md border border-[var(--neutral-700)] overflow-hidden flex-shrink-0">
+          <For each={props.options}>
+            {(o) => (
+              <button
+                class={cn(
+                  "h-7 px-2.5 text-xs cursor-pointer transition-colors duration-150",
+                  "border-r border-[var(--neutral-700)] last:border-r-0",
+                  o.value === props.value
+                    ? "bg-[var(--purple-500)]/20 text-[var(--purple-400)]"
+                    : "bg-[var(--neutral-800)] text-[var(--neutral-400)] hover:text-[var(--neutral-200)]",
+                )}
+                disabled={props.disabled}
+                onClick={() => props.onChange(o.value)}
+              >
+                {o.label}
+              </button>
+            )}
+          </For>
+        </div>
+      </div>
+      {props.children}
+    </SettingRow>
+  );
+}
+
 // --- Readonly with optional copy ---
 
 export function SettingReadonly(props: {

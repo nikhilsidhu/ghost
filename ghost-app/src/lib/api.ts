@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Identity, Group, Channel, Member, Message, Invite, Config, AudioDevices, DevSession } from "./types";
+import type { Identity, Group, Channel, Member, Message, Invite, Config, AudioDevices, DevSession, KeybindConfig } from "./types";
 
 export const getIdentity = () => invoke<Identity>("get_identity");
 
@@ -82,10 +82,19 @@ export const setNoiseSuppression = (mode: string) =>
 export const setAgc = (mode: string) =>
   invoke<void>("set_agc", { mode });
 
+// Input mode
+export const setInputMode = (mode: string) =>
+  invoke<void>("set_input_mode", { mode });
+
 // Audio testing
 export const startMicTest = () => invoke<void>("start_mic_test");
 export const stopMicTest = () => invoke<void>("stop_mic_test");
 export const playTestTone = () => invoke<void>("play_test_tone");
+
+// Keybinds
+export const getKeybinds = () => invoke<KeybindConfig>("get_keybinds");
+export const setKeybind = (action: string, shortcut: string | null) =>
+  invoke<void>("set_keybind", { action, shortcut });
 
 // Dev testing
 export const createDevSession = () => invoke<Group>("create_dev_session");

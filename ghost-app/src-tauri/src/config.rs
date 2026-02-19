@@ -3,6 +3,11 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct KeybindConfig {
+    pub push_to_talk: Option<String>,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct GhostConfig {
     pub display_name: Option<String>,
@@ -11,6 +16,8 @@ pub struct GhostConfig {
     pub output_device: Option<String>,
     pub noise_suppression: Option<String>,
     pub agc: Option<String>,
+    pub input_mode: Option<String>,
+    pub keybinds: Option<KeybindConfig>,
 }
 
 impl GhostConfig {

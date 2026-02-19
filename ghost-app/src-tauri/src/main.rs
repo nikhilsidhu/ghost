@@ -26,6 +26,7 @@ fn main() {
     let relay = app_state.relay.clone();
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .manage(app_state)
         .setup(move |app| {
             #[cfg(target_os = "macos")]
@@ -85,11 +86,14 @@ fn main() {
             commands::set_output_device,
             commands::set_noise_suppression,
             commands::set_agc,
+            commands::set_input_mode,
             commands::start_mic_test,
             commands::stop_mic_test,
             commands::play_test_tone,
             commands::create_dev_session,
             commands::read_dev_session,
+            commands::get_keybinds,
+            commands::set_keybind,
         ])
         .run(tauri::generate_context!())
         .expect("error while running ghost");
