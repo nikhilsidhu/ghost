@@ -61,8 +61,8 @@ export const setRelayUrl = (url: string) =>
 export const seedTestData = () => invoke<void>("seed_test_data");
 
 // Voice
-export const joinVoice = (serverId: string, channelId: string) =>
-  invoke<void>("join_voice", { serverId, channelId });
+export const joinVoice = (serverId: string, channelId: string, muted: boolean, deafened: boolean) =>
+  invoke<void>("join_voice", { serverId, channelId, muted, deafened });
 
 export const leaveVoice = () => invoke<void>("leave_voice");
 

@@ -145,23 +145,23 @@ pub fn derive_message_id(
     hasher.finalize().into()
 }
 
-pub fn derive_mls_group_id(group_id: &[u8; 32]) -> [u8; 32] {
+pub fn derive_mls_group_id(server_id: &[u8; 32]) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(group_id);
+    hasher.update(server_id);
     hasher.update(MLS_GROUP_ID_TAG);
     hasher.finalize().into()
 }
 
-pub fn group_mailbox_id(mls_group_id: &[u8]) -> [u8; 32] {
+pub fn mls_group_mailbox_id(mls_group_id: &[u8]) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(mls_group_id);
     hasher.update(MAILBOX_ID_TAG);
     hasher.finalize().into()
 }
 
-pub fn derive_default_channel_id(group_id: &[u8; 32]) -> [u8; 32] {
+pub fn derive_default_channel_id(server_id: &[u8; 32]) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(group_id);
+    hasher.update(server_id);
     hasher.update(DEFAULT_CHANNEL_TAG);
     hasher.finalize().into()
 }
@@ -680,11 +680,11 @@ mod tests {
     #[test]
     fn mailbox_id_deterministic() {
         let mls_id = derive_mls_group_id(&[0x33; 32]);
-        let a = group_mailbox_id(&mls_id);
-        let b = group_mailbox_id(&mls_id);
+        let a = mls_group_mailbox_id(&mls_id);
+        let b = mls_group_mailbox_id(&mls_id);
         assert_eq!(a, b);
 
-        let different = group_mailbox_id(&[0x44; 32]);
+        let different = mls_group_mailbox_id(&[0x44; 32]);
         assert_ne!(a, different);
     }
 
@@ -757,10 +757,10 @@ mod tests {
     fn create_with_id_uses_derived_group_id() {
         let provider = GhostProvider::new_in_memory().unwrap();
         let id = Identity::from_seed([0x01; 32]).unwrap();
-        let app_group_id = [0x42; 32];
-        let group = GhostGroup::create_with_id(&provider, &id, &app_group_id).unwrap();
+        let server_id = [0x42; 32];
+        let group = GhostGroup::create_with_id(&provider, &id, &server_id).unwrap();
 
-        let expected = derive_mls_group_id(&app_group_id);
+        let expected = derive_mls_group_id(&server_id);
         assert_eq!(group.group_id(), expected);
     }
 
@@ -771,9 +771,9 @@ mod tests {
         let id_a = Identity::from_seed([0x01; 32]).unwrap();
         let id_b = Identity::from_seed([0x02; 32]).unwrap();
 
-        let app_group_id = [0x42; 32];
+        let server_id = [0x42; 32];
         let mut group_a =
-            GhostGroup::create_with_id(&provider_a, &id_a, &app_group_id).unwrap();
+            GhostGroup::create_with_id(&provider_a, &id_a, &server_id).unwrap();
         let kp_b = generate_key_package(&provider_b, &id_b).unwrap();
         let (_commit, welcome) = group_a.add_member(&provider_a, kp_b).unwrap();
         let mut group_b =
@@ -806,9 +806,9 @@ mod tests {
         let id_a = Identity::from_seed([0x01; 32]).unwrap();
         let id_b = Identity::from_seed([0x02; 32]).unwrap();
 
-        let app_group_id = [0x42; 32];
+        let server_id = [0x42; 32];
         let mut group_a =
-            GhostGroup::create_with_id(&provider_a, &id_a, &app_group_id).unwrap();
+            GhostGroup::create_with_id(&provider_a, &id_a, &server_id).unwrap();
         let kp_b = generate_key_package(&provider_b, &id_b).unwrap();
         let (_commit, welcome) = group_a.add_member(&provider_a, kp_b).unwrap();
         let mut group_b =
@@ -840,9 +840,9 @@ mod tests {
         let id_a = Identity::from_seed([0x01; 32]).unwrap();
         let id_b = Identity::from_seed([0x02; 32]).unwrap();
 
-        let app_group_id = [0x42; 32];
+        let server_id = [0x42; 32];
         let mut group_a =
-            GhostGroup::create_with_id(&provider_a, &id_a, &app_group_id).unwrap();
+            GhostGroup::create_with_id(&provider_a, &id_a, &server_id).unwrap();
         let kp_b = generate_key_package(&provider_b, &id_b).unwrap();
         let (_commit, welcome) = group_a.add_member(&provider_a, kp_b).unwrap();
         let mut group_b =

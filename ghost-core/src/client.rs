@@ -15,7 +15,7 @@ use crate::storage::{
     Channel, ChannelKind, GhostStore, Server, ServerKind, Member, MemberRole, StoredMessage,
 };
 use crate::wire::{
-    derive_default_channel_id, group_mailbox_id, open, open_any, seal, ApplicationMessage,
+    derive_default_channel_id, mls_group_mailbox_id, open, open_any, seal, ApplicationMessage,
     InboundMessage, InviteChannel, InviteMember, InvitePayload, Outbound,
 };
 
@@ -74,7 +74,7 @@ impl GhostClient {
 
         let mailbox_map = servers
             .iter()
-            .map(|(sid, g)| (group_mailbox_id(g.group_id()), *sid))
+            .map(|(sid, g)| (mls_group_mailbox_id(g.group_id()), *sid))
             .collect();
 
         Ok(Self {
@@ -135,7 +135,7 @@ impl GhostClient {
         })?;
 
         let channel_name = match kind {
-            ServerKind::Dm => "messages",
+            ServerKind::Dm | ServerKind::Group => "messages",
             ServerKind::Server => "general",
         };
         let channel_id = derive_default_channel_id(&server_id);
@@ -155,7 +155,7 @@ impl GhostClient {
             joined_at: timestamp,
         })?;
 
-        let mailbox_id = group_mailbox_id(ghost_group.group_id());
+        let mailbox_id = mls_group_mailbox_id(ghost_group.group_id());
         self.servers.insert(server_id, ghost_group);
         self.mailbox_map.insert(mailbox_id, server_id);
         Ok(server_id)
@@ -183,7 +183,7 @@ impl GhostClient {
         )?;
 
         let blob = seal(group, &self.provider, &msg)?;
-        let mailbox_id = group_mailbox_id(group.group_id());
+        let mailbox_id = mls_group_mailbox_id(group.group_id());
         let message_id = msg.message_id;
 
         let now = SystemTime::now()
@@ -231,7 +231,7 @@ impl GhostClient {
         )?;
 
         let blob = seal(group, &self.provider, &msg)?;
-        let mailbox_id = group_mailbox_id(group.group_id());
+        let mailbox_id = mls_group_mailbox_id(group.group_id());
         Ok(Outbound { mailbox_id, blob })
     }
 
@@ -288,7 +288,7 @@ impl GhostClient {
             .to_bytes()
             .map_err(|e| GhostError::Mls(format!("serialize welcome: {e}")))?;
 
-        let mailbox_id = group_mailbox_id(group.group_id());
+        let mailbox_id = mls_group_mailbox_id(group.group_id());
 
         self.store.insert_member(&Member {
             server_id: *server_id,
@@ -321,7 +321,7 @@ impl GhostClient {
         })?;
 
         let channel_name = match kind {
-            ServerKind::Dm => "messages",
+            ServerKind::Dm | ServerKind::Group => "messages",
             ServerKind::Server => "general",
         };
         let channel_id = derive_default_channel_id(server_id);
@@ -341,7 +341,7 @@ impl GhostClient {
             joined_at: timestamp,
         })?;
 
-        let mailbox_id = group_mailbox_id(ghost_group.group_id());
+        let mailbox_id = mls_group_mailbox_id(ghost_group.group_id());
         self.servers.insert(*server_id, ghost_group);
         self.mailbox_map.insert(mailbox_id, *server_id);
         Ok(())
@@ -466,7 +466,7 @@ impl GhostClient {
             joined_at: timestamp,
         })?;
 
-        let mailbox_id = group_mailbox_id(ghost_group.group_id());
+        let mailbox_id = mls_group_mailbox_id(ghost_group.group_id());
         self.servers.insert(payload.server_id, ghost_group);
         self.mailbox_map.insert(mailbox_id, payload.server_id);
 
@@ -514,7 +514,7 @@ impl GhostClient {
             group_info_bytes,
         )?;
 
-        let mailbox_id = group_mailbox_id(ghost_group.group_id());
+        let mailbox_id = mls_group_mailbox_id(ghost_group.group_id());
         self.servers.insert(*server_id, ghost_group);
         self.mailbox_map.insert(mailbox_id, *server_id);
 
@@ -538,7 +538,7 @@ impl GhostClient {
     pub fn server_mailboxes(&self) -> Vec<([u8; 32], [u8; 32])> {
         self.servers
             .iter()
-            .map(|(sid, g)| (*sid, group_mailbox_id(g.group_id())))
+            .map(|(sid, g)| (*sid, mls_group_mailbox_id(g.group_id())))
             .collect()
     }
 
@@ -546,7 +546,7 @@ impl GhostClient {
     pub fn mailbox_id_for_server(&self, server_id: &[u8; 32]) -> Option<[u8; 32]> {
         self.servers
             .get(server_id)
-            .map(|g| group_mailbox_id(g.group_id()))
+            .map(|g| mls_group_mailbox_id(g.group_id()))
     }
 
     /// Reverse lookup: find server_id for a given mailbox_id.

@@ -79,13 +79,19 @@ const toggleMute = () => {
     setPttMuteAttempt((n) => n + 1);
     return;
   }
-  setVoiceMuted(!isMuted()).catch(() => {});
+  const next = !isMuted();
+  setIsMuted(next);
+  if (voiceConnected()) setVoiceMuted(next).catch(() => {});
 };
-const toggleDeafen = () => { setVoiceDeafened(!isDeafened()).catch(() => {}); };
+const toggleDeafen = () => {
+  const next = !isDeafened();
+  setIsDeafened(next);
+  if (voiceConnected()) setVoiceDeafened(next).catch(() => {});
+};
 const endCall = () => { leaveVoice().catch(() => {}); };
 
 const joinVoiceChannel = (serverId: string, channelId: string) => {
-  joinVoice(serverId, channelId).catch(() => {});
+  joinVoice(serverId, channelId, isMuted(), isDeafened()).catch(() => {});
 };
 
 const isSpeaking = (fingerprint: string) => speakingSet().has(fingerprint);
@@ -95,7 +101,7 @@ const isInVoiceChannel = (channelId: string) => voiceChannelId() === channelId;
 
 const selectedServer = () => servers().find((s) => s.server_id === selectedServerId());
 const selectedChannelName = () => channels().find((c) => c.channel_id === selectedChannelId())?.name ?? "";
-const dms = () => servers().filter((s) => s.kind === "dm");
+const dms = () => servers().filter((s) => s.kind === "dm" || s.kind === "group");
 const serverList = () => servers().filter((s) => s.kind === "server");
 
 // Known contacts: all members across servers, deduplicated, excluding self

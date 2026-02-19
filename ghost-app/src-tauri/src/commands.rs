@@ -506,6 +506,8 @@ pub async fn set_relay_url(
 pub async fn join_voice(
     server_id: String,
     channel_id: String,
+    muted: bool,
+    deafened: bool,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let fingerprint = {
@@ -544,6 +546,8 @@ pub async fn join_voice(
             vad_threshold: vad_threshold.to_bits(),
             input_gain: input_gain.to_bits(),
             input_mode,
+            muted,
+            deafened,
         })
         .await
         .map_err(|_| "voice task not running".to_string())

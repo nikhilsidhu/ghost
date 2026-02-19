@@ -7,7 +7,7 @@ export interface Identity {
 export interface Server {
   server_id: string;
   name: string;
-  kind: "server" | "dm";
+  kind: "server" | "group" | "dm";
   creator_fp: string;
   created_at: number;
   has_unread: boolean;

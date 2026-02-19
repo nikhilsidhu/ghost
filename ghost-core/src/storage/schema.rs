@@ -3,7 +3,7 @@ use rusqlite::Connection;
 use crate::crypto::MessageType;
 use crate::error::{GhostError, Result};
 
-const CURRENT_VERSION: u32 = 1;
+const CURRENT_VERSION: u32 = 2;
 
 pub fn initialize(conn: &Connection) -> Result<()> {
     let version = get_version(conn)?;
@@ -75,7 +75,7 @@ fn create_tables(conn: &Connection) -> Result<()> {
         CREATE TABLE servers (
             server_id  BLOB    PRIMARY KEY,
             name       TEXT    NOT NULL,
-            kind       TEXT    NOT NULL DEFAULT 'server' CHECK(kind IN ('server', 'dm')),
+            kind       TEXT    NOT NULL DEFAULT 'server' CHECK(kind IN ('server', 'group', 'dm')),
             creator_fp BLOB    NOT NULL,
             created_at INTEGER NOT NULL
         );

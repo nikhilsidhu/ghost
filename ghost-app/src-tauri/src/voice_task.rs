@@ -38,6 +38,8 @@ pub enum VoiceCommand {
         vad_threshold: u32,
         input_gain: u32,
         input_mode: u8,
+        muted: bool,
+        deafened: bool,
     },
     Leave,
     SetMuted(bool),
@@ -345,7 +347,7 @@ pub async fn run(
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else { break };
                 match cmd {
-                    VoiceCommand::Join { server_id, channel_id, relay_url, fingerprint, input_device, output_device, ns_mode, agc_mode, vad_threshold, input_gain, input_mode } => {
+                    VoiceCommand::Join { server_id, channel_id, relay_url, fingerprint, input_device, output_device, ns_mode, agc_mode, vad_threshold, input_gain, input_mode, muted, deafened } => {
                         disconnect(&app, &mut ws, &mut ws_read, &mut state, &state_tx, &mut participants, &mut audio).await;
                         pending = None;
                         assigned_port = None;
@@ -383,8 +385,8 @@ pub async fn run(
                             connected: true,
                             server_id: Some(server_id.clone()),
                             channel_id: Some(channel_id.clone()),
-                            muted: state.muted,
-                            deafened: state.deafened,
+                            muted,
+                            deafened,
                             udp_port: None,
                         };
                         pending = Some(PendingAudioStart {

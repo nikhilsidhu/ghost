@@ -69,12 +69,13 @@ export function VoiceDock() {
     <>
       <div class="relative">
         <DockButton
-          active={isInCall() || isPttMode()}
+          active={isInCall() || isPttMode() || isMuted()}
           label={isPttMode() ? "push to talk" : isMuted() ? "unmute" : "mute"}
           onClick={toggleMute}
           activeIcon={micIcon()}
           inactiveIcon={<Mic size={ICON_SIZE} class="text-[var(--neutral-300)]" />}
           shake={shaking()}
+          hoverReveal
         />
         <Show when={pttHint()}>
           <div

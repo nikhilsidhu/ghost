@@ -5,7 +5,7 @@ use tokio::net::TcpListener;
 use ghost_core::client::GhostClient;
 use ghost_core::relay::{RelayClient, RelayEvent};
 use ghost_core::storage::ServerKind;
-use ghost_core::wire::{derive_default_channel_id, derive_mls_group_id, group_mailbox_id};
+use ghost_core::wire::{derive_default_channel_id, derive_mls_group_id, mls_group_mailbox_id};
 use ghost_relay::config::Config;
 use ghost_relay::storage::Storage;
 use ghost_relay::{routes, state};
@@ -47,7 +47,7 @@ async fn encrypted_message_through_relay() {
         .unwrap();
 
     let mls_gid = derive_mls_group_id(&server_id);
-    let mailbox_id = group_mailbox_id(&mls_gid);
+    let mailbox_id = mls_group_mailbox_id(&mls_gid);
     let channel_id = derive_default_channel_id(&server_id);
 
     // Connect both to relay

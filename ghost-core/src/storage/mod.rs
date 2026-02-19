@@ -78,6 +78,7 @@ impl GhostStore {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ServerKind {
     Server,
+    Group,
     Dm,
 }
 
@@ -85,6 +86,7 @@ impl ServerKind {
     pub fn as_str(&self) -> &'static str {
         match self {
             ServerKind::Server => "server",
+            ServerKind::Group => "group",
             ServerKind::Dm => "dm",
         }
     }
@@ -92,6 +94,7 @@ impl ServerKind {
     pub fn parse(s: &str) -> Result<Self> {
         match s {
             "server" => Ok(ServerKind::Server),
+            "group" => Ok(ServerKind::Group),
             "dm" => Ok(ServerKind::Dm),
             other => Err(GhostError::Database(format!("unknown server kind: {other}"))),
         }
@@ -100,6 +103,7 @@ impl ServerKind {
     pub fn to_byte(self) -> u8 {
         match self {
             ServerKind::Server => 0,
+            ServerKind::Group => 2,
             ServerKind::Dm => 1,
         }
     }
@@ -107,6 +111,7 @@ impl ServerKind {
     pub fn from_byte(b: u8) -> Result<Self> {
         match b {
             0 => Ok(ServerKind::Server),
+            2 => Ok(ServerKind::Group),
             1 => Ok(ServerKind::Dm),
             _ => Err(GhostError::Format(format!("unknown server kind byte: {b}"))),
         }

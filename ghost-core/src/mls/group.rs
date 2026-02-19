@@ -59,7 +59,7 @@ impl GhostGroup {
     pub fn create_with_id(
         provider: &GhostProvider,
         identity: &Identity,
-        group_id: &[u8; 32],
+        server_id: &[u8; 32],
     ) -> Result<Self> {
         let signer = signer_from_identity(identity);
         let credential = credential_from_identity(identity);
@@ -68,7 +68,7 @@ impl GhostGroup {
             .use_ratchet_tree_extension(true)
             .build();
 
-        let mls_group_id = derive_mls_group_id(group_id);
+        let mls_group_id = derive_mls_group_id(server_id);
         let mls_group = MlsGroup::new_with_group_id(
             provider,
             &signer,
@@ -85,9 +85,9 @@ impl GhostGroup {
     pub fn load(
         provider: &GhostProvider,
         identity: &Identity,
-        group_id: &[u8; 32],
+        server_id: &[u8; 32],
     ) -> Result<Option<Self>> {
-        let mls_group_id = derive_mls_group_id(group_id);
+        let mls_group_id = derive_mls_group_id(server_id);
         let mls_group = MlsGroup::load(
             provider.storage(),
             &GroupId::from_slice(&mls_group_id),
@@ -399,13 +399,13 @@ mod tests {
     fn load_persisted_group() {
         let provider = GhostProvider::new_in_memory().unwrap();
         let id = Identity::from_seed([0x01u8; 32]).unwrap();
-        let group_id = [0x42u8; 32];
+        let server_id = [0x42u8; 32];
 
-        let original = GhostGroup::create_with_id(&provider, &id, &group_id).unwrap();
+        let original = GhostGroup::create_with_id(&provider, &id, &server_id).unwrap();
         let original_mls_id = original.group_id().to_vec();
 
         // Load from the same provider — state was written automatically
-        let loaded = GhostGroup::load(&provider, &id, &group_id)
+        let loaded = GhostGroup::load(&provider, &id, &server_id)
             .unwrap()
             .expect("group should be loadable");
         assert_eq!(loaded.group_id(), original_mls_id.as_slice());
