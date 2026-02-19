@@ -1,36 +1,39 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Identity, Group, Channel, Member, Message, Invite, Config, AudioDevices, DevSession, KeybindConfig } from "./types";
+import type { Identity, Server, Channel, Member, Message, Invite, Config, AudioDevices, DevSession, KeybindConfig } from "./types";
 
 export const getIdentity = () => invoke<Identity>("get_identity");
 
-export const listGroups = () => invoke<Group[]>("list_groups");
+export const listServers = () => invoke<Server[]>("list_servers");
 
-export const createGroup = (name: string) =>
-  invoke<Group>("create_group", { name });
+export const createServer = (name: string) =>
+  invoke<Server>("create_server", { name });
 
-export const listChannels = (groupId: string) =>
-  invoke<Channel[]>("list_channels", { groupId });
+export const createDm = (name: string) =>
+  invoke<Server>("create_dm", { name });
 
-export const listMembers = (groupId: string) =>
-  invoke<Member[]>("list_members", { groupId });
+export const listChannels = (serverId: string) =>
+  invoke<Channel[]>("list_channels", { serverId });
 
-export const pinGroup = (groupId: string) =>
-  invoke<void>("pin_group", { groupId });
+export const listMembers = (serverId: string) =>
+  invoke<Member[]>("list_members", { serverId });
 
-export const unpinGroup = (groupId: string) =>
-  invoke<void>("unpin_group", { groupId });
+export const pinServer = (serverId: string) =>
+  invoke<void>("pin_server", { serverId });
 
-export const listPinnedGroups = () =>
-  invoke<string[]>("list_pinned_groups");
+export const unpinServer = (serverId: string) =>
+  invoke<void>("unpin_server", { serverId });
+
+export const listPinnedServers = () =>
+  invoke<string[]>("list_pinned_servers");
 
 export const listMessages = (channelId: string, before?: number, limit?: number) =>
   invoke<Message[]>("list_messages", { channelId, before, limit });
 
-export const sendMessage = (groupId: string, channelId: string, content: string) =>
-  invoke<Message>("send_message", { groupId, channelId, content });
+export const sendMessage = (serverId: string, channelId: string, content: string) =>
+  invoke<Message>("send_message", { serverId, channelId, content });
 
-export const createChannel = (groupId: string, name: string, kind: string) =>
-  invoke<Channel>("create_channel", { groupId, name, kind });
+export const createChannel = (serverId: string, name: string, kind: string) =>
+  invoke<Channel>("create_channel", { serverId, name, kind });
 
 export const renameChannel = (channelId: string, name: string) =>
   invoke<void>("rename_channel", { channelId, name });
@@ -41,11 +44,11 @@ export const deleteChannel = (channelId: string) =>
 export const markChannelRead = (channelId: string) =>
   invoke<void>("mark_channel_read", { channelId });
 
-export const createInvite = (groupId: string) =>
-  invoke<Invite>("create_invite", { groupId });
+export const createInvite = (serverId: string) =>
+  invoke<Invite>("create_invite", { serverId });
 
 export const joinByInvite = (relayUrl: string, token: string) =>
-  invoke<Group>("join_by_invite", { relayUrl, token });
+  invoke<Server>("join_by_invite", { relayUrl, token });
 
 export const getConfig = () => invoke<Config>("get_config");
 
@@ -58,8 +61,8 @@ export const setRelayUrl = (url: string) =>
 export const seedTestData = () => invoke<void>("seed_test_data");
 
 // Voice
-export const joinVoice = (groupId: string, channelId: string) =>
-  invoke<void>("join_voice", { groupId, channelId });
+export const joinVoice = (serverId: string, channelId: string) =>
+  invoke<void>("join_voice", { serverId, channelId });
 
 export const leaveVoice = () => invoke<void>("leave_voice");
 
@@ -105,5 +108,5 @@ export const setKeybind = (action: string, shortcut: string | null) =>
   invoke<void>("set_keybind", { action, shortcut });
 
 // Dev testing
-export const createDevSession = () => invoke<Group>("create_dev_session");
+export const createDevSession = () => invoke<Server>("create_dev_session");
 export const readDevSession = () => invoke<DevSession | null>("read_dev_session");

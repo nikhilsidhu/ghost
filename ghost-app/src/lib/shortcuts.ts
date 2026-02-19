@@ -12,7 +12,7 @@ export const shortcuts: ShortcutDef[] = [
   {
     id: "search",
     keys: [mod, "K"],
-    label: "Search groups",
+    label: "Search servers",
     match: (e) => (e.metaKey || e.ctrlKey) && e.key === "k" && !e.shiftKey,
   },
   {

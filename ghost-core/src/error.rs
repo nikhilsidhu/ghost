@@ -26,8 +26,8 @@ pub enum GhostError {
     #[error("database: {0}")]
     Database(String),
 
-    #[error("group not loaded: {0}")]
-    GroupNotLoaded(String),
+    #[error("server not loaded: {0}")]
+    ServerNotLoaded(String),
 
     #[error("permission denied: {0}")]
     PermissionDenied(String),

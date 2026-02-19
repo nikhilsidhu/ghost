@@ -196,11 +196,11 @@ impl RelayClient {
             .map_err(|e| GhostError::Network(e.to_string()))
     }
 
-    pub async fn put_group_info(&self, mailbox_id: &[u8; 32], data: Vec<u8>) -> Result<()> {
+    pub async fn put_server_info(&self, mailbox_id: &[u8; 32], data: Vec<u8>) -> Result<()> {
         let resp = self
             .http
             .put(format!(
-                "{}/box/{}/group_info",
+                "{}/box/{}/server_info",
                 self.base_url,
                 URL_SAFE_NO_PAD.encode(mailbox_id)
             ))
@@ -210,18 +210,18 @@ impl RelayClient {
             .map_err(|e| GhostError::Network(e.to_string()))?;
         if !resp.status().is_success() {
             return Err(GhostError::Network(format!(
-                "put group_info: {}",
+                "put server_info: {}",
                 resp.status()
             )));
         }
         Ok(())
     }
 
-    pub async fn get_group_info(&self, mailbox_id: &[u8; 32]) -> Result<Vec<u8>> {
+    pub async fn get_server_info(&self, mailbox_id: &[u8; 32]) -> Result<Vec<u8>> {
         let resp = self
             .http
             .get(format!(
-                "{}/box/{}/group_info",
+                "{}/box/{}/server_info",
                 self.base_url,
                 URL_SAFE_NO_PAD.encode(mailbox_id)
             ))
@@ -230,7 +230,7 @@ impl RelayClient {
             .map_err(|e| GhostError::Network(e.to_string()))?;
         if !resp.status().is_success() {
             return Err(GhostError::Network(format!(
-                "get group_info: {}",
+                "get server_info: {}",
                 resp.status()
             )));
         }

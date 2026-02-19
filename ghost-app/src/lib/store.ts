@@ -1,9 +1,9 @@
 import { createSignal } from "solid-js";
 import { listen } from "@tauri-apps/api/event";
-import type { Identity, Group, Channel, Member, Message, VoiceState, VoiceParticipants, VoiceSpeaking, VoiceMuteState, VoiceQuality } from "./types";
+import type { Identity, Server, Channel, Member, Message, VoiceState, VoiceParticipants, VoiceSpeaking, VoiceMuteState, VoiceQuality } from "./types";
 import {
-  getIdentity, listGroups, listChannels, listMembers,
-  listPinnedGroups, markChannelRead, seedTestData,
+  getIdentity, listServers, listChannels, listMembers,
+  listPinnedServers, markChannelRead, seedTestData,
   joinVoice, leaveVoice, setVoiceMuted, setVoiceDeafened,
   createDevSession, readDevSession, joinByInvite, getConfig,
 } from "./api";
@@ -27,13 +27,14 @@ export function createSetting<T>(key: string, defaultValue: T): [() => T, (v: T)
 // --- Data ---
 
 const [identity, setIdentity] = createSignal<Identity | null>(null);
-const [groups, setGroups] = createSignal<Group[]>([]);
-const [selectedGroupId, setSelectedGroupId] = createSignal<string | null>(null);
+const [servers, setServers] = createSignal<Server[]>([]);
+const [selectedServerId, setSelectedServerId] = createSignal<string | null>(null);
 const [channels, setChannels] = createSignal<Channel[]>([]);
 const [members, setMembers] = createSignal<Member[]>([]);
-const [pinnedGroupIds, setPinnedGroupIds] = createSignal<Set<string>>(new Set());
+const [pinnedServerIds, setPinnedServerIds] = createSignal<Set<string>>(new Set());
 const [selectedChannelId, setSelectedChannelId] = createSignal<string | null>(null);
 const [allChannels, setAllChannels] = createSignal<Channel[]>([]);
+const [allMembers, setAllMembers] = createSignal<Member[]>([]);
 
 // --- UI ---
 
@@ -42,6 +43,7 @@ const [showInfo, setShowInfo] = createSignal(false);
 const [desiredChannelKind, setDesiredChannelKind] = createSignal<string>("text");
 const [settingsOpen, setSettingsOpen] = createSignal(false);
 const [settingsCategory, setSettingsCategory] = createSignal("");
+const [dmViewActive, setDmViewActive] = createSignal(false);
 
 const toggleSettings = () => {
   const opening = !settingsOpen();
@@ -52,7 +54,7 @@ const toggleSettings = () => {
 // --- Voice state (driven by backend events) ---
 
 const [voiceConnected, setVoiceConnected] = createSignal(false);
-const [voiceGroupId, setVoiceGroupId] = createSignal<string | null>(null);
+const [voiceServerId, setVoiceServerId] = createSignal<string | null>(null);
 const [voiceChannelId, setVoiceChannelId] = createSignal<string | null>(null);
 const [isMuted, setIsMuted] = createSignal(false);
 const [isDeafened, setIsDeafened] = createSignal(false);
@@ -82,8 +84,8 @@ const toggleMute = () => {
 const toggleDeafen = () => { setVoiceDeafened(!isDeafened()).catch(() => {}); };
 const endCall = () => { leaveVoice().catch(() => {}); };
 
-const joinVoiceChannel = (groupId: string, channelId: string) => {
-  joinVoice(groupId, channelId).catch(() => {});
+const joinVoiceChannel = (serverId: string, channelId: string) => {
+  joinVoice(serverId, channelId).catch(() => {});
 };
 
 const isSpeaking = (fingerprint: string) => speakingSet().has(fingerprint);
@@ -91,50 +93,92 @@ const isInVoiceChannel = (channelId: string) => voiceChannelId() === channelId;
 
 // --- Derived ---
 
-const selectedGroup = () => groups().find((g) => g.group_id === selectedGroupId());
+const selectedServer = () => servers().find((s) => s.server_id === selectedServerId());
 const selectedChannelName = () => channels().find((c) => c.channel_id === selectedChannelId())?.name ?? "";
+const dms = () => servers().filter((s) => s.kind === "dm");
+const serverList = () => servers().filter((s) => s.kind === "server");
+
+// Known contacts: all members across servers, deduplicated, excluding self
+const contacts = () => {
+  const selfFp = identity()?.fingerprint;
+  const seen = new Map<string, { fingerprint: string; display_name: string }>();
+  for (const m of allMembers()) {
+    if (m.fingerprint === selfFp) continue;
+    if (!seen.has(m.fingerprint)) seen.set(m.fingerprint, { fingerprint: m.fingerprint, display_name: m.display_name });
+  }
+  return [...seen.values()];
+};
 
 // --- Refresh helpers ---
 
-const refreshGroups = async () => {
-  setGroups(await listGroups());
+const refreshServers = async () => {
+  setServers(await listServers());
 };
 
 const refreshAllChannels = async () => {
-  const gs = groups();
-  if (gs.length === 0) { setAllChannels([]); return; }
-  const results = await Promise.all(gs.map((g) => listChannels(g.group_id)));
+  const ss = servers();
+  if (ss.length === 0) { setAllChannels([]); return; }
+  const results = await Promise.all(ss.map((s) => listChannels(s.server_id)));
   setAllChannels(results.flat());
 };
 
 const refreshChannels = async () => {
-  const gid = selectedGroupId();
-  if (!gid) { setChannels([]); return; }
-  const ch = await listChannels(gid);
+  const sid = selectedServerId();
+  if (!sid) { setChannels([]); return; }
+  const ch = await listChannels(sid);
   setChannels(ch);
-  setAllChannels((prev) => [...prev.filter((c) => c.group_id !== gid), ...ch]);
+  setAllChannels((prev) => [...prev.filter((c) => c.server_id !== sid), ...ch]);
+};
+
+const refreshAllMembers = async () => {
+  const ss = servers();
+  if (ss.length === 0) { setAllMembers([]); return; }
+  const results = await Promise.all(ss.map((s) => listMembers(s.server_id)));
+  setAllMembers(results.flat());
 };
 
 const refreshPins = async () => {
-  setPinnedGroupIds(new Set(await listPinnedGroups()));
+  setPinnedServerIds(new Set(await listPinnedServers()));
 };
 
 const refreshMembers = async () => {
-  const gid = selectedGroupId();
-  if (!gid) return;
-  setMembers(await listMembers(gid));
+  const sid = selectedServerId();
+  if (!sid) return;
+  setMembers(await listMembers(sid));
 };
 
 // --- Actions ---
 
-const selectGroup = async (id: string | null) => {
-  setSelectedGroupId(id);
+const selectServer = async (id: string | null) => {
+  setDmViewActive(false);
+  setSelectedServerId(id);
   setSelectedChannelId(null);
   if (!id) { setChannels([]); setMembers([]); return; }
   const [ch, mem] = await Promise.all([listChannels(id), listMembers(id)]);
-  if (selectedGroupId() !== id) return;
+  if (selectedServerId() !== id) return;
   setChannels(ch);
   setMembers(mem);
+};
+
+const activateDmView = () => {
+  setDmViewActive(true);
+  setSelectedServerId(null);
+  setSelectedChannelId(null);
+  setChannels([]);
+  setMembers([]);
+};
+
+const selectDm = async (serverId: string) => {
+  setDmViewActive(true);
+  setSelectedServerId(serverId);
+  setSelectedChannelId(null);
+  const [ch, mem] = await Promise.all([listChannels(serverId), listMembers(serverId)]);
+  if (selectedServerId() !== serverId) return;
+  setChannels(ch);
+  setMembers(mem);
+  // Auto-select the single text channel
+  const textCh = ch.find((c) => c.kind === "text");
+  if (textCh) selectChannel(textCh.channel_id);
 };
 
 const selectChannel = (id: string) => {
@@ -144,10 +188,10 @@ const selectChannel = (id: string) => {
       c.channel_id === id ? { ...c, unread_count: 0 } : c
     );
     if (!updated.some((c) => c.unread_count > 0)) {
-      const gid = selectedGroupId();
-      if (gid) {
-        setGroups((gs) => gs.map((g) =>
-          g.group_id === gid ? { ...g, has_unread: false } : g
+      const sid = selectedServerId();
+      if (sid) {
+        setServers((ss) => ss.map((s) =>
+          s.server_id === sid ? { ...s, has_unread: false } : s
         ));
       }
     }
@@ -162,25 +206,25 @@ const updateIdentity = async () => {
 
 const seedAndRefresh = async () => {
   await seedTestData();
-  await refreshGroups();
+  await refreshServers();
   await refreshPins();
 };
 
 const startDevSession = async () => {
-  const group = await createDevSession();
-  await refreshGroups();
-  await selectGroup(group.group_id);
+  const server = await createDevSession();
+  await refreshServers();
+  await selectServer(server.server_id);
 };
 
-// Poll for a dev session file and auto-join if this instance has no groups yet
+// Poll for a dev session file and auto-join if this instance has no servers yet
 const tryDevJoin = async (): Promise<boolean> => {
-  if (groups().length > 0) return true;
+  if (servers().length > 0) return true;
   const session = await readDevSession();
   if (!session) return false;
   try {
-    const group = await joinByInvite(session.relay_url, session.token);
-    await refreshGroups();
-    await selectGroup(group.group_id);
+    const server = await joinByInvite(session.relay_url, session.token);
+    await refreshServers();
+    await selectServer(server.server_id);
     return true;
   } catch {
     return false;
@@ -189,36 +233,38 @@ const tryDevJoin = async (): Promise<boolean> => {
 
 const initialize = async () => {
   await updateIdentity();
-  await refreshGroups();
+  await refreshServers();
   await refreshPins();
   await refreshAllChannels();
+  await refreshAllMembers();
 
   listen<string>("sync", (event) => {
-    const gid = event.payload;
-    if (gid === selectedGroupId()) {
+    const sid = event.payload;
+    if (sid === selectedServerId()) {
       refreshChannels();
       refreshMembers();
     }
-    refreshGroups();
+    refreshServers();
+    refreshAllMembers();
   });
 
   listen<Message>("message", (event) => {
     const msg = event.payload;
     if (msg.channel_id === selectedChannelId()) return;
-    const inCurrentGroup = channels().some((c) => c.channel_id === msg.channel_id);
-    if (inCurrentGroup) {
+    const inCurrentServer = channels().some((c) => c.channel_id === msg.channel_id);
+    if (inCurrentServer) {
       setChannels((prev) => prev.map((c) =>
         c.channel_id === msg.channel_id ? { ...c, unread_count: c.unread_count + 1 } : c
       ));
     } else {
-      refreshGroups();
+      refreshServers();
     }
   });
 
   listen<VoiceState>("voice-state", (event) => {
     const s = event.payload;
     setVoiceConnected(s.connected);
-    setVoiceGroupId(s.group_id);
+    setVoiceServerId(s.server_id);
     setVoiceChannelId(s.channel_id);
     setIsMuted(s.muted);
     setIsDeafened(s.deafened);
@@ -290,16 +336,18 @@ const initialize = async () => {
 };
 
 export {
-  identity, groups, selectedGroupId, channels, members,
-  pinnedGroupIds, selectedChannelId, allChannels,
+  identity, servers, selectedServerId, channels, members,
+  pinnedServerIds, selectedChannelId, allChannels,
   inviteLink, showInfo, desiredChannelKind,
-  selectedGroup, selectedChannelName,
-  selectGroup, selectChannel, updateIdentity, initialize, seedAndRefresh, startDevSession,
-  refreshGroups, refreshChannels, refreshPins, refreshAllChannels,
+  selectedServer, selectedChannelName,
+  dmViewActive, dms, serverList, contacts,
+  selectServer, selectChannel, selectDm, activateDmView,
+  updateIdentity, initialize, seedAndRefresh, startDevSession,
+  refreshServers, refreshChannels, refreshPins, refreshAllChannels, refreshAllMembers,
   setInviteLink, setShowInfo, setDesiredChannelKind,
   settingsOpen, settingsCategory, setSettingsCategory, toggleSettings,
   isInCall, isMuted, isDeafened, isPttMode, setIsPttMode, isPttKeyHeld, pttMuteAttempt, toggleMute, toggleDeafen, endCall,
-  voiceChannelId, voiceGroupId, voiceParticipants, speakingSet, voiceError,
+  voiceChannelId, voiceServerId, voiceParticipants, speakingSet, voiceError,
   joinVoiceChannel, isSpeaking, isInVoiceChannel,
   voiceParticipantChannelId, voiceMuteStates, voiceQuality,
 };

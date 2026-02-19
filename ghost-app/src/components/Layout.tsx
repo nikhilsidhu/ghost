@@ -2,15 +2,15 @@ import { onMount, Show, For } from "solid-js";
 import { Dynamic } from "solid-js/web";
 import "../lib/commands";
 import {
-  selectedGroup, selectedChannelId,
+  selectedServer, selectedChannelId,
   inviteLink, showInfo, settingsOpen, settingsCategory,
   initialize, seedAndRefresh, startDevSession,
-  setInviteLink, setShowInfo,
+  setInviteLink, setShowInfo, dmViewActive,
 } from "../lib/store";
 import { sections } from "../lib/settings-registry";
 import { slideDuration } from "../lib/constants";
 import { Sidebar } from "./Sidebar";
-import { GroupView } from "./GroupView";
+import { ServerView } from "./ServerView";
 import { MemberPanel } from "./MemberPanel";
 import { CommandPalette } from "./CommandPalette";
 import { InviteDialog } from "./InviteDialog";
@@ -48,11 +48,11 @@ export function Layout() {
           }}
         >
           <Show
-            when={selectedGroup()}
+            when={selectedServer()}
             fallback={
               <div class="flex-1 flex items-center justify-center">
                 <div class="flex flex-col items-center gap-5">
-                  <span class="text-sm text-[var(--neutral-400)]">select a group</span>
+                  <span class="text-sm text-[var(--neutral-400)]">select a server</span>
                   <div class="flex flex-col gap-2.5">
                     <For each={shortcutDefs}>
                       {(s) => (
@@ -98,7 +98,7 @@ export function Layout() {
                 </div>
               }
             >
-              <GroupView />
+              <ServerView />
             </Show>
           </Show>
         </div>
@@ -127,20 +127,18 @@ export function Layout() {
           </Show>
         </div>
       </main>
-      <Show when={selectedGroup()}>
-        <div class="divider-v" />
-        <div
-          class="overflow-hidden flex-shrink-0"
-          style={{
-            width: settingsOpen() ? "0px" : "224px",
-            opacity: settingsOpen() ? "0" : "1",
-            transform: settingsOpen() ? "translateX(2rem)" : "translateX(0)",
-            transition: `all ${slideDuration(sections().length)} var(--ease-out)`,
-          }}
-        >
-          <MemberPanel />
-        </div>
-      </Show>
+      <div class="divider-v" />
+      <div
+        class="overflow-hidden flex-shrink-0"
+        style={{
+          width: selectedServer() && !dmViewActive() && !settingsOpen() ? "224px" : "0px",
+          opacity: selectedServer() && !dmViewActive() && !settingsOpen() ? "1" : "0",
+          transform: selectedServer() && !dmViewActive() && !settingsOpen() ? "translateX(0)" : "translateX(2rem)",
+          transition: `all ${slideDuration(sections().length)} var(--ease-out)`,
+        }}
+      >
+        <MemberPanel />
+      </div>
       <CommandPalette />
       <InviteDialog link={inviteLink()} onClose={() => setInviteLink(null)} />
       <ShortcutOverlay shortcuts={overlayShortcuts} forceOpen={showInfo()} onClose={() => setShowInfo(false)} />

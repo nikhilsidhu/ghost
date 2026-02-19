@@ -27,7 +27,7 @@ type WsReader = futures_util::stream::SplitStream<WsStream>;
 
 pub enum VoiceCommand {
     Join {
-        group_id: String,
+        server_id: String,
         channel_id: String,
         relay_url: String,
         fingerprint: String,
@@ -53,7 +53,7 @@ pub enum VoiceCommand {
 #[derive(Clone, Serialize, Default)]
 pub struct VoiceStateEvent {
     pub connected: bool,
-    pub group_id: Option<String>,
+    pub server_id: Option<String>,
     pub channel_id: Option<String>,
     pub muted: bool,
     pub deafened: bool,
@@ -194,7 +194,7 @@ fn emit_error(app: &AppHandle, msg: &str) {
 
 /// Context saved between receiving Join and the relay's Assigned+Participants responses.
 struct PendingAudioStart {
-    group_id: String,
+    server_id: String,
     channel_id: String,
     relay_url: String,
     fingerprint: String,
@@ -220,7 +220,7 @@ fn apply_pending_settings(p: &PendingAudioStart, session: &AudioSession) {
 /// Derive voice encryption keys for a set of participant fingerprints.
 async fn derive_peer_keys(
     client: &Arc<Mutex<GhostClient>>,
-    group_id: &[u8; 32],
+    server_id: &[u8; 32],
     channel_id: &[u8; 32],
     fp_hexes: &[String],
 ) -> Result<HashMap<[u8; 32], [u8; 32]>, String> {
@@ -232,7 +232,7 @@ async fn derive_peer_keys(
             .try_into()
             .map_err(|_| "fp not 32 bytes")?;
         let key = client
-            .derive_voice_key(group_id, channel_id, &fp)
+            .derive_voice_key(server_id, channel_id, &fp)
             .map_err(|e| format!("derive key: {e}"))?;
         keys.insert(fp, key);
     }
@@ -242,7 +242,7 @@ async fn derive_peer_keys(
 /// Start the audio pipeline and UDP transport after receiving Assigned + Participants.
 async fn start_audio(
     client: &Arc<Mutex<GhostClient>>,
-    group_id_hex: &str,
+    server_id_hex: &str,
     channel_id_hex: &str,
     own_fp_hex: &str,
     relay_url: &str,
@@ -252,10 +252,10 @@ async fn start_audio(
     input_device: Option<String>,
     output_device: Option<String>,
 ) -> Result<AudioSession, String> {
-    let group_id: [u8; 32] = hex::decode(group_id_hex)
-        .map_err(|e| format!("bad group_id: {e}"))?
+    let server_id: [u8; 32] = hex::decode(server_id_hex)
+        .map_err(|e| format!("bad server_id: {e}"))?
         .try_into()
-        .map_err(|_| "group_id not 32 bytes".to_string())?;
+        .map_err(|_| "server_id not 32 bytes".to_string())?;
     let channel_id: [u8; 32] = hex::decode(channel_id_hex)
         .map_err(|e| format!("bad channel_id: {e}"))?
         .try_into()
@@ -268,7 +268,7 @@ async fn start_audio(
     // Derive own key
     let own_key = {
         let c = client.lock().await;
-        c.derive_voice_key(&group_id, &channel_id, &own_fp)
+        c.derive_voice_key(&server_id, &channel_id, &own_fp)
             .map_err(|e| format!("derive own key: {e}"))?
     };
 
@@ -278,7 +278,7 @@ async fn start_audio(
         .filter(|fp| fp.as_str() != own_fp_hex)
         .cloned()
         .collect();
-    let peer_keys = derive_peer_keys(client, &group_id, &channel_id, &peer_fps).await?;
+    let peer_keys = derive_peer_keys(client, &server_id, &channel_id, &peer_fps).await?;
 
     let mut pipeline = AudioPipeline::start(own_fp, own_key, channel_id, peer_keys, input_device, output_device)?;
     pipeline.controls.muted.store(voice_state.muted, Ordering::Relaxed);
@@ -345,7 +345,7 @@ pub async fn run(
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else { break };
                 match cmd {
-                    VoiceCommand::Join { group_id, channel_id, relay_url, fingerprint, input_device, output_device, ns_mode, agc_mode, vad_threshold, input_gain, input_mode } => {
+                    VoiceCommand::Join { server_id, channel_id, relay_url, fingerprint, input_device, output_device, ns_mode, agc_mode, vad_threshold, input_gain, input_mode } => {
                         disconnect(&app, &mut ws, &mut ws_read, &mut state, &state_tx, &mut participants, &mut audio).await;
                         pending = None;
                         assigned_port = None;
@@ -381,14 +381,14 @@ pub async fn run(
                         ws_read = Some(read);
                         state = VoiceStateEvent {
                             connected: true,
-                            group_id: Some(group_id.clone()),
+                            server_id: Some(server_id.clone()),
                             channel_id: Some(channel_id.clone()),
                             muted: state.muted,
                             deafened: state.deafened,
                             udp_port: None,
                         };
                         pending = Some(PendingAudioStart {
-                            group_id,
+                            server_id,
                             channel_id,
                             relay_url,
                             fingerprint,
@@ -527,7 +527,7 @@ pub async fn run(
                                 }
                                 if let Some(port) = assigned_port {
                                     if let Some(p) = pending.take() {
-                                        match start_audio(&client, &p.group_id, &p.channel_id, &p.fingerprint, &p.relay_url, port, &p.participant_fps, &state, p.input_device.clone(), p.output_device.clone()).await {
+                                        match start_audio(&client, &p.server_id, &p.channel_id, &p.fingerprint, &p.relay_url, port, &p.participant_fps, &state, p.input_device.clone(), p.output_device.clone()).await {
                                             Ok(session) => {
                                                 apply_pending_settings(&p, &session);
                                                 audio = Some(session);
@@ -545,7 +545,7 @@ pub async fn run(
 
                                 if let Some(p) = pending.take() {
                                     if !p.participant_fps.is_empty() {
-                                        match start_audio(&client, &p.group_id, &p.channel_id, &p.fingerprint, &p.relay_url, port, &p.participant_fps, &state, p.input_device.clone(), p.output_device.clone()).await {
+                                        match start_audio(&client, &p.server_id, &p.channel_id, &p.fingerprint, &p.relay_url, port, &p.participant_fps, &state, p.input_device.clone(), p.output_device.clone()).await {
                                             Ok(session) => {
                                                 apply_pending_settings(&p, &session);
                                                 audio = Some(session);
@@ -563,7 +563,7 @@ pub async fn run(
 
                                 // Derive key for new peer and add to audio pipeline
                                 if let Some(ref session) = audio {
-                                    if let (Some(gid_hex), Some(cid_hex)) = (&state.group_id, &state.channel_id) {
+                                    if let (Some(gid_hex), Some(cid_hex)) = (&state.server_id, &state.channel_id) {
                                         let parsed = hex::decode(gid_hex)
                                             .ok()
                                             .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())

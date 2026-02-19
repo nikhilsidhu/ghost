@@ -13,7 +13,7 @@ pub async fn put(
     body: Bytes,
 ) -> Result<StatusCode> {
     let id = decode_mailbox_id(&mailbox_id)?;
-    state.storage.put_group_info(&id, &body)?;
+    state.storage.put_server_info(&id, &body)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -22,7 +22,7 @@ pub async fn get(
     Path(mailbox_id): Path<String>,
 ) -> Result<impl IntoResponse> {
     let id = decode_mailbox_id(&mailbox_id)?;
-    match state.storage.get_group_info(&id)? {
+    match state.storage.get_server_info(&id)? {
         Some(data) => Ok((StatusCode::OK, data)),
         None => Err(crate::error::RelayError::NotFound),
     }

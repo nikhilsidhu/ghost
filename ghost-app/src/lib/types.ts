@@ -4,9 +4,10 @@ export interface Identity {
   display_name: string;
 }
 
-export interface Group {
-  group_id: string;
+export interface Server {
+  server_id: string;
   name: string;
+  kind: "server" | "dm";
   creator_fp: string;
   created_at: number;
   has_unread: boolean;
@@ -14,7 +15,7 @@ export interface Group {
 
 export interface Channel {
   channel_id: string;
-  group_id: string;
+  server_id: string;
   name: string;
   kind: "text" | "voice";
   position: number;
@@ -22,7 +23,7 @@ export interface Channel {
 }
 
 export interface Member {
-  group_id: string;
+  server_id: string;
   fingerprint: string;
   display_name: string;
   role: "creator" | "member";
@@ -65,7 +66,7 @@ export interface Message {
 
 export interface VoiceState {
   connected: boolean;
-  group_id: string | null;
+  server_id: string | null;
   channel_id: string | null;
   muted: boolean;
   deafened: boolean;

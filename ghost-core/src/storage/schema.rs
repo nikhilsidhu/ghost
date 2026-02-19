@@ -3,15 +3,18 @@ use rusqlite::Connection;
 use crate::crypto::MessageType;
 use crate::error::{GhostError, Result};
 
-const CURRENT_VERSION: u32 = 4;
+const CURRENT_VERSION: u32 = 1;
 
 pub fn initialize(conn: &Connection) -> Result<()> {
     let version = get_version(conn)?;
     if version == 0 {
         create_tables(conn)?;
         set_version(conn, CURRENT_VERSION)?;
-    } else if version < CURRENT_VERSION {
-        migrate(conn, version)?;
+    } else if version != CURRENT_VERSION {
+        // Pre-release: nuke and recreate
+        drop_all(conn)?;
+        create_tables(conn)?;
+        set_version(conn, CURRENT_VERSION)?;
     }
     Ok(())
 }
@@ -43,33 +46,55 @@ fn set_version(conn: &Connection, version: u32) -> Result<()> {
     Ok(())
 }
 
+fn drop_all(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS messages_fts;
+         DROP TABLE IF EXISTS message_references;
+         DROP TABLE IF EXISTS messages;
+         DROP TABLE IF EXISTS channel_read_state;
+         DROP TABLE IF EXISTS members;
+         DROP TABLE IF EXISTS channels;
+         DROP TABLE IF EXISTS pinned_servers;
+         DROP TABLE IF EXISTS pinned_groups;
+         DROP TABLE IF EXISTS servers;
+         DROP TABLE IF EXISTS groups;
+         DROP TABLE IF EXISTS relay_state;
+         DROP TABLE IF EXISTS schema_version;"
+    )
+    .map_err(|e| GhostError::Database(format!("drop tables: {e}")))?;
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);")
+        .map_err(|e| GhostError::Database(format!("recreate schema_version: {e}")))?;
+    Ok(())
+}
+
 fn create_tables(conn: &Connection) -> Result<()> {
     let text = MessageType::Text as u8;
 
     conn.execute_batch(&format!(
         "
-        CREATE TABLE groups (
-            group_id   BLOB    PRIMARY KEY,
+        CREATE TABLE servers (
+            server_id  BLOB    PRIMARY KEY,
             name       TEXT    NOT NULL,
+            kind       TEXT    NOT NULL DEFAULT 'server' CHECK(kind IN ('server', 'dm')),
             creator_fp BLOB    NOT NULL,
             created_at INTEGER NOT NULL
         );
 
         CREATE TABLE channels (
             channel_id BLOB    PRIMARY KEY,
-            group_id   BLOB    NOT NULL REFERENCES groups(group_id) ON DELETE CASCADE,
+            server_id  BLOB    NOT NULL REFERENCES servers(server_id) ON DELETE CASCADE,
             name       TEXT    NOT NULL,
             kind       TEXT    NOT NULL CHECK(kind IN ('text', 'voice')),
             position   INTEGER NOT NULL
         );
 
         CREATE TABLE members (
-            group_id     BLOB    NOT NULL REFERENCES groups(group_id) ON DELETE CASCADE,
+            server_id    BLOB    NOT NULL REFERENCES servers(server_id) ON DELETE CASCADE,
             fingerprint  BLOB    NOT NULL,
             display_name TEXT    NOT NULL,
             role         TEXT    NOT NULL CHECK(role IN ('creator', 'member')),
             joined_at    INTEGER NOT NULL,
-            PRIMARY KEY (group_id, fingerprint)
+            PRIMARY KEY (server_id, fingerprint)
         );
 
         CREATE TABLE messages (
@@ -123,8 +148,8 @@ fn create_tables(conn: &Connection) -> Result<()> {
             INSERT INTO messages_fts(rowid, content) VALUES (NEW.rowid, NEW.content);
         END;
 
-        CREATE TABLE pinned_groups (
-            group_id  BLOB PRIMARY KEY REFERENCES groups(group_id) ON DELETE CASCADE,
+        CREATE TABLE pinned_servers (
+            server_id BLOB PRIMARY KEY REFERENCES servers(server_id) ON DELETE CASCADE,
             pinned_at INTEGER NOT NULL
         );
 
@@ -141,48 +166,5 @@ fn create_tables(conn: &Connection) -> Result<()> {
     ))
     .map_err(|e| GhostError::Database(format!("create tables: {e}")))?;
 
-    Ok(())
-}
-
-fn migrate(conn: &Connection, from_version: u32) -> Result<()> {
-    let mut v = from_version;
-    while v < CURRENT_VERSION {
-        match v {
-            1 => {
-                conn.execute_batch(
-                    "CREATE TABLE pinned_groups (
-                        group_id  BLOB PRIMARY KEY REFERENCES groups(group_id) ON DELETE CASCADE,
-                        pinned_at INTEGER NOT NULL
-                    );"
-                )
-                .map_err(|e| GhostError::Database(format!("migrate v1->v2: {e}")))?;
-            }
-            2 => {
-                conn.execute_batch(
-                    "CREATE TABLE channel_read_state (
-                        channel_id   BLOB PRIMARY KEY REFERENCES channels(channel_id) ON DELETE CASCADE,
-                        last_read_ts INTEGER NOT NULL
-                    );"
-                )
-                .map_err(|e| GhostError::Database(format!("migrate v2->v3: {e}")))?;
-            }
-            3 => {
-                conn.execute_batch(
-                    "CREATE TABLE relay_state (
-                        mailbox_id    BLOB PRIMARY KEY,
-                        last_seen_seq INTEGER NOT NULL DEFAULT 0
-                    );"
-                )
-                .map_err(|e| GhostError::Database(format!("migrate v3->v4: {e}")))?;
-            }
-            _ => {
-                return Err(GhostError::Database(format!(
-                    "no migration from version {v}"
-                )));
-            }
-        }
-        v += 1;
-        set_version(conn, v)?;
-    }
     Ok(())
 }

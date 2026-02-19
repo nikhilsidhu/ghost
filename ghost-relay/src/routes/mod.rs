@@ -1,5 +1,5 @@
 mod blob;
-mod group_info;
+mod server_info;
 mod health;
 mod invite;
 mod voice;
@@ -16,7 +16,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health::health))
         .route("/box/{mailbox_id}", post(blob::post_blob).get(blob::get_blobs))
-        .route("/box/{mailbox_id}/group_info", put(group_info::put).get(group_info::get))
+        .route("/box/{mailbox_id}/server_info", put(server_info::put).get(server_info::get))
         .route("/ws/{mailbox_id}", get(ws::ws_upgrade))
         .route("/voice/{channel_id}", get(voice::ws_upgrade))
         .route("/invite", post(invite::register))

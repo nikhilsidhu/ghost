@@ -1,23 +1,24 @@
 import { createSignal, createEffect, on, onCleanup, For, Show } from "solid-js";
 import type { JSX } from "solid-js";
-import type { Group, Channel } from "../lib/types";
+import type { Server, Channel } from "../lib/types";
 import { hashGradient } from "../lib/gradients";
 import { Avatar } from "./ui/avatar";
 import { Tooltip } from "./ui/tooltip";
 import { ScrollArea } from "./ui/scroll-area";
 import { cn } from "../lib/cn";
-import { Settings, X } from "lucide-solid";
+import { Settings, X, Mailbox } from "lucide-solid";
 import { channelPrefix, slideDuration } from "../lib/constants";
 import {
-  identity, groups, selectedGroupId, channels, selectedChannelId,
-  selectedGroup, selectGroup, selectChannel,
+  identity, servers, selectedServerId, channels, selectedChannelId,
+  selectedServer, selectServer, selectChannel,
   settingsOpen, settingsCategory, setSettingsCategory, toggleSettings,
   joinVoiceChannel, isInVoiceChannel, endCall,
   voiceParticipants, voiceParticipantChannelId,
+  dmViewActive, dms, serverList, activateDmView, selectDm,
 } from "../lib/store";
 import { sections } from "../lib/settings-registry";
 import "../lib/settings";
-import { handleCreateChannel } from "../lib/commands";
+import { handleCreateChannel, handleCreateDm } from "../lib/commands";
 import { SettingsPanel } from "./SettingsPanel";
 import { VoiceDock, VoiceChannelItem, VoiceParticipantList } from "./VoiceControls";
 import {
@@ -38,23 +39,23 @@ export function Sidebar() {
 
   const [textCollapsed, setTextCollapsed] = createSignal(false);
   const [voiceCollapsed, setVoiceCollapsed] = createSignal(false);
-  const [groupOrder, setGroupOrder] = createSignal<string[]>([]);
+  const [serverOrder, setServerOrder] = createSignal<string[]>([]);
   const [channelOrder, setChannelOrder] = createSignal<string[]>([]);
-  const [activeGroupId, setActiveGroupId] = createSignal<string | null>(null);
+  const [activeServerId, setActiveServerId] = createSignal<string | null>(null);
   const [activeChannelId, setActiveChannelId] = createSignal<string | null>(null);
 
-  createEffect(on(selectedGroupId, () => {
+  createEffect(on(selectedServerId, () => {
     setTextCollapsed(false);
     setVoiceCollapsed(false);
   }));
 
-  createEffect(on(groups, (gs) => {
-    const current = groupOrder();
-    const ids = gs.map((g) => g.group_id);
+  createEffect(on(servers, (gs) => {
+    const current = serverOrder();
+    const ids = gs.map((g) => g.server_id);
     const ordered = current.filter((id) => ids.includes(id));
     const newIds = ids.filter((id) => !ordered.includes(id));
     if (newIds.length > 0 || ordered.length !== current.length) {
-      setGroupOrder([...ordered, ...newIds]);
+      setServerOrder([...ordered, ...newIds]);
     }
   }));
 
@@ -68,10 +69,11 @@ export function Sidebar() {
     }
   }));
 
-  const orderedGroups = () => {
-    const order = groupOrder();
-    const map = new Map(groups().map((g) => [g.group_id, g]));
-    return order.map((id) => map.get(id)!).filter(Boolean);
+  const orderedServers = () => {
+    const order = serverOrder();
+    const list = serverList();
+    const map = new Map(list.map((g) => [g.server_id, g]));
+    return order.map((id) => map.get(id)).filter((g): g is Server => g !== undefined);
   };
 
   const textChannels = () => {
@@ -88,24 +90,28 @@ export function Sidebar() {
     return order.map((id) => map.get(id)).filter((c): c is Channel => c !== undefined && c.kind === "voice");
   };
 
-  const handleGroupClick = (groupId: string) => {
-    selectGroup(groupId === selectedGroupId() ? null : groupId);
+  const handleServerClick = (serverId: string) => {
+    if (serverId === selectedServerId() && !dmViewActive()) {
+      selectServer(null);
+    } else {
+      selectServer(serverId);
+    }
   };
 
-  const onGroupDragStart = (e: DragEvent) => setActiveGroupId(String(e.draggable.id));
-  const onGroupDragEnd = (e: DragEvent) => {
-    setActiveGroupId(null);
+  const onServerDragStart = (e: DragEvent) => setActiveServerId(String(e.draggable.id));
+  const onServerDragEnd = (e: DragEvent) => {
+    setActiveServerId(null);
     if (e.draggable && e.droppable) {
       const from = String(e.draggable.id);
       const to = String(e.droppable.id);
       if (from !== to) {
-        const order = [...groupOrder()];
+        const order = [...serverOrder()];
         const fromIdx = order.indexOf(from);
         const toIdx = order.indexOf(to);
         if (fromIdx >= 0 && toIdx >= 0) {
           order.splice(fromIdx, 1);
           order.splice(toIdx, 0, from);
-          setGroupOrder(order);
+          setServerOrder(order);
         }
       }
     }
@@ -137,9 +143,9 @@ export function Sidebar() {
         class="w-[var(--size-lg)] flex-shrink-0 flex flex-col"
         style={{ background: "var(--neutral-950)" }}
       >
-        {/* Swap zone: group icons ↔ settings icons */}
+        {/* Swap zone: server icons ↔ settings icons */}
         <div class="flex-1 w-full relative overflow-hidden">
-          {/* Group icons */}
+          {/* Server icons */}
           <div
             class={cn(
               "absolute inset-0",
@@ -147,33 +153,34 @@ export function Sidebar() {
             )}
             style={{
               transform: settingsOpen() ? "translateY(-100%)" : "translateY(0)",
-              transition: `transform ${slideDuration(orderedGroups().length)} var(--ease-out)`,
+              transition: `transform ${slideDuration(orderedServers().length)} var(--ease-out)`,
             }}
           >
             <DragDropProvider
               collisionDetector={closestCenter}
-              onDragStart={onGroupDragStart}
-              onDragEnd={onGroupDragEnd}
+              onDragStart={onServerDragStart}
+              onDragEnd={onServerDragEnd}
             >
               <DragDropSensors />
               <ScrollArea class="h-full w-full scrollbar-none">
-                <SortableProvider ids={groupOrder()}>
-                  <div class="flex flex-col items-center pt-6 pb-3">
-                    <For each={orderedGroups()}>
+                <div class="flex flex-col items-center pt-6 pb-3">
+                  <DmIcon />
+                  <SortableProvider ids={serverOrder()}>
+                    <For each={orderedServers()}>
                       {(g) => (
-                        <GroupIcon group={g} isActive={g.group_id === selectedGroupId()} onClick={handleGroupClick} />
+                        <ServerIcon server={g} isActive={g.server_id === selectedServerId() && !dmViewActive()} onClick={handleServerClick} />
                       )}
                     </For>
-                  </div>
-                </SortableProvider>
+                  </SortableProvider>
+                </div>
               </ScrollArea>
               <DragOverlay>
                 {(() => {
-                  const id = activeGroupId();
+                  const id = activeServerId();
                   if (!id) return null;
-                  const g = groups().find((x) => x.group_id === id);
+                  const g = servers().find((x) => x.server_id === id);
                   if (!g) return null;
-                  const grad = hashGradient(g.group_id);
+                  const grad = hashGradient(g.server_id);
                   return (
                     <div class="w-[var(--size-lg)] h-[var(--size-lg)] flex items-center justify-center">
                       <div
@@ -252,7 +259,7 @@ export function Sidebar() {
           />
         </div>
 
-        {/* Bottom dock — each item uses the same --size-lg cell as group icons */}
+        {/* Bottom dock — each item uses the same --size-lg cell as server icons */}
         <div class="flex-shrink-0 flex flex-col items-center pb-3 pt-2 group/dock">
 
           <VoiceDock />
@@ -319,8 +326,8 @@ export function Sidebar() {
       <div
         class="relative flex-shrink-0 overflow-hidden"
         style={{
-          width: settingsOpen() ? "380px" : selectedGroup() ? "208px" : "0px",
-          transition: `width ${slideDuration(settingsOpen() ? sections().length : orderedGroups().length)} var(--ease-out)`,
+          width: settingsOpen() ? "380px" : (selectedServer() || dmViewActive()) ? "208px" : "0px",
+          transition: `width ${slideDuration(settingsOpen() ? sections().length : orderedServers().length)} var(--ease-out)`,
         }}
       >
         {/* Settings panel — slides down from top, synced with settings icons */}
@@ -337,19 +344,22 @@ export function Sidebar() {
           <SettingsPanel onClose={toggleSettings} />
         </div>
 
-        {/* Channel panel — slides up when settings opens, synced with group icons */}
+        {/* Channel panel — slides up when settings opens, synced with server icons */}
         <div
           class={cn(
             "absolute inset-0",
-            (settingsOpen() || !selectedGroup()) && "pointer-events-none",
+            (settingsOpen() || (!selectedServer() && !dmViewActive())) && "pointer-events-none",
           )}
           style={{
             transform: settingsOpen() ? "translateY(-100%)" : "translateY(0)",
-            transition: `transform ${slideDuration(orderedGroups().length)} var(--ease-out)`,
+            transition: `transform ${slideDuration(orderedServers().length)} var(--ease-out)`,
           }}
         >
-          <Show when={selectedGroup()}>
-            {(group) => (
+          <Show when={dmViewActive()}>
+            <DmPanel />
+          </Show>
+          <Show when={!dmViewActive() && selectedServer()}>
+            {(server) => (
               <div
                 class="w-full h-full flex flex-col min-h-0"
                 style={{ background: "var(--neutral-950)" }}
@@ -358,7 +368,7 @@ export function Sidebar() {
 
                 <div class="h-[var(--size-lg)] flex items-center px-4 flex-shrink-0 -mt-1">
                   <span class="text-base font-semibold text-[var(--neutral-100)] truncate lowercase">
-                    {group().name}
+                    {server().name}
                   </span>
                 </div>
 
@@ -425,7 +435,7 @@ export function Sidebar() {
                             <For each={voiceChannels()}>
                               {(ch) => {
                                 const active = () => isInVoiceChannel(ch.channel_id);
-                                const gid = selectedGroupId()!;
+                                const sid = selectedServerId()!;
                                 return (
                                   <>
                                     <VoiceChannelItem
@@ -433,7 +443,7 @@ export function Sidebar() {
                                       active={active()}
                                       onToggle={() => {
                                         if (active()) endCall();
-                                        else joinVoiceChannel(gid, ch.channel_id);
+                                        else joinVoiceChannel(sid, ch.channel_id);
                                       }}
                                     />
                                     <Show when={active() || (voiceParticipantChannelId() === ch.channel_id && voiceParticipants().length > 0)}>
@@ -471,10 +481,10 @@ export function Sidebar() {
   );
 }
 
-// Rounded group icon with active indicator bar
-function GroupIcon(props: { group: Group; isActive: boolean; onClick: (id: string) => void }) {
-  const sortable = createSortable(props.group.group_id);
-  const grad = hashGradient(props.group.group_id);
+// Rounded server icon with active indicator bar
+function ServerIcon(props: { server: Server; isActive: boolean; onClick: (id: string) => void }) {
+  const sortable = createSortable(props.server.server_id);
+  const grad = hashGradient(props.server.server_id);
 
   return (
     <div
@@ -493,32 +503,32 @@ function GroupIcon(props: { group: Group; isActive: boolean; onClick: (id: strin
         )}
         style={{ background: "var(--neutral-400)" }}
       />
-      <Tooltip label={props.group.name}>
+      <Tooltip label={props.server.name}>
         <button
           class="w-[var(--size-lg)] h-[var(--size-lg)] flex items-center justify-center cursor-pointer"
-          onClick={() => props.onClick(props.group.group_id)}
+          onClick={() => props.onClick(props.server.server_id)}
         >
           <Avatar
-            hashKey={props.group.group_id}
-            label={props.group.name}
+            hashKey={props.server.server_id}
+            label={props.server.name}
             square
             active={props.isActive}
             class={cn(
               "relative w-[var(--size-md)] h-[var(--size-md)] text-sm transition-all duration-200",
-              props.isActive || props.group.has_unread
+              props.isActive || props.server.has_unread
                 ? "opacity-100 scale-100"
                 : "opacity-60 scale-95 hover:opacity-90 hover:scale-100",
             )}
           >
-            {props.group.name[0]?.toLowerCase()}
+            {props.server.name[0]?.toLowerCase()}
             {/* Unread dot */}
-            <Show when={!props.isActive && props.group.has_unread}>
+            <Show when={!props.isActive && props.server.has_unread}>
               <div
                 class="absolute -top-0.5 -right-0.5 w-[10px] h-[10px] rounded-full border-2"
                 style={{ background: "var(--neutral-100)", "border-color": "var(--neutral-950)" }}
               />
             </Show>
-            {/* Breathing glow on active group */}
+            {/* Breathing glow on active server */}
             <Show when={props.isActive}>
               <div
                 class="absolute inset-0 rounded-[14%] pointer-events-none"
@@ -569,6 +579,123 @@ function ChannelItem(props: {
           </span>
         </Show>
       </span>
+    </button>
+  );
+}
+
+function DmIcon() {
+  const active = () => dmViewActive();
+  const hasUnread = () => dms().some((g) => g.has_unread);
+
+  return (
+    <div class="relative flex items-center justify-center w-full group/dm">
+      <div
+        class={cn(
+          "absolute left-0 w-[3px] rounded-r-full transition-all duration-200",
+          active()
+            ? "top-1 bottom-1 opacity-100"
+            : "top-[38%] bottom-[38%] opacity-0 group-hover/dm:opacity-100",
+        )}
+        style={{ background: "var(--neutral-400)" }}
+      />
+      <Tooltip label="direct messages">
+        <button
+          class={cn(
+            "w-[var(--size-lg)] h-[var(--size-lg)] flex items-center justify-center cursor-pointer transition-all duration-200",
+            active()
+              ? "opacity-100 text-[var(--neutral-100)]"
+              : "opacity-50 hover:opacity-90 text-[var(--neutral-400)]",
+          )}
+          onClick={() => dmViewActive() ? selectServer(null) : activateDmView()}
+        >
+          <div class="relative">
+            <Mailbox size={26} />
+            <Show when={!active() && hasUnread()}>
+              <div
+                class="absolute -top-0.5 -right-0.5 w-[10px] h-[10px] rounded-full border-2"
+                style={{ background: "var(--neutral-100)", "border-color": "var(--neutral-950)" }}
+              />
+            </Show>
+          </div>
+        </button>
+      </Tooltip>
+    </div>
+  );
+}
+
+function DmPanel() {
+  const dmList = dms;
+
+  return (
+    <div
+      class="w-full h-full flex flex-col min-h-0"
+      style={{ background: "var(--neutral-950)" }}
+    >
+      <div class="h-7 flex-shrink-0" />
+
+      <div class="h-[var(--size-lg)] flex items-center justify-between px-4 flex-shrink-0 -mt-1">
+        <span class="text-base font-semibold text-[var(--neutral-100)] lowercase">
+          direct messages
+        </span>
+        <button
+          class="w-6 h-6 flex items-center justify-center rounded-md text-sm leading-none text-[var(--neutral-500)] hover:text-[var(--neutral-200)] cursor-pointer hover:bg-[var(--hover)]"
+          onClick={handleCreateDm}
+        >
+          +
+        </button>
+      </div>
+
+      <ScrollArea class="flex-1">
+        <div class="px-2 pt-1">
+          <Show
+            when={dmList().length > 0}
+            fallback={
+              <div class="px-2 py-8 text-center text-sm text-[var(--neutral-500)]">
+                no conversations yet
+              </div>
+            }
+          >
+            <For each={dmList()}>
+              {(dm) => (
+                <DmItem
+                  dm={dm}
+                  isSelected={dm.server_id === selectedServerId()}
+                  onSelect={selectDm}
+                />
+              )}
+            </For>
+          </Show>
+        </div>
+      </ScrollArea>
+    </div>
+  );
+}
+
+function DmItem(props: { dm: Server; isSelected: boolean; onSelect: (id: string) => void }) {
+  return (
+    <button
+      class={cn(
+        "w-full flex items-center gap-2 px-2 py-1.5 rounded-md text-sm text-left cursor-pointer",
+        props.isSelected
+          ? "bg-[var(--active)] text-[var(--neutral-100)]"
+          : props.dm.has_unread
+            ? "text-[var(--neutral-100)] font-medium hover:bg-[var(--hover)]"
+            : "text-[var(--neutral-400)] hover:bg-[var(--hover)]",
+      )}
+      onClick={() => props.onSelect(props.dm.server_id)}
+    >
+      <Avatar
+        hashKey={props.dm.server_id}
+        label={props.dm.name}
+        class="w-6 h-6 text-[10px] flex-shrink-0"
+      />
+      <span class="flex-1 truncate">{props.dm.name}</span>
+      <Show when={props.dm.has_unread && !props.isSelected}>
+        <div
+          class="w-2 h-2 rounded-full flex-shrink-0"
+          style={{ background: "var(--neutral-100)" }}
+        />
+      </Show>
     </button>
   );
 }

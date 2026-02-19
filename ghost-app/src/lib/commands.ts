@@ -1,11 +1,11 @@
 import {
-  groups, selectedGroupId, channels, allChannels,
-  pinnedGroupIds, desiredChannelKind,
-  selectGroup, selectChannel, refreshGroups, refreshChannels,
+  servers, selectedServerId, channels, allChannels,
+  pinnedServerIds, desiredChannelKind, contacts,
+  selectServer, selectChannel, selectDm, refreshServers, refreshChannels, refreshAllMembers,
   updateIdentity, setInviteLink, setShowInfo, setDesiredChannelKind,
 } from "./store";
 import {
-  createGroup, createChannel, renameChannel, deleteChannel,
+  createServer, createDm, createChannel, renameChannel, deleteChannel,
   createInvite, joinByInvite, setDisplayName,
 } from "./api";
 import { registerCommand, registerProvider, triggerCommand } from "./registry";
@@ -14,16 +14,16 @@ import { channelPrefix } from "./constants";
 
 // --- Completers ---
 
-const groupCompleter = (q: string, _collected: Record<string, string>) => {
+const serverCompleter = (q: string, _collected: Record<string, string>) => {
   const lq = q.toLowerCase();
-  return groups()
-    .filter((g) => !lq || g.name.toLowerCase().includes(lq))
-    .map((g) => ({ label: g.name, value: g.group_id, iconKey: g.group_id, iconLabel: g.name[0]?.toUpperCase() }));
+  return servers()
+    .filter((s) => !lq || s.name.toLowerCase().includes(lq))
+    .map((s) => ({ label: s.name, value: s.server_id, iconKey: s.server_id, iconLabel: s.name[0]?.toUpperCase() }));
 };
 
 const channelCompleter = (q: string, collected: Record<string, string>) => {
-  const gid = collected.group;
-  const pool = gid ? allChannels().filter((ch) => ch.group_id === gid) : channels();
+  const sid = collected.server;
+  const pool = sid ? allChannels().filter((ch) => ch.server_id === sid) : channels();
   const lq = q.toLowerCase();
   return pool
     .filter((ch) => !lq || ch.name.toLowerCase().includes(lq))
@@ -35,13 +35,20 @@ const typeCompleter = (_q: string, _collected: Record<string, string>) => [
   { label: "voice", value: "voice" },
 ];
 
+const contactCompleter = (q: string, _collected: Record<string, string>) => {
+  const lq = q.toLowerCase();
+  return contacts()
+    .filter((c) => !lq || c.display_name.toLowerCase().includes(lq))
+    .map((c) => ({ label: c.display_name, value: c.display_name }));
+};
+
 // --- Search providers ---
 
-const groupProvider: SearchProvider = (q) => {
-  let gList = groups();
+const serverProvider: SearchProvider = (q) => {
+  let sList = servers();
   if (q) {
-    gList = gList
-      .filter((g) => g.name.toLowerCase().includes(q))
+    sList = sList
+      .filter((s) => s.name.toLowerCase().includes(q))
       .sort((a, b) => {
         const aExact = a.name.toLowerCase() === q ? 0 : 1;
         const bExact = b.name.toLowerCase() === q ? 0 : 1;
@@ -51,27 +58,27 @@ const groupProvider: SearchProvider = (q) => {
         return aStarts - bStarts;
       });
   }
-  const pinned = gList.filter((g) => pinnedGroupIds().has(g.group_id));
-  const rest = gList.filter((g) => !pinnedGroupIds().has(g.group_id));
-  return [...pinned, ...rest].map((g) => ({
-    id: g.group_id,
-    label: g.name,
-    iconKey: g.group_id,
-    iconLabel: g.name[0]?.toUpperCase(),
-    onSelect: () => selectGroup(g.group_id),
+  const pinned = sList.filter((s) => pinnedServerIds().has(s.server_id));
+  const rest = sList.filter((s) => !pinnedServerIds().has(s.server_id));
+  return [...pinned, ...rest].map((s) => ({
+    id: s.server_id,
+    label: s.name,
+    iconKey: s.server_id,
+    iconLabel: s.name[0]?.toUpperCase(),
+    onSelect: () => selectServer(s.server_id),
   }));
 };
 
 const channelProvider: SearchProvider = (q) => {
-  const groupMap = new Map(groups().map((g) => [g.group_id, g.name]));
+  const serverMap = new Map(servers().map((s) => [s.server_id, s.name]));
   const pool = q ? allChannels().filter((ch) => ch.name.toLowerCase().includes(q)) : allChannels();
   return pool.map((ch) => ({
     id: ch.channel_id,
     label: ch.name,
     prefix: channelPrefix(ch.kind),
-    badge: groupMap.get(ch.group_id) ?? "",
-    badgeIconKey: ch.group_id,
-    onSelect: () => { selectGroup(ch.group_id); selectChannel(ch.channel_id); },
+    badge: serverMap.get(ch.server_id) ?? "",
+    badgeIconKey: ch.server_id,
+    onSelect: () => { selectServer(ch.server_id); selectChannel(ch.channel_id); },
   }));
 };
 
@@ -79,24 +86,24 @@ const channelProvider: SearchProvider = (q) => {
 
 const commands: CommandDef[] = [
   {
-    id: "create-group",
-    command: "create group",
-    args: [{ name: "name", placeholder: "group name" }],
+    id: "create-server",
+    command: "create server",
+    args: [{ name: "name", placeholder: "server name" }],
     execute: async (args) => {
-      await createGroup(args.name);
-      await refreshGroups();
+      await createServer(args.name);
+      await refreshServers();
     },
   },
   {
     id: "create-channel",
     command: "create channel",
     args: [
-      { name: "group", placeholder: "group", complete: groupCompleter, defaultValue: () => selectedGroupId() },
+      { name: "server", placeholder: "server", complete: serverCompleter, defaultValue: () => selectedServerId() },
       { name: "name", placeholder: "channel name" },
       { name: "type", placeholder: "text or voice", complete: typeCompleter, defaultValue: () => desiredChannelKind() },
     ],
     execute: async (args) => {
-      await createChannel(args.group, args.name, args.type);
+      await createChannel(args.server, args.name, args.type);
       await refreshChannels();
     },
   },
@@ -104,7 +111,7 @@ const commands: CommandDef[] = [
     id: "rename-channel",
     command: "rename channel",
     args: [
-      { name: "group", placeholder: "group", complete: groupCompleter, defaultValue: () => selectedGroupId() },
+      { name: "server", placeholder: "server", complete: serverCompleter, defaultValue: () => selectedServerId() },
       { name: "channel", placeholder: "channel", complete: channelCompleter },
       { name: "name", placeholder: "new name" },
     ],
@@ -127,7 +134,7 @@ const commands: CommandDef[] = [
     command: "delete channel",
     dangerous: true,
     args: [
-      { name: "group", placeholder: "group", complete: groupCompleter, defaultValue: () => selectedGroupId() },
+      { name: "server", placeholder: "server", complete: serverCompleter, defaultValue: () => selectedServerId() },
       { name: "channel", placeholder: "channel", complete: channelCompleter },
     ],
     execute: async (args) => {
@@ -138,9 +145,9 @@ const commands: CommandDef[] = [
   {
     id: "invite",
     command: "invite",
-    args: [{ name: "group", placeholder: "group", complete: groupCompleter, defaultValue: () => selectedGroupId() }],
+    args: [{ name: "server", placeholder: "server", complete: serverCompleter, defaultValue: () => selectedServerId() }],
     execute: async (args) => {
-      const invite = await createInvite(args.group);
+      const invite = await createInvite(args.server);
       setInviteLink(invite.link);
     },
   },
@@ -154,7 +161,20 @@ const commands: CommandDef[] = [
       const token = url.searchParams.get("token");
       if (!relay || !token) throw new Error("invalid invite link");
       await joinByInvite(relay, token);
-      await refreshGroups();
+      await refreshServers();
+    },
+  },
+  {
+    id: "new-dm",
+    command: "new dm",
+    args: [{ name: "name", placeholder: "contact", complete: contactCompleter }],
+    execute: async (args) => {
+      const dm = await createDm(args.name);
+      await refreshServers();
+      await refreshAllMembers();
+      await selectDm(dm.server_id);
+      const invite = await createInvite(dm.server_id);
+      setInviteLink(invite.link);
     },
   },
   {
@@ -174,11 +194,15 @@ if (import.meta.hot) {
 }
 
 cleanups.push(...commands.map(registerCommand));
-cleanups.push(registerProvider(groupProvider));
+cleanups.push(registerProvider(serverProvider));
 cleanups.push(registerProvider(channelProvider));
 
 // Sidebar uses this to open the create-channel command with the right kind
 export const handleCreateChannel = (kind: "text" | "voice") => {
   setDesiredChannelKind(kind);
   triggerCommand("create-channel");
+};
+
+export const handleCreateDm = () => {
+  triggerCommand("new-dm");
 };

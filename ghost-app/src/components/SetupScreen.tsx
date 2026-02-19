@@ -56,7 +56,7 @@ export function SetupScreen(props: Props) {
       <div class="w-80 flex flex-col gap-6">
         <div class="text-center">
           <h1 class="text-lg font-semibold text-[var(--neutral-100)]">ghost</h1>
-          <p class="text-xs text-[var(--neutral-500)] mt-1">encrypted group chat</p>
+          <p class="text-xs text-[var(--neutral-500)] mt-1">encrypted chat</p>
         </div>
 
         <div class="flex flex-col gap-3">

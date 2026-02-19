@@ -1,7 +1,7 @@
 use serde::Serialize;
 
 use ghost_core::identity::Identity;
-use ghost_core::storage::{Channel, ChannelKind, Group, Member, MemberRole, StoredMessage};
+use ghost_core::storage::{Channel, ChannelKind, Server, Member, MemberRole, StoredMessage};
 use ghost_core::wire::ApplicationMessage;
 
 #[derive(Serialize)]
@@ -12,9 +12,10 @@ pub struct IdentityDto {
 }
 
 #[derive(Serialize)]
-pub struct GroupDto {
-    pub group_id: String,
+pub struct ServerDto {
+    pub server_id: String,
     pub name: String,
+    pub kind: String,
     pub creator_fp: String,
     pub created_at: u64,
     pub has_unread: bool,
@@ -23,7 +24,7 @@ pub struct GroupDto {
 #[derive(Serialize)]
 pub struct ChannelDto {
     pub channel_id: String,
-    pub group_id: String,
+    pub server_id: String,
     pub name: String,
     pub kind: String,
     pub position: i32,
@@ -32,7 +33,7 @@ pub struct ChannelDto {
 
 #[derive(Serialize)]
 pub struct MemberDto {
-    pub group_id: String,
+    pub server_id: String,
     pub fingerprint: String,
     pub display_name: String,
     pub role: String,
@@ -49,13 +50,14 @@ impl From<&Identity> for IdentityDto {
     }
 }
 
-impl GroupDto {
-    pub fn from_group(g: &Group, has_unread: bool) -> Self {
+impl ServerDto {
+    pub fn from_server(s: &Server, has_unread: bool) -> Self {
         Self {
-            group_id: hex::encode(g.group_id),
-            name: g.name.clone(),
-            creator_fp: hex::encode(g.creator_fp),
-            created_at: g.created_at,
+            server_id: hex::encode(s.server_id),
+            name: s.name.clone(),
+            kind: s.kind.as_str().to_string(),
+            creator_fp: hex::encode(s.creator_fp),
+            created_at: s.created_at,
             has_unread,
         }
     }
@@ -65,7 +67,7 @@ impl ChannelDto {
     pub fn from_channel(c: &Channel, unread_count: u32) -> Self {
         Self {
             channel_id: hex::encode(c.channel_id),
-            group_id: hex::encode(c.group_id),
+            server_id: hex::encode(c.server_id),
             name: c.name.clone(),
             kind: match c.kind {
                 ChannelKind::Text => "text",
@@ -144,8 +146,7 @@ pub struct KeybindConfigDto {
 impl From<&Member> for MemberDto {
     fn from(m: &Member) -> Self {
         Self {
-            group_id: hex::encode(m.group_id),
-            fingerprint: hex::encode(m.fingerprint),
+            server_id: hex::encode(m.server_id),            fingerprint: hex::encode(m.fingerprint),
             display_name: m.display_name.clone(),
             role: match m.role {
                 MemberRole::Creator => "creator",

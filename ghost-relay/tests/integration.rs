@@ -627,16 +627,16 @@ async fn voice_max_participants() {
     assert!(msg["message"].as_str().unwrap().contains("full"));
 }
 
-// --- GroupInfo tests ---
+// --- ServerInfo tests ---
 
 #[tokio::test]
-async fn group_info_put_get() {
+async fn server_info_put_get() {
     let base = start_server(test_config()).await;
     let client = reqwest::Client::new();
     let mailbox_id = URL_SAFE_NO_PAD.encode([0xDD; 32]);
 
     let resp = client
-        .put(format!("{base}/box/{mailbox_id}/group_info"))
+        .put(format!("{base}/box/{mailbox_id}/server_info"))
         .body(b"group-info-bytes".to_vec())
         .send()
         .await
@@ -644,7 +644,7 @@ async fn group_info_put_get() {
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
     let resp = client
-        .get(format!("{base}/box/{mailbox_id}/group_info"))
+        .get(format!("{base}/box/{mailbox_id}/server_info"))
         .send()
         .await
         .unwrap();
@@ -653,13 +653,13 @@ async fn group_info_put_get() {
 }
 
 #[tokio::test]
-async fn group_info_not_found() {
+async fn server_info_not_found() {
     let base = start_server(test_config()).await;
     let client = reqwest::Client::new();
     let mailbox_id = URL_SAFE_NO_PAD.encode([0xEE; 32]);
 
     let resp = client
-        .get(format!("{base}/box/{mailbox_id}/group_info"))
+        .get(format!("{base}/box/{mailbox_id}/server_info"))
         .send()
         .await
         .unwrap();
@@ -667,27 +667,27 @@ async fn group_info_not_found() {
 }
 
 #[tokio::test]
-async fn group_info_overwrite() {
+async fn server_info_overwrite() {
     let base = start_server(test_config()).await;
     let client = reqwest::Client::new();
     let mailbox_id = URL_SAFE_NO_PAD.encode([0xFF; 32]);
 
     client
-        .put(format!("{base}/box/{mailbox_id}/group_info"))
+        .put(format!("{base}/box/{mailbox_id}/server_info"))
         .body(b"v1".to_vec())
         .send()
         .await
         .unwrap();
 
     client
-        .put(format!("{base}/box/{mailbox_id}/group_info"))
+        .put(format!("{base}/box/{mailbox_id}/server_info"))
         .body(b"v2".to_vec())
         .send()
         .await
         .unwrap();
 
     let resp = client
-        .get(format!("{base}/box/{mailbox_id}/group_info"))
+        .get(format!("{base}/box/{mailbox_id}/server_info"))
         .send()
         .await
         .unwrap();

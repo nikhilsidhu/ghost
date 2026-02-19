@@ -6,7 +6,7 @@ import { hashGradient } from "../lib/gradients";
 import { Avatar } from "./ui/avatar";
 import { cn } from "../lib/cn";
 import { ChevronDown, SendHorizonal } from "lucide-solid";
-import { selectedGroupId, selectedChannelId, members, settingsOpen } from "../lib/store";
+import { selectedServerId, selectedChannelId, members, settingsOpen } from "../lib/store";
 import { slideDuration } from "../lib/constants";
 import { sections } from "../lib/settings-registry";
 import { showTimestamps } from "./settings/AppearanceSettings";
@@ -106,14 +106,14 @@ export function MessageView() {
 
   const handleSend = async () => {
     const text = inputText().trim();
-    const gid = selectedGroupId();
+    const sid = selectedServerId();
     const cid = selectedChannelId();
-    if (!text || !gid || !cid) return;
+    if (!text || !sid || !cid) return;
     setInputText("");
     if (inputRef) inputRef.value = "";
     setError(null);
     try {
-      const msg = await sendMessage(gid, cid, text);
+      const msg = await sendMessage(sid, cid, text);
       seenIds.add(msg.message_id);
       setMessages((prev) => [...prev, msg]);
       requestAnimationFrame(scrollToBottom);

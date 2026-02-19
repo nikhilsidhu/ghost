@@ -4,12 +4,12 @@ use base64::Engine;
 use rand::RngCore;
 use tauri::State;
 
-use ghost_core::storage::{Channel, ChannelKind, Group, Member, MemberRole, StoredMessage};
+use ghost_core::storage::{Channel, ChannelKind, Server, ServerKind, Member, MemberRole, StoredMessage};
 use ghost_core::wire::{encode_channel_op, encode_member_announce, ChannelOpPayload};
 
 use crate::constants::{DEFAULT_PAGE_SIZE, INVITE_EXPIRY_MS, SEQ_HEADER};
 use crate::config::KeybindConfig;
-use crate::dto::{ChannelDto, ConfigDto, GroupDto, IdentityDto, InviteDto, KeybindConfigDto, MemberDto, MessageDto};
+use crate::dto::{ChannelDto, ConfigDto, ServerDto, IdentityDto, InviteDto, KeybindConfigDto, MemberDto, MessageDto};
 use crate::state::AppState;
 use crate::voice_task::VoiceCommand;
 
@@ -32,30 +32,30 @@ pub async fn get_identity(state: State<'_, AppState>) -> Result<IdentityDto, Str
 }
 
 #[tauri::command]
-pub async fn list_groups(state: State<'_, AppState>) -> Result<Vec<GroupDto>, String> {
+pub async fn list_servers(state: State<'_, AppState>) -> Result<Vec<ServerDto>, String> {
     let client = state.client.lock().await;
     let store = client.store();
-    let groups = store.list_groups().map_err(|e| e.to_string())?;
-    let unread_groups = store.groups_with_unread().map_err(|e| e.to_string())?;
-    Ok(groups
+    let servers = store.list_servers().map_err(|e| e.to_string())?;
+    let unread_servers = store.servers_with_unread().map_err(|e| e.to_string())?;
+    Ok(servers
         .iter()
-        .map(|g| GroupDto::from_group(g, unread_groups.contains(&g.group_id)))
+        .map(|s| ServerDto::from_server(s, unread_servers.contains(&s.server_id)))
         .collect())
 }
 
 #[tauri::command]
-pub async fn create_group(name: String, state: State<'_, AppState>) -> Result<GroupDto, String> {
-    let (group_dto, mailbox_id) = {
+pub async fn create_server(name: String, state: State<'_, AppState>) -> Result<ServerDto, String> {
+    let (server_dto, mailbox_id) = {
         let mut client = state.client.lock().await;
-        let group_id = client
-            .create_group(&name, now_millis())
+        let server_id = client
+            .create_server(&name, ServerKind::Server, now_millis())
             .map_err(|e| e.to_string())?;
-        let group = client
+        let server = client
             .store()
-            .get_group(&group_id)
+            .get_server(&server_id)
             .map_err(|e| e.to_string())?;
-        let mid = client.mailbox_id_for_group(&group_id);
-        (GroupDto::from_group(&group, false), mid)
+        let mid = client.mailbox_id_for_server(&server_id);
+        (ServerDto::from_server(&server, false), mid)
     };
 
     if let Some(mid) = mailbox_id {
@@ -63,19 +63,42 @@ pub async fn create_group(name: String, state: State<'_, AppState>) -> Result<Gr
         relay.subscribe(mid, 0);
     }
 
-    Ok(group_dto)
+    Ok(server_dto)
+}
+
+#[tauri::command]
+pub async fn create_dm(name: String, state: State<'_, AppState>) -> Result<ServerDto, String> {
+    let (server_dto, mailbox_id) = {
+        let mut client = state.client.lock().await;
+        let server_id = client
+            .create_server(&name, ServerKind::Dm, now_millis())
+            .map_err(|e| e.to_string())?;
+        let server = client
+            .store()
+            .get_server(&server_id)
+            .map_err(|e| e.to_string())?;
+        let mid = client.mailbox_id_for_server(&server_id);
+        (ServerDto::from_server(&server, false), mid)
+    };
+
+    if let Some(mid) = mailbox_id {
+        let mut relay = state.relay.lock().await;
+        relay.subscribe(mid, 0);
+    }
+
+    Ok(server_dto)
 }
 
 #[tauri::command]
 pub async fn list_channels(
-    group_id: String,
+    server_id: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<ChannelDto>, String> {
-    let gid = parse_id(&group_id)?;
+    let sid = parse_id(&server_id)?;
     let client = state.client.lock().await;
     let store = client.store();
-    let channels = store.list_channels(&gid).map_err(|e| e.to_string())?;
-    let unread = store.get_unread_counts(&gid).map_err(|e| e.to_string())?;
+    let channels = store.list_channels(&sid).map_err(|e| e.to_string())?;
+    let unread = store.get_unread_counts(&sid).map_err(|e| e.to_string())?;
     let unread_map: std::collections::HashMap<[u8; 32], u32> = unread.into_iter().collect();
     Ok(channels
         .iter()
@@ -85,44 +108,44 @@ pub async fn list_channels(
 
 #[tauri::command]
 pub async fn list_members(
-    group_id: String,
+    server_id: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<MemberDto>, String> {
-    let gid = parse_id(&group_id)?;
+    let sid = parse_id(&server_id)?;
     let client = state.client.lock().await;
     let members = client
         .store()
-        .list_members(&gid)
+        .list_members(&sid)
         .map_err(|e| e.to_string())?;
     Ok(members.iter().map(MemberDto::from).collect())
 }
 
 #[tauri::command]
-pub async fn pin_group(group_id: String, state: State<'_, AppState>) -> Result<(), String> {
-    let gid = parse_id(&group_id)?;
+pub async fn pin_server(server_id: String, state: State<'_, AppState>) -> Result<(), String> {
+    let sid = parse_id(&server_id)?;
     let client = state.client.lock().await;
     client
         .store()
-        .pin_group(&gid, now_millis())
+        .pin_server(&sid, now_millis())
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub async fn unpin_group(group_id: String, state: State<'_, AppState>) -> Result<(), String> {
-    let gid = parse_id(&group_id)?;
+pub async fn unpin_server(server_id: String, state: State<'_, AppState>) -> Result<(), String> {
+    let sid = parse_id(&server_id)?;
     let client = state.client.lock().await;
     client
         .store()
-        .unpin_group(&gid)
+        .unpin_server(&sid)
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub async fn list_pinned_groups(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+pub async fn list_pinned_servers(state: State<'_, AppState>) -> Result<Vec<String>, String> {
     let client = state.client.lock().await;
     let ids = client
         .store()
-        .list_pinned_group_ids()
+        .list_pinned_server_ids()
         .map_err(|e| e.to_string())?;
     Ok(ids.iter().map(hex::encode).collect())
 }
@@ -145,18 +168,18 @@ pub async fn list_messages(
 
 #[tauri::command]
 pub async fn send_message(
-    group_id: String,
+    server_id: String,
     channel_id: String,
     content: String,
     state: State<'_, AppState>,
 ) -> Result<MessageDto, String> {
-    let gid = parse_id(&group_id)?;
+    let sid = parse_id(&server_id)?;
     let cid = parse_id(&channel_id)?;
 
     let (outbound, dto) = {
         let mut client = state.client.lock().await;
         let (outbound, msg_id) = client
-            .send_message(&gid, &cid, content.into_bytes(), vec![], now_millis())
+            .send_message(&sid, &cid, content.into_bytes(), vec![], now_millis())
             .map_err(|e| e.to_string())?;
         let stored = client
             .store()
@@ -174,12 +197,12 @@ pub async fn send_message(
 
 #[tauri::command]
 pub async fn create_channel(
-    group_id: String,
+    server_id: String,
     name: String,
     kind: String,
     state: State<'_, AppState>,
 ) -> Result<ChannelDto, String> {
-    let gid = parse_id(&group_id)?;
+    let sid = parse_id(&server_id)?;
     let mut channel_id = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut channel_id);
     let kind = match kind.as_str() {
@@ -191,12 +214,12 @@ pub async fn create_channel(
         let mut client = state.client.lock().await;
         let position = client
             .store()
-            .list_channels(&gid)
+            .list_channels(&sid)
             .map_err(|e| e.to_string())?
             .len() as i32;
         let channel = Channel {
             channel_id,
-            group_id: gid,
+            server_id: sid,
             name: name.clone(),
             kind,
             position,
@@ -208,7 +231,7 @@ pub async fn create_channel(
 
         let op = ChannelOpPayload::Create { channel_id, name, kind, position };
         client
-            .send_control(&gid, encode_channel_op(&op))
+            .send_control(&sid, encode_channel_op(&op))
             .map_err(|e| e.to_string())?
     };
 
@@ -238,7 +261,7 @@ pub async fn rename_channel(
 
         let op = ChannelOpPayload::Rename { channel_id: cid, name };
         client
-            .send_control(&channel.group_id, encode_channel_op(&op))
+            .send_control(&channel.server_id, encode_channel_op(&op))
             .map_err(|e| e.to_string())?
     };
 
@@ -264,7 +287,7 @@ pub async fn delete_channel(
 
         let op = ChannelOpPayload::Delete { channel_id: cid };
         client
-            .send_control(&channel.group_id, encode_channel_op(&op))
+            .send_control(&channel.server_id, encode_channel_op(&op))
             .map_err(|e| e.to_string())?
     };
 
@@ -288,14 +311,14 @@ pub async fn mark_channel_read(
 
 #[tauri::command]
 pub async fn create_invite(
-    group_id: String,
+    server_id: String,
     state: State<'_, AppState>,
 ) -> Result<InviteDto, String> {
-    let gid = parse_id(&group_id)?;
+    let sid = parse_id(&server_id)?;
 
     let (token, payload_bytes) = {
         let client = state.client.lock().await;
-        client.create_invite(&gid).map_err(|e| e.to_string())?
+        client.create_invite(&sid).map_err(|e| e.to_string())?
     };
 
     let expires_at = now_millis() + INVITE_EXPIRY_MS;
@@ -334,7 +357,7 @@ pub async fn join_by_invite(
     relay_url: String,
     token: String,
     state: State<'_, AppState>,
-) -> Result<GroupDto, String> {
+) -> Result<ServerDto, String> {
     let response = state
         .http
         .get(format!("{}/invite/{}/join", relay_url, token))
@@ -355,7 +378,7 @@ pub async fn join_by_invite(
         .await
         .map_err(|e| format!("read invite body: {e}"))?;
 
-    let (group_id, commit_bytes, mailbox_id) = {
+    let (server_id, commit_bytes, mailbox_id) = {
         let mut client = state.client.lock().await;
         client
             .join_by_invite(&payload_bytes, now_millis())
@@ -383,7 +406,7 @@ pub async fn join_by_invite(
     let updated_payload = {
         let client = state.client.lock().await;
         client
-            .refresh_invite_payload(&group_id)
+            .refresh_invite_payload(&server_id)
             .map_err(|e| e.to_string())?
     };
 
@@ -405,7 +428,7 @@ pub async fn join_by_invite(
         let mut client = state.client.lock().await;
         let _ = client.store().set_last_seen_seq(&mailbox_id, commit_seq);
         let name = client.identity().display_name.clone();
-        match client.send_control(&group_id, encode_member_announce(&name)) {
+        match client.send_control(&server_id, encode_member_announce(&name)) {
             Ok(out) => Some(out),
             Err(e) => {
                 eprintln!("send_control failed: {e}");
@@ -422,11 +445,11 @@ pub async fn join_by_invite(
     }
 
     let client = state.client.lock().await;
-    let group = client
+    let server = client
         .store()
-        .get_group(&group_id)
+        .get_server(&server_id)
         .map_err(|e| e.to_string())?;
-    Ok(GroupDto::from_group(&group, false))
+    Ok(ServerDto::from_server(&server, false))
 }
 
 #[tauri::command]
@@ -481,7 +504,7 @@ pub async fn set_relay_url(
 
 #[tauri::command]
 pub async fn join_voice(
-    group_id: String,
+    server_id: String,
     channel_id: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
@@ -510,7 +533,7 @@ pub async fn join_voice(
         .voice
         .cmd_tx
         .send(VoiceCommand::Join {
-            group_id,
+            server_id,
             channel_id,
             relay_url,
             fingerprint,
@@ -577,21 +600,21 @@ pub async fn seed_test_data(state: State<'_, AppState>) -> Result<(), String> {
     let dave_fp = id();
     let eve_fp = id();
 
-    // --- Group 1: ghost-dev (3 text, 1 voice, 4 members) ---
+    // --- Server 1: ghost-dev (3 text, 1 voice, 4 members) ---
     let g1 = id();
-    store.insert_group(&Group { group_id: g1, name: "ghost-dev".into(), creator_fp: own_fp, created_at: now - 86_400_000 }).map_err(|e| e.to_string())?;
+    store.insert_server(&Server { server_id: g1, name: "ghost-dev".into(), kind: ServerKind::Server, creator_fp: own_fp, created_at: now - 86_400_000 }).map_err(|e| e.to_string())?;
     let g1_general = id();
     let g1_random = id();
     let g1_bugs = id();
     let g1_voice = id();
-    store.insert_channel(&Channel { channel_id: g1_general, group_id: g1, name: "general".into(), kind: ChannelKind::Text, position: 0 }).map_err(|e| e.to_string())?;
-    store.insert_channel(&Channel { channel_id: g1_random, group_id: g1, name: "random".into(), kind: ChannelKind::Text, position: 1 }).map_err(|e| e.to_string())?;
-    store.insert_channel(&Channel { channel_id: g1_bugs, group_id: g1, name: "bugs".into(), kind: ChannelKind::Text, position: 2 }).map_err(|e| e.to_string())?;
-    store.insert_channel(&Channel { channel_id: g1_voice, group_id: g1, name: "standup".into(), kind: ChannelKind::Voice, position: 3 }).map_err(|e| e.to_string())?;
-    store.insert_member(&Member { group_id: g1, fingerprint: own_fp, display_name: client.identity().display_name.clone(), role: MemberRole::Creator, joined_at: now - 86_400_000 }).map_err(|e| e.to_string())?;
-    store.insert_member(&Member { group_id: g1, fingerprint: alice_fp, display_name: "alice".into(), role: MemberRole::Member, joined_at: now - 82_000_000 }).map_err(|e| e.to_string())?;
-    store.insert_member(&Member { group_id: g1, fingerprint: bob_fp, display_name: "bob".into(), role: MemberRole::Member, joined_at: now - 80_000_000 }).map_err(|e| e.to_string())?;
-    store.insert_member(&Member { group_id: g1, fingerprint: carol_fp, display_name: "carol".into(), role: MemberRole::Member, joined_at: now - 78_000_000 }).map_err(|e| e.to_string())?;
+    store.insert_channel(&Channel { channel_id: g1_general, server_id: g1, name: "general".into(), kind: ChannelKind::Text, position: 0 }).map_err(|e| e.to_string())?;
+    store.insert_channel(&Channel { channel_id: g1_random, server_id: g1, name: "random".into(), kind: ChannelKind::Text, position: 1 }).map_err(|e| e.to_string())?;
+    store.insert_channel(&Channel { channel_id: g1_bugs, server_id: g1, name: "bugs".into(), kind: ChannelKind::Text, position: 2 }).map_err(|e| e.to_string())?;
+    store.insert_channel(&Channel { channel_id: g1_voice, server_id: g1, name: "standup".into(), kind: ChannelKind::Voice, position: 3 }).map_err(|e| e.to_string())?;
+    store.insert_member(&Member { server_id: g1, fingerprint: own_fp, display_name: client.identity().display_name.clone(), role: MemberRole::Creator, joined_at: now - 86_400_000 }).map_err(|e| e.to_string())?;
+    store.insert_member(&Member { server_id: g1, fingerprint: alice_fp, display_name: "alice".into(), role: MemberRole::Member, joined_at: now - 82_000_000 }).map_err(|e| e.to_string())?;
+    store.insert_member(&Member { server_id: g1, fingerprint: bob_fp, display_name: "bob".into(), role: MemberRole::Member, joined_at: now - 80_000_000 }).map_err(|e| e.to_string())?;
+    store.insert_member(&Member { server_id: g1, fingerprint: carol_fp, display_name: "carol".into(), role: MemberRole::Member, joined_at: now - 78_000_000 }).map_err(|e| e.to_string())?;
 
     // Messages in #general — conversation about the project
     let msgs: &[(&[u8; 32], &str)] = &[
@@ -637,18 +660,18 @@ pub async fn seed_test_data(state: State<'_, AppState>) -> Result<(), String> {
         }).map_err(|e| e.to_string())?;
     }
 
-    // --- Group 2: design-club (2 text, 1 voice, 3 members) ---
+    // --- Server 2: design-club (2 text, 1 voice, 3 members) ---
     let g2 = id();
-    store.insert_group(&Group { group_id: g2, name: "design-club".into(), creator_fp: alice_fp, created_at: now - 172_800_000 }).map_err(|e| e.to_string())?;
+    store.insert_server(&Server { server_id: g2, name: "design-club".into(), kind: ServerKind::Server, creator_fp: alice_fp, created_at: now - 172_800_000 }).map_err(|e| e.to_string())?;
     let g2_inspo = id();
     let g2_feedback = id();
     let g2_voice = id();
-    store.insert_channel(&Channel { channel_id: g2_inspo, group_id: g2, name: "inspiration".into(), kind: ChannelKind::Text, position: 0 }).map_err(|e| e.to_string())?;
-    store.insert_channel(&Channel { channel_id: g2_feedback, group_id: g2, name: "feedback".into(), kind: ChannelKind::Text, position: 1 }).map_err(|e| e.to_string())?;
-    store.insert_channel(&Channel { channel_id: g2_voice, group_id: g2, name: "voice-chat".into(), kind: ChannelKind::Voice, position: 2 }).map_err(|e| e.to_string())?;
-    store.insert_member(&Member { group_id: g2, fingerprint: alice_fp, display_name: "alice".into(), role: MemberRole::Creator, joined_at: now - 172_800_000 }).map_err(|e| e.to_string())?;
-    store.insert_member(&Member { group_id: g2, fingerprint: own_fp, display_name: client.identity().display_name.clone(), role: MemberRole::Member, joined_at: now - 170_000_000 }).map_err(|e| e.to_string())?;
-    store.insert_member(&Member { group_id: g2, fingerprint: dave_fp, display_name: "dave".into(), role: MemberRole::Member, joined_at: now - 168_000_000 }).map_err(|e| e.to_string())?;
+    store.insert_channel(&Channel { channel_id: g2_inspo, server_id: g2, name: "inspiration".into(), kind: ChannelKind::Text, position: 0 }).map_err(|e| e.to_string())?;
+    store.insert_channel(&Channel { channel_id: g2_feedback, server_id: g2, name: "feedback".into(), kind: ChannelKind::Text, position: 1 }).map_err(|e| e.to_string())?;
+    store.insert_channel(&Channel { channel_id: g2_voice, server_id: g2, name: "voice-chat".into(), kind: ChannelKind::Voice, position: 2 }).map_err(|e| e.to_string())?;
+    store.insert_member(&Member { server_id: g2, fingerprint: alice_fp, display_name: "alice".into(), role: MemberRole::Creator, joined_at: now - 172_800_000 }).map_err(|e| e.to_string())?;
+    store.insert_member(&Member { server_id: g2, fingerprint: own_fp, display_name: client.identity().display_name.clone(), role: MemberRole::Member, joined_at: now - 170_000_000 }).map_err(|e| e.to_string())?;
+    store.insert_member(&Member { server_id: g2, fingerprint: dave_fp, display_name: "dave".into(), role: MemberRole::Member, joined_at: now - 168_000_000 }).map_err(|e| e.to_string())?;
 
     let inspo_msgs: &[(&[u8; 32], &str)] = &[
         (&alice_fp, "found this amazing dark UI kit — pure black with accent colors"),
@@ -667,18 +690,18 @@ pub async fn seed_test_data(state: State<'_, AppState>) -> Result<(), String> {
         }).map_err(|e| e.to_string())?;
     }
 
-    // --- Group 3: music (1 text, 1 voice, 5 members) ---
+    // --- Server 3: music (1 text, 1 voice, 5 members) ---
     let g3 = id();
-    store.insert_group(&Group { group_id: g3, name: "music".into(), creator_fp: carol_fp, created_at: now - 259_200_000 }).map_err(|e| e.to_string())?;
+    store.insert_server(&Server { server_id: g3, name: "music".into(), kind: ServerKind::Server, creator_fp: carol_fp, created_at: now - 259_200_000 }).map_err(|e| e.to_string())?;
     let g3_recs = id();
     let g3_listen = id();
-    store.insert_channel(&Channel { channel_id: g3_recs, group_id: g3, name: "recommendations".into(), kind: ChannelKind::Text, position: 0 }).map_err(|e| e.to_string())?;
-    store.insert_channel(&Channel { channel_id: g3_listen, group_id: g3, name: "listening-party".into(), kind: ChannelKind::Voice, position: 1 }).map_err(|e| e.to_string())?;
-    store.insert_member(&Member { group_id: g3, fingerprint: carol_fp, display_name: "carol".into(), role: MemberRole::Creator, joined_at: now - 259_200_000 }).map_err(|e| e.to_string())?;
-    store.insert_member(&Member { group_id: g3, fingerprint: own_fp, display_name: client.identity().display_name.clone(), role: MemberRole::Member, joined_at: now - 250_000_000 }).map_err(|e| e.to_string())?;
-    store.insert_member(&Member { group_id: g3, fingerprint: alice_fp, display_name: "alice".into(), role: MemberRole::Member, joined_at: now - 248_000_000 }).map_err(|e| e.to_string())?;
-    store.insert_member(&Member { group_id: g3, fingerprint: bob_fp, display_name: "bob".into(), role: MemberRole::Member, joined_at: now - 246_000_000 }).map_err(|e| e.to_string())?;
-    store.insert_member(&Member { group_id: g3, fingerprint: eve_fp, display_name: "eve".into(), role: MemberRole::Member, joined_at: now - 244_000_000 }).map_err(|e| e.to_string())?;
+    store.insert_channel(&Channel { channel_id: g3_recs, server_id: g3, name: "recommendations".into(), kind: ChannelKind::Text, position: 0 }).map_err(|e| e.to_string())?;
+    store.insert_channel(&Channel { channel_id: g3_listen, server_id: g3, name: "listening-party".into(), kind: ChannelKind::Voice, position: 1 }).map_err(|e| e.to_string())?;
+    store.insert_member(&Member { server_id: g3, fingerprint: carol_fp, display_name: "carol".into(), role: MemberRole::Creator, joined_at: now - 259_200_000 }).map_err(|e| e.to_string())?;
+    store.insert_member(&Member { server_id: g3, fingerprint: own_fp, display_name: client.identity().display_name.clone(), role: MemberRole::Member, joined_at: now - 250_000_000 }).map_err(|e| e.to_string())?;
+    store.insert_member(&Member { server_id: g3, fingerprint: alice_fp, display_name: "alice".into(), role: MemberRole::Member, joined_at: now - 248_000_000 }).map_err(|e| e.to_string())?;
+    store.insert_member(&Member { server_id: g3, fingerprint: bob_fp, display_name: "bob".into(), role: MemberRole::Member, joined_at: now - 246_000_000 }).map_err(|e| e.to_string())?;
+    store.insert_member(&Member { server_id: g3, fingerprint: eve_fp, display_name: "eve".into(), role: MemberRole::Member, joined_at: now - 244_000_000 }).map_err(|e| e.to_string())?;
 
     let rec_msgs: &[(&[u8; 32], &str)] = &[
         (&carol_fp, "new burial album dropped"),
@@ -699,8 +722,53 @@ pub async fn seed_test_data(state: State<'_, AppState>) -> Result<(), String> {
         }).map_err(|e| e.to_string())?;
     }
 
-    // Pin the first group
-    store.pin_group(&g1, now).map_err(|e| e.to_string())?;
+    // --- DM 1: with alice ---
+    let dm1 = id();
+    let dm1_ch = id();
+    store.insert_server(&Server { server_id: dm1, name: "alice".into(), kind: ServerKind::Dm, creator_fp: own_fp, created_at: now - 50_000_000 }).map_err(|e| e.to_string())?;
+    store.insert_channel(&Channel { channel_id: dm1_ch, server_id: dm1, name: "messages".into(), kind: ChannelKind::Text, position: 0 }).map_err(|e| e.to_string())?;
+    store.insert_member(&Member { server_id: dm1, fingerprint: own_fp, display_name: client.identity().display_name.clone(), role: MemberRole::Creator, joined_at: now - 50_000_000 }).map_err(|e| e.to_string())?;
+    store.insert_member(&Member { server_id: dm1, fingerprint: alice_fp, display_name: "alice".into(), role: MemberRole::Member, joined_at: now - 49_000_000 }).map_err(|e| e.to_string())?;
+    let dm1_msgs: &[(&[u8; 32], &str)] = &[
+        (&alice_fp, "hey, got a sec?"),
+        (&own_fp, "yeah what's up"),
+        (&alice_fp, "can you review my PR? it's the sidebar refactor"),
+        (&own_fp, "sure, I'll take a look after standup"),
+        (&alice_fp, "thanks!"),
+    ];
+    for (i, (sender, content)) in dm1_msgs.iter().enumerate() {
+        let t = now - 1_800_000 + (i as u64 * 60_000);
+        store.insert_message(&StoredMessage {
+            message_id: id(), channel_id: dm1_ch, sender_fp: **sender,
+            message_type: 0, timestamp: t, received_at: t, content: content.as_bytes().to_vec(),
+            expires_at: None, references: vec![],
+        }).map_err(|e| e.to_string())?;
+    }
+
+    // --- DM 2: with bob ---
+    let dm2 = id();
+    let dm2_ch = id();
+    store.insert_server(&Server { server_id: dm2, name: "bob".into(), kind: ServerKind::Dm, creator_fp: bob_fp, created_at: now - 40_000_000 }).map_err(|e| e.to_string())?;
+    store.insert_channel(&Channel { channel_id: dm2_ch, server_id: dm2, name: "messages".into(), kind: ChannelKind::Text, position: 0 }).map_err(|e| e.to_string())?;
+    store.insert_member(&Member { server_id: dm2, fingerprint: own_fp, display_name: client.identity().display_name.clone(), role: MemberRole::Member, joined_at: now - 39_000_000 }).map_err(|e| e.to_string())?;
+    store.insert_member(&Member { server_id: dm2, fingerprint: bob_fp, display_name: "bob".into(), role: MemberRole::Creator, joined_at: now - 40_000_000 }).map_err(|e| e.to_string())?;
+    let dm2_msgs: &[(&[u8; 32], &str)] = &[
+        (&bob_fp, "that voice codec patch is wild"),
+        (&own_fp, "right? opus is doing heavy lifting"),
+        (&bob_fp, "latency numbers?"),
+        (&own_fp, "~20ms encode, jitter buffer adds ~40ms"),
+    ];
+    for (i, (sender, content)) in dm2_msgs.iter().enumerate() {
+        let t = now - 5_400_000 + (i as u64 * 90_000);
+        store.insert_message(&StoredMessage {
+            message_id: id(), channel_id: dm2_ch, sender_fp: **sender,
+            message_type: 0, timestamp: t, received_at: t, content: content.as_bytes().to_vec(),
+            expires_at: None, references: vec![],
+        }).map_err(|e| e.to_string())?;
+    }
+
+    // Pin the first server
+    store.pin_server(&g1, now).map_err(|e| e.to_string())?;
 
     Ok(())
 }
@@ -715,14 +783,14 @@ pub struct DevSession {
 }
 
 #[tauri::command]
-pub async fn create_dev_session(state: State<'_, AppState>) -> Result<GroupDto, String> {
-    // Create group
-    let (group_id, mailbox_id) = {
+pub async fn create_dev_session(state: State<'_, AppState>) -> Result<ServerDto, String> {
+    // Create server
+    let (server_id, mailbox_id) = {
         let mut client = state.client.lock().await;
-        let gid = client
-            .create_group("dev", now_millis())
+        let sid = client
+            .create_server("dev", ServerKind::Server, now_millis())
             .map_err(|e| e.to_string())?;
-        let mid = client.mailbox_id_for_group(&gid);
+        let mid = client.mailbox_id_for_server(&sid);
 
         // Create default channels
         let mut general_id = [0u8; 32];
@@ -731,14 +799,14 @@ pub async fn create_dev_session(state: State<'_, AppState>) -> Result<GroupDto, 
         rand::rngs::OsRng.fill_bytes(&mut voice_id);
         let position = client
             .store()
-            .list_channels(&gid)
+            .list_channels(&sid)
             .map_err(|e| e.to_string())?
             .len() as i32;
         client
             .store()
             .insert_channel(&Channel {
                 channel_id: general_id,
-                group_id: gid,
+                server_id: sid,
                 name: "general".into(),
                 kind: ChannelKind::Text,
                 position,
@@ -748,14 +816,14 @@ pub async fn create_dev_session(state: State<'_, AppState>) -> Result<GroupDto, 
             .store()
             .insert_channel(&Channel {
                 channel_id: voice_id,
-                group_id: gid,
+                server_id: sid,
                 name: "voice".into(),
                 kind: ChannelKind::Voice,
                 position: position + 1,
             })
             .map_err(|e| e.to_string())?;
 
-        (gid, mid)
+        (sid, mid)
     };
 
     // Subscribe to mailbox
@@ -767,7 +835,7 @@ pub async fn create_dev_session(state: State<'_, AppState>) -> Result<GroupDto, 
     // Create invite and upload to relay
     let (token, payload_bytes) = {
         let client = state.client.lock().await;
-        client.create_invite(&group_id).map_err(|e| e.to_string())?
+        client.create_invite(&server_id).map_err(|e| e.to_string())?
     };
 
     let expires_at = now_millis() + INVITE_EXPIRY_MS;
@@ -804,11 +872,11 @@ pub async fn create_dev_session(state: State<'_, AppState>) -> Result<GroupDto, 
     .map_err(|e| format!("write dev session: {e}"))?;
 
     let client = state.client.lock().await;
-    let group = client
+    let server = client
         .store()
-        .get_group(&group_id)
+        .get_server(&server_id)
         .map_err(|e| e.to_string())?;
-    Ok(GroupDto::from_group(&group, false))
+    Ok(ServerDto::from_server(&server, false))
 }
 
 #[tauri::command]

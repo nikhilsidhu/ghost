@@ -1,5 +1,5 @@
 pub mod channels;
-pub mod groups;
+pub mod servers;
 pub mod members;
 pub mod messages;
 pub mod pins;
@@ -24,7 +24,7 @@ pub(crate) fn blob32(row: &rusqlite::Row, idx: usize) -> rusqlite::Result<[u8; 3
     })
 }
 
-/// Encrypted local database for groups, channels, members, and messages.
+/// Encrypted local database for servers, channels, members, and messages.
 pub struct GhostStore {
     conn: Connection,
 }
@@ -75,10 +75,49 @@ impl GhostStore {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ServerKind {
+    Server,
+    Dm,
+}
+
+impl ServerKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ServerKind::Server => "server",
+            ServerKind::Dm => "dm",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<Self> {
+        match s {
+            "server" => Ok(ServerKind::Server),
+            "dm" => Ok(ServerKind::Dm),
+            other => Err(GhostError::Database(format!("unknown server kind: {other}"))),
+        }
+    }
+
+    pub fn to_byte(self) -> u8 {
+        match self {
+            ServerKind::Server => 0,
+            ServerKind::Dm => 1,
+        }
+    }
+
+    pub fn from_byte(b: u8) -> Result<Self> {
+        match b {
+            0 => Ok(ServerKind::Server),
+            1 => Ok(ServerKind::Dm),
+            _ => Err(GhostError::Format(format!("unknown server kind byte: {b}"))),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
-pub struct Group {
-    pub group_id: [u8; 32],
+pub struct Server {
+    pub server_id: [u8; 32],
     pub name: String,
+    pub kind: ServerKind,
     pub creator_fp: [u8; 32],
     pub created_at: u64,
 }
@@ -126,7 +165,7 @@ impl ChannelKind {
 #[derive(Debug, Clone)]
 pub struct Channel {
     pub channel_id: [u8; 32],
-    pub group_id: [u8; 32],
+    pub server_id: [u8; 32],
     pub name: String,
     pub kind: ChannelKind,
     pub position: i32,
@@ -172,7 +211,7 @@ impl MemberRole {
 
 #[derive(Debug, Clone)]
 pub struct Member {
-    pub group_id: [u8; 32],
+    pub server_id: [u8; 32],
     pub fingerprint: [u8; 32],
     pub display_name: String,
     pub role: MemberRole,
@@ -209,28 +248,29 @@ mod tests {
         id
     }
 
-    fn make_group(name: &str) -> Group {
-        Group {
-            group_id: rand_id(),
+    fn make_server(name: &str) -> Server {
+        Server {
+            server_id: rand_id(),
             name: name.to_string(),
+            kind: ServerKind::Server,
             creator_fp: rand_id(),
             created_at: 1000,
         }
     }
 
-    fn make_channel(group_id: [u8; 32], name: &str, pos: i32) -> Channel {
+    fn make_channel(server_id: [u8; 32], name: &str, pos: i32) -> Channel {
         Channel {
             channel_id: rand_id(),
-            group_id,
+            server_id,
             name: name.to_string(),
             kind: ChannelKind::Text,
             position: pos,
         }
     }
 
-    fn make_member(group_id: [u8; 32], role: MemberRole) -> Member {
+    fn make_member(server_id: [u8; 32], role: MemberRole) -> Member {
         Member {
-            group_id,
+            server_id,
             fingerprint: rand_id(),
             display_name: "user".to_string(),
             role,
@@ -252,47 +292,47 @@ mod tests {
         }
     }
 
-    // -- Group tests --
+    // -- Server tests --
 
     #[test]
-    fn group_insert_get_list() {
+    fn server_insert_get_list() {
         let store = test_store();
-        let g = make_group("test-group");
-        store.insert_group(&g).unwrap();
+        let s = make_server("test-server");
+        store.insert_server(&s).unwrap();
 
-        let got = store.get_group(&g.group_id).unwrap();
-        assert_eq!(got.name, "test-group");
-        assert_eq!(got.group_id, g.group_id);
+        let got = store.get_server(&s.server_id).unwrap();
+        assert_eq!(got.name, "test-server");
+        assert_eq!(got.server_id, s.server_id);
 
-        let all = store.list_groups().unwrap();
+        let all = store.list_servers().unwrap();
         assert_eq!(all.len(), 1);
     }
 
     #[test]
-    fn group_rename() {
+    fn server_rename() {
         let store = test_store();
-        let g = make_group("old-name");
-        store.insert_group(&g).unwrap();
-        store.rename_group(&g.group_id, "new-name").unwrap();
+        let s = make_server("old-name");
+        store.insert_server(&s).unwrap();
+        store.rename_server(&s.server_id, "new-name").unwrap();
 
-        let got = store.get_group(&g.group_id).unwrap();
+        let got = store.get_server(&s.server_id).unwrap();
         assert_eq!(got.name, "new-name");
     }
 
     // -- Channel tests --
 
     #[test]
-    fn channel_insert_list_by_group() {
+    fn channel_insert_list_by_server() {
         let store = test_store();
-        let g = make_group("grp");
-        store.insert_group(&g).unwrap();
+        let s = make_server("grp");
+        store.insert_server(&s).unwrap();
 
-        let c1 = make_channel(g.group_id, "general", 0);
-        let c2 = make_channel(g.group_id, "random", 1);
+        let c1 = make_channel(s.server_id, "general", 0);
+        let c2 = make_channel(s.server_id, "random", 1);
         store.insert_channel(&c1).unwrap();
         store.insert_channel(&c2).unwrap();
 
-        let channels = store.list_channels(&g.group_id).unwrap();
+        let channels = store.list_channels(&s.server_id).unwrap();
         assert_eq!(channels.len(), 2);
         assert_eq!(channels[0].name, "general");
         assert_eq!(channels[1].name, "random");
@@ -301,9 +341,9 @@ mod tests {
     #[test]
     fn channel_rename() {
         let store = test_store();
-        let g = make_group("grp");
-        store.insert_group(&g).unwrap();
-        let c = make_channel(g.group_id, "old", 0);
+        let s = make_server("grp");
+        store.insert_server(&s).unwrap();
+        let c = make_channel(s.server_id, "old", 0);
         store.insert_channel(&c).unwrap();
 
         store.rename_channel(&c.channel_id, "new").unwrap();
@@ -316,18 +356,18 @@ mod tests {
     #[test]
     fn member_insert_list_remove() {
         let store = test_store();
-        let g = make_group("grp");
-        store.insert_group(&g).unwrap();
+        let s = make_server("grp");
+        store.insert_server(&s).unwrap();
 
-        let m = make_member(g.group_id, MemberRole::Creator);
+        let m = make_member(s.server_id, MemberRole::Creator);
         store.insert_member(&m).unwrap();
 
-        let members = store.list_members(&g.group_id).unwrap();
+        let members = store.list_members(&s.server_id).unwrap();
         assert_eq!(members.len(), 1);
         assert_eq!(members[0].role, MemberRole::Creator);
 
-        store.remove_member(&g.group_id, &m.fingerprint).unwrap();
-        let members = store.list_members(&g.group_id).unwrap();
+        store.remove_member(&s.server_id, &m.fingerprint).unwrap();
+        let members = store.list_members(&s.server_id).unwrap();
         assert_eq!(members.len(), 0);
     }
 
@@ -336,9 +376,9 @@ mod tests {
     #[test]
     fn message_insert_get_paginate() {
         let store = test_store();
-        let g = make_group("grp");
-        store.insert_group(&g).unwrap();
-        let c = make_channel(g.group_id, "general", 0);
+        let s = make_server("grp");
+        store.insert_server(&s).unwrap();
+        let c = make_channel(s.server_id, "general", 0);
         store.insert_channel(&c).unwrap();
 
         for i in 0..5 {
@@ -361,9 +401,9 @@ mod tests {
     #[test]
     fn message_references() {
         let store = test_store();
-        let g = make_group("grp");
-        store.insert_group(&g).unwrap();
-        let c = make_channel(g.group_id, "general", 0);
+        let s = make_server("grp");
+        store.insert_server(&s).unwrap();
+        let c = make_channel(s.server_id, "general", 0);
         store.insert_channel(&c).unwrap();
 
         let original = make_message(c.channel_id, 1000, "hello");
@@ -382,9 +422,9 @@ mod tests {
     #[test]
     fn delete_message_clears_content() {
         let store = test_store();
-        let g = make_group("grp");
-        store.insert_group(&g).unwrap();
-        let c = make_channel(g.group_id, "general", 0);
+        let s = make_server("grp");
+        store.insert_server(&s).unwrap();
+        let c = make_channel(s.server_id, "general", 0);
         store.insert_channel(&c).unwrap();
 
         let msg = make_message(c.channel_id, 1000, "secret");
@@ -399,9 +439,9 @@ mod tests {
     #[test]
     fn fts_search() {
         let store = test_store();
-        let g = make_group("grp");
-        store.insert_group(&g).unwrap();
-        let c = make_channel(g.group_id, "general", 0);
+        let s = make_server("grp");
+        store.insert_server(&s).unwrap();
+        let c = make_channel(s.server_id, "general", 0);
         store.insert_channel(&c).unwrap();
 
         let m1 = make_message(c.channel_id, 1000, "hello world");
@@ -418,9 +458,9 @@ mod tests {
     #[test]
     fn deleted_message_excluded_from_search() {
         let store = test_store();
-        let g = make_group("grp");
-        store.insert_group(&g).unwrap();
-        let c = make_channel(g.group_id, "general", 0);
+        let s = make_server("grp");
+        store.insert_server(&s).unwrap();
+        let c = make_channel(s.server_id, "general", 0);
         store.insert_channel(&c).unwrap();
 
         let m1 = make_message(c.channel_id, 1000, "sensitive data");
@@ -456,33 +496,33 @@ mod tests {
     // -- Cascade delete tests --
 
     #[test]
-    fn cascade_delete_group_removes_children() {
+    fn cascade_delete_server_removes_children() {
         let store = test_store();
-        let g = make_group("grp");
-        store.insert_group(&g).unwrap();
+        let s = make_server("grp");
+        store.insert_server(&s).unwrap();
 
-        let c = make_channel(g.group_id, "general", 0);
+        let c = make_channel(s.server_id, "general", 0);
         store.insert_channel(&c).unwrap();
 
-        let m = make_member(g.group_id, MemberRole::Member);
+        let m = make_member(s.server_id, MemberRole::Member);
         store.insert_member(&m).unwrap();
 
         let msg = make_message(c.channel_id, 1000, "hi");
         store.insert_message(&msg).unwrap();
 
-        store.delete_group(&g.group_id).unwrap();
+        store.delete_server(&s.server_id).unwrap();
 
         assert!(store.get_channel(&c.channel_id).is_err());
-        assert!(store.list_members(&g.group_id).unwrap().is_empty());
+        assert!(store.list_members(&s.server_id).unwrap().is_empty());
         assert!(store.get_message(&msg.message_id).is_err());
     }
 
     #[test]
     fn cascade_delete_channel_removes_messages() {
         let store = test_store();
-        let g = make_group("grp");
-        store.insert_group(&g).unwrap();
-        let c = make_channel(g.group_id, "general", 0);
+        let s = make_server("grp");
+        store.insert_server(&s).unwrap();
+        let c = make_channel(s.server_id, "general", 0);
         store.insert_channel(&c).unwrap();
 
         let msg = make_message(c.channel_id, 1000, "hi");
@@ -495,19 +535,19 @@ mod tests {
     #[test]
     fn remove_member_keeps_messages() {
         let store = test_store();
-        let g = make_group("grp");
-        store.insert_group(&g).unwrap();
-        let c = make_channel(g.group_id, "general", 0);
+        let s = make_server("grp");
+        store.insert_server(&s).unwrap();
+        let c = make_channel(s.server_id, "general", 0);
         store.insert_channel(&c).unwrap();
 
-        let m = make_member(g.group_id, MemberRole::Member);
+        let m = make_member(s.server_id, MemberRole::Member);
         store.insert_member(&m).unwrap();
 
         let mut msg = make_message(c.channel_id, 1000, "hi");
         msg.sender_fp = m.fingerprint;
         store.insert_message(&msg).unwrap();
 
-        store.remove_member(&g.group_id, &m.fingerprint).unwrap();
+        store.remove_member(&s.server_id, &m.fingerprint).unwrap();
 
         // Message still exists after member removal
         let got = store.get_message(&msg.message_id).unwrap();
@@ -517,31 +557,31 @@ mod tests {
     // -- Pin tests --
 
     #[test]
-    fn pin_unpin_group() {
+    fn pin_unpin_server() {
         let store = test_store();
-        let g = make_group("pinnable");
-        store.insert_group(&g).unwrap();
+        let s = make_server("pinnable");
+        store.insert_server(&s).unwrap();
 
-        store.pin_group(&g.group_id, 5000).unwrap();
-        assert!(store.is_pinned(&g.group_id).unwrap());
+        store.pin_server(&s.server_id, 5000).unwrap();
+        assert!(store.is_pinned(&s.server_id).unwrap());
 
-        let pins = store.list_pinned_group_ids().unwrap();
+        let pins = store.list_pinned_server_ids().unwrap();
         assert_eq!(pins.len(), 1);
-        assert_eq!(pins[0], g.group_id);
+        assert_eq!(pins[0], s.server_id);
 
-        store.unpin_group(&g.group_id).unwrap();
-        assert!(!store.is_pinned(&g.group_id).unwrap());
-        assert!(store.list_pinned_group_ids().unwrap().is_empty());
+        store.unpin_server(&s.server_id).unwrap();
+        assert!(!store.is_pinned(&s.server_id).unwrap());
+        assert!(store.list_pinned_server_ids().unwrap().is_empty());
     }
 
     #[test]
-    fn pin_cascades_on_group_delete() {
+    fn pin_cascades_on_server_delete() {
         let store = test_store();
-        let g = make_group("temp");
-        store.insert_group(&g).unwrap();
-        store.pin_group(&g.group_id, 5000).unwrap();
-        store.delete_group(&g.group_id).unwrap();
-        assert!(store.list_pinned_group_ids().unwrap().is_empty());
+        let s = make_server("temp");
+        store.insert_server(&s).unwrap();
+        store.pin_server(&s.server_id, 5000).unwrap();
+        store.delete_server(&s.server_id).unwrap();
+        assert!(store.list_pinned_server_ids().unwrap().is_empty());
     }
 
     // -- Encrypted DB tests --
@@ -554,13 +594,13 @@ mod tests {
 
         {
             let store = GhostStore::open(&seed, &path).unwrap();
-            let g = make_group("grp");
-            store.insert_group(&g).unwrap();
+            let s = make_server("grp");
+            store.insert_server(&s).unwrap();
         }
 
         // Try opening the file without encryption — should fail
         let plain = Connection::open(&path).unwrap();
-        let result = plain.execute_batch("SELECT * FROM groups");
+        let result = plain.execute_batch("SELECT * FROM servers");
         assert!(result.is_err());
     }
 
@@ -569,18 +609,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("persist.db");
         let seed = [0xABu8; 32];
-        let group_id;
+        let server_id;
 
         {
             let store = GhostStore::open(&seed, &path).unwrap();
-            let g = make_group("survivors");
-            group_id = g.group_id;
-            store.insert_group(&g).unwrap();
+            let s = make_server("survivors");
+            server_id = s.server_id;
+            store.insert_server(&s).unwrap();
         }
 
         // Reopen with same seed, data should be there
         let store = GhostStore::open(&seed, &path).unwrap();
-        let got = store.get_group(&group_id).unwrap();
+        let got = store.get_server(&server_id).unwrap();
         assert_eq!(got.name, "survivors");
     }
 
@@ -591,7 +631,7 @@ mod tests {
         let store = test_store();
         let fake = rand_id();
 
-        assert!(store.get_group(&fake).is_err());
+        assert!(store.get_server(&fake).is_err());
         assert!(store.get_channel(&fake).is_err());
         assert!(store.get_message(&fake).is_err());
         assert!(store.get_member(&fake, &fake).is_err());
@@ -603,9 +643,9 @@ mod tests {
     #[test]
     fn duplicate_references_deduped() {
         let store = test_store();
-        let g = make_group("grp");
-        store.insert_group(&g).unwrap();
-        let c = make_channel(g.group_id, "general", 0);
+        let s = make_server("grp");
+        store.insert_server(&s).unwrap();
+        let c = make_channel(s.server_id, "general", 0);
         store.insert_channel(&c).unwrap();
 
         let target = rand_id();
@@ -620,9 +660,9 @@ mod tests {
     #[test]
     fn duplicate_message_id_is_idempotent() {
         let store = test_store();
-        let g = make_group("grp");
-        store.insert_group(&g).unwrap();
-        let c = make_channel(g.group_id, "general", 0);
+        let s = make_server("grp");
+        store.insert_server(&s).unwrap();
+        let c = make_channel(s.server_id, "general", 0);
         store.insert_channel(&c).unwrap();
 
         let msg = make_message(c.channel_id, 1000, "hello");
@@ -639,9 +679,9 @@ mod tests {
     #[test]
     fn fts_special_characters_dont_crash() {
         let store = test_store();
-        let g = make_group("grp");
-        store.insert_group(&g).unwrap();
-        let c = make_channel(g.group_id, "general", 0);
+        let s = make_server("grp");
+        store.insert_server(&s).unwrap();
+        let c = make_channel(s.server_id, "general", 0);
         store.insert_channel(&c).unwrap();
 
         let m = make_message(c.channel_id, 1000, "normal message");

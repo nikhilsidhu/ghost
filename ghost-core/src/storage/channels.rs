@@ -6,10 +6,10 @@ impl GhostStore {
     pub fn insert_channel(&self, channel: &Channel) -> Result<()> {
         self.conn
             .execute(
-                "INSERT INTO channels (channel_id, group_id, name, kind, position) VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO channels (channel_id, server_id, name, kind, position) VALUES (?1, ?2, ?3, ?4, ?5)",
                 rusqlite::params![
                     channel.channel_id.as_slice(),
-                    channel.group_id.as_slice(),
+                    channel.server_id.as_slice(),
                     channel.name,
                     channel.kind.as_str(),
                     channel.position,
@@ -22,12 +22,12 @@ impl GhostStore {
     pub fn get_channel(&self, channel_id: &[u8; 32]) -> Result<Channel> {
         self.conn
             .query_row(
-                "SELECT channel_id, group_id, name, kind, position FROM channels WHERE channel_id = ?1",
+                "SELECT channel_id, server_id, name, kind, position FROM channels WHERE channel_id = ?1",
                 [channel_id.as_slice()],
                 |row| {
                     Ok(RawChannel {
                         channel_id: blob32(row, 0)?,
-                        group_id: blob32(row, 1)?,
+                        server_id: blob32(row, 1)?,
                         name: row.get(2)?,
                         kind_str: row.get(3)?,
                         position: row.get(4)?,
@@ -38,19 +38,19 @@ impl GhostStore {
             .and_then(|r| r.into_channel())
     }
 
-    pub fn list_channels(&self, group_id: &[u8; 32]) -> Result<Vec<Channel>> {
+    pub fn list_channels(&self, server_id: &[u8; 32]) -> Result<Vec<Channel>> {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT channel_id, group_id, name, kind, position FROM channels WHERE group_id = ?1 ORDER BY position",
+                "SELECT channel_id, server_id, name, kind, position FROM channels WHERE server_id = ?1 ORDER BY position",
             )
             .map_err(|e| GhostError::Database(format!("prepare list channels: {e}")))?;
 
         let rows = stmt
-            .query_map([group_id.as_slice()], |row| {
+            .query_map([server_id.as_slice()], |row| {
                 Ok(RawChannel {
                     channel_id: blob32(row, 0)?,
-                    group_id: blob32(row, 1)?,
+                    server_id: blob32(row, 1)?,
                     name: row.get(2)?,
                     kind_str: row.get(3)?,
                     position: row.get(4)?,
@@ -95,7 +95,7 @@ impl GhostStore {
 // Intermediate struct to avoid complex tuples with String in rusqlite closures.
 struct RawChannel {
     channel_id: [u8; 32],
-    group_id: [u8; 32],
+    server_id: [u8; 32],
     name: String,
     kind_str: String,
     position: i32,
@@ -105,7 +105,7 @@ impl RawChannel {
     fn into_channel(self) -> Result<Channel> {
         Ok(Channel {
             channel_id: self.channel_id,
-            group_id: self.group_id,
+            server_id: self.server_id,
             name: self.name,
             kind: ChannelKind::parse(&self.kind_str)?,
             position: self.position,

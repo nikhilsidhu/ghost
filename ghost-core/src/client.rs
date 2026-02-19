@@ -12,7 +12,7 @@ use crate::identity::Identity;
 use crate::mls::credential::generate_key_package;
 use crate::mls::group::GhostGroup;
 use crate::storage::{
-    Channel, ChannelKind, GhostStore, Group, Member, MemberRole, StoredMessage,
+    Channel, ChannelKind, GhostStore, Server, ServerKind, Member, MemberRole, StoredMessage,
 };
 use crate::wire::{
     derive_default_channel_id, group_mailbox_id, open, open_any, seal, ApplicationMessage,
@@ -47,8 +47,8 @@ pub struct GhostClient {
     identity: Identity,
     provider: GhostProvider,
     store: GhostStore,
-    groups: HashMap<[u8; 32], GhostGroup>,
-    /// mailbox_id → group_id for O(1) reverse lookup
+    servers: HashMap<[u8; 32], GhostGroup>,
+    /// mailbox_id → server_id for O(1) reverse lookup
     mailbox_map: HashMap<[u8; 32], [u8; 32]>,
 }
 
@@ -61,27 +61,27 @@ impl GhostClient {
         let provider = GhostProvider::new(mls_conn)?;
 
         // Reload MLS groups that were persisted from previous sessions
-        let mut groups = HashMap::new();
-        if let Ok(stored_groups) = store.list_groups() {
-            for g in &stored_groups {
+        let mut servers = HashMap::new();
+        if let Ok(stored_servers) = store.list_servers() {
+            for s in &stored_servers {
                 if let Ok(Some(ghost_group)) =
-                    GhostGroup::load(&provider, &identity, &g.group_id)
+                    GhostGroup::load(&provider, &identity, &s.server_id)
                 {
-                    groups.insert(g.group_id, ghost_group);
+                    servers.insert(s.server_id, ghost_group);
                 }
             }
         }
 
-        let mailbox_map = groups
+        let mailbox_map = servers
             .iter()
-            .map(|(gid, g)| (group_mailbox_id(g.group_id()), *gid))
+            .map(|(sid, g)| (group_mailbox_id(g.group_id()), *sid))
             .collect();
 
         Ok(Self {
             identity,
             provider,
             store,
-            groups,
+            servers,
             mailbox_map,
         })
     }
@@ -94,7 +94,7 @@ impl GhostClient {
             identity,
             provider,
             store,
-            groups: HashMap::new(),
+            servers: HashMap::new(),
             mailbox_map: HashMap::new(),
         })
     }
@@ -119,31 +119,36 @@ impl GhostClient {
         generate_key_package(&self.provider, &self.identity)
     }
 
-    pub fn create_group(&mut self, name: &str, timestamp: u64) -> Result<[u8; 32]> {
-        let mut group_id = [0u8; 32];
-        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut group_id);
+    pub fn create_server(&mut self, name: &str, kind: ServerKind, timestamp: u64) -> Result<[u8; 32]> {
+        let mut server_id = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut server_id);
 
         let ghost_group =
-            GhostGroup::create_with_id(&self.provider, &self.identity, &group_id)?;
+            GhostGroup::create_with_id(&self.provider, &self.identity, &server_id)?;
 
-        self.store.insert_group(&Group {
-            group_id,
+        self.store.insert_server(&Server {
+            server_id,
             name: name.to_string(),
+            kind,
             creator_fp: self.identity.fingerprint,
             created_at: timestamp,
         })?;
 
-        let channel_id = derive_default_channel_id(&group_id);
+        let channel_name = match kind {
+            ServerKind::Dm => "messages",
+            ServerKind::Server => "general",
+        };
+        let channel_id = derive_default_channel_id(&server_id);
         self.store.insert_channel(&Channel {
             channel_id,
-            group_id,
-            name: "general".to_string(),
+            server_id,
+            name: channel_name.to_string(),
             kind: ChannelKind::Text,
             position: 0,
         })?;
 
         self.store.insert_member(&Member {
-            group_id,
+            server_id,
             fingerprint: self.identity.fingerprint,
             display_name: self.identity.display_name.clone(),
             role: MemberRole::Creator,
@@ -151,21 +156,21 @@ impl GhostClient {
         })?;
 
         let mailbox_id = group_mailbox_id(ghost_group.group_id());
-        self.groups.insert(group_id, ghost_group);
-        self.mailbox_map.insert(mailbox_id, group_id);
-        Ok(group_id)
+        self.servers.insert(server_id, ghost_group);
+        self.mailbox_map.insert(mailbox_id, server_id);
+        Ok(server_id)
     }
 
     pub fn send_message(
         &mut self,
-        group_id: &[u8; 32],
+        server_id: &[u8; 32],
         channel_id: &[u8; 32],
         content: Vec<u8>,
         references: Vec<[u8; 32]>,
         timestamp: u64,
     ) -> Result<(Outbound, [u8; 32])> {
-        let group = self.groups.get_mut(group_id).ok_or_else(|| {
-            GhostError::GroupNotLoaded(hex::encode(&group_id[..8]))
+        let group = self.servers.get_mut(server_id).ok_or_else(|| {
+            GhostError::ServerNotLoaded(hex::encode(&server_id[..8]))
         })?;
 
         let msg = ApplicationMessage::new(
@@ -204,11 +209,11 @@ impl GhostClient {
     /// Send a control message (e.g. channel ops). MLS-encrypted but not stored locally.
     pub fn send_control(
         &mut self,
-        group_id: &[u8; 32],
+        server_id: &[u8; 32],
         content: Vec<u8>,
     ) -> Result<Outbound> {
-        let group = self.groups.get_mut(group_id).ok_or_else(|| {
-            GhostError::GroupNotLoaded(hex::encode(&group_id[..8]))
+        let group = self.servers.get_mut(server_id).ok_or_else(|| {
+            GhostError::ServerNotLoaded(hex::encode(&server_id[..8]))
         })?;
 
         let now = SystemTime::now()
@@ -234,12 +239,12 @@ impl GhostClient {
     /// provided, otherwise falls back to local clock.
     pub fn receive_blob(
         &mut self,
-        group_id: &[u8; 32],
+        server_id: &[u8; 32],
         blob: &[u8],
         received_at: Option<u64>,
     ) -> Result<ApplicationMessage> {
-        let group = self.groups.get_mut(group_id).ok_or_else(|| {
-            GhostError::GroupNotLoaded(hex::encode(&group_id[..8]))
+        let group = self.servers.get_mut(server_id).ok_or_else(|| {
+            GhostError::ServerNotLoaded(hex::encode(&server_id[..8]))
         })?;
 
         let msg = open(group, &self.provider, blob)?;
@@ -268,14 +273,14 @@ impl GhostClient {
 
     pub fn invite_member(
         &mut self,
-        group_id: &[u8; 32],
+        server_id: &[u8; 32],
         key_package: KeyPackage,
         invitee_fp: [u8; 32],
         invitee_name: &str,
         timestamp: u64,
     ) -> Result<(Outbound, Vec<u8>)> {
-        let group = self.groups.get_mut(group_id).ok_or_else(|| {
-            GhostError::GroupNotLoaded(hex::encode(&group_id[..8]))
+        let group = self.servers.get_mut(server_id).ok_or_else(|| {
+            GhostError::ServerNotLoaded(hex::encode(&server_id[..8]))
         })?;
 
         let (commit_blob, welcome) = group.add_member(&self.provider, key_package)?;
@@ -286,7 +291,7 @@ impl GhostClient {
         let mailbox_id = group_mailbox_id(group.group_id());
 
         self.store.insert_member(&Member {
-            group_id: *group_id,
+            server_id: *server_id,
             fingerprint: invitee_fp,
             display_name: invitee_name.to_string(),
             role: MemberRole::Member,
@@ -296,34 +301,40 @@ impl GhostClient {
         Ok((Outbound { mailbox_id, blob: commit_blob }, welcome_bytes))
     }
 
-    pub fn join_group(
+    pub fn join_server(
         &mut self,
-        group_id: &[u8; 32],
+        server_id: &[u8; 32],
         welcome_bytes: &[u8],
-        group_name: &str,
+        server_name: &str,
+        kind: ServerKind,
         timestamp: u64,
     ) -> Result<()> {
         let ghost_group =
             GhostGroup::join(&self.provider, &self.identity, welcome_bytes)?;
 
-        self.store.insert_group(&Group {
-            group_id: *group_id,
-            name: group_name.to_string(),
+        self.store.insert_server(&Server {
+            server_id: *server_id,
+            name: server_name.to_string(),
+            kind,
             creator_fp: [0u8; 32],
             created_at: timestamp,
         })?;
 
-        let channel_id = derive_default_channel_id(group_id);
+        let channel_name = match kind {
+            ServerKind::Dm => "messages",
+            ServerKind::Server => "general",
+        };
+        let channel_id = derive_default_channel_id(server_id);
         self.store.insert_channel(&Channel {
             channel_id,
-            group_id: *group_id,
-            name: "general".to_string(),
+            server_id: *server_id,
+            name: channel_name.to_string(),
             kind: ChannelKind::Text,
             position: 0,
         })?;
 
         self.store.insert_member(&Member {
-            group_id: *group_id,
+            server_id: *server_id,
             fingerprint: self.identity.fingerprint,
             display_name: self.identity.display_name.clone(),
             role: MemberRole::Member,
@@ -331,21 +342,23 @@ impl GhostClient {
         })?;
 
         let mailbox_id = group_mailbox_id(ghost_group.group_id());
-        self.groups.insert(*group_id, ghost_group);
-        self.mailbox_map.insert(mailbox_id, *group_id);
+        self.servers.insert(*server_id, ghost_group);
+        self.mailbox_map.insert(mailbox_id, *server_id);
         Ok(())
     }
 
     fn build_invite_payload(
-        group_id: &[u8; 32],
-        group_name: &str,
+        server_id: &[u8; 32],
+        server_name: &str,
+        kind: ServerKind,
         members: &[Member],
         channels: &[Channel],
         group_info_bytes: Vec<u8>,
     ) -> InvitePayload {
         InvitePayload {
-            group_id: *group_id,
-            group_name: group_name.to_string(),
+            server_id: *server_id,
+            server_name: server_name.to_string(),
+            kind,
             members: members
                 .iter()
                 .map(|m| InviteMember {
@@ -367,26 +380,26 @@ impl GhostClient {
         }
     }
 
-    /// Creator exports an invite payload containing GroupInfo + group metadata.
+    /// Creator exports an invite payload containing GroupInfo + server metadata.
     /// Returns (random_token, serialized_payload).
-    pub fn create_invite(&self, group_id: &[u8; 32]) -> Result<(String, Vec<u8>)> {
-        let member = self.store.get_member(group_id, &self.identity.fingerprint)?;
+    pub fn create_invite(&self, server_id: &[u8; 32]) -> Result<(String, Vec<u8>)> {
+        let member = self.store.get_member(server_id, &self.identity.fingerprint)?;
         if member.role != MemberRole::Creator {
             return Err(GhostError::PermissionDenied(
                 "only the creator can create invites".into(),
             ));
         }
 
-        let group = self.groups.get(group_id).ok_or_else(|| {
-            GhostError::GroupNotLoaded(hex::encode(&group_id[..8]))
+        let group = self.servers.get(server_id).ok_or_else(|| {
+            GhostError::ServerNotLoaded(hex::encode(&server_id[..8]))
         })?;
 
         let group_info_bytes = group.export_group_info(&self.provider)?;
-        let meta = self.store.get_group(group_id)?;
-        let members = self.store.list_members(group_id)?;
-        let channels = self.store.list_channels(group_id)?;
+        let meta = self.store.get_server(server_id)?;
+        let members = self.store.list_members(server_id)?;
+        let channels = self.store.list_channels(server_id)?;
 
-        let payload = Self::build_invite_payload(group_id, &meta.name, &members, &channels, group_info_bytes);
+        let payload = Self::build_invite_payload(server_id, &meta.name, meta.kind, &members, &channels, group_info_bytes);
 
         let mut token_bytes = [0u8; 16];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut token_bytes);
@@ -395,8 +408,8 @@ impl GhostClient {
         Ok((token, payload.to_bytes()))
     }
 
-    /// Join a group via an invite payload (external commit).
-    /// Returns (group_id, commit_bytes_to_broadcast, mailbox_id).
+    /// Join a server via an invite payload (external commit).
+    /// Returns (server_id, commit_bytes_to_broadcast, mailbox_id).
     pub fn join_by_invite(
         &mut self,
         payload_bytes: &[u8],
@@ -417,9 +430,10 @@ impl GhostClient {
             .map(|m| m.fingerprint)
             .unwrap_or([0u8; 32]);
 
-        self.store.insert_group(&Group {
-            group_id: payload.group_id,
-            name: payload.group_name,
+        self.store.insert_server(&Server {
+            server_id: payload.server_id,
+            name: payload.server_name,
+            kind: payload.kind,
             creator_fp,
             created_at: timestamp,
         })?;
@@ -427,7 +441,7 @@ impl GhostClient {
         for ch in &payload.channels {
             self.store.insert_channel(&Channel {
                 channel_id: ch.channel_id,
-                group_id: payload.group_id,
+                server_id: payload.server_id,
                 name: ch.name.clone(),
                 kind: ch.kind,
                 position: ch.position,
@@ -436,7 +450,7 @@ impl GhostClient {
 
         for m in &payload.members {
             self.store.insert_member(&Member {
-                group_id: payload.group_id,
+                server_id: payload.server_id,
                 fingerprint: m.fingerprint,
                 display_name: m.display_name.clone(),
                 role: m.role.clone(),
@@ -445,7 +459,7 @@ impl GhostClient {
         }
 
         self.store.insert_member(&Member {
-            group_id: payload.group_id,
+            server_id: payload.server_id,
             fingerprint: self.identity.fingerprint,
             display_name: self.identity.display_name.clone(),
             role: MemberRole::Member,
@@ -453,44 +467,44 @@ impl GhostClient {
         })?;
 
         let mailbox_id = group_mailbox_id(ghost_group.group_id());
-        self.groups.insert(payload.group_id, ghost_group);
-        self.mailbox_map.insert(mailbox_id, payload.group_id);
+        self.servers.insert(payload.server_id, ghost_group);
+        self.mailbox_map.insert(mailbox_id, payload.server_id);
 
-        Ok((payload.group_id, commit_bytes, mailbox_id))
+        Ok((payload.server_id, commit_bytes, mailbox_id))
     }
 
     /// Re-export an invite payload with fresh GroupInfo (after joining via external commit).
-    pub fn refresh_invite_payload(&self, group_id: &[u8; 32]) -> Result<Vec<u8>> {
-        let group = self.groups.get(group_id).ok_or_else(|| {
-            GhostError::GroupNotLoaded(hex::encode(&group_id[..8]))
+    pub fn refresh_invite_payload(&self, server_id: &[u8; 32]) -> Result<Vec<u8>> {
+        let group = self.servers.get(server_id).ok_or_else(|| {
+            GhostError::ServerNotLoaded(hex::encode(&server_id[..8]))
         })?;
 
         let group_info_bytes = group.export_group_info(&self.provider)?;
-        let meta = self.store.get_group(group_id)?;
-        let members = self.store.list_members(group_id)?;
-        let channels = self.store.list_channels(group_id)?;
+        let meta = self.store.get_server(server_id)?;
+        let members = self.store.list_members(server_id)?;
+        let channels = self.store.list_channels(server_id)?;
 
-        let payload = Self::build_invite_payload(group_id, &meta.name, &members, &channels, group_info_bytes);
+        let payload = Self::build_invite_payload(server_id, &meta.name, meta.kind, &members, &channels, group_info_bytes);
         Ok(payload.to_bytes())
     }
 
-    /// Export GroupInfo for a group so other clients can recover via external commit.
-    pub fn export_group_info(&self, group_id: &[u8; 32]) -> Result<Vec<u8>> {
-        let group = self.groups.get(group_id).ok_or_else(|| {
-            GhostError::GroupNotLoaded(hex::encode(&group_id[..8]))
+    /// Export GroupInfo for a server so other clients can recover via external commit.
+    pub fn export_server_info(&self, server_id: &[u8; 32]) -> Result<Vec<u8>> {
+        let group = self.servers.get(server_id).ok_or_else(|| {
+            GhostError::ServerNotLoaded(hex::encode(&server_id[..8]))
         })?;
         group.export_group_info(&self.provider)
     }
 
-    /// Rejoin a group via external commit after falling too far behind.
+    /// Rejoin a server via external commit after falling too far behind.
     /// Deletes old MLS state and creates a fresh session from GroupInfo.
     /// Returns (commit_bytes_to_broadcast, mailbox_id).
     pub fn recover_via_external_commit(
         &mut self,
-        group_id: &[u8; 32],
+        server_id: &[u8; 32],
         group_info_bytes: &[u8],
     ) -> Result<(Vec<u8>, [u8; 32])> {
-        if let Some(old_group) = self.groups.remove(group_id) {
+        if let Some(old_group) = self.servers.remove(server_id) {
             let _ = old_group.delete(&self.provider);
         }
 
@@ -501,49 +515,49 @@ impl GhostClient {
         )?;
 
         let mailbox_id = group_mailbox_id(ghost_group.group_id());
-        self.groups.insert(*group_id, ghost_group);
-        self.mailbox_map.insert(mailbox_id, *group_id);
+        self.servers.insert(*server_id, ghost_group);
+        self.mailbox_map.insert(mailbox_id, *server_id);
 
         Ok((commit_bytes, mailbox_id))
     }
 
-    /// Derive a per-sender encryption key for voice in this group+channel.
+    /// Derive a per-sender encryption key for voice in this server+channel.
     pub fn derive_voice_key(
         &self,
-        group_id: &[u8; 32],
+        server_id: &[u8; 32],
         channel_id: &[u8; 32],
         sender_fp: &[u8; 32],
     ) -> Result<[u8; 32]> {
-        let group = self.groups.get(group_id).ok_or_else(|| {
-            GhostError::GroupNotLoaded(hex::encode(&group_id[..8]))
+        let group = self.servers.get(server_id).ok_or_else(|| {
+            GhostError::ServerNotLoaded(hex::encode(&server_id[..8]))
         })?;
         crate::mls::voice::derive_voice_key(group, &self.provider, channel_id, sender_fp)
     }
 
-    /// Returns (group_id, mailbox_id) for every loaded group.
-    pub fn group_mailboxes(&self) -> Vec<([u8; 32], [u8; 32])> {
-        self.groups
+    /// Returns (server_id, mailbox_id) for every loaded server.
+    pub fn server_mailboxes(&self) -> Vec<([u8; 32], [u8; 32])> {
+        self.servers
             .iter()
-            .map(|(gid, g)| (*gid, group_mailbox_id(g.group_id())))
+            .map(|(sid, g)| (*sid, group_mailbox_id(g.group_id())))
             .collect()
     }
 
-    /// Direct lookup: get mailbox_id for a group.
-    pub fn mailbox_id_for_group(&self, group_id: &[u8; 32]) -> Option<[u8; 32]> {
-        self.groups
-            .get(group_id)
+    /// Direct lookup: get mailbox_id for a server.
+    pub fn mailbox_id_for_server(&self, server_id: &[u8; 32]) -> Option<[u8; 32]> {
+        self.servers
+            .get(server_id)
             .map(|g| group_mailbox_id(g.group_id()))
     }
 
-    /// Reverse lookup: find group_id for a given mailbox_id.
-    pub fn group_id_for_mailbox(&self, mailbox_id: &[u8; 32]) -> Option<[u8; 32]> {
+    /// Reverse lookup: find server_id for a given mailbox_id.
+    pub fn server_id_for_mailbox(&self, mailbox_id: &[u8; 32]) -> Option<[u8; 32]> {
         self.mailbox_map.get(mailbox_id).copied()
     }
 
     /// Extract fingerprints of all MLS group members (from credentials).
-    pub fn mls_member_fingerprints(&self, group_id: &[u8; 32]) -> Result<Vec<[u8; 32]>> {
-        let group = self.groups.get(group_id).ok_or_else(|| {
-            GhostError::GroupNotLoaded(hex::encode(&group_id[..8]))
+    pub fn mls_member_fingerprints(&self, server_id: &[u8; 32]) -> Result<Vec<[u8; 32]>> {
+        let group = self.servers.get(server_id).ok_or_else(|| {
+            GhostError::ServerNotLoaded(hex::encode(&server_id[..8]))
         })?;
         let mut fps = Vec::new();
         for member in group.members() {
@@ -559,12 +573,12 @@ impl GhostClient {
     /// Process an inbound blob — could be an app message, a commit, or a self-message.
     pub fn receive_any(
         &mut self,
-        group_id: &[u8; 32],
+        server_id: &[u8; 32],
         blob: &[u8],
         received_at: Option<u64>,
     ) -> Result<ReceiveResult> {
-        let group = self.groups.get_mut(group_id).ok_or_else(|| {
-            GhostError::GroupNotLoaded(hex::encode(&group_id[..8]))
+        let group = self.servers.get_mut(server_id).ok_or_else(|| {
+            GhostError::ServerNotLoaded(hex::encode(&server_id[..8]))
         })?;
 
         let inbound = match open_any(group, &self.provider, blob) {
@@ -607,22 +621,22 @@ impl GhostClient {
 mod tests {
     use super::*;
 
-    /// Returns (creator, joiner, group_id) with both clients in a shared MLS group.
+    /// Returns (creator, joiner, server_id) with both clients in a shared MLS group.
     fn setup_two_clients() -> (GhostClient, GhostClient, [u8; 32]) {
         let mut c1 = GhostClient::open_in_memory([0x01; 32]).unwrap();
         let mut c2 = GhostClient::open_in_memory([0x02; 32]).unwrap();
 
-        let group_id = c1.create_group("test", 1000).unwrap();
+        let server_id = c1.create_server("test", ServerKind::Server, 1000).unwrap();
 
         let kp = c2.generate_key_package().unwrap();
         let fp = *c2.fingerprint();
         let name = c2.identity().display_name.clone();
         let (_outbound, welcome_bytes) =
-            c1.invite_member(&group_id, kp, fp, &name, 1000).unwrap();
+            c1.invite_member(&server_id, kp, fp, &name, 1000).unwrap();
 
-        c2.join_group(&group_id, &welcome_bytes, "test", 1000).unwrap();
+        c2.join_server(&server_id, &welcome_bytes, "test", ServerKind::Server, 1000).unwrap();
 
-        (c1, c2, group_id)
+        (c1, c2, server_id)
     }
 
     #[test]
@@ -639,48 +653,48 @@ mod tests {
     }
 
     #[test]
-    fn create_group_stores_records() {
+    fn create_server_stores_records() {
         let mut client = GhostClient::open_in_memory([0x01; 32]).unwrap();
-        let group_id = client.create_group("test-group", 1000).unwrap();
+        let server_id = client.create_server("test-server", ServerKind::Server, 1000).unwrap();
 
-        let group = client.store().get_group(&group_id).unwrap();
-        assert_eq!(group.name, "test-group");
-        assert_eq!(group.creator_fp, *client.fingerprint());
-        assert_eq!(group.created_at, 1000);
+        let server = client.store().get_server(&server_id).unwrap();
+        assert_eq!(server.name, "test-server");
+        assert_eq!(server.creator_fp, *client.fingerprint());
+        assert_eq!(server.created_at, 1000);
 
-        let channels = client.store().list_channels(&group_id).unwrap();
+        let channels = client.store().list_channels(&server_id).unwrap();
         assert_eq!(channels.len(), 1);
         assert_eq!(channels[0].name, "general");
         assert_eq!(channels[0].kind, ChannelKind::Text);
-        assert_eq!(channels[0].channel_id, derive_default_channel_id(&group_id));
+        assert_eq!(channels[0].channel_id, derive_default_channel_id(&server_id));
 
-        let members = client.store().list_members(&group_id).unwrap();
+        let members = client.store().list_members(&server_id).unwrap();
         assert_eq!(members.len(), 1);
         assert_eq!(members[0].fingerprint, *client.fingerprint());
         assert_eq!(members[0].role, MemberRole::Creator);
     }
 
     #[test]
-    fn send_to_unknown_group_fails() {
+    fn send_to_unknown_server_fails() {
         let mut client = GhostClient::open_in_memory([0x01; 32]).unwrap();
         let result = client.send_message(&[0xFF; 32], &[0xAA; 32], b"hi".to_vec(), vec![], 1000);
-        assert!(matches!(result, Err(GhostError::GroupNotLoaded(_))));
+        assert!(matches!(result, Err(GhostError::ServerNotLoaded(_))));
     }
 
     #[test]
-    fn receive_from_unknown_group_fails() {
+    fn receive_from_unknown_server_fails() {
         let mut client = GhostClient::open_in_memory([0x01; 32]).unwrap();
         let result = client.receive_blob(&[0xFF; 32], &[0x00; 64], None);
-        assert!(matches!(result, Err(GhostError::GroupNotLoaded(_))));
+        assert!(matches!(result, Err(GhostError::ServerNotLoaded(_))));
     }
 
     #[test]
     fn send_message_stores_in_db() {
-        let (mut c1, _c2, group_id) = setup_two_clients();
-        let channel_id = derive_default_channel_id(&group_id);
+        let (mut c1, _c2, server_id) = setup_two_clients();
+        let channel_id = derive_default_channel_id(&server_id);
 
         let (_outbound, msg_id) = c1
-            .send_message(&group_id, &channel_id, b"hello".to_vec(), vec![], 2000)
+            .send_message(&server_id, &channel_id, b"hello".to_vec(), vec![], 2000)
             .unwrap();
 
         let stored = c1.store().get_message(&msg_id).unwrap();
@@ -691,14 +705,14 @@ mod tests {
 
     #[test]
     fn send_receive_roundtrip() {
-        let (mut c1, mut c2, group_id) = setup_two_clients();
-        let channel_id = derive_default_channel_id(&group_id);
+        let (mut c1, mut c2, server_id) = setup_two_clients();
+        let channel_id = derive_default_channel_id(&server_id);
 
         let (outbound, msg_id) = c1
-            .send_message(&group_id, &channel_id, b"hello".to_vec(), vec![], 2000)
+            .send_message(&server_id, &channel_id, b"hello".to_vec(), vec![], 2000)
             .unwrap();
 
-        let received = c2.receive_blob(&group_id, &outbound.blob, None).unwrap();
+        let received = c2.receive_blob(&server_id, &outbound.blob, None).unwrap();
         assert_eq!(received.content, b"hello");
         assert_eq!(received.sender_fp, *c1.fingerprint());
         assert_eq!(received.message_id, msg_id);
@@ -712,32 +726,32 @@ mod tests {
         let mut c1 = GhostClient::open_in_memory([0x01; 32]).unwrap();
         let mut c2 = GhostClient::open_in_memory([0x02; 32]).unwrap();
 
-        let group_id = c1.create_group("full-flow", 1000).unwrap();
-        let channel_id = derive_default_channel_id(&group_id);
+        let server_id = c1.create_server("full-flow", ServerKind::Server, 1000).unwrap();
+        let channel_id = derive_default_channel_id(&server_id);
 
         // c1 invites c2
         let kp = c2.generate_key_package().unwrap();
         let fp = *c2.fingerprint();
         let name = c2.identity().display_name.clone();
         let (_outbound, welcome) =
-            c1.invite_member(&group_id, kp, fp, &name, 1000).unwrap();
+            c1.invite_member(&server_id, kp, fp, &name, 1000).unwrap();
 
         // c2 joins
-        c2.join_group(&group_id, &welcome, "full-flow", 1000).unwrap();
+        c2.join_server(&server_id, &welcome, "full-flow", ServerKind::Server, 1000).unwrap();
 
         // c1 sends, c2 receives
         let (out1, id1) = c1
-            .send_message(&group_id, &channel_id, b"from c1".to_vec(), vec![], 2000)
+            .send_message(&server_id, &channel_id, b"from c1".to_vec(), vec![], 2000)
             .unwrap();
-        let recv1 = c2.receive_blob(&group_id, &out1.blob, None).unwrap();
+        let recv1 = c2.receive_blob(&server_id, &out1.blob, None).unwrap();
         assert_eq!(recv1.content, b"from c1");
         assert_eq!(recv1.sender_fp, *c1.fingerprint());
 
         // c2 sends, c1 receives
         let (out2, id2) = c2
-            .send_message(&group_id, &channel_id, b"from c2".to_vec(), vec![], 3000)
+            .send_message(&server_id, &channel_id, b"from c2".to_vec(), vec![], 3000)
             .unwrap();
-        let recv2 = c1.receive_blob(&group_id, &out2.blob, None).unwrap();
+        let recv2 = c1.receive_blob(&server_id, &out2.blob, None).unwrap();
         assert_eq!(recv2.content, b"from c2");
         assert_eq!(recv2.sender_fp, *c2.fingerprint());
 
@@ -750,14 +764,14 @@ mod tests {
 
     #[test]
     fn create_invite_requires_creator() {
-        let (c1, c2, group_id) = setup_two_clients();
+        let (c1, c2, server_id) = setup_two_clients();
 
         // c1 (creator) can create invite
-        let result = c1.create_invite(&group_id);
+        let result = c1.create_invite(&server_id);
         assert!(result.is_ok());
 
         // c2 (member) cannot
-        let result = c2.create_invite(&group_id);
+        let result = c2.create_invite(&server_id);
         assert!(matches!(result, Err(GhostError::PermissionDenied(_))));
     }
 
@@ -766,25 +780,25 @@ mod tests {
         let mut c1 = GhostClient::open_in_memory([0x01; 32]).unwrap();
         let mut c2 = GhostClient::open_in_memory([0x02; 32]).unwrap();
 
-        let group_id = c1.create_group("test", 1000).unwrap();
+        let server_id = c1.create_server("test", ServerKind::Server, 1000).unwrap();
 
-        let (_token, payload_bytes) = c1.create_invite(&group_id).unwrap();
+        let (_token, payload_bytes) = c1.create_invite(&server_id).unwrap();
 
-        let (joined_group_id, commit_bytes, _mailbox_id) =
+        let (joined_server_id, commit_bytes, _mailbox_id) =
             c2.join_by_invite(&payload_bytes, 2000).unwrap();
-        assert_eq!(joined_group_id, group_id);
+        assert_eq!(joined_server_id, server_id);
 
-        // c2 should have the group, channel, and members in their store
-        let group = c2.store().get_group(&group_id).unwrap();
-        assert_eq!(group.name, "test");
-        let channels = c2.store().list_channels(&group_id).unwrap();
+        // c2 should have the server, channel, and members in their store
+        let server = c2.store().get_server(&server_id).unwrap();
+        assert_eq!(server.name, "test");
+        let channels = c2.store().list_channels(&server_id).unwrap();
         assert_eq!(channels.len(), 1);
         assert_eq!(channels[0].name, "general");
-        let members = c2.store().list_members(&group_id).unwrap();
+        let members = c2.store().list_members(&server_id).unwrap();
         assert_eq!(members.len(), 2); // c1 + c2
 
         // c1 processes the external commit
-        let result = c1.receive_any(&group_id, &commit_bytes, Some(2000)).unwrap();
+        let result = c1.receive_any(&server_id, &commit_bytes, Some(2000)).unwrap();
         assert!(matches!(result, ReceiveResult::CommitProcessed));
     }
 
@@ -793,17 +807,17 @@ mod tests {
         let mut c1 = GhostClient::open_in_memory([0x01; 32]).unwrap();
         let mut c2 = GhostClient::open_in_memory([0x02; 32]).unwrap();
 
-        let group_id = c1.create_group("test", 1000).unwrap();
-        let (_, payload_bytes) = c1.create_invite(&group_id).unwrap();
+        let server_id = c1.create_server("test", ServerKind::Server, 1000).unwrap();
+        let (_, payload_bytes) = c1.create_invite(&server_id).unwrap();
 
         c2.join_by_invite(&payload_bytes, 2000).unwrap();
 
-        let refreshed = c2.refresh_invite_payload(&group_id).unwrap();
+        let refreshed = c2.refresh_invite_payload(&server_id).unwrap();
         let payload = InvitePayload::from_bytes(&refreshed).unwrap();
 
         // Should include c1 + c2
         assert_eq!(payload.members.len(), 2);
-        assert_eq!(payload.group_name, "test");
+        assert_eq!(payload.server_name, "test");
         assert!(!payload.group_info_bytes.is_empty());
     }
 }

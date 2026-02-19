@@ -7,7 +7,7 @@ use crate::crypto::{
 };
 use crate::error::{GhostError, Result};
 use crate::mls::group::GhostGroup;
-use crate::storage::{ChannelKind, MemberRole};
+use crate::storage::{ChannelKind, ServerKind, MemberRole};
 
 const MAX_REFERENCES: usize = 255;
 
@@ -182,8 +182,9 @@ pub struct InviteChannel {
 }
 
 pub struct InvitePayload {
-    pub group_id: [u8; 32],
-    pub group_name: String,
+    pub server_id: [u8; 32],
+    pub server_name: String,
+    pub kind: ServerKind,
     pub members: Vec<InviteMember>,
     pub channels: Vec<InviteChannel>,
     pub group_info_bytes: Vec<u8>,
@@ -267,8 +268,9 @@ fn read_blob32(data: &[u8], pos: &mut usize) -> Result<[u8; 32]> {
 impl InvitePayload {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::new();
-        buf.extend_from_slice(&self.group_id);
-        write_string(&mut buf, &self.group_name);
+        buf.extend_from_slice(&self.server_id);
+        write_string(&mut buf, &self.server_name);
+        buf.push(self.kind.to_byte());
 
         buf.extend_from_slice(&(self.members.len() as u16).to_be_bytes());
         for m in &self.members {
@@ -293,8 +295,9 @@ impl InvitePayload {
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
         let mut pos = 0;
 
-        let group_id = read_blob32(data, &mut pos)?;
-        let group_name = read_string(data, &mut pos)?;
+        let server_id = read_blob32(data, &mut pos)?;
+        let server_name = read_string(data, &mut pos)?;
+        let kind = ServerKind::from_byte(read_u8(data, &mut pos)?)?;
 
         let member_count = read_u16(data, &mut pos)? as usize;
         let mut members = Vec::with_capacity(member_count);
@@ -327,7 +330,7 @@ impl InvitePayload {
         }
         let group_info_bytes = data[pos..].to_vec();
 
-        Ok(Self { group_id, group_name, members, channels, group_info_bytes })
+        Ok(Self { server_id, server_name, kind, members, channels, group_info_bytes })
     }
 }
 

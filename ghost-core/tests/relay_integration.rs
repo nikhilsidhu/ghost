@@ -4,6 +4,7 @@ use tokio::net::TcpListener;
 
 use ghost_core::client::GhostClient;
 use ghost_core::relay::{RelayClient, RelayEvent};
+use ghost_core::storage::ServerKind;
 use ghost_core::wire::{derive_default_channel_id, derive_mls_group_id, group_mailbox_id};
 use ghost_relay::config::Config;
 use ghost_relay::storage::Storage;
@@ -34,20 +35,20 @@ async fn encrypted_message_through_relay() {
     let mut receiver = GhostClient::open_in_memory([0x02; 32]).unwrap();
 
     // Local MLS setup
-    let group_id = sender.create_group("test", 1000).unwrap();
+    let server_id = sender.create_server("test", ServerKind::Server, 1000).unwrap();
     let kp = receiver.generate_key_package().unwrap();
     let recv_fp = *receiver.fingerprint();
     let recv_name = receiver.identity().display_name.clone();
     let (_, welcome_bytes) = sender
-        .invite_member(&group_id, kp, recv_fp, &recv_name, 1000)
+        .invite_member(&server_id, kp, recv_fp, &recv_name, 1000)
         .unwrap();
     receiver
-        .join_group(&group_id, &welcome_bytes, "test", 1000)
+        .join_server(&server_id, &welcome_bytes, "test", ServerKind::Server, 1000)
         .unwrap();
 
-    let mls_gid = derive_mls_group_id(&group_id);
+    let mls_gid = derive_mls_group_id(&server_id);
     let mailbox_id = group_mailbox_id(&mls_gid);
-    let channel_id = derive_default_channel_id(&group_id);
+    let channel_id = derive_default_channel_id(&server_id);
 
     // Connect both to relay
     let (mut send_relay, _) = RelayClient::new(&relay_url);
@@ -59,7 +60,7 @@ async fn encrypted_message_through_relay() {
     // Encrypt, send through relay, receive, decrypt
     let (outbound, _) = sender
         .send_message(
-            &group_id,
+            &server_id,
             &channel_id,
             b"hello through relay".to_vec(),
             vec![],
@@ -83,7 +84,7 @@ async fn encrypted_message_through_relay() {
     assert_eq!(incoming.mailbox_id, mailbox_id);
 
     let msg = receiver
-        .receive_blob(&group_id, &incoming.payload, Some(incoming.received_at))
+        .receive_blob(&server_id, &incoming.payload, Some(incoming.received_at))
         .unwrap();
     assert_eq!(msg.content, b"hello through relay");
     assert_eq!(msg.sender_fp, *sender.fingerprint());
