@@ -4,7 +4,7 @@ import "../lib/commands";
 import {
   selectedServer, selectedChannelId,
   inviteLink, showInfo, settingsOpen, settingsCategory,
-  initialize, seedAndRefresh, startDevSession,
+  initialize,
   setInviteLink, setShowInfo, dmViewActive,
 } from "../lib/store";
 import { sections } from "../lib/settings-registry";
@@ -66,22 +66,6 @@ export function Layout() {
                         </div>
                       )}
                     </For>
-                  </div>
-                  <div class="flex gap-2 mt-1">
-                    <button
-                      class="px-3 py-1.5 rounded-md text-xs text-[var(--neutral-400)] hover:bg-[var(--hover)] cursor-pointer"
-                      style={{ border: "1px solid var(--neutral-700)" }}
-                      onClick={async () => { try { await startDevSession(); } catch {} }}
-                    >
-                      start dev session
-                    </button>
-                    <button
-                      class="px-3 py-1.5 rounded-md text-xs text-[var(--neutral-400)] hover:bg-[var(--hover)] cursor-pointer"
-                      style={{ border: "1px solid var(--neutral-700)" }}
-                      onClick={async () => { try { await seedAndRefresh(); } catch {} }}
-                    >
-                      seed test data
-                    </button>
                   </div>
                 </div>
               </div>

@@ -14,6 +14,13 @@ pkill -f "tauri dev" 2>/dev/null || true
 pkill -f "vite.*ghost-app" 2>/dev/null || true
 sleep 1
 
+# Clean ALL data dirs and dev session file
+rm -f /tmp/ghost-dev-session.json
+for i in $(seq 1 "$N"); do
+    rm -rf "/tmp/ghost-$i"
+    mkdir -p "/tmp/ghost-$i"
+done
+
 cleanup() {
     echo "shutting down..."
     kill $(jobs -p) 2>/dev/null
@@ -27,20 +34,19 @@ cd "$ROOT/ghost-relay"
 cargo run &
 sleep 1
 
-# Instance 1 — default config, default data dir
-echo "starting instance 1..."
 cd "$ROOT/ghost-app"
-VITE_GHOST_INSTANCE=1 npx tauri dev &
+
+# Instance 1 — creates the dev session, other instances auto-join
+echo "starting instance 1 (data=/tmp/ghost-1)..."
+GHOST_DATA_DIR="/tmp/ghost-1" VITE_GHOST_INSTANCE=1 npx tauri dev &
 
 # Instances 2..N — each gets a unique data dir, vite port, tauri port, and identifier
 for i in $(seq 2 "$N"); do
     VITE_PORT=$((1420 + (i - 1) * 2))
     TAURI_PORT=$((1430 + i - 1))
-    DATA_DIR="/tmp/ghost-$i"
-    mkdir -p "$DATA_DIR"
 
-    echo "starting instance $i (vite=$VITE_PORT, data=$DATA_DIR)..."
-    GHOST_DATA_DIR="$DATA_DIR" VITE_GHOST_INSTANCE="$i" npx tauri dev \
+    echo "starting instance $i (vite=$VITE_PORT, data=/tmp/ghost-$i)..."
+    GHOST_DATA_DIR="/tmp/ghost-$i" VITE_GHOST_INSTANCE="$i" npx tauri dev \
         --config "{\"identifier\":\"com.ghost.app.dev$i\",\"build\":{\"devUrl\":\"http://localhost:$VITE_PORT\",\"beforeDevCommand\":\"npx vite --port $VITE_PORT\"}}" \
         --port "$TAURI_PORT" &
 done
