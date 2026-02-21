@@ -3,7 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import type { Identity, Server, Channel, Member, Message, VoiceState, VoiceParticipants, VoiceSpeaking, VoiceMuteState, VoiceQuality } from "./types";
 import {
   getIdentity, listServers, listChannels, listMembers,
-  listPinnedServers, markChannelRead, seedTestData,
+  listPinnedServers, markChannelRead,
   joinVoice, leaveVoice, setVoiceMuted, setVoiceDeafened,
   createDevSession, readDevSession, joinByInvite, getConfig,
 } from "./api";
@@ -212,21 +212,8 @@ const updateIdentity = async () => {
   setIdentity(await getIdentity());
 };
 
-const seedAndRefresh = async () => {
-  await seedTestData();
-  await refreshServers();
-  await refreshPins();
-};
-
-const startDevSession = async () => {
-  const server = await createDevSession();
-  await refreshServers();
-  await selectServer(server.server_id);
-};
-
-// Poll for a dev session file and auto-join if this instance has no servers yet
+// Auto dev session: instance 1 creates, others join
 const tryDevJoin = async (): Promise<boolean> => {
-  if (servers().length > 0) return true;
   const session = await readDevSession();
   if (!session) return false;
   try {
@@ -234,7 +221,12 @@ const tryDevJoin = async (): Promise<boolean> => {
     await refreshServers();
     await selectServer(server.server_id);
     return true;
-  } catch {
+  } catch (e) {
+    console.warn("dev join failed:", e);
+    if (servers().length > 0) {
+      await selectServer(servers()[0].server_id);
+      return true;
+    }
     return false;
   }
 };
@@ -332,6 +324,19 @@ const initialize = async () => {
     });
   });
 
+  listen<string>("kicked", (event) => {
+    const sid = event.payload;
+    if (selectedServerId() === sid) {
+      setSelectedServerId(null);
+      setSelectedChannelId(null);
+      setChannels([]);
+      setMembers([]);
+    }
+    refreshServers();
+    refreshAllChannels();
+    refreshAllMembers();
+  });
+
   listen<string>("voice-error", (event) => {
     console.error("voice:", event.payload);
     setVoiceError(event.payload);
@@ -342,13 +347,24 @@ const initialize = async () => {
   initKeybinds().catch((e) => console.error("keybinds init failed:", e));
   getConfig().then((c) => setIsPttMode(c.input_mode === "push_to_talk")).catch(() => {});
 
-  // Dev mode: poll for a dev session file and auto-join
+  // Dev mode: instance 1 creates a dev server, others poll and auto-join
   if (import.meta.env.DEV) {
-    const joined = await tryDevJoin();
-    if (!joined) {
-      const interval = setInterval(async () => {
-        if (await tryDevJoin()) clearInterval(interval);
-      }, 3000);
+    const inst = import.meta.env.VITE_GHOST_INSTANCE;
+    if (!inst || inst === "1") {
+      try {
+        const server = await createDevSession();
+        await refreshServers();
+        await selectServer(server.server_id);
+      } catch (e) {
+        console.warn("auto dev session failed:", e);
+      }
+    } else {
+      const joined = await tryDevJoin();
+      if (!joined) {
+        const interval = setInterval(async () => {
+          if (await tryDevJoin()) clearInterval(interval);
+        }, 3000);
+      }
     }
   }
 };
@@ -360,7 +376,7 @@ export {
   selectedServer, selectedChannelName,
   dmViewActive, dms, serverList, contacts,
   selectServer, selectChannel, selectDm, activateDmView,
-  updateIdentity, initialize, seedAndRefresh, startDevSession,
+  updateIdentity, initialize,
   refreshServers, refreshChannels, refreshPins, refreshAllChannels, refreshAllMembers,
   setInviteLink, setShowInfo, setDesiredChannelKind,
   settingsOpen, settingsCategory, setSettingsCategory, toggleSettings,

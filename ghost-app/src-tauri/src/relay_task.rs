@@ -91,19 +91,17 @@ pub async fn run(
                     Some((server_id, Ok(ReceiveResult::CommitProcessed))) => {
                         let c = client.lock().await;
                         let _ = c.store().set_last_seen_seq(&mailbox_id, seq);
-                        // Add any new MLS members we don't have in the store yet
+                        // Discover new members added by this commit (e.g. external join)
                         if let Ok(mls_fps) = c.mls_member_fingerprints(&server_id) {
-                            let stored: std::collections::HashSet<[u8; 32]> = c.store()
+                            let stored: HashSet<[u8; 32]> = c.store()
                                 .list_members(&server_id)
                                 .unwrap_or_default()
-                                .iter()
-                                .map(|m| m.fingerprint)
-                                .collect();
-                            for fp in mls_fps {
-                                if !stored.contains(&fp) {
+                                .iter().map(|m| m.fingerprint).collect();
+                            for fp in &mls_fps {
+                                if !stored.contains(fp) {
                                     let _ = c.store().insert_member(&Member {
                                         server_id,
-                                        fingerprint: fp,
+                                        fingerprint: *fp,
                                         display_name: hex::encode(&fp[..8]),
                                         role: MemberRole::Member,
                                         joined_at: received_at,
@@ -111,7 +109,24 @@ pub async fn run(
                                 }
                             }
                         }
-                        // Upload fresh GroupInfo so other clients can recover
+                        if let Ok(gi) = c.export_server_info(&server_id) {
+                            let r = relay.lock().await;
+                            let _ = r.put_server_info(&mailbox_id, gi).await;
+                        }
+                        let _ = app.emit("sync", hex::encode(server_id));
+                    }
+                    Some((server_id, Ok(ReceiveResult::Kicked))) => {
+                        let c = client.lock().await;
+                        let _ = c.store().set_last_seen_seq(&mailbox_id, seq);
+                        drop(c);
+                        let _ = app.emit("kicked", hex::encode(server_id));
+                    }
+                    Some((server_id, Ok(ReceiveResult::MembersRemoved(removed)))) => {
+                        let c = client.lock().await;
+                        let _ = c.store().set_last_seen_seq(&mailbox_id, seq);
+                        for fp in &removed {
+                            let _ = c.store().remove_member(&server_id, fp);
+                        }
                         if let Ok(gi) = c.export_server_info(&server_id) {
                             let r = relay.lock().await;
                             let _ = r.put_server_info(&mailbox_id, gi).await;
@@ -125,11 +140,10 @@ pub async fn run(
                     Some((_, Err(e))) => {
                         let msg = e.to_string();
                         if msg.contains("epoch") || msg.contains("Epoch") {
-                            // Stale message from wrong epoch — skip and advance seq
                             let c = client.lock().await;
                             let _ = c.store().set_last_seen_seq(&mailbox_id, seq);
                         } else {
-                            eprintln!("relay receive error: {e}");
+                            eprintln!("relay: receive error seq={seq}: {e}");
                         }
                     }
                     None => {}

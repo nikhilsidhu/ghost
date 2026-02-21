@@ -297,6 +297,26 @@ pub async fn delete_channel(
 }
 
 #[tauri::command]
+pub async fn kick_member(
+    server_id: String,
+    fingerprint: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let sid = parse_id(&server_id)?;
+    let fp = parse_id(&fingerprint)?;
+
+    let outbound = {
+        let mut client = state.client.lock().await;
+        client.kick_member(&sid, &fp).map_err(|e| e.to_string())?
+    };
+
+    let relay = state.relay.lock().await;
+    let _ = relay.send(&outbound.mailbox_id, outbound.blob).await;
+
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn mark_channel_read(
     channel_id: String,
     state: State<'_, AppState>,

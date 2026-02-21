@@ -1,9 +1,41 @@
-import { For, Show } from "solid-js";
+import { createSignal, For, Show, onCleanup } from "solid-js";
+import { Portal } from "solid-js/web";
 import { ScrollArea } from "./ui/scroll-area";
 import { Avatar } from "./ui/avatar";
-import { members } from "../lib/store";
+import { identity, members, selectedServerId, selectedServer } from "../lib/store";
+import { kickMember } from "../lib/api";
 
 export function MemberPanel() {
+  const [ctxMenu, setCtxMenu] = createSignal<{ x: number; y: number; fingerprint: string } | null>(null);
+
+  const isCreator = () => identity()?.fingerprint === selectedServer()?.creator_fp;
+
+  const onRightClick = (fingerprint: string, role: string, e: MouseEvent) => {
+    if (!isCreator() || role === "creator") return;
+    e.preventDefault();
+    const menuW = 140, menuH = 40;
+    const x = Math.min(e.clientX, window.innerWidth - menuW);
+    const y = Math.min(e.clientY, window.innerHeight - menuH);
+    setCtxMenu({ x, y, fingerprint });
+  };
+
+  const handleKick = async () => {
+    const menu = ctxMenu();
+    const sid = selectedServerId();
+    if (!menu || !sid) return;
+    setCtxMenu(null);
+    try {
+      await kickMember(sid, menu.fingerprint);
+    } catch (e) {
+      console.error("kick failed:", e);
+    }
+  };
+
+  const dismiss = () => setCtxMenu(null);
+
+  window.addEventListener("click", dismiss);
+  onCleanup(() => window.removeEventListener("click", dismiss));
+
   return (
     <div
       class="w-56 flex-shrink-0 flex flex-col"
@@ -19,7 +51,10 @@ export function MemberPanel() {
         <div class="px-2 py-1">
           <For each={members()}>
             {(m) => (
-              <div class="flex items-center gap-2.5 px-2 py-1.5 rounded-md hover:bg-[var(--hover)]">
+              <div
+                class="flex items-center gap-2.5 px-2 py-1.5 rounded-md hover:bg-[var(--hover)]"
+                onContextMenu={(e) => onRightClick(m.fingerprint, m.role, e)}
+              >
                 <Avatar
                   hashKey={m.fingerprint}
                   label={m.display_name}
@@ -38,6 +73,29 @@ export function MemberPanel() {
           </For>
         </div>
       </ScrollArea>
+
+      <Portal>
+        <Show when={ctxMenu()}>
+          {(menu) => (
+            <div
+              class="fixed z-50 min-w-32 rounded-md border border-[var(--neutral-700)] py-1 shadow-lg"
+              style={{
+                background: "var(--neutral-800)",
+                left: `${menu().x}px`,
+                top: `${menu().y}px`,
+              }}
+              onClick={(e) => e.stopPropagation()}
+            >
+              <button
+                class="w-full px-3 py-1.5 text-left text-sm text-red-400 hover:bg-[var(--neutral-700)] cursor-pointer"
+                onClick={handleKick}
+              >
+                Kick
+              </button>
+            </div>
+          )}
+        </Show>
+      </Portal>
     </div>
   );
 }

@@ -41,6 +41,9 @@ export const renameChannel = (channelId: string, name: string) =>
 export const deleteChannel = (channelId: string) =>
   invoke<void>("delete_channel", { channelId });
 
+export const kickMember = (serverId: string, fingerprint: string) =>
+  invoke<void>("kick_member", { serverId, fingerprint });
+
 export const markChannelRead = (channelId: string) =>
   invoke<void>("mark_channel_read", { channelId });
 
@@ -57,8 +60,6 @@ export const setDisplayName = (name: string) =>
 
 export const setRelayUrl = (url: string) =>
   invoke<void>("set_relay_url", { url });
-
-export const seedTestData = () => invoke<void>("seed_test_data");
 
 // Voice
 export const joinVoice = (serverId: string, channelId: string, muted: boolean, deafened: boolean) =>

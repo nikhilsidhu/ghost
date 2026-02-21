@@ -429,7 +429,8 @@ pub enum MetadataPayload {
 
 pub enum InboundMessage {
     Application(ApplicationMessage),
-    Commit,
+    /// A commit was merged. Contains fingerprints of members removed by this commit.
+    Commit { removed: Vec<[u8; 32]> },
 }
 
 /// Process an inbound blob that could be an application message or a commit.
@@ -459,11 +460,35 @@ pub fn open_any(
             Ok(InboundMessage::Application(msg))
         }
         ProcessedMessageContent::StagedCommitMessage(staged_commit) => {
+            // Extract removed member fingerprints before merging
+            let removed = extract_removed_fps(group, &staged_commit);
             group.merge_staged_commit(provider, *staged_commit)?;
-            Ok(InboundMessage::Commit)
+            Ok(InboundMessage::Commit { removed })
         }
         _ => Err(GhostError::Mls("unexpected message type".into())),
     }
+}
+
+/// Read remove proposals from a staged commit, resolve leaf indices to fingerprints.
+fn extract_removed_fps(group: &GhostGroup, staged: &openmls::prelude::StagedCommit) -> Vec<[u8; 32]> {
+    use std::collections::HashMap;
+    let member_map: HashMap<u32, [u8; 32]> = group
+        .members()
+        .filter_map(|m| {
+            BasicCredential::try_from(m.credential)
+                .ok()
+                .and_then(|bc| <[u8; 32]>::try_from(bc.identity()).ok())
+                .map(|fp| (m.index.u32(), fp))
+        })
+        .collect();
+
+    staged
+        .remove_proposals()
+        .filter_map(|rp| {
+            let idx = rp.remove_proposal().removed().u32();
+            member_map.get(&idx).copied()
+        })
+        .collect()
 }
 
 /// Encrypted blob addressed to a relay mailbox.

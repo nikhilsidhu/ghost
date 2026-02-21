@@ -39,6 +39,10 @@ fn open_mls_connection(seed: &[u8; 32], app_db_path: &Path) -> Result<Connection
 pub enum ReceiveResult {
     Message(ApplicationMessage),
     CommitProcessed,
+    /// This client was removed from the group by a commit.
+    Kicked,
+    /// A commit removed these members (fingerprints) from the group.
+    MembersRemoved(Vec<[u8; 32]>),
     Skipped,
 }
 
@@ -521,6 +525,47 @@ impl GhostClient {
         Ok((commit_bytes, mailbox_id))
     }
 
+    /// Creator-only: remove a member from the MLS group and broadcast the commit.
+    pub fn kick_member(
+        &mut self,
+        server_id: &[u8; 32],
+        target_fp: &[u8; 32],
+    ) -> Result<Outbound> {
+        if target_fp == &self.identity.fingerprint {
+            return Err(GhostError::PermissionDenied("cannot kick yourself".into()));
+        }
+
+        let member = self.store.get_member(server_id, &self.identity.fingerprint)?;
+        if member.role != MemberRole::Creator {
+            return Err(GhostError::PermissionDenied(
+                "only the creator can kick members".into(),
+            ));
+        }
+
+        let group = self.servers.get_mut(server_id).ok_or_else(|| {
+            GhostError::ServerNotLoaded(hex::encode(&server_id[..8]))
+        })?;
+
+        // Find the target's LeafNodeIndex by matching credential identity
+        let leaf_index = group
+            .members()
+            .find(|m| {
+                openmls::prelude::BasicCredential::try_from(m.credential.clone())
+                    .ok()
+                    .map(|bc| bc.identity() == target_fp.as_slice())
+                    .unwrap_or(false)
+            })
+            .map(|m| m.index)
+            .ok_or_else(|| GhostError::Mls("member not found in MLS group".into()))?;
+
+        let commit_blob = group.remove_member(&self.provider, leaf_index)?;
+        let mailbox_id = mls_group_mailbox_id(group.group_id());
+
+        self.store.remove_member(server_id, target_fp)?;
+
+        Ok(Outbound { mailbox_id, blob: commit_blob })
+    }
+
     /// Derive a per-sender encryption key for voice in this server+channel.
     pub fn derive_voice_key(
         &self,
@@ -656,7 +701,16 @@ impl GhostClient {
 
                 Ok(ReceiveResult::Message(msg))
             }
-            InboundMessage::Commit => Ok(ReceiveResult::CommitProcessed),
+            InboundMessage::Commit { removed } => {
+                if removed.contains(&self.identity.fingerprint) {
+                    return Ok(ReceiveResult::Kicked);
+                }
+                if removed.is_empty() {
+                    Ok(ReceiveResult::CommitProcessed)
+                } else {
+                    Ok(ReceiveResult::MembersRemoved(removed))
+                }
+            }
         }
     }
 }
@@ -844,6 +898,12 @@ mod tests {
         // c1 processes the external commit
         let result = c1.receive_any(&server_id, &commit_bytes, Some(2000)).unwrap();
         assert!(matches!(result, ReceiveResult::CommitProcessed));
+
+        // After merging, c1's MLS group should include c2
+        let mls_fps = c1.mls_member_fingerprints(&server_id).unwrap();
+        assert_eq!(mls_fps.len(), 2, "MLS group should have both members after external commit");
+        assert!(mls_fps.contains(c1.fingerprint()));
+        assert!(mls_fps.contains(c2.fingerprint()));
     }
 
     #[test]
