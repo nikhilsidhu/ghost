@@ -148,7 +148,7 @@ export function Sidebar() {
           {/* Server icons */}
           <div
             class={cn(
-              "absolute inset-0",
+              "absolute inset-0 overflow-hidden",
               settingsOpen() && "pointer-events-none",
             )}
             style={{
@@ -202,7 +202,7 @@ export function Sidebar() {
           {/* Settings icons */}
           <div
             class={cn(
-              "absolute inset-0",
+              "absolute inset-0 overflow-hidden",
               !settingsOpen() && "pointer-events-none",
             )}
             style={{
