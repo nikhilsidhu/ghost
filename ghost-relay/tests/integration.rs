@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD};
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use reqwest::StatusCode;
@@ -78,6 +78,25 @@ async fn ws_handshake(
     ws.send(Message::Binary(last_seen.to_be_bytes().to_vec().into()))
         .await
         .unwrap();
+}
+
+/// Consume the vs_snap text frame that's always sent after replay completes.
+async fn consume_vs_snap(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) {
+    let snap = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let m = ws.next().await.unwrap().unwrap();
+            if let Message::Text(t) = m {
+                break t.to_string();
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for vs_snap");
+    assert!(snap.starts_with("{\"vs_snap\""), "expected vs_snap, got: {snap}");
 }
 
 #[tokio::test]
@@ -161,6 +180,8 @@ async fn ws_fanout() {
     let (mut ws_b, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
     ws_handshake(&mut ws_a, 0).await;
     ws_handshake(&mut ws_b, 0).await;
+    consume_vs_snap(&mut ws_a).await;
+    consume_vs_snap(&mut ws_b).await;
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -191,6 +212,7 @@ async fn ws_epoch_mismatch_ack() {
 
     let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
     ws_handshake(&mut ws, 0).await;
+    consume_vs_snap(&mut ws).await;
 
     // Send at epoch 0 — no mismatch, ack is just the seq number
     ws.send(Message::Binary(envelope(EnvelopeType::Application, 0, b"ok").into())).await.unwrap();
@@ -427,7 +449,7 @@ async fn expired_invite_rejected() {
 
 fn build_voice_packet(
     channel_id: &[u8; 32],
-    sender_fp: &[u8; 32],
+    slot_id: u32,
     sequence: u32,
     payload: &[u8],
 ) -> Vec<u8> {
@@ -435,7 +457,7 @@ fn build_voice_packet(
     [
         &header_len.to_be_bytes()[..],
         channel_id,
-        sender_fp,
+        &slot_id.to_be_bytes()[..],
         &[0x00], // flags
         &sequence.to_be_bytes(),
         &(payload.len() as u16).to_be_bytes(),
@@ -470,42 +492,39 @@ async fn voice_signaling_join_leave() {
     let channel_b64 = URL_SAFE_NO_PAD.encode(channel_id);
     let ws_url = format!("{ws_base}/voice/{channel_b64}");
 
-    let fp_a = [0xAA; 32];
-    let fp_b = [0xBB; 32];
+    let presence_a = B64.encode(b"opaque-presence-a");
+    let presence_b = B64.encode(b"opaque-presence-b");
 
     // A joins
     let (mut ws_a, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
-    let join_a = serde_json::json!({"type": "join", "fingerprint": hex::encode(fp_a)});
+    let join_a = serde_json::json!({"type": "join", "presence": presence_a});
     ws_a.send(Message::Text(join_a.to_string().into())).await.unwrap();
 
-    // A gets participants (just itself)
+    // A gets Welcome (no peers, has slot_id and port)
     let msg = read_voice_msg(&mut ws_a).await;
-    assert_eq!(msg["type"], "participants");
-    assert_eq!(msg["list"].as_array().unwrap().len(), 1);
-
-    // A gets assigned UDP port
-    let msg = read_voice_msg(&mut ws_a).await;
-    assert_eq!(msg["type"], "assigned");
+    assert_eq!(msg["type"], "welcome");
+    assert!(msg["slot_id"].as_u64().unwrap() > 0);
+    assert!(msg["port"].as_u64().is_some());
+    assert_eq!(msg["peers"].as_array().unwrap().len(), 0);
 
     // B joins
     let (mut ws_b, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
-    let join_b = serde_json::json!({"type": "join", "fingerprint": hex::encode(fp_b)});
+    let join_b = serde_json::json!({"type": "join", "presence": presence_b});
     ws_b.send(Message::Text(join_b.to_string().into())).await.unwrap();
 
-    // B gets participants (both A and B)
+    // B gets Welcome (A is a peer)
     let msg = read_voice_msg(&mut ws_b).await;
-    assert_eq!(msg["type"], "participants");
-    assert_eq!(msg["list"].as_array().unwrap().len(), 2);
+    assert_eq!(msg["type"], "welcome");
+    assert_eq!(msg["peers"].as_array().unwrap().len(), 1);
+    let slot_b = msg["slot_id"].as_u64().unwrap() as u32;
 
-    // B gets assigned
-    let _ = read_voice_msg(&mut ws_b).await;
-
-    // A gets notified that B joined
+    // A gets notified that B joined (with presence blob)
     let msg = tokio::time::timeout(Duration::from_secs(2), read_voice_msg(&mut ws_a))
         .await
         .expect("timed out waiting for joined event");
     assert_eq!(msg["type"], "joined");
-    assert_eq!(msg["fingerprint"], hex::encode(fp_b));
+    assert!(msg["slot_id"].as_u64().is_some());
+    assert!(msg["presence"].as_str().is_some());
 
     // B disconnects
     let leave = serde_json::json!({"type": "leave"});
@@ -517,7 +536,7 @@ async fn voice_signaling_join_leave() {
         .await
         .expect("timed out waiting for left event");
     assert_eq!(msg["type"], "left");
-    assert_eq!(msg["fingerprint"], hex::encode(fp_b));
+    assert_eq!(msg["slot_id"].as_u64().unwrap() as u32, slot_b);
 }
 
 #[tokio::test]
@@ -528,24 +547,23 @@ async fn voice_udp_forwarding() {
     let channel_b64 = URL_SAFE_NO_PAD.encode(channel_id);
     let ws_url = format!("{ws_base}/voice/{channel_b64}");
 
-    let fp_a = [0xAA; 32];
-    let fp_b = [0xBB; 32];
     let relay_addr: SocketAddr = format!("127.0.0.1:{udp_port}").parse().unwrap();
 
-    // Both join via signaling
+    // Both join via signaling — extract slot_ids from Welcome
     let (mut ws_a, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
     ws_a.send(Message::Text(
-        serde_json::json!({"type": "join", "fingerprint": hex::encode(fp_a)}).to_string().into(),
+        serde_json::json!({"type": "join", "presence": B64.encode(b"pa")}).to_string().into(),
     )).await.unwrap();
-    let _ = read_voice_msg(&mut ws_a).await; // participants
-    let _ = read_voice_msg(&mut ws_a).await; // assigned
+    let msg_a = read_voice_msg(&mut ws_a).await; // welcome
+    let slot_a = msg_a["slot_id"].as_u64().unwrap() as u32;
 
     let (mut ws_b, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
     ws_b.send(Message::Text(
-        serde_json::json!({"type": "join", "fingerprint": hex::encode(fp_b)}).to_string().into(),
+        serde_json::json!({"type": "join", "presence": B64.encode(b"pb")}).to_string().into(),
     )).await.unwrap();
-    let _ = read_voice_msg(&mut ws_b).await; // participants
-    let _ = read_voice_msg(&mut ws_b).await; // assigned
+    let msg_b = read_voice_msg(&mut ws_b).await; // welcome
+    let slot_b = msg_b["slot_id"].as_u64().unwrap() as u32;
+
     // drain A's "joined" notification for B
     let _ = tokio::time::timeout(Duration::from_secs(1), read_voice_msg(&mut ws_a)).await;
 
@@ -553,17 +571,17 @@ async fn voice_udp_forwarding() {
 
     // A sends initial UDP packet to register its address
     let sock_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let pkt_a = build_voice_packet(&channel_id, &fp_a, 1, b"opus-from-a");
+    let pkt_a = build_voice_packet(&channel_id, slot_a, 1, b"opus-from-a");
     sock_a.send_to(&pkt_a, relay_addr).await.unwrap();
 
     // B sends initial UDP packet to register its address
     let sock_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let pkt_b = build_voice_packet(&channel_id, &fp_b, 1, b"opus-from-b");
+    let pkt_b = build_voice_packet(&channel_id, slot_b, 1, b"opus-from-b");
     sock_b.send_to(&pkt_b, relay_addr).await.unwrap();
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // Drain any forwarded packets from registration (B's initial packet forwarded to A)
+    // Drain any forwarded packets from registration
     let mut recv_buf = [0u8; 1500];
     while tokio::time::timeout(Duration::from_millis(100), sock_a.recv_from(&mut recv_buf))
         .await
@@ -571,7 +589,7 @@ async fn voice_udp_forwarding() {
     {}
 
     // A sends another packet — B should receive it
-    let pkt_a2 = build_voice_packet(&channel_id, &fp_a, 2, b"frame-2");
+    let pkt_a2 = build_voice_packet(&channel_id, slot_a, 2, b"frame-2");
     sock_a.send_to(&pkt_a2, relay_addr).await.unwrap();
 
     let (len, _) = tokio::time::timeout(Duration::from_secs(2), sock_b.recv_from(&mut recv_buf))
@@ -579,8 +597,9 @@ async fn voice_udp_forwarding() {
         .expect("timed out waiting for forwarded packet")
         .unwrap();
 
-    // Verify header and payload match what A sent
-    assert_eq!(&recv_buf[34..66], &fp_a);
+    // Verify slot_id and payload
+    let recv_slot = u32::from_be_bytes(recv_buf[34..38].try_into().unwrap());
+    assert_eq!(recv_slot, slot_a);
     let hdr = ghost_wire::VOICE_HEADER_SIZE;
     assert_eq!(&recv_buf[hdr..len], b"frame-2");
 
@@ -602,22 +621,20 @@ async fn voice_max_participants() {
     // Fill to capacity
     let (mut ws1, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
     ws1.send(Message::Text(
-        serde_json::json!({"type": "join", "fingerprint": hex::encode([0x01u8; 32])}).to_string().into(),
+        serde_json::json!({"type": "join", "presence": B64.encode(b"p1")}).to_string().into(),
     )).await.unwrap();
-    let _ = read_voice_msg(&mut ws1).await; // participants
-    let _ = read_voice_msg(&mut ws1).await; // assigned
+    let _ = read_voice_msg(&mut ws1).await; // welcome
 
     let (mut ws2, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
     ws2.send(Message::Text(
-        serde_json::json!({"type": "join", "fingerprint": hex::encode([0x02u8; 32])}).to_string().into(),
+        serde_json::json!({"type": "join", "presence": B64.encode(b"p2")}).to_string().into(),
     )).await.unwrap();
-    let _ = read_voice_msg(&mut ws2).await; // participants
-    let _ = read_voice_msg(&mut ws2).await; // assigned
+    let _ = read_voice_msg(&mut ws2).await; // welcome
 
     // Third should be rejected
     let (mut ws3, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
     ws3.send(Message::Text(
-        serde_json::json!({"type": "join", "fingerprint": hex::encode([0x03u8; 32])}).to_string().into(),
+        serde_json::json!({"type": "join", "presence": B64.encode(b"p3")}).to_string().into(),
     )).await.unwrap();
 
     let msg = tokio::time::timeout(Duration::from_secs(2), read_voice_msg(&mut ws3))
@@ -744,6 +761,7 @@ async fn ws_no_gap_on_fresh_subscribe() {
     // Connect with last_seen=0 — first subscribe, no gap expected
     let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
     ws_handshake(&mut ws, 0).await;
+    consume_vs_snap(&mut ws).await;
 
     // Should not receive any text "gap" — only pings should arrive
     let result = tokio::time::timeout(Duration::from_millis(200), async {
