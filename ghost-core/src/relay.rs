@@ -31,10 +31,16 @@ pub enum RelayEvent {
     Blob(IncomingBlob),
     Ack(Ack),
     Gap { mailbox_id: [u8; 32] },
+    VoiceState { mailbox_id: [u8; 32], json: String },
+}
+
+pub enum WsOutgoing {
+    Binary(Vec<u8>),
+    Text(String),
 }
 
 struct WsHandle {
-    outbox: mpsc::Sender<Vec<u8>>,
+    outbox: mpsc::Sender<WsOutgoing>,
     task: JoinHandle<()>,
 }
 
@@ -96,7 +102,19 @@ impl RelayClient {
             .ok_or_else(|| GhostError::Network("not subscribed to mailbox".into()))?;
         handle
             .outbox
-            .send(blob)
+            .send(WsOutgoing::Binary(blob))
+            .await
+            .map_err(|_| GhostError::Network("ws connection closed".into()))
+    }
+
+    pub async fn send_text(&self, mailbox_id: &[u8; 32], text: String) -> Result<()> {
+        let handle = self
+            .connections
+            .get(mailbox_id)
+            .ok_or_else(|| GhostError::Network("not subscribed to mailbox".into()))?;
+        handle
+            .outbox
+            .send(WsOutgoing::Text(text))
             .await
             .map_err(|_| GhostError::Network("ws connection closed".into()))
     }
@@ -255,7 +273,7 @@ async fn ws_task(
     mailbox_id: [u8; 32],
     initial_last_seen: u64,
     event_tx: mpsc::Sender<RelayEvent>,
-    mut outbox_rx: mpsc::Receiver<Vec<u8>>,
+    mut outbox_rx: mpsc::Receiver<WsOutgoing>,
 ) {
     let mut last_seen = initial_last_seen;
     let mut backoff = INITIAL_BACKOFF;
@@ -288,14 +306,19 @@ async fn ws_task(
 
         loop {
             tokio::select! {
-                blob = outbox_rx.recv() => {
-                    match blob {
-                        Some(data) => {
+                outgoing = outbox_rx.recv() => {
+                    match outgoing {
+                        Some(WsOutgoing::Binary(data)) => {
                             if sink.send(Message::Binary(data.into())).await.is_err() {
-                                break; // reconnect
+                                break;
                             }
                         }
-                        None => return, // unsubscribed, exit task
+                        Some(WsOutgoing::Text(text)) => {
+                            if sink.send(Message::Text(text.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                        None => return,
                     }
                 }
                 msg = stream.next() => {
@@ -326,9 +349,15 @@ async fn ws_task(
                                 got_message = true;
                                 backoff = INITIAL_BACKOFF;
                             }
-                            if text.as_str() == WS_SIGNAL_GAP {
+                            let s = text.as_str();
+                            if s == WS_SIGNAL_GAP {
                                 let _ = event_tx.send(RelayEvent::Gap { mailbox_id }).await;
-                            } else if let Some(ack) = parse_ack(&text) {
+                            } else if s.starts_with("{\"vs") {
+                                let _ = event_tx.send(RelayEvent::VoiceState {
+                                    mailbox_id,
+                                    json: s.to_string(),
+                                }).await;
+                            } else if let Some(ack) = parse_ack(s) {
                                 let _ = event_tx.send(RelayEvent::Ack(ack)).await;
                             }
                         }

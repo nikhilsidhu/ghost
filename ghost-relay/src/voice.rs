@@ -9,24 +9,23 @@ use crate::constants::{DEFAULT_MAX_VOICE_PARTICIPANTS, VOICE_EVENT_CAPACITY};
 
 #[derive(Clone, Debug)]
 pub enum VoiceEvent {
-    Joined { fingerprint: [u8; 32] },
-    Left { fingerprint: [u8; 32] },
-    Speaking { fingerprint: [u8; 32], speaking: bool },
-    MuteState { fingerprint: [u8; 32], muted: bool, deafened: bool },
+    Joined { slot_id: u32 },
+    Left { slot_id: u32 },
+    Presence { slot_id: u32, blob: Vec<u8> },
+    Speaking { slot_id: u32, speaking: bool },
 }
 
 pub struct Participant {
-    pub fingerprint: [u8; 32],
+    pub slot_id: u32,
     pub udp_addr: Option<SocketAddr>,
     pub last_udp: Instant,
-    pub speaking: bool,
-    pub muted: bool,
-    pub deafened: bool,
+    pub latest_presence: Option<Vec<u8>>,
 }
 
 pub struct VoiceChannel {
     pub participants: Vec<Participant>,
     pub notify: broadcast::Sender<VoiceEvent>,
+    next_slot: u32,
 }
 
 impl VoiceChannel {
@@ -35,13 +34,20 @@ impl VoiceChannel {
         Self {
             participants: Vec::new(),
             notify,
+            next_slot: 1,
         }
+    }
+
+    pub fn alloc_slot(&mut self) -> u32 {
+        let id = self.next_slot;
+        self.next_slot = self.next_slot.wrapping_add(1);
+        id
     }
 }
 
 /// Maps channel → participant addresses for UDP packet forwarding.
 pub struct RoutingTable {
-    channels: DashMap<[u8; 32], Vec<([u8; 32], SocketAddr)>>,
+    channels: DashMap<[u8; 32], Vec<(u32, SocketAddr)>>,
 }
 
 impl RoutingTable {
@@ -51,17 +57,17 @@ impl RoutingTable {
         }
     }
 
-    pub fn insert(&self, channel_id: [u8; 32], fingerprint: [u8; 32], addr: SocketAddr) {
+    pub fn insert(&self, channel_id: [u8; 32], slot_id: u32, addr: SocketAddr) {
         self.channels
             .entry(channel_id)
             .or_default()
-            .push((fingerprint, addr));
+            .push((slot_id, addr));
     }
 
-    pub fn remove(&self, channel_id: &[u8; 32], fingerprint: &[u8; 32]) {
+    pub fn remove(&self, channel_id: &[u8; 32], slot_id: &u32) {
         let mut remove_channel = false;
         if let Some(mut entries) = self.channels.get_mut(channel_id) {
-            entries.retain(|(fp, _)| fp != fingerprint);
+            entries.retain(|(s, _)| s != slot_id);
             remove_channel = entries.is_empty();
         }
         if remove_channel {
@@ -90,20 +96,20 @@ impl RoutingTable {
     pub fn update_addr(
         &self,
         channel_id: &[u8; 32],
-        fingerprint: &[u8; 32],
+        slot_id: &u32,
         new_addr: SocketAddr,
     ) {
         if let Some(mut entries) = self.channels.get_mut(channel_id) {
-            if let Some((_, addr)) = entries.iter_mut().find(|(fp, _)| fp == fingerprint) {
+            if let Some((_, addr)) = entries.iter_mut().find(|(s, _)| s == slot_id) {
                 *addr = new_addr;
             }
         }
     }
 
-    pub fn contains(&self, channel_id: &[u8; 32], fingerprint: &[u8; 32]) -> bool {
+    pub fn contains(&self, channel_id: &[u8; 32], slot_id: &u32) -> bool {
         self.channels
             .get(channel_id)
-            .map(|entries| entries.iter().any(|(fp, _)| fp == fingerprint))
+            .map(|entries| entries.iter().any(|(s, _)| s == slot_id))
             .unwrap_or(false)
     }
 }

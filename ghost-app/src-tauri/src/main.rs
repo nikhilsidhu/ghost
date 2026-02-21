@@ -24,6 +24,7 @@ fn main() {
     let client = app_state.client.clone();
     let voice_client = app_state.client.clone();
     let relay = app_state.relay.clone();
+    let voice_relay = app_state.relay.clone();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
@@ -50,6 +51,7 @@ fn main() {
             tauri::async_runtime::spawn(voice_task::run(
                 handle,
                 voice_client,
+                voice_relay,
                 voice_cmd_rx,
                 voice_state_tx,
             ));

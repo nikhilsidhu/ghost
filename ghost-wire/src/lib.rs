@@ -3,7 +3,7 @@
 /// Every blob sent to the relay is prefixed with a 10-byte plaintext header
 /// that the relay can inspect without decrypting:
 ///
-///   [version: u8][type: u8][epoch: u64 BE][...ciphertext]
+///   [version:1][type:1][epoch:8 BE][ciphertext...]
 ///
 /// The relay uses `type` and `epoch` for ordering guarantees (epoch gating on
 /// commits). Everything after the header is opaque ciphertext.
@@ -13,7 +13,7 @@ use thiserror::Error;
 pub const ENVELOPE_VERSION: u8 = 0x01;
 pub const ENVELOPE_HEADER_SIZE: usize = 10;
 
-// WS frame: [seq: u64 BE][received_at: u64 BE][payload...]
+// WS frame: [seq:8 BE][received_at:8 BE][payload...]
 pub const WS_SEQ_SIZE: usize = 8;
 pub const WS_TIMESTAMP_SIZE: usize = 8;
 pub const WS_FRAME_HEADER_SIZE: usize = WS_SEQ_SIZE + WS_TIMESTAMP_SIZE;
@@ -22,11 +22,11 @@ pub const WS_FRAME_HEADER_SIZE: usize = WS_SEQ_SIZE + WS_TIMESTAMP_SIZE;
 pub const WS_SIGNAL_GAP: &str = "gap";
 pub const WS_SIGNAL_EPOCH_MISMATCH: &str = "epoch_mismatch";
 
-// Voice packet: [header_len:2][channel_id:32][sender_fp:32][flags:1][seq:4][payload_len:2][payload...]
-// Relay only reads the first 66 bytes (header_len + channel_id + sender_fp).
-// New fields go after payload_len; header_len grows but relay code stays unchanged.
-pub const VOICE_HEADER_SIZE: usize = 73;
-pub const VOICE_RELAY_PREFIX: usize = 66;
+// Voice packet: [header_len:2][channel_id:32][slot_id:4][flags:1][seq:4][payload_len:2][payload...]
+// Relay reads first 38 bytes (header_len + channel_id + slot_id) for routing.
+// slot_id is relay-assigned per WS connection; replaces fingerprint in the header.
+pub const VOICE_HEADER_SIZE: usize = 45;
+pub const VOICE_RELAY_PREFIX: usize = 38;
 pub const VOICE_MAX_PACKET: usize = 1500;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

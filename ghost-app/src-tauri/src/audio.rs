@@ -83,13 +83,13 @@ impl AudioControls {
 }
 
 pub struct InboundFrame {
-    pub sender_fp: [u8; 32],
+    pub slot_id: u32,
     pub sequence: u32,
     pub encrypted_payload: Vec<u8>,
 }
 
-// Per-sender jitter buffer. Gates initial playback on target_depth, then
-// keeps playing continuously using loss concealment (PLC) for missing frames.
+// Per-sender jitter buffer. Buffers N frames before starting playback, then
+// keeps playing continuously using loss concealment for missing frames.
 
 struct JitterBuffer {
     buffer: BTreeMap<u32, Vec<u8>>,
@@ -180,8 +180,8 @@ impl JitterBuffer {
             return false;
         }
 
-        // Try FEC recovery: if the next packet is available, decode it with
-        // fec=true to recover a rough version of this missing frame
+        // Try forward error correction: if the next packet is available,
+        // decode it with fec=true to recover a rough version of this missing frame
         let next_seq = seq.wrapping_add(1);
         if let Some(next_encrypted) = self.buffer.get(&next_seq) {
             if let Ok(next_opus) = decrypt_voice_frame(key, next_seq, next_encrypted) {
@@ -191,7 +191,7 @@ impl JitterBuffer {
             }
         }
 
-        // No FEC available — fall back to loss concealment (empty decode)
+        // No forward error correction available — fall back to loss concealment (empty decode)
         let _ = self.decoder.decode_float(&[], out, false);
         self.adapt_depth();
         true
@@ -217,8 +217,8 @@ impl JitterBuffer {
 }
 
 // Compensates clock drift between sender and receiver by resampling decoded audio
-// at a variable rate. Adaptive P-controller: gentle correction for normal drift,
-// aggressive correction for large deviations (device reconnect, Bluetooth handoff).
+// at a variable rate. Small drift gets gentle correction, large drift (device
+// reconnect, Bluetooth handoff) gets aggressive correction.
 struct DriftResampler {
     pos: f64,
     smoothed_error: f64,
@@ -284,14 +284,14 @@ impl Agc {
 
 pub fn build_packet(
     channel_id: &[u8; 32],
-    sender_fp: &[u8; 32],
+    slot_id: u32,
     sequence: u32,
     payload: &[u8],
 ) -> Vec<u8> {
     let mut pkt = Vec::with_capacity(VOICE_HEADER_SIZE + payload.len());
     pkt.extend_from_slice(&(VOICE_HEADER_SIZE as u16).to_be_bytes());
     pkt.extend_from_slice(channel_id);
-    pkt.extend_from_slice(sender_fp);
+    pkt.extend_from_slice(&slot_id.to_be_bytes());
     pkt.push(0x00); // flags
     pkt.extend_from_slice(&sequence.to_be_bytes());
     pkt.extend_from_slice(&(payload.len() as u16).to_be_bytes());
@@ -299,9 +299,9 @@ pub fn build_packet(
     pkt
 }
 
-/// Returns (channel_id, sender_fp, sequence, payload_len, header_len).
+/// Returns (channel_id, slot_id, sequence, payload_len, header_len).
 /// Payload starts at buf[header_len..header_len + payload_len].
-pub fn parse_header(buf: &[u8]) -> Option<([u8; 32], [u8; 32], u32, usize, usize)> {
+pub fn parse_header(buf: &[u8]) -> Option<([u8; 32], u32, u32, usize, usize)> {
     if buf.len() < VOICE_HEADER_SIZE {
         return None;
     }
@@ -310,13 +310,14 @@ pub fn parse_header(buf: &[u8]) -> Option<([u8; 32], [u8; 32], u32, usize, usize
         return None;
     }
     let channel_id: [u8; 32] = buf[2..34].try_into().ok()?;
-    let sender_fp: [u8; 32] = buf[34..66].try_into().ok()?;
-    let sequence = u32::from_be_bytes(buf[67..71].try_into().ok()?);
-    let payload_len = u16::from_be_bytes(buf[71..73].try_into().ok()?) as usize;
+    let slot_id = u32::from_be_bytes(buf[34..38].try_into().ok()?);
+    // flags at byte 38
+    let sequence = u32::from_be_bytes(buf[39..43].try_into().ok()?);
+    let payload_len = u16::from_be_bytes(buf[43..45].try_into().ok()?) as usize;
     if buf.len() < header_len + payload_len {
         return None;
     }
-    Some((channel_id, sender_fp, sequence, payload_len, header_len))
+    Some((channel_id, slot_id, sequence, payload_len, header_len))
 }
 
 struct SampleRateConverter {
@@ -364,15 +365,16 @@ pub struct AudioPipeline {
     pub controls: Arc<AudioControls>,
     pub outbound_rx: Option<mpsc::Receiver<Vec<u8>>>,
     pub inbound_tx: mpsc::Sender<InboundFrame>,
-    pub peer_keys: Arc<Mutex<HashMap<[u8; 32], [u8; 32]>>>,
+    // slot_id → (fingerprint, voice_key) — single map eliminates double-lock in output callback
+    pub peer_keys: Arc<Mutex<HashMap<u32, ([u8; 32], [u8; 32])>>>,
 }
 
 impl AudioPipeline {
     pub fn start(
-        own_fp: [u8; 32],
+        own_slot_id: u32,
         own_key: [u8; 32],
         channel_id: [u8; 32],
-        peer_keys: HashMap<[u8; 32], [u8; 32]>,
+        peer_keys: HashMap<u32, ([u8; 32], [u8; 32])>,
         input_device_name: Option<String>,
         output_device_name: Option<String>,
     ) -> Result<Self, String> {
@@ -392,7 +394,7 @@ impl AudioPipeline {
                     controls_clone,
                     outbound_tx,
                     inbound_rx,
-                    own_fp,
+                    own_slot_id,
                     own_key,
                     channel_id,
                     peer_keys_clone,
@@ -484,7 +486,7 @@ pub fn resolve_device(
 }
 
 struct PlaybackShared {
-    jitter_buffers: HashMap<[u8; 32], JitterBuffer>,
+    jitter_buffers: HashMap<u32, JitterBuffer>,
 }
 
 struct AudioStreams {
@@ -499,7 +501,7 @@ fn setup_streams(
     input_device_name: &Option<String>,
     output_device_name: &Option<String>,
     playback_shared: Arc<Mutex<PlaybackShared>>,
-    peer_keys: Arc<Mutex<HashMap<[u8; 32], [u8; 32]>>>,
+    peer_keys: Arc<Mutex<HashMap<u32, ([u8; 32], [u8; 32])>>>,
     controls: Arc<AudioControls>,
 ) -> Result<AudioStreams, String> {
     let input_device = resolve_device(host, input_device_name, "input")?;
@@ -650,8 +652,8 @@ fn energy_vad(samples: &[f32]) -> f32 {
 
 // Mix all ready jitter buffers into mix_buf, return true if any audio was mixed
 fn mix_playback(
-    jitter_buffers: &mut HashMap<[u8; 32], JitterBuffer>,
-    peer_keys: &Mutex<HashMap<[u8; 32], [u8; 32]>>,
+    jitter_buffers: &mut HashMap<u32, JitterBuffer>,
+    peer_keys: &Mutex<HashMap<u32, ([u8; 32], [u8; 32])>>,
     mix_buf: &mut [f32],
     decode_buf: &mut [f32],
 ) -> bool {
@@ -659,13 +661,13 @@ fn mix_playback(
     let mut any_audio = false;
 
     let keys = peer_keys.lock().unwrap();
-    let fps: Vec<[u8; 32]> = jitter_buffers.keys().copied().collect();
-    for fp in &fps {
-        let jb = jitter_buffers.get_mut(fp).unwrap();
+    let slot_ids: Vec<u32> = jitter_buffers.keys().copied().collect();
+    for sid in &slot_ids {
+        let jb = jitter_buffers.get_mut(sid).unwrap();
         if !jb.ready() {
             continue;
         }
-        if let Some(key) = keys.get(fp) {
+        if let Some((_, key)) = keys.get(sid) {
             if jb.pop_frame(key, decode_buf) {
                 any_audio = true;
                 for i in 0..OPUS_FRAME_SIZE {
@@ -689,10 +691,10 @@ fn run_audio_thread(
     controls: Arc<AudioControls>,
     outbound_tx: mpsc::Sender<Vec<u8>>,
     mut inbound_rx: mpsc::Receiver<InboundFrame>,
-    own_fp: [u8; 32],
+    own_slot_id: u32,
     own_key: [u8; 32],
     channel_id: [u8; 32],
-    peer_keys: Arc<Mutex<HashMap<[u8; 32], [u8; 32]>>>,
+    peer_keys: Arc<Mutex<HashMap<u32, ([u8; 32], [u8; 32])>>>,
     input_device_name: Option<String>,
     output_device_name: Option<String>,
 ) -> Result<(), String> {
@@ -770,7 +772,7 @@ fn run_audio_thread(
             while let Ok(frame) = inbound_rx.try_recv() {
                 diag_frames_recv += 1;
                 let jb = shared.jitter_buffers
-                    .entry(frame.sender_fp)
+                    .entry(frame.slot_id)
                     .or_insert_with(|| JitterBuffer::new().expect("jitter buffer init"));
                 jb.set_next_seq(frame.sequence);
                 jb.insert(frame.sequence, frame.encrypted_payload);
@@ -839,7 +841,7 @@ fn run_audio_thread(
                     // PTT: always speaking while key held
                     controls.speaking.store(true, Ordering::Relaxed);
                 } else {
-                    // VA: VAD hangover controls speaking indicator
+                    // Voice activity mode: keep speaking indicator on briefly after voice drops
                     let vad_thresh = f32::from_bits(controls.vad_threshold.load(Ordering::Relaxed));
                     if max_vad > vad_thresh {
                         vad_hangover = VAD_HANGOVER_FRAMES;
@@ -854,7 +856,7 @@ fn run_audio_thread(
                 }
                 if let Ok(len) = encoder.encode_float(&frame_48k, &mut encode_buf) {
                     if let Ok(encrypted) = encrypt_voice_frame(&own_key, sequence, &encode_buf[..len]) {
-                        let pkt = build_packet(&channel_id, &own_fp, sequence, &encrypted);
+                        let pkt = build_packet(&channel_id, own_slot_id, sequence, &encrypted);
                         let _ = outbound_tx.try_send(pkt);
                         sequence = sequence.wrapping_add(1);
                         diag_frames_sent += 1;

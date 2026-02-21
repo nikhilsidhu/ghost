@@ -3,8 +3,11 @@ use openmls::prelude::Ciphersuite;
 /// Which MLS ciphersuite all Ghost groups use.
 pub const MLS_CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
 
-/// Label used when deriving per-sender voice encryption keys from MLS epoch secrets.
+/// Label used when deriving per-sender voice encryption keys from the MLS group's shared secret.
 pub const VOICE_EXPORT_LABEL: &str = "ghost-voice";
+
+/// Label used when deriving per-sender presence encryption keys from the MLS group's shared secret.
+pub const VOICE_PRESENCE_EXPORT_LABEL: &str = "ghost-voice-presence";
 
 /// Label used when deriving Ed25519 signing keys from identity seeds.
 pub const ED25519_DERIVE_LABEL: &[u8] = b"ghost-ed25519";

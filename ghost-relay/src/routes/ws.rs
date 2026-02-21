@@ -1,17 +1,33 @@
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::response::{IntoResponse, Response};
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
+use serde::Deserialize;
+use std::sync::atomic::Ordering::Relaxed;
 use std::time::Duration;
 
 use ghost_wire::{WS_FRAME_HEADER_SIZE, WS_SIGNAL_EPOCH_MISMATCH, WS_SIGNAL_GAP};
 
-use crate::constants::{WS_MAX_FANOUT_BATCH, WS_PING_INTERVAL_SECS};
+use crate::constants::{MAX_PRESENCE_BLOB_SIZE, WS_MAX_FANOUT_BATCH, WS_PING_INTERVAL_SECS};
 use crate::mailbox::Mailbox;
-use crate::state::AppState;
+use crate::state::{AppState, VpEntry};
 use crate::util::decode_mailbox_id;
 
 const HANDSHAKE_TIMEOUT_SECS: u64 = 5;
+
+#[derive(Deserialize)]
+struct VsMsg {
+    vs: VsInner,
+}
+
+#[derive(Deserialize)]
+struct VsInner {
+    ch: String,
+    p: Option<String>,
+    leave: Option<bool>,
+}
 
 pub async fn ws_upgrade(
     State(state): State<AppState>,
@@ -27,12 +43,13 @@ pub async fn ws_upgrade(
 
 async fn ws_connection(socket: WebSocket, mailbox_id: [u8; 32], state: AppState) {
     let (mut sink, mut stream) = socket.split();
+    let conn_id = state.next_conn_id.fetch_add(1, Relaxed);
 
     // Subscribe before handshake so we don't miss blobs during replay
-    let mut seq_rx = {
+    let (mut seq_rx, mut voice_rx) = {
         let mut map = state.mailboxes.write().await;
         let mailbox = map.entry(mailbox_id).or_insert_with(Mailbox::new);
-        mailbox.seq_tx.subscribe()
+        (mailbox.seq_tx.subscribe(), mailbox.voice_tx.subscribe())
     };
 
     // Handshake: first binary frame is 8-byte BE last_seen_seq
@@ -76,6 +93,26 @@ async fn ws_connection(socket: WebSocket, mailbox_id: [u8; 32], state: AppState)
         }
     }
 
+    // Voice state snapshot: send current voice presence for this mailbox
+    {
+        let vp = state.voice_presence.read().await;
+        let entries: Vec<serde_json::Value> = vp
+            .iter()
+            .filter(|e| e.mailbox_id == mailbox_id)
+            .map(|e| {
+                serde_json::json!({
+                    "ch": B64.encode(e.channel_id),
+                    "p": B64.encode(&e.blob),
+                })
+            })
+            .collect();
+        // Always send snapshot (even empty) so client clears stale voice state
+        let snap = serde_json::json!({ "vs_snap": entries });
+        if sink.send(Message::text(snap.to_string())).await.is_err() {
+            return;
+        }
+    }
+
     let ping_interval_dur = Duration::from_secs(WS_PING_INTERVAL_SECS);
     let mut ping_interval = tokio::time::interval(ping_interval_dur);
     let mut own_seqs: Vec<u64> = Vec::new();
@@ -102,6 +139,11 @@ async fn ws_connection(socket: WebSocket, mailbox_id: [u8; 32], state: AppState)
                             }
                         }
                     }
+                    Some(Ok(Message::Text(text))) => {
+                        if let Ok(vs) = serde_json::from_str::<VsMsg>(&text) {
+                            handle_voice_state(&state, &mailbox_id, conn_id, vs.vs).await;
+                        }
+                    }
                     Some(Ok(Message::Close(_))) | None => break,
                     _ => {}
                 }
@@ -123,11 +165,117 @@ async fn ws_connection(socket: WebSocket, mailbox_id: [u8; 32], state: AppState)
                     }
                 }
             }
+            voice_event = voice_rx.recv() => {
+                match voice_event {
+                    Ok((sender_conn_id, json)) if sender_conn_id != conn_id => {
+                        if sink.send(Message::text(json)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    _ => {} // own message or lagged
+                }
+            }
             _ = ping_interval.tick() => {
                 if sink.send(Message::Ping(bytes::Bytes::new())).await.is_err() {
                     break;
                 }
             }
+        }
+    }
+
+    // Cleanup: remove voice presence entries for this connection and broadcast leaves
+    let removed = {
+        let mut vp = state.voice_presence.write().await;
+        let mut removed = Vec::new();
+        vp.retain(|e| {
+            if e.conn_id == conn_id && e.mailbox_id == mailbox_id {
+                removed.push((e.channel_id, e.blob.clone()));
+                false
+            } else {
+                true
+            }
+        });
+        removed
+    };
+    if !removed.is_empty() {
+        let map = state.mailboxes.read().await;
+        if let Some(mailbox) = map.get(&mailbox_id) {
+            for (channel_id, blob) in removed {
+                let leave_json = serde_json::json!({
+                    "vs": {
+                        "ch": B64.encode(channel_id),
+                        "leave": true,
+                        "p": B64.encode(&blob),
+                    }
+                });
+                let _ = mailbox.voice_tx.send((conn_id, leave_json.to_string()));
+            }
+        }
+    }
+}
+
+async fn handle_voice_state(
+    state: &AppState,
+    mailbox_id: &[u8; 32],
+    conn_id: u64,
+    vs: VsInner,
+) {
+    let channel_id: [u8; 32] = match B64.decode(&vs.ch) {
+        Ok(b) if b.len() == 32 => b.try_into().unwrap(),
+        _ => return,
+    };
+
+    if vs.leave == Some(true) {
+        // Remove this connection's entry for this channel
+        let removed_blob = {
+            let mut vp = state.voice_presence.write().await;
+            let pos = vp.iter().position(|e| {
+                e.conn_id == conn_id && e.mailbox_id == *mailbox_id && e.channel_id == channel_id
+            });
+            pos.map(|i| vp.remove(i).blob)
+        };
+        if let Some(blob) = removed_blob {
+            let leave_json = serde_json::json!({
+                "vs": {
+                    "ch": vs.ch,
+                    "leave": true,
+                    "p": B64.encode(&blob),
+                }
+            });
+            let map = state.mailboxes.read().await;
+            if let Some(mailbox) = map.get(mailbox_id) {
+                let _ = mailbox.voice_tx.send((conn_id, leave_json.to_string()));
+            }
+        }
+    } else if let Some(p_b64) = vs.p {
+        let blob = match B64.decode(&p_b64) {
+            Ok(b) if !b.is_empty() && b.len() <= MAX_PRESENCE_BLOB_SIZE => b,
+            _ => return,
+        };
+        // Upsert in voice_presence
+        {
+            let mut vp = state.voice_presence.write().await;
+            if let Some(entry) = vp.iter_mut().find(|e| {
+                e.conn_id == conn_id && e.mailbox_id == *mailbox_id && e.channel_id == channel_id
+            }) {
+                entry.blob = blob.clone();
+            } else {
+                vp.push(VpEntry {
+                    mailbox_id: *mailbox_id,
+                    channel_id,
+                    conn_id,
+                    blob: blob.clone(),
+                });
+            }
+        }
+        // Broadcast to all mailbox subscribers
+        let broadcast_json = serde_json::json!({
+            "vs": { "ch": vs.ch, "p": p_b64 }
+        });
+        let map = state.mailboxes.read().await;
+        if let Some(mailbox) = map.get(mailbox_id) {
+            let _ = mailbox.voice_tx.send((conn_id, broadcast_json.to_string()));
         }
     }
 }

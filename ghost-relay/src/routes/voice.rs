@@ -1,35 +1,47 @@
+use std::collections::HashSet;
+
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::response::{IntoResponse, Response};
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use crate::constants::{MAX_PRESENCE_BLOB_SIZE, PRESENCE_RATE_LIMIT, SPEAKING_RATE_LIMIT};
 use crate::state::AppState;
 use crate::util::decode_mailbox_id;
 use crate::voice::{Participant, VoiceChannel, VoiceEvent};
 
 const PING_INTERVAL: Duration = Duration::from_secs(30);
+const PONG_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ClientMsg {
-    Join { fingerprint: String },
+    Join { presence: String },
     Leave,
+    Presence { blob: String },
     Speaking { speaking: bool },
-    MuteState { muted: bool, deafened: bool },
+    Resync,
 }
 
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ServerMsg {
-    Participants { list: Vec<String> },
-    Assigned { port: u16 },
-    Joined { fingerprint: String },
-    Left { fingerprint: String },
-    Speaking { fingerprint: String, speaking: bool },
-    MuteState { fingerprint: String, muted: bool, deafened: bool },
+    Welcome { slot_id: u32, port: u16, peers: Vec<PeerEntry> },
+    Joined { slot_id: u32, presence: String },
+    Left { slot_id: u32 },
+    Presence { slot_id: u32, blob: String },
+    Speaking { slot_id: u32, speaking: bool },
     Error { message: String },
+}
+
+#[derive(Serialize)]
+struct PeerEntry {
+    slot_id: u32,
+    presence: String,
 }
 
 pub async fn ws_upgrade(
@@ -47,8 +59,18 @@ pub async fn ws_upgrade(
 async fn voice_connection(socket: WebSocket, channel_id: [u8; 32], state: AppState) {
     let (mut sink, mut stream) = socket.split();
     let mut ping_interval = tokio::time::interval(PING_INTERVAL);
-    let mut fingerprint: Option<[u8; 32]> = None;
+    let mut last_pong = Instant::now();
+    let mut slot_id: Option<u32> = None;
     let mut event_rx: Option<tokio::sync::broadcast::Receiver<VoiceEvent>> = None;
+
+    // Track which peer slots this connection knows about
+    let mut known_slots: HashSet<u32> = HashSet::new();
+
+    // Rate limiting state
+    let mut last_presence_time = Instant::now();
+    let mut presence_count: u32 = 0;
+    let mut last_speaking_time = Instant::now();
+    let mut speaking_count: u32 = 0;
 
     loop {
         tokio::select! {
@@ -56,18 +78,24 @@ async fn voice_connection(socket: WebSocket, channel_id: [u8; 32], state: AppSta
                 match msg {
                     Some(Ok(Message::Text(text))) => {
                         match serde_json::from_str::<ClientMsg>(&text) {
-                            Ok(ClientMsg::Join { fingerprint: fp_hex }) => {
-                                let fp = match parse_fingerprint(&fp_hex) {
-                                    Some(fp) => fp,
-                                    None => {
+                            Ok(ClientMsg::Join { presence }) => {
+                                if slot_id.is_some() {
+                                    let _ = send_json(&mut sink, &ServerMsg::Error {
+                                        message: "already joined".into(),
+                                    }).await;
+                                    continue;
+                                }
+                                let blob = match B64.decode(&presence) {
+                                    Ok(b) if !b.is_empty() && b.len() <= MAX_PRESENCE_BLOB_SIZE => b,
+                                    _ => {
                                         let _ = send_json(&mut sink, &ServerMsg::Error {
-                                            message: "invalid fingerprint".into(),
+                                            message: "invalid presence blob".into(),
                                         }).await;
                                         continue;
                                     }
                                 };
 
-                                let (participants_list, initial_mute, rx) = {
+                                let (welcome, rx) = {
                                     let mut channels = state.voice_channels.write().await;
                                     let channel = channels
                                         .entry(channel_id)
@@ -82,87 +110,153 @@ async fn voice_connection(socket: WebSocket, channel_id: [u8; 32], state: AppSta
                                         continue;
                                     }
 
-                                    // Collect mute states before adding self
-                                    let mute_states: Vec<_> = channel.participants.iter()
-                                        .filter(|p| p.muted || p.deafened)
-                                        .map(|p| (hex::encode(p.fingerprint), p.muted, p.deafened))
-                                        .collect();
+                                    let new_slot = channel.alloc_slot();
 
-                                    // Remove stale entry if re-joining
-                                    channel.participants.retain(|p| p.fingerprint != fp);
-                                    channel.participants.push(Participant {
-                                        fingerprint: fp,
-                                        udp_addr: None,
-                                        last_udp: std::time::Instant::now(),
-                                        speaking: false,
-                                        muted: false,
-                                        deafened: false,
-                                    });
-
-                                    let list: Vec<String> = channel
+                                    // Collect existing peers before adding self
+                                    let peers: Vec<PeerEntry> = channel
                                         .participants
                                         .iter()
-                                        .map(|p| hex::encode(p.fingerprint))
+                                        .filter_map(|p| {
+                                            p.latest_presence.as_ref().map(|blob| PeerEntry {
+                                                slot_id: p.slot_id,
+                                                presence: B64.encode(blob),
+                                            })
+                                        })
                                         .collect();
 
+                                    channel.participants.push(Participant {
+                                        slot_id: new_slot,
+                                        udp_addr: None,
+                                        last_udp: Instant::now(),
+                                        latest_presence: Some(blob.clone()),
+                                    });
+
                                     let _ = channel.notify.send(VoiceEvent::Joined {
-                                        fingerprint: fp,
+                                        slot_id: new_slot,
+                                    });
+                                    let _ = channel.notify.send(VoiceEvent::Presence {
+                                        slot_id: new_slot,
+                                        blob,
                                     });
 
                                     let rx = channel.notify.subscribe();
-                                    (list, mute_states, rx)
+                                    let udp_port = *state.voice_udp_port_rx.borrow();
+
+                                    let welcome = ServerMsg::Welcome {
+                                        slot_id: new_slot,
+                                        port: udp_port,
+                                        peers,
+                                    };
+
+                                    (welcome, rx)
                                 };
 
-                                fingerprint = Some(fp);
+                                // Set connection state after releasing the lock
+                                let (own_sid, peer_sids) = match &welcome {
+                                    ServerMsg::Welcome { slot_id, peers, .. } => {
+                                        (*slot_id, peers.iter().map(|p| p.slot_id).collect::<Vec<_>>())
+                                    }
+                                    _ => unreachable!(),
+                                };
+                                slot_id = Some(own_sid);
                                 event_rx = Some(rx);
-
-                                let _ = send_json(&mut sink, &ServerMsg::Participants {
-                                    list: participants_list,
-                                }).await;
-                                let udp_port = *state.voice_udp_port_rx.borrow();
-                                let _ = send_json(&mut sink, &ServerMsg::Assigned {
-                                    port: udp_port,
-                                }).await;
-                                // Send current mute states of existing participants
-                                for (fp_hex, muted, deafened) in &initial_mute {
-                                    let _ = send_json(&mut sink, &ServerMsg::MuteState {
-                                        fingerprint: fp_hex.clone(),
-                                        muted: *muted,
-                                        deafened: *deafened,
-                                    }).await;
+                                for sid in peer_sids {
+                                    known_slots.insert(sid);
                                 }
+
+                                let _ = send_json(&mut sink, &welcome).await;
                             }
                             Ok(ClientMsg::Leave) => {
                                 break;
                             }
-                            Ok(ClientMsg::Speaking { speaking }) => {
-                                if let Some(fp) = fingerprint {
+                            Ok(ClientMsg::Presence { blob: blob_b64 }) => {
+                                let sid = match slot_id {
+                                    Some(s) => s,
+                                    None => continue,
+                                };
+
+                                // Rate limit
+                                let now = Instant::now();
+                                if now.duration_since(last_presence_time) >= Duration::from_secs(1) {
+                                    last_presence_time = now;
+                                    presence_count = 0;
+                                }
+                                presence_count += 1;
+                                if presence_count > PRESENCE_RATE_LIMIT {
+                                    continue;
+                                }
+
+                                let blob = match B64.decode(&blob_b64) {
+                                    Ok(b) if !b.is_empty() && b.len() <= MAX_PRESENCE_BLOB_SIZE => b,
+                                    _ => continue,
+                                };
+
+                                {
                                     let mut channels = state.voice_channels.write().await;
                                     if let Some(channel) = channels.get_mut(&channel_id) {
-                                        if let Some(p) = channel.participants.iter_mut().find(|p| p.fingerprint == fp) {
-                                            p.speaking = speaking;
+                                        if let Some(p) = channel.participants.iter_mut().find(|p| p.slot_id == sid) {
+                                            p.latest_presence = Some(blob.clone());
                                         }
+                                        let _ = channel.notify.send(VoiceEvent::Presence {
+                                            slot_id: sid,
+                                            blob,
+                                        });
+                                    }
+                                }
+                            }
+                            Ok(ClientMsg::Speaking { speaking }) => {
+                                let sid = match slot_id {
+                                    Some(s) => s,
+                                    None => continue,
+                                };
+
+                                // Rate limit
+                                let now = Instant::now();
+                                if now.duration_since(last_speaking_time) >= Duration::from_secs(1) {
+                                    last_speaking_time = now;
+                                    speaking_count = 0;
+                                }
+                                speaking_count += 1;
+                                if speaking_count > SPEAKING_RATE_LIMIT {
+                                    continue;
+                                }
+
+                                {
+                                    let channels = state.voice_channels.read().await;
+                                    if let Some(channel) = channels.get(&channel_id) {
                                         let _ = channel.notify.send(VoiceEvent::Speaking {
-                                            fingerprint: fp,
+                                            slot_id: sid,
                                             speaking,
                                         });
                                     }
                                 }
                             }
-                            Ok(ClientMsg::MuteState { muted, deafened }) => {
-                                if let Some(fp) = fingerprint {
-                                    let mut channels = state.voice_channels.write().await;
-                                    if let Some(channel) = channels.get_mut(&channel_id) {
-                                        if let Some(p) = channel.participants.iter_mut().find(|p| p.fingerprint == fp) {
-                                            p.muted = muted;
-                                            p.deafened = deafened;
-                                        }
-                                        let _ = channel.notify.send(VoiceEvent::MuteState {
-                                            fingerprint: fp,
-                                            muted,
-                                            deafened,
-                                        });
-                                    }
+                            Ok(ClientMsg::Resync) => {
+                                let sid = match slot_id {
+                                    Some(s) => s,
+                                    None => continue,
+                                };
+
+                                let channels = state.voice_channels.read().await;
+                                if let Some(channel) = channels.get(&channel_id) {
+                                    let peers: Vec<PeerEntry> = channel
+                                        .participants
+                                        .iter()
+                                        .filter(|p| p.slot_id != sid)
+                                        .filter_map(|p| {
+                                            p.latest_presence.as_ref().map(|blob| PeerEntry {
+                                                slot_id: p.slot_id,
+                                                presence: B64.encode(blob),
+                                            })
+                                        })
+                                        .collect();
+
+                                    let udp_port = *state.voice_udp_port_rx.borrow();
+                                    let _ = send_json(&mut sink, &ServerMsg::Welcome {
+                                        slot_id: sid,
+                                        port: udp_port,
+                                        peers,
+                                    }).await;
                                 }
                             }
                             Err(_) => {
@@ -171,6 +265,9 @@ async fn voice_connection(socket: WebSocket, channel_id: [u8; 32], state: AppSta
                                 }).await;
                             }
                         }
+                    }
+                    Some(Ok(Message::Pong(_))) => {
+                        last_pong = Instant::now();
                     }
                     Some(Ok(Message::Close(_))) | None => break,
                     _ => {}
@@ -183,42 +280,79 @@ async fn voice_connection(socket: WebSocket, channel_id: [u8; 32], state: AppSta
                 }
             } => {
                 match event {
-                    Ok(VoiceEvent::Joined { fingerprint: fp }) => {
-                        if fingerprint.map_or(true, |own| own != fp) {
-                            let _ = send_json(&mut sink, &ServerMsg::Joined {
-                                fingerprint: hex::encode(fp),
-                            }).await;
-                        }
+                    Ok(VoiceEvent::Joined { slot_id: sid }) => {
+                        // No-op: the Presence event that follows carries the blob.
+                        let _ = sid;
                     }
-                    Ok(VoiceEvent::Left { fingerprint: fp }) => {
-                        if fingerprint.map_or(true, |own| own != fp) {
+                    Ok(VoiceEvent::Left { slot_id: sid }) => {
+                        if slot_id.map_or(true, |own| own != sid) {
+                            known_slots.remove(&sid);
                             let _ = send_json(&mut sink, &ServerMsg::Left {
-                                fingerprint: hex::encode(fp),
+                                slot_id: sid,
                             }).await;
                         }
                     }
-                    Ok(VoiceEvent::Speaking { fingerprint: fp, speaking }) => {
-                        if fingerprint.map_or(true, |own| own != fp) {
+                    Ok(VoiceEvent::Presence { slot_id: sid, blob }) => {
+                        if slot_id.map_or(true, |own| own != sid) {
+                            if known_slots.insert(sid) {
+                                // First time seeing this slot — it's a join
+                                let _ = send_json(&mut sink, &ServerMsg::Joined {
+                                    slot_id: sid,
+                                    presence: B64.encode(&blob),
+                                }).await;
+                            } else {
+                                let _ = send_json(&mut sink, &ServerMsg::Presence {
+                                    slot_id: sid,
+                                    blob: B64.encode(&blob),
+                                }).await;
+                            }
+                        }
+                    }
+                    Ok(VoiceEvent::Speaking { slot_id: sid, speaking }) => {
+                        if slot_id.map_or(true, |own| own != sid) {
                             let _ = send_json(&mut sink, &ServerMsg::Speaking {
-                                fingerprint: hex::encode(fp),
+                                slot_id: sid,
                                 speaking,
                             }).await;
                         }
                     }
-                    Ok(VoiceEvent::MuteState { fingerprint: fp, muted, deafened }) => {
-                        if fingerprint.map_or(true, |own| own != fp) {
-                            let _ = send_json(&mut sink, &ServerMsg::MuteState {
-                                fingerprint: hex::encode(fp),
-                                muted,
-                                deafened,
-                            }).await;
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        // Receiver fell behind — send full state snapshot to recover
+                        if let Some(sid) = slot_id {
+                            eprintln!("voice ws: slot {sid} lagged {n} events, sending resync");
+                            let channels = state.voice_channels.read().await;
+                            if let Some(channel) = channels.get(&channel_id) {
+                                let peers: Vec<PeerEntry> = channel
+                                    .participants
+                                    .iter()
+                                    .filter(|p| p.slot_id != sid)
+                                    .filter_map(|p| {
+                                        p.latest_presence.as_ref().map(|blob| PeerEntry {
+                                            slot_id: p.slot_id,
+                                            presence: B64.encode(blob),
+                                        })
+                                    })
+                                    .collect();
+                                known_slots.clear();
+                                for peer in &peers {
+                                    known_slots.insert(peer.slot_id);
+                                }
+                                let udp_port = *state.voice_udp_port_rx.borrow();
+                                let _ = send_json(&mut sink, &ServerMsg::Welcome {
+                                    slot_id: sid,
+                                    port: udp_port,
+                                    peers,
+                                }).await;
+                            }
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
             _ = ping_interval.tick() => {
+                if last_pong.elapsed() > PONG_TIMEOUT {
+                    break;
+                }
                 if sink.send(Message::Ping(bytes::Bytes::new())).await.is_err() {
                     break;
                 }
@@ -227,24 +361,19 @@ async fn voice_connection(socket: WebSocket, channel_id: [u8; 32], state: AppSta
     }
 
     // Cleanup on disconnect
-    if let Some(fp) = fingerprint {
+    if let Some(sid) = slot_id {
         {
             let mut channels = state.voice_channels.write().await;
             if let Some(channel) = channels.get_mut(&channel_id) {
-                channel.participants.retain(|p| p.fingerprint != fp);
-                let _ = channel.notify.send(VoiceEvent::Left { fingerprint: fp });
+                channel.participants.retain(|p| p.slot_id != sid);
+                let _ = channel.notify.send(VoiceEvent::Left { slot_id: sid });
                 if channel.participants.is_empty() {
                     channels.remove(&channel_id);
                 }
             }
         }
-        state.routing.remove(&channel_id, &fp);
+        state.routing.remove(&channel_id, &sid);
     }
-}
-
-fn parse_fingerprint(hex_str: &str) -> Option<[u8; 32]> {
-    let bytes = hex::decode(hex_str).ok()?;
-    bytes.try_into().ok()
 }
 
 async fn send_json(

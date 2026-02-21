@@ -11,6 +11,7 @@ import {
 import {
   isInCall, isMuted, isDeafened, isPttMode, isPttKeyHeld, pttMuteAttempt, toggleMute, toggleDeafen, endCall,
   voiceParticipants, members, isSpeaking, voiceMuteStates, voiceQuality, identity,
+  isInVoiceChannel, voiceChannelMembers,
 } from "../lib/store";
 import {
   createSortable,
@@ -271,36 +272,59 @@ export function CallQualityIndicator(props: { size?: number }) {
   );
 }
 
-// Participant avatars shown under the active voice channel
-export function VoiceParticipantList() {
+// Participant avatars shown under a voice channel.
+// Active call: uses voiceParticipants + voiceMuteStates + speaking indicators.
+// Observer: uses voiceChannelMembers from mailbox WS (no speaking ring).
+export function VoiceParticipantList(props: { channelId: string }) {
   const memberMap = () => new Map(members().map((m) => [m.fingerprint, m]));
+  const active = () => isInVoiceChannel(props.channelId);
+
+  // For active call: fingerprints from voice WS
+  const activeFps = () => active() ? voiceParticipants() : [];
+  // For observer: fingerprints from mailbox WS
+  const observerMembers = () => !active() ? (voiceChannelMembers().get(props.channelId) ?? []) : [];
+
+  const entries = () => {
+    if (active()) {
+      return activeFps().map(fp => ({
+        fp,
+        muted: voiceMuteStates().get(fp)?.muted ?? false,
+        deafened: voiceMuteStates().get(fp)?.deafened ?? false,
+        speaking: isSpeaking(fp),
+      }));
+    }
+    return observerMembers().map(m => ({
+      fp: m.fingerprint,
+      muted: m.muted,
+      deafened: m.deafened,
+      speaking: false,
+    }));
+  };
 
   return (
     <div class="ml-1 mb-1">
-      <For each={voiceParticipants()}>
-        {(fp) => {
-          const member = () => memberMap().get(fp);
-          const speaking = () => isSpeaking(fp);
-          const muteState = () => voiceMuteStates().get(fp);
-          const name = () => member()?.display_name ?? fp.slice(0, FALLBACK_NAME_LEN);
+      <For each={entries()}>
+        {(e) => {
+          const member = () => memberMap().get(e.fp);
+          const name = () => member()?.display_name ?? e.fp.slice(0, FALLBACK_NAME_LEN);
           return (
             <div class="flex items-center gap-2 px-2 py-1 rounded-md">
               <div class={cn(
                 "rounded-full flex-shrink-0 transition-shadow duration-[var(--duration-fast)]",
-                speaking() && "ring-2 ring-[var(--emerald-400)]",
+                e.speaking && "ring-2 ring-[var(--emerald-400)]",
               )}>
-                <Avatar hashKey={fp} label={name()} class="w-5 h-5 text-[9px]" />
+                <Avatar hashKey={e.fp} label={name()} class="w-5 h-5 text-[9px]" />
               </div>
               <span class={cn(
                 "text-sm truncate flex-1",
-                speaking() ? "text-[var(--neutral-100)]" : "text-[var(--neutral-400)]",
+                e.speaking ? "text-[var(--neutral-100)]" : "text-[var(--neutral-400)]",
               )}>
                 {name()}
               </span>
-              <Show when={muteState()?.deafened}>
+              <Show when={e.deafened}>
                 <HeadphoneOff size={12} class="flex-shrink-0 text-[var(--neutral-600)]" />
               </Show>
-              <Show when={muteState()?.muted && !muteState()?.deafened}>
+              <Show when={e.muted && !e.deafened}>
                 <MicOff size={12} class="flex-shrink-0 text-[var(--neutral-600)]" />
               </Show>
             </div>

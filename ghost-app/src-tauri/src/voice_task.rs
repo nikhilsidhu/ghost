@@ -3,9 +3,12 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use ghost_core::client::GhostClient;
+use ghost_core::mls::voice::PresenceState;
+use ghost_core::relay::RelayClient;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 use tokio::sync::{mpsc, watch, Mutex};
@@ -88,25 +91,34 @@ pub struct VoiceQualityEvent {
     pub ping_ms: Option<u32>,
 }
 
+// Client → relay
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[allow(dead_code)]
 enum ClientMsg {
-    Join { fingerprint: String },
+    Join { presence: String },
     Leave,
+    Presence { blob: String },
     Speaking { speaking: bool },
-    MuteState { muted: bool, deafened: bool },
+    Resync,
 }
 
+// Relay → client
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ServerMsg {
-    Participants { list: Vec<String> },
-    Assigned { port: u16 },
-    Joined { fingerprint: String },
-    Left { fingerprint: String },
-    Speaking { fingerprint: String, speaking: bool },
-    MuteState { fingerprint: String, muted: bool, deafened: bool },
+    Welcome { slot_id: u32, port: u16, peers: Vec<PeerEntry> },
+    Joined { slot_id: u32, presence: String },
+    Left { slot_id: u32 },
+    Presence { slot_id: u32, blob: String },
+    Speaking { slot_id: u32, speaking: bool },
     Error { message: String },
+}
+
+#[derive(Deserialize)]
+struct PeerEntry {
+    slot_id: u32,
+    presence: String,
 }
 
 pub struct VoiceHandle {
@@ -116,6 +128,8 @@ pub struct VoiceHandle {
 /// Active audio session dropped on disconnect to stop everything.
 struct AudioSession {
     pipeline: AudioPipeline,
+    #[allow(dead_code)]
+    own_slot_id: u32,
     own_fp: [u8; 32],
     udp_send_task: JoinHandle<()>,
     udp_recv_task: JoinHandle<()>,
@@ -152,7 +166,7 @@ async fn disconnect(
     ws_read: &mut Option<WsReader>,
     state: &mut VoiceStateEvent,
     state_tx: &watch::Sender<VoiceStateEvent>,
-    participants: &mut Vec<String>,
+    peer_state: &mut HashMap<u32, PresenceState>,
     audio: &mut Option<AudioSession>,
 ) {
     if let Some(ref mut sink) = ws {
@@ -163,7 +177,7 @@ async fn disconnect(
         })
         .await;
     }
-    reset(app, ws, ws_read, state, state_tx, participants, audio);
+    reset(app, ws, ws_read, state, state_tx, peer_state, audio);
 }
 
 /// Resets local state (preserves mute/deafen) without notifying the relay.
@@ -173,7 +187,7 @@ fn reset(
     ws_read: &mut Option<WsReader>,
     state: &mut VoiceStateEvent,
     state_tx: &watch::Sender<VoiceStateEvent>,
-    participants: &mut Vec<String>,
+    peer_state: &mut HashMap<u32, PresenceState>,
     audio: &mut Option<AudioSession>,
 ) {
     *ws = None;
@@ -184,7 +198,7 @@ fn reset(
         deafened: state.deafened,
         ..VoiceStateEvent::default()
     };
-    participants.clear();
+    peer_state.clear();
     let _ = state_tx.send(state.clone());
     let _ = app.emit("voice-state", &state);
 }
@@ -194,104 +208,89 @@ fn emit_error(app: &AppHandle, msg: &str) {
     let _ = app.emit("voice-error", msg);
 }
 
-/// Context saved between receiving Join and the relay's Assigned+Participants responses.
-struct PendingAudioStart {
-    server_id: String,
-    channel_id: String,
-    relay_url: String,
-    fingerprint: String,
-    participant_fps: Vec<String>,
-    input_device: Option<String>,
-    output_device: Option<String>,
-    ns_mode: u8,
-    agc_mode: u8,
-    vad_threshold: u32,
-    input_gain: u32,
-    input_mode: u8,
+fn parse_hex_id(hex: &str) -> Option<[u8; 32]> {
+    hex::decode(hex)
+        .ok()
+        .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
 }
 
-fn apply_pending_settings(p: &PendingAudioStart, session: &AudioSession) {
-    let c = &session.pipeline.controls;
-    c.noise_suppression.store(p.ns_mode, Ordering::Relaxed);
-    c.agc.store(p.agc_mode, Ordering::Relaxed);
-    c.vad_threshold.store(p.vad_threshold, Ordering::Relaxed);
-    c.input_gain.store(p.input_gain, Ordering::Relaxed);
-    c.input_mode.store(p.input_mode, Ordering::Relaxed);
+/// Emit participant list (fingerprint hex strings) derived from peer_state.
+fn emit_participants(app: &AppHandle, peer_state: &HashMap<u32, PresenceState>, own_fp: Option<&[u8; 32]>) {
+    let mut fps: Vec<String> = peer_state
+        .values()
+        .map(|p| hex::encode(p.fingerprint))
+        .collect();
+    if let Some(fp) = own_fp {
+        fps.push(hex::encode(fp));
+    }
+    let _ = app.emit("voice-participants", &VoiceParticipantsEvent { participants: fps });
 }
 
-/// Derive voice encryption keys for a set of participant fingerprints.
-async fn derive_peer_keys(
+/// Try to decrypt a presence blob and, on success, derive the voice key for that peer.
+async fn process_presence_blob(
     client: &Arc<Mutex<GhostClient>>,
     server_id: &[u8; 32],
     channel_id: &[u8; 32],
-    fp_hexes: &[String],
-) -> Result<HashMap<[u8; 32], [u8; 32]>, String> {
-    let client = client.lock().await;
-    let mut keys = HashMap::new();
-    for fp_hex in fp_hexes {
-        let fp: [u8; 32] = hex::decode(fp_hex)
-            .map_err(|e| format!("bad fp: {e}"))?
-            .try_into()
-            .map_err(|_| "fp not 32 bytes")?;
-        let key = client
-            .derive_voice_key(server_id, channel_id, &fp)
-            .map_err(|e| format!("derive key: {e}"))?;
-        keys.insert(fp, key);
-    }
-    Ok(keys)
+    blob_b64: &str,
+) -> Result<(ghost_core::mls::voice::PresenceState, [u8; 32]), String> {
+    let blob = B64.decode(blob_b64).map_err(|e| format!("bad base64: {e}"))?;
+    let c = client.lock().await;
+    let ps = c
+        .open_presence_blob(server_id, channel_id, &blob)
+        .map_err(|e| format!("presence decrypt: {e}"))?;
+    let voice_key = c
+        .derive_voice_key(server_id, channel_id, &ps.fingerprint)
+        .map_err(|e| format!("derive key: {e}"))?;
+    Ok((ps, voice_key))
 }
 
-/// Start the audio pipeline and UDP transport after receiving Assigned + Participants.
+/// Seal a presence blob for the local user.
+async fn seal_presence(
+    client: &Arc<Mutex<GhostClient>>,
+    server_id: &[u8; 32],
+    channel_id: &[u8; 32],
+    muted: bool,
+    deafened: bool,
+) -> Result<String, String> {
+    let c = client.lock().await;
+    let blob = c
+        .seal_presence_blob(server_id, channel_id, muted, deafened)
+        .map_err(|e| format!("seal presence: {e}"))?;
+    Ok(B64.encode(&blob))
+}
+
+/// Start the audio pipeline and UDP transport after receiving Welcome.
 async fn start_audio(
     client: &Arc<Mutex<GhostClient>>,
-    server_id_hex: &str,
-    channel_id_hex: &str,
-    own_fp_hex: &str,
+    server_id: &[u8; 32],
+    channel_id: &[u8; 32],
+    own_fp: &[u8; 32],
+    own_slot_id: u32,
     relay_url: &str,
     port: u16,
-    participant_fps: &[String],
+    peer_keys: HashMap<u32, ([u8; 32], [u8; 32])>,
     voice_state: &VoiceStateEvent,
     input_device: Option<String>,
     output_device: Option<String>,
 ) -> Result<AudioSession, String> {
-    let server_id: [u8; 32] = hex::decode(server_id_hex)
-        .map_err(|e| format!("bad server_id: {e}"))?
-        .try_into()
-        .map_err(|_| "server_id not 32 bytes".to_string())?;
-    let channel_id: [u8; 32] = hex::decode(channel_id_hex)
-        .map_err(|e| format!("bad channel_id: {e}"))?
-        .try_into()
-        .map_err(|_| "channel_id not 32 bytes".to_string())?;
-    let own_fp: [u8; 32] = hex::decode(own_fp_hex)
-        .map_err(|e| format!("bad own_fp: {e}"))?
-        .try_into()
-        .map_err(|_| "own_fp not 32 bytes".to_string())?;
-
-    // Derive own key
     let own_key = {
         let c = client.lock().await;
-        c.derive_voice_key(&server_id, &channel_id, &own_fp)
+        c.derive_voice_key(server_id, channel_id, own_fp)
             .map_err(|e| format!("derive own key: {e}"))?
     };
 
-    // Derive peer keys (excluding self)
-    let peer_fps: Vec<String> = participant_fps
-        .iter()
-        .filter(|fp| fp.as_str() != own_fp_hex)
-        .cloned()
-        .collect();
-    let peer_keys = derive_peer_keys(client, &server_id, &channel_id, &peer_fps).await?;
-
-    let mut pipeline = AudioPipeline::start(own_fp, own_key, channel_id, peer_keys, input_device, output_device)?;
+    let mut pipeline = AudioPipeline::start(
+        own_slot_id, own_key, *channel_id, peer_keys,
+        input_device, output_device,
+    )?;
     pipeline.controls.muted.store(voice_state.muted, Ordering::Relaxed);
     pipeline.controls.deafened.store(voice_state.deafened, Ordering::Relaxed);
 
     let host = relay_host(relay_url)?;
     let transport = Arc::new(UdpTransport::connect(&host, port).await?);
 
-    // Send a registration packet so the relay learns our UDP address even
-    // before we transmit any audio (needed for PTT-only clients to receive).
-    let reg_pkt = crate::audio::build_packet(&channel_id, &own_fp, 0, &[]);
+    // Registration packet so relay learns our UDP address before we transmit audio
+    let reg_pkt = crate::audio::build_packet(channel_id, own_slot_id, 0, &[]);
     if let Err(e) = transport.socket.send(&reg_pkt).await {
         eprintln!("voice udp registration send: {e}");
     }
@@ -311,36 +310,101 @@ async fn start_audio(
         }
     });
     let udp_recv_task = tokio::spawn(async move {
-        transport.recv_loop(inbound_tx, own_fp).await;
+        transport.recv_loop(inbound_tx, own_slot_id).await;
     });
 
     Ok(AudioSession {
         pipeline,
-        own_fp,
+        own_slot_id,
+        own_fp: *own_fp,
         udp_send_task,
         udp_recv_task,
     })
 }
 
+/// Context saved between receiving Join command and the relay's Welcome response.
+struct PendingJoin {
+    server_id: [u8; 32],
+    channel_id: [u8; 32],
+    relay_url: String,
+    own_fp: [u8; 32],
+    input_device: Option<String>,
+    output_device: Option<String>,
+    ns_mode: u8,
+    agc_mode: u8,
+    vad_threshold: u32,
+    input_gain: u32,
+    input_mode: u8,
+}
+
+fn apply_pending_settings(p: &PendingJoin, session: &AudioSession) {
+    let c = &session.pipeline.controls;
+    c.noise_suppression.store(p.ns_mode, Ordering::Relaxed);
+    c.agc.store(p.agc_mode, Ordering::Relaxed);
+    c.vad_threshold.store(p.vad_threshold, Ordering::Relaxed);
+    c.input_gain.store(p.input_gain, Ordering::Relaxed);
+    c.input_mode.store(p.input_mode, Ordering::Relaxed);
+}
+
+/// Send a presence blob update to the relay (used on mute/deafen change).
+async fn send_presence_update(
+    ws: &mut Option<WsSink>,
+    client: &Arc<Mutex<GhostClient>>,
+    server_id: &[u8; 32],
+    channel_id: &[u8; 32],
+    muted: bool,
+    deafened: bool,
+) {
+    let Some(ref mut sink) = ws else { return };
+    match seal_presence(client, server_id, channel_id, muted, deafened).await {
+        Ok(blob_b64) => {
+            let msg = serde_json::to_string(&ClientMsg::Presence { blob: blob_b64 }).unwrap();
+            let _ = sink.send(Message::Text(msg.into())).await;
+        }
+        Err(e) => eprintln!("voice: failed to seal presence update: {e}"),
+    }
+}
+
+/// Send a voice state JSON frame over the mailbox WS for server-wide visibility.
+async fn send_mailbox_vs(
+    relay: &Arc<Mutex<RelayClient>>,
+    client: &Arc<Mutex<GhostClient>>,
+    server_id: &[u8; 32],
+    json: String,
+) {
+    let mailbox_id = {
+        let c = client.lock().await;
+        c.mailbox_id_for_server(server_id)
+    };
+    if let Some(mid) = mailbox_id {
+        let r = relay.lock().await;
+        let _ = r.send_text(&mid, json).await;
+    }
+}
+
 pub async fn run(
     app: AppHandle,
     client: Arc<Mutex<GhostClient>>,
+    relay: Arc<Mutex<RelayClient>>,
     mut cmd_rx: mpsc::Receiver<VoiceCommand>,
     state_tx: watch::Sender<VoiceStateEvent>,
 ) {
     let mut state = VoiceStateEvent::default();
     let mut ws: Option<WsSink> = None;
     let mut ws_read: Option<WsReader> = None;
-    let mut participants: Vec<String> = Vec::new();
+    let mut peer_state: HashMap<u32, PresenceState> = HashMap::new();
     let mut audio: Option<AudioSession> = None;
     let mut last_speaking = false;
     let mut speaking_timer = tokio::time::interval(Duration::from_millis(SPEAKING_POLL_MS));
 
-    let mut pending: Option<PendingAudioStart> = None;
-    let mut assigned_port: Option<u16> = None;
+    let mut pending: Option<PendingJoin> = None;
     let mut quality_timer = tokio::time::interval(Duration::from_millis(QUALITY_POLL_MS));
     let mut ping_sent_at: Option<Instant> = None;
     let mut last_ping_ms: Option<u32> = None;
+
+    // Parsed IDs cached while connected (avoids re-parsing on every presence update)
+    let mut active_server_id: Option<[u8; 32]> = None;
+    let mut active_channel_id: Option<[u8; 32]> = None;
 
     loop {
         tokio::select! {
@@ -348,9 +412,23 @@ pub async fn run(
                 let Some(cmd) = cmd else { break };
                 match cmd {
                     VoiceCommand::Join { server_id, channel_id, relay_url, fingerprint, input_device, output_device, ns_mode, agc_mode, vad_threshold, input_gain, input_mode, muted, deafened } => {
-                        disconnect(&app, &mut ws, &mut ws_read, &mut state, &state_tx, &mut participants, &mut audio).await;
+                        disconnect(&app, &mut ws, &mut ws_read, &mut state, &state_tx, &mut peer_state, &mut audio).await;
                         pending = None;
-                        assigned_port = None;
+                        active_server_id = None;
+                        active_channel_id = None;
+
+                        let server_id_bytes = match parse_hex_id(&server_id) {
+                            Some(b) => b,
+                            None => { emit_error(&app, "bad server_id"); continue; }
+                        };
+                        let channel_id_bytes = match parse_hex_id(&channel_id) {
+                            Some(b) => b,
+                            None => { emit_error(&app, "bad channel_id"); continue; }
+                        };
+                        let own_fp = match parse_hex_id(&fingerprint) {
+                            Some(b) => b,
+                            None => { emit_error(&app, "bad fingerprint"); continue; }
+                        };
 
                         let url = match ws_url(&relay_url, &channel_id) {
                             Ok(u) => u,
@@ -359,6 +437,16 @@ pub async fn run(
                                 continue;
                             }
                         };
+
+                        // Seal initial presence blob
+                        let presence_b64 = match seal_presence(&client, &server_id_bytes, &channel_id_bytes, muted, deafened).await {
+                            Ok(b) => b,
+                            Err(e) => {
+                                emit_error(&app, &format!("seal presence: {e}"));
+                                continue;
+                            }
+                        };
+
                         let stream = match tokio::time::timeout(
                             WS_CONNECT_TIMEOUT,
                             tokio_tungstenite::connect_async(&url),
@@ -374,27 +462,33 @@ pub async fn run(
                             }
                         };
                         let (mut sink, read) = stream.split();
-                        let join_msg = serde_json::to_string(&ClientMsg::Join { fingerprint: fingerprint.clone() }).unwrap();
+                        let join_msg = serde_json::to_string(&ClientMsg::Join { presence: presence_b64.clone() }).unwrap();
                         if let Err(e) = sink.send(Message::Text(join_msg.into())).await {
                             emit_error(&app, &format!("ws send: {e}"));
                             continue;
                         }
+
+                        // Broadcast voice state over mailbox WS after successful voice WS join
+                        let ch_b64 = B64.encode(channel_id_bytes);
+                        let vs_json = serde_json::json!({"vs":{"ch":&ch_b64,"p":&presence_b64}}).to_string();
+                        send_mailbox_vs(&relay, &client, &server_id_bytes, vs_json).await;
                         ws = Some(sink);
                         ws_read = Some(read);
                         state = VoiceStateEvent {
                             connected: true,
-                            server_id: Some(server_id.clone()),
-                            channel_id: Some(channel_id.clone()),
+                            server_id: Some(server_id),
+                            channel_id: Some(channel_id),
                             muted,
                             deafened,
                             udp_port: None,
                         };
-                        pending = Some(PendingAudioStart {
-                            server_id,
-                            channel_id,
+                        active_server_id = Some(server_id_bytes);
+                        active_channel_id = Some(channel_id_bytes);
+                        pending = Some(PendingJoin {
+                            server_id: server_id_bytes,
+                            channel_id: channel_id_bytes,
                             relay_url,
-                            fingerprint,
-                            participant_fps: Vec::new(),
+                            own_fp,
                             input_device,
                             output_device,
                             ns_mode,
@@ -407,9 +501,16 @@ pub async fn run(
                         let _ = app.emit("voice-state", &state);
                     }
                     VoiceCommand::Leave => {
-                        disconnect(&app, &mut ws, &mut ws_read, &mut state, &state_tx, &mut participants, &mut audio).await;
+                        // Broadcast leave over mailbox WS
+                        if let (Some(sid), Some(cid)) = (active_server_id, active_channel_id) {
+                            let ch_b64 = B64.encode(cid);
+                            let vs_json = serde_json::json!({"vs":{"ch":ch_b64,"leave":true}}).to_string();
+                            send_mailbox_vs(&relay, &client, &sid, vs_json).await;
+                        }
+                        disconnect(&app, &mut ws, &mut ws_read, &mut state, &state_tx, &mut peer_state, &mut audio).await;
                         pending = None;
-                        assigned_port = None;
+                        active_server_id = None;
+                        active_channel_id = None;
                     }
                     VoiceCommand::SetMuted(muted) => {
                         // unmuting while deafened also undeafens
@@ -425,14 +526,18 @@ pub async fn run(
                         }
                         let _ = state_tx.send(state.clone());
                         let _ = app.emit("voice-state", &state);
-                        if let Some(ref mut sink) = ws {
-                            let msg = serde_json::to_string(&ClientMsg::MuteState { muted: state.muted, deafened: state.deafened }).unwrap();
-                            let _ = sink.send(Message::Text(msg.into())).await;
+                        if let (Some(sid), Some(cid)) = (active_server_id, active_channel_id) {
+                            send_presence_update(&mut ws, &client, &sid, &cid, state.muted, state.deafened).await;
+                            // Also broadcast over mailbox WS
+                            if let Ok(blob_b64) = seal_presence(&client, &sid, &cid, state.muted, state.deafened).await {
+                                let ch_b64 = B64.encode(cid);
+                                let vs_json = serde_json::json!({"vs":{"ch":ch_b64,"p":blob_b64}}).to_string();
+                                send_mailbox_vs(&relay, &client, &sid, vs_json).await;
+                            }
                         }
                     }
                     VoiceCommand::SetDeafened(deafened) => {
                         state.deafened = deafened;
-                        // deafen controls both: on → mute+deafen, off → unmute+undeafen
                         state.muted = deafened;
                         if let Some(ref session) = audio {
                             session.pipeline.controls.muted.store(deafened, Ordering::Relaxed);
@@ -440,9 +545,14 @@ pub async fn run(
                         }
                         let _ = state_tx.send(state.clone());
                         let _ = app.emit("voice-state", &state);
-                        if let Some(ref mut sink) = ws {
-                            let msg = serde_json::to_string(&ClientMsg::MuteState { muted: state.muted, deafened: state.deafened }).unwrap();
-                            let _ = sink.send(Message::Text(msg.into())).await;
+                        if let (Some(sid), Some(cid)) = (active_server_id, active_channel_id) {
+                            send_presence_update(&mut ws, &client, &sid, &cid, state.muted, state.deafened).await;
+                            // Also broadcast over mailbox WS
+                            if let Ok(blob_b64) = seal_presence(&client, &sid, &cid, state.muted, state.deafened).await {
+                                let ch_b64 = B64.encode(cid);
+                                let vs_json = serde_json::json!({"vs":{"ch":ch_b64,"p":blob_b64}}).to_string();
+                                send_mailbox_vs(&relay, &client, &sid, vs_json).await;
+                            }
                         }
                     }
                     VoiceCommand::SetNoiseSuppression(mode) => {
@@ -469,7 +579,6 @@ pub async fn run(
                         if let Some(ref session) = audio {
                             session.pipeline.controls.input_mode.store(mode, Ordering::Relaxed);
                         }
-                        // Switching to PTT clears mute so PTT gating takes over
                         if mode == crate::audio::INPUT_MODE_PTT && state.muted {
                             state.muted = false;
                             if let Some(ref session) = audio {
@@ -477,9 +586,13 @@ pub async fn run(
                             }
                             let _ = state_tx.send(state.clone());
                             let _ = app.emit("voice-state", &state);
-                            if let Some(ref mut sink) = ws {
-                                let msg = serde_json::to_string(&ClientMsg::MuteState { muted: state.muted, deafened: state.deafened }).unwrap();
-                                let _ = sink.send(Message::Text(msg.into())).await;
+                            if let (Some(sid), Some(cid)) = (active_server_id, active_channel_id) {
+                                send_presence_update(&mut ws, &client, &sid, &cid, state.muted, state.deafened).await;
+                                if let Ok(blob_b64) = seal_presence(&client, &sid, &cid, state.muted, state.deafened).await {
+                                    let ch_b64 = B64.encode(cid);
+                                    let vs_json = serde_json::json!({"vs":{"ch":ch_b64,"p":blob_b64}}).to_string();
+                                    send_mailbox_vs(&relay, &client, &sid, vs_json).await;
+                                }
                             }
                         }
                     }
@@ -497,18 +610,20 @@ pub async fn run(
                 }
             } => {
                 let Some(msg) = msg else {
-                    reset(&app, &mut ws, &mut ws_read, &mut state, &state_tx, &mut participants, &mut audio);
+                    reset(&app, &mut ws, &mut ws_read, &mut state, &state_tx, &mut peer_state, &mut audio);
                     pending = None;
-                    assigned_port = None;
+                    active_server_id = None;
+                    active_channel_id = None;
                     continue;
                 };
                 let msg = match msg {
                     Ok(m) => m,
                     Err(e) => {
                         emit_error(&app, &format!("ws read: {e}"));
-                        reset(&app, &mut ws, &mut ws_read, &mut state, &state_tx, &mut participants, &mut audio);
+                        reset(&app, &mut ws, &mut ws_read, &mut state, &state_tx, &mut peer_state, &mut audio);
                         pending = None;
-                        assigned_port = None;
+                        active_server_id = None;
+                        active_channel_id = None;
                         continue;
                     }
                 };
@@ -520,86 +635,128 @@ pub async fn run(
                 if let Message::Text(text) = msg {
                     match serde_json::from_str::<ServerMsg>(text.as_str()) {
                         Ok(server_msg) => match server_msg {
-                            ServerMsg::Participants { list } => {
-                                participants = list;
-                                let _ = app.emit("voice-participants", &VoiceParticipantsEvent { participants: participants.clone() });
-
-                                if let Some(ref mut p) = pending {
-                                    p.participant_fps = participants.clone();
-                                }
-                                if let Some(port) = assigned_port {
-                                    if let Some(p) = pending.take() {
-                                        match start_audio(&client, &p.server_id, &p.channel_id, &p.fingerprint, &p.relay_url, port, &p.participant_fps, &state, p.input_device.clone(), p.output_device.clone()).await {
-                                            Ok(session) => {
-                                                apply_pending_settings(&p, &session);
-                                                audio = Some(session);
+                            ServerMsg::Welcome { slot_id, port, peers } => {
+                                let Some(p) = pending.take() else {
+                                    // Resync: relay pushed fresh state after broadcast lag
+                                    let Some(ref session) = audio else { continue };
+                                    let (Some(sid), Some(cid)) = (active_server_id, active_channel_id) else { continue };
+                                    let mut new_peer_state: HashMap<u32, PresenceState> = HashMap::new();
+                                    let mut new_keys: HashMap<u32, ([u8; 32], [u8; 32])> = HashMap::new();
+                                    for peer in &peers {
+                                        match process_presence_blob(&client, &sid, &cid, &peer.presence).await {
+                                            Ok((ps, voice_key)) => {
+                                                new_keys.insert(peer.slot_id, (ps.fingerprint, voice_key));
+                                                new_peer_state.insert(peer.slot_id, ps);
                                             }
-                                            Err(e) => emit_error(&app, &format!("audio start: {e}")),
+                                            Err(e) => eprintln!("voice: resync decrypt (slot {}): {e}", peer.slot_id),
                                         }
                                     }
+                                    if let Ok(mut pk) = session.pipeline.peer_keys.lock() {
+                                        pk.clear();
+                                        pk.extend(new_keys);
+                                    }
+                                    peer_state = new_peer_state;
+                                    emit_participants(&app, &peer_state, Some(&session.own_fp));
+                                    for ps in peer_state.values() {
+                                        let _ = app.emit("voice-mute-state", &VoiceMuteStateEvent {
+                                            fingerprint: hex::encode(ps.fingerprint),
+                                            muted: ps.muted,
+                                            deafened: ps.deafened,
+                                        });
+                                    }
+                                    eprintln!("voice: resync complete, {} peers", peer_state.len());
+                                    continue;
+                                };
+
+                                // Decrypt peer presence blobs and collect voice keys
+                                let mut initial_keys: HashMap<u32, ([u8; 32], [u8; 32])> = HashMap::new();
+                                for peer in &peers {
+                                    match process_presence_blob(&client, &p.server_id, &p.channel_id, &peer.presence).await {
+                                        Ok((ps, voice_key)) => {
+                                            initial_keys.insert(peer.slot_id, (ps.fingerprint, voice_key));
+                                            peer_state.insert(peer.slot_id, ps);
+                                        }
+                                        Err(e) => eprintln!("voice: failed to decrypt peer presence (slot {}): {e}", peer.slot_id),
+                                    }
                                 }
-                            }
-                            ServerMsg::Assigned { port } => {
+
                                 state.udp_port = Some(port);
-                                assigned_port = Some(port);
                                 let _ = state_tx.send(state.clone());
                                 let _ = app.emit("voice-state", &state);
+                                emit_participants(&app, &peer_state, Some(&p.own_fp));
 
-                                if let Some(p) = pending.take() {
-                                    if !p.participant_fps.is_empty() {
-                                        match start_audio(&client, &p.server_id, &p.channel_id, &p.fingerprint, &p.relay_url, port, &p.participant_fps, &state, p.input_device.clone(), p.output_device.clone()).await {
-                                            Ok(session) => {
-                                                apply_pending_settings(&p, &session);
-                                                audio = Some(session);
-                                            }
-                                            Err(e) => emit_error(&app, &format!("audio start: {e}")),
-                                        }
-                                    } else {
-                                        pending = Some(p);
+                                for ps in peer_state.values() {
+                                    let _ = app.emit("voice-mute-state", &VoiceMuteStateEvent {
+                                        fingerprint: hex::encode(ps.fingerprint),
+                                        muted: ps.muted,
+                                        deafened: ps.deafened,
+                                    });
+                                }
+
+                                match start_audio(
+                                    &client, &p.server_id, &p.channel_id, &p.own_fp, slot_id,
+                                    &p.relay_url, port, initial_keys, &state,
+                                    p.input_device.clone(), p.output_device.clone(),
+                                ).await {
+                                    Ok(session) => {
+                                        apply_pending_settings(&p, &session);
+                                        audio = Some(session);
                                     }
+                                    Err(e) => emit_error(&app, &format!("audio start: {e}")),
                                 }
                             }
-                            ServerMsg::Joined { fingerprint } => {
-                                participants.push(fingerprint.clone());
-                                let _ = app.emit("voice-participants", &VoiceParticipantsEvent { participants: participants.clone() });
-
-                                // Derive key for new peer and add to audio pipeline
-                                if let Some(ref session) = audio {
-                                    if let (Some(gid_hex), Some(cid_hex)) = (&state.server_id, &state.channel_id) {
-                                        let parsed = hex::decode(gid_hex)
-                                            .ok()
-                                            .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
-                                            .zip(hex::decode(cid_hex).ok().and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok()));
-                                        if let Some((gid, cid)) = parsed {
-                                            if let Ok(keys) = derive_peer_keys(&client, &gid, &cid, &[fingerprint]).await {
-                                                if let Ok(mut pk) = session.pipeline.peer_keys.lock() {
-                                                    pk.extend(keys);
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            ServerMsg::Left { fingerprint } => {
-                                participants.retain(|fp| fp != &fingerprint);
-                                let _ = app.emit("voice-participants", &VoiceParticipantsEvent { participants: participants.clone() });
-
-                                // Remove peer's key from audio pipeline
-                                if let Some(ref session) = audio {
-                                    if let Ok(fp_bytes) = hex::decode(&fingerprint) {
-                                        if let Ok(fp_arr) = <[u8; 32]>::try_from(fp_bytes.as_slice()) {
+                            ServerMsg::Joined { slot_id, presence } => {
+                                let (Some(sid), Some(cid)) = (active_server_id, active_channel_id) else { continue };
+                                match process_presence_blob(&client, &sid, &cid, &presence).await {
+                                    Ok((ps, voice_key)) => {
+                                        let _ = app.emit("voice-mute-state", &VoiceMuteStateEvent {
+                                            fingerprint: hex::encode(ps.fingerprint),
+                                            muted: ps.muted,
+                                            deafened: ps.deafened,
+                                        });
+                                        if let Some(ref session) = audio {
                                             if let Ok(mut pk) = session.pipeline.peer_keys.lock() {
-                                                pk.remove(&fp_arr);
+                                                pk.insert(slot_id, (ps.fingerprint, voice_key));
                                             }
                                         }
+                                        peer_state.insert(slot_id, ps);
+                                        emit_participants(&app, &peer_state, audio.as_ref().map(|s| &s.own_fp));
                                     }
+                                    Err(e) => eprintln!("voice: failed to decrypt joined presence (slot {slot_id}): {e}"),
                                 }
                             }
-                            ServerMsg::Speaking { fingerprint, speaking } => {
-                                let _ = app.emit("voice-speaking", &VoiceSpeakingEvent { fingerprint, speaking });
+                            ServerMsg::Left { slot_id } => {
+                                peer_state.remove(&slot_id);
+                                if let Some(ref session) = audio {
+                                    if let Ok(mut pk) = session.pipeline.peer_keys.lock() {
+                                        pk.remove(&slot_id);
+                                    }
+                                }
+                                emit_participants(&app, &peer_state, audio.as_ref().map(|s| &s.own_fp));
                             }
-                            ServerMsg::MuteState { fingerprint, muted, deafened } => {
-                                let _ = app.emit("voice-mute-state", &VoiceMuteStateEvent { fingerprint, muted, deafened });
+                            ServerMsg::Presence { slot_id, blob } => {
+                                let (Some(sid), Some(cid)) = (active_server_id, active_channel_id) else { continue };
+                                match process_presence_blob(&client, &sid, &cid, &blob).await {
+                                    Ok((ps, _)) => {
+                                        let _ = app.emit("voice-mute-state", &VoiceMuteStateEvent {
+                                            fingerprint: hex::encode(ps.fingerprint),
+                                            muted: ps.muted,
+                                            deafened: ps.deafened,
+                                        });
+                                        if peer_state.contains_key(&slot_id) {
+                                            peer_state.insert(slot_id, ps);
+                                        }
+                                    }
+                                    Err(e) => eprintln!("voice: failed to decrypt presence update (slot {slot_id}): {e}"),
+                                }
+                            }
+                            ServerMsg::Speaking { slot_id, speaking } => {
+                                if let Some(info) = peer_state.get(&slot_id) {
+                                    let _ = app.emit("voice-speaking", &VoiceSpeakingEvent {
+                                        fingerprint: hex::encode(info.fingerprint),
+                                        speaking,
+                                    });
+                                }
                             }
                             ServerMsg::Error { message } => {
                                 emit_error(&app, &format!("server: {message}"));
@@ -615,7 +772,6 @@ pub async fn run(
                     let speaking = session.pipeline.controls.speaking.load(Ordering::Relaxed);
                     if speaking != last_speaking {
                         last_speaking = speaking;
-                        // Emit locally so the frontend can show self-speaking indicator
                         let fp_hex = hex::encode(session.own_fp);
                         let _ = app.emit("voice-speaking", &VoiceSpeakingEvent { fingerprint: fp_hex, speaking });
                         if let Some(ref mut sink) = ws {
@@ -638,7 +794,6 @@ pub async fn run(
                         jitter_target: target,
                         ping_ms: last_ping_ms,
                     });
-                    // Send WS ping for next RTT measurement
                     if let Some(ref mut sink) = ws {
                         ping_sent_at = Some(Instant::now());
                         let _ = sink.send(Message::Ping(vec![].into())).await;

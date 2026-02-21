@@ -13,7 +13,7 @@ import {
   selectedServer, selectServer, selectChannel,
   settingsOpen, settingsCategory, setSettingsCategory, toggleSettings,
   joinVoiceChannel, isInVoiceChannel, endCall,
-  voiceParticipants, voiceParticipantChannelId,
+  voiceChannelMembers,
   dmViewActive, dms, serverList, activateDmView, selectDm,
 } from "../lib/store";
 import { sections } from "../lib/settings-registry";
@@ -435,7 +435,6 @@ export function Sidebar() {
                             <For each={voiceChannels()}>
                               {(ch) => {
                                 const active = () => isInVoiceChannel(ch.channel_id);
-                                const sid = selectedServerId()!;
                                 return (
                                   <>
                                     <VoiceChannelItem
@@ -443,11 +442,14 @@ export function Sidebar() {
                                       active={active()}
                                       onToggle={() => {
                                         if (active()) endCall();
-                                        else joinVoiceChannel(sid, ch.channel_id);
+                                        else {
+                                          const sid = selectedServerId();
+                                          if (sid) joinVoiceChannel(sid, ch.channel_id);
+                                        }
                                       }}
                                     />
-                                    <Show when={active() || (voiceParticipantChannelId() === ch.channel_id && voiceParticipants().length > 0)}>
-                                      <VoiceParticipantList />
+                                    <Show when={active() || voiceChannelMembers().has(ch.channel_id)}>
+                                      <VoiceParticipantList channelId={ch.channel_id} />
                                     </Show>
                                   </>
                                 );

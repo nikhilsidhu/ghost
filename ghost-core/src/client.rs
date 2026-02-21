@@ -534,6 +534,50 @@ impl GhostClient {
         crate::mls::voice::derive_voice_key(group, &self.provider, channel_id, sender_fp)
     }
 
+    /// Derive a per-sender presence encryption key for a voice channel.
+    pub fn derive_presence_key(
+        &self,
+        server_id: &[u8; 32],
+        channel_id: &[u8; 32],
+        sender_fp: &[u8; 32],
+    ) -> Result<[u8; 32]> {
+        let group = self.servers.get(server_id).ok_or_else(|| {
+            GhostError::ServerNotLoaded(hex::encode(&server_id[..8]))
+        })?;
+        crate::mls::voice::derive_presence_key(group, &self.provider, channel_id, sender_fp)
+    }
+
+    /// Seal an encrypted presence blob for the current identity.
+    pub fn seal_presence_blob(
+        &self,
+        server_id: &[u8; 32],
+        channel_id: &[u8; 32],
+        muted: bool,
+        deafened: bool,
+    ) -> Result<Vec<u8>> {
+        let key = self.derive_presence_key(server_id, channel_id, &self.identity.fingerprint)?;
+        let state = crate::mls::voice::PresenceState {
+            fingerprint: self.identity.fingerprint,
+            muted,
+            deafened,
+        };
+        crate::mls::voice::seal_presence(&key, &state)
+    }
+
+    /// Decrypt a presence blob by trial-decrypting with all server members' keys.
+    pub fn open_presence_blob(
+        &self,
+        server_id: &[u8; 32],
+        channel_id: &[u8; 32],
+        blob: &[u8],
+    ) -> Result<crate::mls::voice::PresenceState> {
+        let group = self.servers.get(server_id).ok_or_else(|| {
+            GhostError::ServerNotLoaded(hex::encode(&server_id[..8]))
+        })?;
+        let member_fps = self.mls_member_fingerprints(server_id)?;
+        crate::mls::voice::try_open_presence(&member_fps, group, &self.provider, channel_id, blob)
+    }
+
     /// Returns (server_id, mailbox_id) for every loaded server.
     pub fn server_mailboxes(&self) -> Vec<([u8; 32], [u8; 32])> {
         self.servers

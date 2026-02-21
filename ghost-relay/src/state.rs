@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -18,6 +19,14 @@ pub struct Invite {
     pub accept_notify: broadcast::Sender<()>,
 }
 
+/// Cached voice presence entry for mailbox WS broadcast
+pub struct VpEntry {
+    pub mailbox_id: [u8; 32],
+    pub channel_id: [u8; 32],
+    pub conn_id: u64,
+    pub blob: Vec<u8>,
+}
+
 pub struct Inner {
     pub mailboxes: RwLock<HashMap<[u8; 32], Mailbox>>,
     pub invites: RwLock<HashMap<String, Invite>>,
@@ -28,6 +37,8 @@ pub struct Inner {
     pub config: Config,
     pub start_time: Instant,
     pub storage: Storage,
+    pub voice_presence: RwLock<Vec<VpEntry>>,
+    pub next_conn_id: AtomicU64,
 }
 
 impl Inner {
@@ -65,5 +76,7 @@ pub fn new_state(config: Config, storage: Storage) -> AppState {
         config,
         start_time: Instant::now(),
         storage,
+        voice_presence: RwLock::new(Vec::new()),
+        next_conn_id: AtomicU64::new(1),
     })
 }

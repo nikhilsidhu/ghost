@@ -9,8 +9,11 @@ pub const DEFAULT_READ_LIMIT: u32 = 1000;
 pub const WS_PING_INTERVAL_SECS: u64 = 30;
 pub const WS_MAX_FANOUT_BATCH: u32 = 100;
 
-// Voice / SFU
+// Voice relay
 pub const DEFAULT_VOICE_PORT: u16 = 10000;
 pub const DEFAULT_MAX_VOICE_PARTICIPANTS: usize = 25;
 pub const VOICE_UDP_TIMEOUT_SECS: u64 = 30;
 pub const VOICE_EVENT_CAPACITY: usize = 16;
+pub const MAX_PRESENCE_BLOB_SIZE: usize = 2048;
+pub const PRESENCE_RATE_LIMIT: u32 = 2;
+pub const SPEAKING_RATE_LIMIT: u32 = 20;

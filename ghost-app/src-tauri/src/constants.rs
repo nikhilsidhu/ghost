@@ -25,7 +25,7 @@ pub const AGC_RELEASE: f32 = 0.05;
 // Voice activity threshold (nnnoiseless returns 0.0–1.0, community recommends 0.85+)
 pub const VAD_THRESHOLD: f32 = 0.85;
 
-// Continue transmitting for this many frames after VAD drops (prevents clipping word ends)
+// Continue transmitting for this many frames after voice activity drops (prevents clipping word ends)
 pub const VAD_HANGOVER_FRAMES: u32 = 15; // ~300ms at 50fps
 
 // Shared buffer holds ~1 second of audio between device callbacks and processing thread

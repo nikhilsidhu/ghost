@@ -2,22 +2,30 @@ use std::net::SocketAddr;
 
 use tokio::net::UdpSocket;
 
-use ghost_wire::{VOICE_MAX_PACKET, VOICE_RELAY_PREFIX};
+use ghost_wire::VOICE_MAX_PACKET;
 use crate::state::AppState;
 
-// Relay only reads header_len + channel_id + sender_fp. It forwards the
-// entire datagram without understanding flags, sequence, or payload.
-fn parse_header(buf: &[u8]) -> Option<([u8; 32], [u8; 32])> {
-    if buf.len() < VOICE_RELAY_PREFIX {
+// Relay reads header_len + channel_id + slot_id for routing.
+// Dispatches on header_len to reject old 73-byte format packets.
+fn parse_header(buf: &[u8]) -> Option<([u8; 32], u32)> {
+    if buf.len() < 38 {
         return None;
     }
     let header_len = u16::from_be_bytes(buf[0..2].try_into().ok()?) as usize;
-    if header_len < VOICE_RELAY_PREFIX || buf.len() < header_len {
+    if buf.len() < header_len {
         return None;
     }
     let channel_id: [u8; 32] = buf[2..34].try_into().ok()?;
-    let sender_fp: [u8; 32] = buf[34..66].try_into().ok()?;
-    Some((channel_id, sender_fp))
+    match header_len {
+        // [header_len:2][channel_id:32][slot_id:4]...
+        45 => {
+            let slot_id = u32::from_be_bytes(buf[34..38].try_into().ok()?);
+            Some((channel_id, slot_id))
+        }
+        // [header_len:2][channel_id:32][fingerprint:32]... — reject, old clients must upgrade
+        73 => None,
+        _ => None,
+    }
 }
 
 pub async fn run(state: AppState) {
@@ -48,14 +56,16 @@ pub async fn run(state: AppState) {
             }
         };
 
-        let (channel_id, sender_fp) = match parse_header(&buf[..len]) {
+        let (channel_id, slot_id) = match parse_header(&buf[..len]) {
             Some(h) => h,
             None => continue,
         };
 
-        // First packet from this sender registers their real address
-        if !state.routing.contains(&channel_id, &sender_fp) {
-            state.routing.insert(channel_id, sender_fp, sender_addr);
+        // Register or update the slot's address (handles NAT rebinding)
+        if !state.routing.contains(&channel_id, &slot_id) {
+            state.routing.insert(channel_id, slot_id, sender_addr);
+        } else {
+            state.routing.update_addr(&channel_id, &slot_id, sender_addr);
         }
 
         let peers = state.routing.peers(&channel_id, &sender_addr);

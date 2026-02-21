@@ -67,6 +67,8 @@ const [voiceParticipantChannelId, setVoiceParticipantChannelId] = createSignal<s
 const [voiceMuteStates, setVoiceMuteStates] = createSignal<Map<string, { muted: boolean; deafened: boolean }>>(new Map());
 // Call quality metrics from audio pipeline
 const [voiceQuality, setVoiceQuality] = createSignal<VoiceQuality | null>(null);
+// Per-channel voice members from mailbox WS (visible to all server members)
+const [voiceChannelMembers, setVoiceChannelMembers] = createSignal<Map<string, Array<{ fingerprint: string; muted: boolean; deafened: boolean }>>>(new Map());
 
 const isInCall = voiceConnected;
 const [isPttMode, setIsPttMode] = createSignal(false);
@@ -320,6 +322,16 @@ const initialize = async () => {
     setVoiceQuality(event.payload);
   });
 
+  listen<{ channel_id: string; members: Array<{ fingerprint: string; muted: boolean; deafened: boolean }> }>("voice-channel-members", (event) => {
+    const { channel_id, members } = event.payload;
+    setVoiceChannelMembers(prev => {
+      const next = new Map(prev);
+      if (members.length === 0) next.delete(channel_id);
+      else next.set(channel_id, members);
+      return next;
+    });
+  });
+
   listen<string>("voice-error", (event) => {
     console.error("voice:", event.payload);
     setVoiceError(event.payload);
@@ -356,4 +368,5 @@ export {
   voiceChannelId, voiceServerId, voiceParticipants, speakingSet, voiceError,
   joinVoiceChannel, isSpeaking, isInVoiceChannel,
   voiceParticipantChannelId, voiceMuteStates, voiceQuality,
+  voiceChannelMembers,
 };

@@ -29,11 +29,9 @@ impl UdpTransport {
         Ok(Self { socket })
     }
 
-    /// Sends encoded packets from the audio pipeline to the relay.
-
     /// Receives packets from the relay and forwards them to the audio pipeline,
     /// skipping our own packets.
-    pub async fn recv_loop(&self, inbound_tx: mpsc::Sender<InboundFrame>, own_fp: [u8; 32]) {
+    pub async fn recv_loop(&self, inbound_tx: mpsc::Sender<InboundFrame>, own_slot_id: u32) {
         let mut buf = [0u8; VOICE_MAX_PACKET];
         loop {
             let len = match self.socket.recv(&mut buf).await {
@@ -44,20 +42,20 @@ impl UdpTransport {
                 }
             };
 
-            let (_channel_id, sender_fp, sequence, payload_len, header_len) =
+            let (_channel_id, slot_id, sequence, payload_len, header_len) =
                 match parse_header(&buf[..len]) {
                     Some(h) => h,
                     None => continue,
                 };
 
-            if sender_fp == own_fp {
+            if slot_id == own_slot_id || payload_len == 0 {
                 continue;
             }
 
             let payload = buf[header_len..header_len + payload_len].to_vec();
             let _ = inbound_tx
                 .try_send(InboundFrame {
-                    sender_fp,
+                    slot_id,
                     sequence,
                     encrypted_payload: payload,
                 })

@@ -1,10 +1,15 @@
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine;
 use ghost_core::client::{GhostClient, ReceiveResult};
 use ghost_core::crypto::MessageType;
+use ghost_core::mls::voice::PresenceState;
 use ghost_core::relay::{RelayClient, RelayEvent};
 use ghost_core::storage::{Channel, Member, MemberRole};
 use ghost_core::wire::{decode_metadata, ChannelOpPayload, MetadataPayload};
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 use tokio::sync::{mpsc, Mutex};
 
@@ -26,6 +31,11 @@ pub async fn run(
             r.subscribe(*mailbox_id, seq);
         }
     }
+
+    // Per-channel voice members visible to all mailbox subscribers
+    let mut voice_members: HashMap<[u8; 32], Vec<PresenceState>> = HashMap::new();
+    // Track which channels belong to which mailbox (so snapshots don't clobber other servers)
+    let mut mailbox_channels: HashMap<[u8; 32], HashSet<[u8; 32]>> = HashMap::new();
 
     while let Some(event) = events.recv().await {
         match event {
@@ -129,6 +139,11 @@ pub async fn run(
             RelayEvent::Gap { mailbox_id } => {
                 handle_gap(&client, &relay, &mailbox_id).await;
             }
+            RelayEvent::VoiceState { mailbox_id, json } => {
+                handle_voice_state(
+                    &app, &client, &mailbox_id, &json, &mut voice_members, &mut mailbox_channels,
+                ).await;
+            }
         }
     }
 }
@@ -139,14 +154,27 @@ async fn handle_gap(
     mailbox_id: &[u8; 32],
 ) {
     // Fetch GroupInfo from relay, rejoin via external commit
-    let server_info = {
+    let fetch_result = {
         let r = relay.lock().await;
-        match r.get_server_info(mailbox_id).await {
-            Ok(gi) => gi,
-            Err(e) => {
+        r.get_server_info(mailbox_id).await
+    };
+    let server_info = match fetch_result {
+        Ok(gi) => gi,
+        Err(e) => {
+            if e.to_string().contains("404") {
+                // Relay was restarted — no server_info exists yet.
+                // Our local MLS state is still valid; just reset last_seen
+                // and resubscribe from the start of the (now-empty) log.
+                eprintln!("gap recovery: relay has no server_info, resetting last_seen");
+                let c = client.lock().await;
+                let _ = c.store().set_last_seen_seq(mailbox_id, 0);
+                drop(c);
+                let mut r = relay.lock().await;
+                r.subscribe(*mailbox_id, 0);
+            } else {
                 eprintln!("gap recovery: failed to fetch server_info: {e}");
-                return;
             }
+            return;
         }
     };
 
@@ -181,4 +209,164 @@ async fn handle_gap(
             let _ = r.put_server_info(mailbox_id, gi).await;
         }
     }
+}
+
+// --- Voice state via mailbox WS ---
+
+#[derive(Deserialize)]
+struct VsMsg {
+    ch: String,
+    p: Option<String>,
+    leave: Option<bool>,
+}
+
+#[derive(Serialize, Clone)]
+struct VoiceChannelMembersEvent {
+    channel_id: String,
+    members: Vec<VoiceChannelMember>,
+}
+
+#[derive(Serialize, Clone)]
+struct VoiceChannelMember {
+    fingerprint: String,
+    muted: bool,
+    deafened: bool,
+}
+
+async fn handle_voice_state(
+    app: &AppHandle,
+    client: &Arc<Mutex<GhostClient>>,
+    mailbox_id: &[u8; 32],
+    json: &str,
+    voice_members: &mut HashMap<[u8; 32], Vec<PresenceState>>,
+    mailbox_channels: &mut HashMap<[u8; 32], HashSet<[u8; 32]>>,
+) {
+    // Try parsing as snapshot first
+    if let Ok(snap) = serde_json::from_str::<serde_json::Value>(json) {
+        if let Some(arr) = snap.get("vs_snap").and_then(|v| v.as_array()) {
+            // Snapshot: clear only channels belonging to this mailbox, then rebuild
+            if let Some(old_channels) = mailbox_channels.remove(mailbox_id) {
+                for ch_id in &old_channels {
+                    if let Some(members) = voice_members.remove(ch_id) {
+                        if !members.is_empty() {
+                            let empty: Vec<PresenceState> = Vec::new();
+                            emit_channel_members(app, ch_id, &empty);
+                        }
+                    }
+                }
+            }
+            let c = client.lock().await;
+            let server_id = match c.server_id_for_mailbox(mailbox_id) {
+                Some(sid) => sid,
+                None => return,
+            };
+            for entry in arr {
+                let ch_b64 = match entry.get("ch").and_then(|v| v.as_str()) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                let p_b64 = match entry.get("p").and_then(|v| v.as_str()) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                let channel_id = match decode_channel_id(ch_b64) {
+                    Some(id) => id,
+                    None => continue,
+                };
+                let blob = match B64.decode(p_b64) {
+                    Ok(b) => b,
+                    Err(_) => continue,
+                };
+                if let Ok(ps) = c.open_presence_blob(&server_id, &channel_id, &blob) {
+                    voice_members.entry(channel_id).or_default().push(ps);
+                    mailbox_channels.entry(*mailbox_id).or_default().insert(channel_id);
+                }
+            }
+            drop(c);
+            // Emit for all channels belonging to this mailbox
+            let ch_set = mailbox_channels.get(mailbox_id);
+            for (channel_id, members) in voice_members.iter() {
+                if ch_set.map_or(false, |s| s.contains(channel_id)) {
+                    emit_channel_members(app, channel_id, members);
+                }
+            }
+            return;
+        }
+
+        // Single voice state update
+        if let Some(vs_val) = snap.get("vs") {
+            if let Ok(vs) = serde_json::from_value::<VsMsg>(vs_val.clone()) {
+                let channel_id = match decode_channel_id(&vs.ch) {
+                    Some(id) => id,
+                    None => return,
+                };
+
+                if vs.leave == Some(true) {
+                    // Leave: decrypt last blob to identify who left
+                    if let Some(p_b64) = &vs.p {
+                        if let Ok(blob) = B64.decode(p_b64) {
+                            let c = client.lock().await;
+                            if let Some(server_id) = c.server_id_for_mailbox(mailbox_id) {
+                                if let Ok(ps) = c.open_presence_blob(&server_id, &channel_id, &blob) {
+                                    drop(c);
+                                    if let Some(members) = voice_members.get_mut(&channel_id) {
+                                        members.retain(|m| m.fingerprint != ps.fingerprint);
+                                        if members.is_empty() {
+                                            let empty: Vec<PresenceState> = Vec::new();
+                                            emit_channel_members(app, &channel_id, &empty);
+                                            voice_members.remove(&channel_id);
+                                            // Clean up mailbox_channels tracking
+                                            if let Some(chs) = mailbox_channels.get_mut(mailbox_id) {
+                                                chs.remove(&channel_id);
+                                            }
+                                        } else {
+                                            emit_channel_members(app, &channel_id, members);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else if let Some(p_b64) = &vs.p {
+                    // Join or presence update
+                    if let Ok(blob) = B64.decode(p_b64) {
+                        let c = client.lock().await;
+                        if let Some(server_id) = c.server_id_for_mailbox(mailbox_id) {
+                            if let Ok(ps) = c.open_presence_blob(&server_id, &channel_id, &blob) {
+                                drop(c);
+                                mailbox_channels.entry(*mailbox_id).or_default().insert(channel_id);
+                                let members = voice_members.entry(channel_id).or_default();
+                                if let Some(existing) = members.iter_mut().find(|m| m.fingerprint == ps.fingerprint) {
+                                    existing.muted = ps.muted;
+                                    existing.deafened = ps.deafened;
+                                } else {
+                                    members.push(ps);
+                                }
+                                emit_channel_members(app, &channel_id, members);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn decode_channel_id(b64: &str) -> Option<[u8; 32]> {
+    B64.decode(b64).ok().and_then(|b| b.try_into().ok())
+}
+
+fn emit_channel_members(app: &AppHandle, channel_id: &[u8; 32], members: &[PresenceState]) {
+    let event = VoiceChannelMembersEvent {
+        channel_id: hex::encode(channel_id),
+        members: members
+            .iter()
+            .map(|m| VoiceChannelMember {
+                fingerprint: hex::encode(m.fingerprint),
+                muted: m.muted,
+                deafened: m.deafened,
+            })
+            .collect(),
+    };
+    let _ = app.emit("voice-channel-members", &event);
 }
