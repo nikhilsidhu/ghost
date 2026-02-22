@@ -6,12 +6,13 @@ import { Avatar } from "./ui/avatar";
 import { Tooltip } from "./ui/tooltip";
 import { ScrollArea } from "./ui/scroll-area";
 import { cn } from "../lib/cn";
-import { Settings, X, Mailbox } from "lucide-solid";
+import { Settings, X, Mailbox, UserPen } from "lucide-solid";
 import { channelPrefix, slideDuration } from "../lib/constants";
 import {
   identity, servers, selectedServerId, channels, selectedChannelId,
   selectedServer, selectServer, selectChannel,
   settingsOpen, settingsCategory, setSettingsCategory, toggleSettings,
+  profileOpen, toggleProfile,
   joinVoiceChannel, isInVoiceChannel, endCall,
   voiceChannelMembers,
   dmViewActive, dms, serverList, activateDmView, selectDm,
@@ -20,6 +21,7 @@ import { sections } from "../lib/settings-registry";
 import "../lib/settings";
 import { handleCreateChannel, handleCreateDm } from "../lib/commands";
 import { SettingsPanel } from "./SettingsPanel";
+import { ProfilePanel } from "./ProfilePanel";
 import { VoiceDock, VoiceChannelItem, VoiceParticipantList } from "./VoiceControls";
 import {
   DragDropProvider,
@@ -264,38 +266,46 @@ export function Sidebar() {
 
           <VoiceDock />
 
-          {/* User avatar */}
+          {/* User avatar — opens profile panel, swaps to UserPen icon when open */}
           <Show when={identity()}>
-            {(id) => {
-              const [copied, setCopied] = createSignal(false);
-              const copyFp = () => {
-                navigator.clipboard.writeText(id().fingerprint);
-                setCopied(true);
-                setTimeout(() => setCopied(false), 1200);
-              };
-              return (
-                <Tooltip label={copied() ? "copied!" : id().display_name}>
-                  <button
-                    class="w-[var(--size-lg)] h-[var(--size-lg)] flex items-center justify-center cursor-pointer hover:opacity-80"
-                    onClick={copyFp}
-                  >
-                    <Avatar
-                      hashKey={id().fingerprint}
-                      label={id().display_name}
-                      class="w-[var(--size-md)] h-[var(--size-md)] text-sm"
-                    />
-                  </button>
-                </Tooltip>
-              );
-            }}
+            {(id) => (
+              <Tooltip label={profileOpen() ? "close profile" : id().display_name}>
+                <button
+                  class={cn(
+                    "w-[var(--size-lg)] h-[var(--size-lg)] flex items-center justify-center cursor-pointer transition-opacity duration-[var(--duration-fast)]",
+                    profileOpen() ? "opacity-100 hover:brightness-125" : "opacity-50 hover:opacity-100",
+                  )}
+                  onClick={toggleProfile}
+                >
+                  <div class="relative w-[var(--size-md)] h-[var(--size-md)]">
+                    <div
+                      class="absolute inset-0 flex items-center justify-center transition-opacity duration-200"
+                      style={{ opacity: profileOpen() ? "0" : "1" }}
+                    >
+                      <Avatar
+                        hashKey={id().fingerprint}
+                        label={id().display_name}
+                        class="w-[var(--size-md)] h-[var(--size-md)] text-sm"
+                      />
+                    </div>
+                    <div
+                      class="absolute inset-0 flex items-center justify-center text-[var(--neutral-300)] transition-opacity duration-200"
+                      style={{ opacity: profileOpen() ? "1" : "0" }}
+                    >
+                      <UserPen size={20} />
+                    </div>
+                  </div>
+                </button>
+              </Tooltip>
+            )}
           </Show>
 
           {/* Settings */}
           <Tooltip label="settings">
             <button
               class={cn(
-                "w-[var(--size-lg)] h-[var(--size-md)] flex items-center justify-center cursor-pointer transition-all duration-150 group/settings",
-                settingsOpen() ? "opacity-100" : "opacity-50 hover:opacity-100",
+                "w-[var(--size-lg)] h-[var(--size-md)] flex items-center justify-center cursor-pointer transition-opacity duration-[var(--duration-fast)]",
+                settingsOpen() ? "opacity-100 hover:brightness-125" : "opacity-50 hover:opacity-100",
               )}
               onClick={toggleSettings}
             >
@@ -326,7 +336,7 @@ export function Sidebar() {
       <div
         class="relative flex-shrink-0 overflow-hidden"
         style={{
-          width: settingsOpen() ? "380px" : (selectedServer() || dmViewActive()) ? "208px" : "0px",
+          width: (settingsOpen() || profileOpen()) ? "380px" : (selectedServer() || dmViewActive()) ? "208px" : "0px",
           transition: `width ${slideDuration(settingsOpen() ? sections().length : orderedServers().length)} var(--ease-out)`,
         }}
       >
@@ -478,6 +488,9 @@ export function Sidebar() {
             )}
           </Show>
         </div>
+
+        {/* Profile overlay — slides up from bottom, coexists with channels/settings */}
+        <ProfilePanel />
       </div>
     </div>
   );

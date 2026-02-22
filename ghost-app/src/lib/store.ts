@@ -44,6 +44,8 @@ const [desiredChannelKind, setDesiredChannelKind] = createSignal<string>("text")
 const [settingsOpen, setSettingsOpen] = createSignal(false);
 const [settingsCategory, setSettingsCategory] = createSignal("");
 const [dmViewActive, setDmViewActive] = createSignal(false);
+const [profileOpen, setProfileOpen] = createSignal(false);
+const toggleProfile = () => setProfileOpen((v) => !v);
 
 const toggleSettings = () => {
   const opening = !settingsOpen();
@@ -380,6 +382,7 @@ export {
   refreshServers, refreshChannels, refreshPins, refreshAllChannels, refreshAllMembers,
   setInviteLink, setShowInfo, setDesiredChannelKind,
   settingsOpen, settingsCategory, setSettingsCategory, toggleSettings,
+  profileOpen, setProfileOpen, toggleProfile,
   isInCall, isMuted, isDeafened, isPttMode, setIsPttMode, isPttKeyHeld, pttMuteAttempt, toggleMute, toggleDeafen, endCall,
   voiceChannelId, voiceServerId, voiceParticipants, speakingSet, voiceError,
   joinVoiceChannel, isSpeaking, isInVoiceChannel,
