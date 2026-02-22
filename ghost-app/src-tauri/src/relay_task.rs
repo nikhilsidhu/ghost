@@ -5,6 +5,7 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use ghost_core::client::{GhostClient, ReceiveResult};
 use ghost_core::crypto::MessageType;
+use ghost_core::mls::presence::OnlineStatus;
 use ghost_core::mls::voice::PresenceState;
 use ghost_core::relay::{RelayClient, RelayEvent};
 use ghost_core::storage::{Channel, Member, MemberRole};
@@ -14,12 +15,24 @@ use tauri::{AppHandle, Emitter};
 use tokio::sync::{mpsc, Mutex};
 
 use crate::dto::MessageDto;
+use crate::presence::{self, PresenceInfo};
+
+async fn rebroadcast_presence(
+    client: &Arc<Mutex<GhostClient>>,
+    relay: &Arc<Mutex<RelayClient>>,
+    mailbox_id: &[u8; 32],
+    presence: &Arc<Mutex<PresenceInfo>>,
+) {
+    let info = presence.lock().await.clone();
+    presence::broadcast_presence_to_mailbox(client, relay, mailbox_id, &info).await;
+}
 
 pub async fn run(
     app: AppHandle,
     client: Arc<Mutex<GhostClient>>,
     relay: Arc<Mutex<RelayClient>>,
     mut events: mpsc::Receiver<RelayEvent>,
+    presence: Arc<Mutex<PresenceInfo>>,
 ) {
     // Subscribe to all existing server mailboxes with persisted last_seen_seq
     {
@@ -36,6 +49,10 @@ pub async fn run(
     let mut voice_members: HashMap<[u8; 32], Vec<PresenceState>> = HashMap::new();
     // Track which channels belong to which mailbox (so snapshots don't clobber other servers)
     let mut mailbox_channels: HashMap<[u8; 32], HashSet<[u8; 32]>> = HashMap::new();
+    // Track connected mailboxes for relay connectivity indicator
+    let mut connected_mailboxes: HashSet<[u8; 32]> = HashSet::new();
+    // Online presence per server: server_id → list of online members
+    let mut online_members: HashMap<[u8; 32], Vec<OnlineMember>> = HashMap::new();
 
     while let Some(event) = events.recv().await {
         match event {
@@ -113,6 +130,8 @@ pub async fn run(
                             let r = relay.lock().await;
                             let _ = r.put_server_info(&mailbox_id, gi).await;
                         }
+                        drop(c);
+                        rebroadcast_presence(&client, &relay, &mailbox_id, &presence).await;
                         let _ = app.emit("sync", hex::encode(server_id));
                     }
                     Some((server_id, Ok(ReceiveResult::Kicked))) => {
@@ -131,6 +150,8 @@ pub async fn run(
                             let r = relay.lock().await;
                             let _ = r.put_server_info(&mailbox_id, gi).await;
                         }
+                        drop(c);
+                        rebroadcast_presence(&client, &relay, &mailbox_id, &presence).await;
                         let _ = app.emit("sync", hex::encode(server_id));
                     }
                     Some((_, Ok(ReceiveResult::Skipped))) => {
@@ -157,6 +178,20 @@ pub async fn run(
                 handle_voice_state(
                     &app, &client, &mailbox_id, &json, &mut voice_members, &mut mailbox_channels,
                 ).await;
+            }
+            RelayEvent::Presence { mailbox_id, json } => {
+                handle_online_presence(
+                    &app, &client, &mailbox_id, &json, &mut online_members,
+                ).await;
+            }
+            RelayEvent::ConnectionState { mailbox_id, connected } => {
+                if connected {
+                    connected_mailboxes.insert(mailbox_id);
+                    rebroadcast_presence(&client, &relay, &mailbox_id, &presence).await;
+                } else {
+                    connected_mailboxes.remove(&mailbox_id);
+                }
+                let _ = app.emit("relay-connectivity", !connected_mailboxes.is_empty());
             }
         }
     }
@@ -383,4 +418,130 @@ fn emit_channel_members(app: &AppHandle, channel_id: &[u8; 32], members: &[Prese
             .collect(),
     };
     let _ = app.emit("voice-channel-members", &event);
+}
+
+// --- Online presence via mailbox WS ---
+
+#[derive(Clone)]
+struct OnlineMember {
+    fingerprint: [u8; 32],
+    status: &'static str,
+    status_message: Option<String>,
+}
+
+#[derive(Serialize)]
+struct OnlinePresenceEvent {
+    server_id: String,
+    members: Vec<OnlinePresenceMemberDto>,
+}
+
+#[derive(Serialize)]
+struct OnlinePresenceMemberDto {
+    fingerprint: String,
+    status: String,
+    status_message: Option<String>,
+}
+
+fn status_str(s: OnlineStatus) -> &'static str {
+    match s {
+        OnlineStatus::Online => "online",
+        OnlineStatus::Idle => "idle",
+        OnlineStatus::Away => "away",
+        OnlineStatus::Invisible => "offline",
+    }
+}
+
+fn emit_online_presence(app: &AppHandle, server_id: &[u8; 32], members: &[OnlineMember]) {
+    let event = OnlinePresenceEvent {
+        server_id: hex::encode(server_id),
+        members: members
+            .iter()
+            .map(|m| OnlinePresenceMemberDto {
+                fingerprint: hex::encode(m.fingerprint),
+                status: m.status.to_string(),
+                status_message: m.status_message.clone(),
+            })
+            .collect(),
+    };
+    let _ = app.emit("online-presence", &event);
+}
+
+async fn handle_online_presence(
+    app: &AppHandle,
+    client: &Arc<Mutex<GhostClient>>,
+    mailbox_id: &[u8; 32],
+    json: &str,
+    online_members: &mut HashMap<[u8; 32], Vec<OnlineMember>>,
+) {
+    let snap: serde_json::Value = match serde_json::from_str(json) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+
+    // Snapshot: replace all online members for this server
+    if let Some(arr) = snap.get("ps_snap").and_then(|v| v.as_array()) {
+        let c = client.lock().await;
+        let server_id = match c.server_id_for_mailbox(mailbox_id) {
+            Some(sid) => sid,
+            None => return,
+        };
+        let mut members_list = Vec::new();
+        for entry in arr {
+            let p_b64 = match entry.get("p").and_then(|v| v.as_str()) {
+                Some(s) => s,
+                None => continue,
+            };
+            let blob = match B64.decode(p_b64) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            if let Ok(ps) = c.open_online_presence_blob(&server_id, &blob) {
+                members_list.push(OnlineMember {
+                    fingerprint: ps.fingerprint,
+                    status: status_str(ps.status),
+                    status_message: ps.status_message,
+                });
+            }
+        }
+        drop(c);
+        online_members.insert(server_id, members_list);
+        emit_online_presence(app, &server_id, online_members.get(&server_id).unwrap());
+        return;
+    }
+
+    // Single update or leave
+    if let Some(ps_val) = snap.get("ps") {
+        let leave = ps_val.get("leave").and_then(|v| v.as_bool()).unwrap_or(false);
+        let p_b64 = match ps_val.get("p").and_then(|v| v.as_str()) {
+            Some(s) => s,
+            None => return,
+        };
+        let blob = match B64.decode(p_b64) {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+
+        let c = client.lock().await;
+        let server_id = match c.server_id_for_mailbox(mailbox_id) {
+            Some(sid) => sid,
+            None => return,
+        };
+        if let Ok(ps) = c.open_online_presence_blob(&server_id, &blob) {
+            drop(c);
+            let members = online_members.entry(server_id).or_default();
+            if leave {
+                members.retain(|m| m.fingerprint != ps.fingerprint);
+            } else if let Some(existing) = members.iter_mut().find(|m| m.fingerprint == ps.fingerprint) {
+                existing.status = status_str(ps.status);
+                existing.status_message = ps.status_message;
+            } else {
+                members.push(OnlineMember {
+                    fingerprint: ps.fingerprint,
+                    status: status_str(ps.status),
+                    status_message: ps.status_message,
+                });
+            }
+            emit_online_presence(app, &server_id, members);
+        }
+    }
 }

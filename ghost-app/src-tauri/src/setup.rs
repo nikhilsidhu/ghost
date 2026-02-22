@@ -9,6 +9,7 @@ use tokio::sync::{mpsc, watch, Mutex};
 
 use crate::config::{self, GhostConfig};
 use crate::constants::VOICE_CMD_CHANNEL_SIZE;
+use crate::presence::PresenceInfo;
 use crate::state::AppState;
 use crate::voice_task::{VoiceCommand, VoiceHandle, VoiceStateEvent};
 
@@ -108,6 +109,7 @@ pub fn initialize() -> SetupResult {
         voice: VoiceHandle {
             cmd_tx: voice_cmd_tx,
         },
+        presence: Arc::new(Mutex::new(PresenceInfo::default())),
     };
 
     SetupResult {

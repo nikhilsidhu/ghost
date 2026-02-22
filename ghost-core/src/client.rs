@@ -623,6 +623,44 @@ impl GhostClient {
         crate::mls::voice::try_open_presence(&member_fps, group, &self.provider, channel_id, blob)
     }
 
+    /// Seal an encrypted online presence blob for the current identity.
+    pub fn seal_online_presence_blob(
+        &self,
+        server_id: &[u8; 32],
+        status: crate::mls::presence::OnlineStatus,
+        status_message: Option<String>,
+        status_expiry: Option<u64>,
+        avatar_hash: Option<[u8; 32]>,
+    ) -> Result<Vec<u8>> {
+        let group = self.servers.get(server_id).ok_or_else(|| {
+            GhostError::ServerNotLoaded(hex::encode(&server_id[..8]))
+        })?;
+        let key = crate::mls::presence::derive_online_presence_key(
+            group, &self.provider, &self.identity.fingerprint,
+        )?;
+        let state = crate::mls::presence::OnlinePresence {
+            fingerprint: self.identity.fingerprint,
+            status,
+            status_message,
+            status_expiry,
+            avatar_hash,
+        };
+        crate::mls::presence::seal_online_presence(&key, &state)
+    }
+
+    /// Decrypt an online presence blob by trial-decrypting with all server members' keys.
+    pub fn open_online_presence_blob(
+        &self,
+        server_id: &[u8; 32],
+        blob: &[u8],
+    ) -> Result<crate::mls::presence::OnlinePresence> {
+        let group = self.servers.get(server_id).ok_or_else(|| {
+            GhostError::ServerNotLoaded(hex::encode(&server_id[..8]))
+        })?;
+        let member_fps = self.mls_member_fingerprints(server_id)?;
+        crate::mls::presence::try_open_online_presence(&member_fps, group, &self.provider, blob)
+    }
+
     /// Returns (server_id, mailbox_id) for every loaded server.
     pub fn server_mailboxes(&self) -> Vec<([u8; 32], [u8; 32])> {
         self.servers

@@ -108,6 +108,12 @@ export const getKeybinds = () => invoke<KeybindConfig>("get_keybinds");
 export const setKeybind = (action: string, shortcut: string | null) =>
   invoke<void>("set_keybind", { action, shortcut });
 
+// Online presence
+export const setStatus = (status: string) =>
+  invoke<void>("set_status", { status });
+export const setStatusMessage = (message: string | null, expiry: number | null) =>
+  invoke<void>("set_status_message", { message, expiry });
+
 // Dev testing
 export const createDevSession = () => invoke<Server>("create_dev_session");
 export const readDevSession = () => invoke<DevSession | null>("read_dev_session");

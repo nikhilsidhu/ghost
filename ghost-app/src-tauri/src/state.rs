@@ -6,6 +6,7 @@ use ghost_core::relay::RelayClient;
 use tokio::sync::Mutex;
 
 use crate::config::GhostConfig;
+use crate::presence::PresenceInfo;
 use crate::voice_task::VoiceHandle;
 
 pub struct AppState {
@@ -16,4 +17,5 @@ pub struct AppState {
     pub config_path: PathBuf,
     pub config: Mutex<GhostConfig>,
     pub voice: VoiceHandle,
+    pub presence: Arc<Mutex<PresenceInfo>>,
 }

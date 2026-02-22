@@ -103,3 +103,14 @@ export interface DevSession {
 export interface KeybindConfig {
   push_to_talk: string | null;
 }
+
+export interface OnlinePresenceEvent {
+  server_id: string;
+  members: OnlinePresenceMember[];
+}
+
+export interface OnlinePresenceMember {
+  fingerprint: string;
+  status: "online" | "idle" | "away";
+  status_message: string | null;
+}

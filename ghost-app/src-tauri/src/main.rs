@@ -7,6 +7,7 @@ mod config;
 mod constants;
 mod device_watcher;
 mod dto;
+mod presence;
 mod relay_task;
 mod setup;
 mod state;
@@ -25,6 +26,7 @@ fn main() {
     let voice_client = app_state.client.clone();
     let relay = app_state.relay.clone();
     let voice_relay = app_state.relay.clone();
+    let presence = app_state.presence.clone();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
@@ -47,6 +49,7 @@ fn main() {
                 client,
                 relay,
                 inbox_rx,
+                presence,
             ));
             tauri::async_runtime::spawn(voice_task::run(
                 handle,
@@ -101,6 +104,8 @@ fn main() {
             commands::read_dev_session,
             commands::get_keybinds,
             commands::set_keybind,
+            commands::set_status,
+            commands::set_status_message,
         ])
         .run(tauri::generate_context!())
         .expect("error while running ghost");

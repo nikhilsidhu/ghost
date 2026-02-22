@@ -74,7 +74,7 @@ async fn encrypted_message_through_relay() {
         loop {
             match events.recv().await {
                 Some(RelayEvent::Blob(blob)) => break blob,
-                Some(RelayEvent::Ack(_) | RelayEvent::Gap { .. } | RelayEvent::VoiceState { .. }) => continue,
+                Some(RelayEvent::Ack(_) | RelayEvent::Gap { .. } | RelayEvent::VoiceState { .. } | RelayEvent::Presence { .. } | RelayEvent::ConnectionState { .. }) => continue,
                 None => panic!("event channel closed"),
             }
         }

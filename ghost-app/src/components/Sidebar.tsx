@@ -3,6 +3,7 @@ import type { JSX } from "solid-js";
 import type { Server, Channel } from "../lib/types";
 import { hashGradient } from "../lib/gradients";
 import { Avatar } from "./ui/avatar";
+import type { AvatarStatus } from "./ui/avatar";
 import { Tooltip } from "./ui/tooltip";
 import { ScrollArea } from "./ui/scroll-area";
 import { cn } from "../lib/cn";
@@ -12,7 +13,7 @@ import {
   identity, servers, selectedServerId, channels, selectedChannelId,
   selectedServer, selectServer, selectChannel,
   settingsOpen, settingsCategory, setSettingsCategory, toggleSettings,
-  profileOpen, toggleProfile,
+  profileOpen, toggleProfile, relayConnected, ownStatus, INVISIBLE,
   joinVoiceChannel, isInVoiceChannel, endCall,
   voiceChannelMembers,
   dmViewActive, dms, serverList, activateDmView, selectDm,
@@ -286,6 +287,7 @@ export function Sidebar() {
                         hashKey={id().fingerprint}
                         label={id().display_name}
                         class="w-[var(--size-md)] h-[var(--size-md)] text-sm"
+                        status={relayConnected() && ownStatus() !== INVISIBLE ? ownStatus() as AvatarStatus : undefined}
                       />
                     </div>
                     <div

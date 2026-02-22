@@ -7,9 +7,12 @@ use tauri::State;
 use ghost_core::storage::{Channel, ChannelKind, Server, ServerKind, Member, MemberRole, StoredMessage};
 use ghost_core::wire::{encode_channel_op, encode_member_announce, ChannelOpPayload};
 
+use ghost_core::mls::presence::OnlineStatus;
+
 use crate::constants::{DEFAULT_PAGE_SIZE, INVITE_EXPIRY_MS, SEQ_HEADER};
 use crate::config::KeybindConfig;
 use crate::dto::{ChannelDto, ConfigDto, ServerDto, IdentityDto, InviteDto, KeybindConfigDto, MemberDto, MessageDto};
+use crate::presence;
 use crate::state::AppState;
 use crate::voice_task::VoiceCommand;
 
@@ -1120,4 +1123,38 @@ pub async fn set_keybind(
         _ => return Err(format!("unknown keybind action: {action}")),
     }
     cfg.save(&state.config_path)
+}
+
+#[tauri::command]
+pub async fn set_status(status: String, state: State<'_, AppState>) -> Result<(), String> {
+    let os = match status.as_str() {
+        "online" => OnlineStatus::Online,
+        "idle" => OnlineStatus::Idle,
+        "away" => OnlineStatus::Away,
+        "invisible" => OnlineStatus::Invisible,
+        _ => return Err(format!("unknown status: {status}")),
+    };
+    let info = {
+        let mut p = state.presence.lock().await;
+        p.status = os;
+        p.clone()
+    };
+    presence::broadcast_presence(&state.client, &state.relay, &info).await;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn set_status_message(
+    message: Option<String>,
+    expiry: Option<u64>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let info = {
+        let mut p = state.presence.lock().await;
+        p.status_message = message;
+        p.status_expiry = expiry;
+        p.clone()
+    };
+    presence::broadcast_presence(&state.client, &state.relay, &info).await;
+    Ok(())
 }

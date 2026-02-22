@@ -1,27 +1,25 @@
 import { createSignal, Show } from "solid-js";
+import { Select } from "@kobalte/core/select";
 import { Avatar } from "./ui/avatar";
 import { X, Fingerprint, Check, ChevronDown } from "lucide-solid";
 import { cn } from "../lib/cn";
-import { identity, profileOpen, setProfileOpen } from "../lib/store";
-import { setDisplayName } from "../lib/api";
+import { identity, profileOpen, setProfileOpen, ownStatus, setOwnStatus, ownStatusMessage, setOwnStatusMessage, rebuildPresence } from "../lib/store";
+import { setDisplayName, setStatus as apiSetStatus, setStatusMessage as apiSetStatusMessage } from "../lib/api";
 
 type Status = "online" | "away" | "invisible";
 
 const STATUS_OPTIONS: { value: Status; label: string; color: string }[] = [
   { value: "online", label: "Online", color: "var(--emerald-400)" },
-  { value: "away", label: "Away", color: "var(--amber-400)" },
+  { value: "away", label: "Away", color: "var(--ember-400)" },
   { value: "invisible", label: "Invisible", color: "var(--neutral-500)" },
 ];
 
 export function ProfilePanel() {
-  const [status, setStatus] = createSignal<Status>("online");
-  const [statusMessage, setStatusMessage] = createSignal("");
-  const [statusDropdownOpen, setStatusDropdownOpen] = createSignal(false);
   const [editingName, setEditingName] = createSignal(false);
   const [nameInput, setNameInput] = createSignal("");
   const [copied, setCopied] = createSignal(false);
 
-  const currentStatus = () => STATUS_OPTIONS.find((o) => o.value === status())!;
+  const currentStatus = () => STATUS_OPTIONS.find((o) => o.value === ownStatus())!;
 
   const copyFingerprint = () => {
     const fp = identity()?.fingerprint;
@@ -119,52 +117,64 @@ export function ProfilePanel() {
               </div>
 
               {/* Status selector */}
-              <div class="relative">
-                <button
-                  class="w-full flex items-center gap-2 px-3 py-2 rounded-md text-sm cursor-pointer hover:bg-[var(--hover)] border border-[var(--neutral-800)] hover:border-[var(--neutral-700)]"
-                  onClick={() => setStatusDropdownOpen((v) => !v)}
+              <Select<typeof STATUS_OPTIONS[number]>
+                value={currentStatus()}
+                onChange={(opt) => { if (opt) { setOwnStatus(opt.value); rebuildPresence(); apiSetStatus(opt.value).catch(() => {}); } }}
+                options={STATUS_OPTIONS}
+                optionValue="value"
+                optionTextValue="label"
+                placement="top"
+                gutter={4}
+                sameWidth
+                itemComponent={(props) => (
+                  <Select.Item
+                    item={props.item}
+                    class={cn(
+                      "w-full flex items-center gap-2 px-3 py-1.5 text-sm cursor-pointer outline-none",
+                      "hover:bg-[var(--hover)] data-[highlighted]:bg-[var(--hover)]",
+                      "data-[selected]:text-[var(--neutral-100)] text-[var(--neutral-400)]",
+                    )}
+                  >
+                    <div
+                      class="w-2.5 h-2.5 rounded-full flex-shrink-0"
+                      style={{ background: props.item.rawValue.color }}
+                    />
+                    <Select.ItemLabel>{props.item.rawValue.label}</Select.ItemLabel>
+                  </Select.Item>
+                )}
+              >
+                <Select.Trigger
+                  class="w-full flex items-center gap-2 px-3 py-2 rounded-md text-sm cursor-pointer hover:bg-[var(--hover)] border border-[var(--neutral-800)] hover:border-[var(--neutral-700)] outline-none"
                 >
                   <div
                     class="w-2.5 h-2.5 rounded-full flex-shrink-0"
                     style={{ background: currentStatus().color }}
                   />
-                  <span class="text-[var(--neutral-200)]">{currentStatus().label}</span>
-                  <ChevronDown size={14} class="ml-auto text-[var(--neutral-500)]" />
-                </button>
-
-                <Show when={statusDropdownOpen()}>
-                  <div
-                    class="absolute top-full left-0 right-0 mt-1 rounded-md border border-[var(--neutral-700)] py-1 z-50"
+                  <Select.Value<typeof STATUS_OPTIONS[number]>>
+                    {(state) => state.selectedOption()?.label}
+                  </Select.Value>
+                  <Select.Icon class="ml-auto text-[var(--neutral-500)]">
+                    <ChevronDown size={14} />
+                  </Select.Icon>
+                </Select.Trigger>
+                <Select.Portal>
+                  <Select.Content
+                    class="rounded-md border border-[var(--neutral-700)] py-1 z-50"
                     style={{ background: "var(--neutral-800)", "box-shadow": "var(--shadow-float)" }}
                   >
-                    {STATUS_OPTIONS.map((opt) => (
-                      <button
-                        class={cn(
-                          "w-full flex items-center gap-2 px-3 py-1.5 text-sm cursor-pointer hover:bg-[var(--hover)]",
-                          status() === opt.value ? "text-[var(--neutral-100)]" : "text-[var(--neutral-400)]",
-                        )}
-                        onClick={() => {
-                          setStatus(opt.value);
-                          setStatusDropdownOpen(false);
-                        }}
-                      >
-                        <div
-                          class="w-2.5 h-2.5 rounded-full flex-shrink-0"
-                          style={{ background: opt.color }}
-                        />
-                        {opt.label}
-                      </button>
-                    ))}
-                  </div>
-                </Show>
-              </div>
+                    <Select.Listbox />
+                  </Select.Content>
+                </Select.Portal>
+              </Select>
 
               {/* Status message */}
               <input
                 class="w-full text-sm text-[var(--neutral-200)] bg-transparent border border-[var(--neutral-800)] hover:border-[var(--neutral-700)] focus:border-[var(--neutral-600)] rounded-md px-3 py-2 outline-none placeholder:text-[var(--neutral-600)]"
                 placeholder="set a status message..."
-                value={statusMessage()}
-                onInput={(e) => setStatusMessage(e.currentTarget.value)}
+                value={ownStatusMessage()}
+                onInput={(e) => setOwnStatusMessage(e.currentTarget.value)}
+                onBlur={() => { rebuildPresence(); apiSetStatusMessage(ownStatusMessage().trim() || null, null).catch(() => {}); }}
+                onKeyDown={(e) => { if (e.key === "Enter") { e.currentTarget.blur(); } }}
                 maxLength={128}
               />
             </div>

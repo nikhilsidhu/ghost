@@ -2,13 +2,29 @@ import { createSignal, For, Show, onCleanup } from "solid-js";
 import { Portal } from "solid-js/web";
 import { ScrollArea } from "./ui/scroll-area";
 import { Avatar } from "./ui/avatar";
-import { identity, members, selectedServerId, selectedServer } from "../lib/store";
+import type { AvatarStatus } from "./ui/avatar";
+import { identity, members, selectedServerId, selectedServer, onlinePresence } from "../lib/store";
 import { kickMember } from "../lib/api";
+
+const STATUS_ORDER: Record<string, number> = { online: 0, idle: 1, away: 2 };
 
 export function MemberPanel() {
   const [ctxMenu, setCtxMenu] = createSignal<{ x: number; y: number; fingerprint: string } | null>(null);
 
   const isCreator = () => identity()?.fingerprint === selectedServer()?.creator_fp;
+  const memberStatus = (fp: string) => onlinePresence().get(fp)?.status as AvatarStatus | undefined;
+  const memberStatusMessage = (fp: string) => onlinePresence().get(fp)?.status_message;
+
+  const sortedMembers = () => {
+    const presence = onlinePresence();
+    return [...members()].sort((a, b) => {
+      const aStatus = presence.get(a.fingerprint)?.status;
+      const bStatus = presence.get(b.fingerprint)?.status;
+      const aOrder = aStatus ? (STATUS_ORDER[aStatus] ?? 99) : 99;
+      const bOrder = bStatus ? (STATUS_ORDER[bStatus] ?? 99) : 99;
+      return aOrder - bOrder;
+    });
+  };
 
   const onRightClick = (fingerprint: string, role: string, e: MouseEvent) => {
     if (!isCreator() || role === "creator") return;
@@ -49,7 +65,7 @@ export function MemberPanel() {
       </div>
       <ScrollArea class="flex-1">
         <div class="px-2 py-1">
-          <For each={members()}>
+          <For each={sortedMembers()}>
             {(m) => (
               <div
                 class="flex items-center gap-2.5 px-2 py-1.5 rounded-md hover:bg-[var(--hover)]"
@@ -59,12 +75,18 @@ export function MemberPanel() {
                   hashKey={m.fingerprint}
                   label={m.display_name}
                   class="w-[var(--size-md)] h-[var(--size-md)] text-xs transition-all duration-200 opacity-85 hover:opacity-100 hover:scale-105"
+                  status={memberStatus(m.fingerprint)}
                 />
                 <div class="flex-1 min-w-0">
                   <div class="text-sm text-[var(--neutral-200)] truncate">
                     {m.display_name}
                   </div>
-                  <Show when={m.role === "creator"}>
+                  <Show when={memberStatusMessage(m.fingerprint)}>
+                    {(msg) => (
+                      <div class="text-[11px] text-[var(--neutral-500)] truncate leading-tight">{msg()}</div>
+                    )}
+                  </Show>
+                  <Show when={!memberStatusMessage(m.fingerprint) && m.role === "creator"}>
                     <div class="text-[11px] text-[var(--purple-400)] leading-tight">creator</div>
                   </Show>
                 </div>

@@ -1,6 +1,6 @@
 import { createSignal } from "solid-js";
 import { listen } from "@tauri-apps/api/event";
-import type { Identity, Server, Channel, Member, Message, VoiceState, VoiceParticipants, VoiceSpeaking, VoiceMuteState, VoiceQuality } from "./types";
+import type { Identity, Server, Channel, Member, Message, VoiceState, VoiceParticipants, VoiceSpeaking, VoiceMuteState, VoiceQuality, OnlinePresenceEvent } from "./types";
 import {
   getIdentity, listServers, listChannels, listMembers,
   listPinnedServers, markChannelRead,
@@ -46,6 +46,26 @@ const [settingsCategory, setSettingsCategory] = createSignal("");
 const [dmViewActive, setDmViewActive] = createSignal(false);
 const [profileOpen, setProfileOpen] = createSignal(false);
 const toggleProfile = () => setProfileOpen((v) => !v);
+const [relayConnected, setRelayConnected] = createSignal(false);
+const INVISIBLE = "invisible" as const;
+const [ownStatus, setOwnStatus] = createSignal<string>("online");
+const [ownStatusMessage, setOwnStatusMessage] = createSignal<string>("");
+const presenceByServer = new Map<string, Map<string, { status: string; status_message: string | null }>>();
+const [onlinePresence, setOnlinePresence] = createSignal<Map<string, { status: string; status_message: string | null }>>(new Map());
+
+const rebuildPresence = () => {
+  const flat = new Map<string, { status: string; status_message: string | null }>();
+  for (const [, smap] of presenceByServer) {
+    for (const [fp, info] of smap) flat.set(fp, info);
+  }
+  const fp = identity()?.fingerprint;
+  if (fp && ownStatus() !== INVISIBLE) {
+    flat.set(fp, { status: ownStatus(), status_message: ownStatusMessage() || null });
+  } else if (fp) {
+    flat.delete(fp);
+  }
+  setOnlinePresence(flat);
+};
 
 const toggleSettings = () => {
   const opening = !settingsOpen();
@@ -339,6 +359,21 @@ const initialize = async () => {
     refreshAllMembers();
   });
 
+  listen<boolean>("relay-connectivity", (event) => {
+    setRelayConnected(event.payload);
+    if (event.payload) rebuildPresence();
+  });
+
+  listen<OnlinePresenceEvent>("online-presence", (event) => {
+    const { server_id, members } = event.payload;
+    const serverMap = new Map<string, { status: string; status_message: string | null }>();
+    for (const member of members) {
+      serverMap.set(member.fingerprint, { status: member.status, status_message: member.status_message });
+    }
+    presenceByServer.set(server_id, serverMap);
+    rebuildPresence();
+  });
+
   listen<string>("voice-error", (event) => {
     console.error("voice:", event.payload);
     setVoiceError(event.payload);
@@ -382,7 +417,8 @@ export {
   refreshServers, refreshChannels, refreshPins, refreshAllChannels, refreshAllMembers,
   setInviteLink, setShowInfo, setDesiredChannelKind,
   settingsOpen, settingsCategory, setSettingsCategory, toggleSettings,
-  profileOpen, setProfileOpen, toggleProfile,
+  profileOpen, setProfileOpen, toggleProfile, relayConnected, onlinePresence,
+  INVISIBLE, ownStatus, setOwnStatus, ownStatusMessage, setOwnStatusMessage, rebuildPresence,
   isInCall, isMuted, isDeafened, isPttMode, setIsPttMode, isPttKeyHeld, pttMuteAttempt, toggleMute, toggleDeafen, endCall,
   voiceChannelId, voiceServerId, voiceParticipants, speakingSet, voiceError,
   joinVoiceChannel, isSpeaking, isInVoiceChannel,

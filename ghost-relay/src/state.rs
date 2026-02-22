@@ -27,6 +27,13 @@ pub struct VpEntry {
     pub blob: Vec<u8>,
 }
 
+/// Cached online presence entry for mailbox WS broadcast
+pub struct OpEntry {
+    pub mailbox_id: [u8; 32],
+    pub conn_id: u64,
+    pub blob: Vec<u8>,
+}
+
 pub struct Inner {
     pub mailboxes: RwLock<HashMap<[u8; 32], Mailbox>>,
     pub invites: RwLock<HashMap<String, Invite>>,
@@ -38,6 +45,7 @@ pub struct Inner {
     pub start_time: Instant,
     pub storage: Storage,
     pub voice_presence: RwLock<Vec<VpEntry>>,
+    pub online_presence: RwLock<Vec<OpEntry>>,
     pub next_conn_id: AtomicU64,
 }
 
@@ -77,6 +85,7 @@ pub fn new_state(config: Config, storage: Storage) -> AppState {
         start_time: Instant::now(),
         storage,
         voice_presence: RwLock::new(Vec::new()),
+        online_presence: RwLock::new(Vec::new()),
         next_conn_id: AtomicU64::new(1),
     })
 }

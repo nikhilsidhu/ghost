@@ -4,9 +4,10 @@ import type { Message } from "../lib/types";
 import { listMessages, sendMessage } from "../lib/api";
 import { hashGradient } from "../lib/gradients";
 import { Avatar } from "./ui/avatar";
+import type { AvatarStatus } from "./ui/avatar";
 import { cn } from "../lib/cn";
 import { ChevronDown, SendHorizonal } from "lucide-solid";
-import { selectedServerId, selectedChannelId, members, settingsOpen } from "../lib/store";
+import { selectedServerId, selectedChannelId, members, settingsOpen, onlinePresence } from "../lib/store";
 import { slideDuration } from "../lib/constants";
 import { sections } from "../lib/settings-registry";
 import { showTimestamps } from "./settings/AppearanceSettings";
@@ -157,6 +158,7 @@ export function MessageView() {
                       hashKey={msg.sender_fp}
                       label={name()}
                       class="w-[var(--size-md)] h-[var(--size-md)] text-xs mt-1 transition-all duration-200 opacity-85 hover:opacity-100 hover:scale-105"
+                      status={onlinePresence().get(msg.sender_fp)?.status as AvatarStatus | undefined}
                     />
                     <div class="flex-1 min-w-0">
                       <div class="flex items-baseline gap-2">

@@ -32,6 +32,8 @@ pub enum RelayEvent {
     Ack(Ack),
     Gap { mailbox_id: [u8; 32] },
     VoiceState { mailbox_id: [u8; 32], json: String },
+    Presence { mailbox_id: [u8; 32], json: String },
+    ConnectionState { mailbox_id: [u8; 32], connected: bool },
 }
 
 pub enum WsOutgoing {
@@ -302,6 +304,7 @@ async fn ws_task(
             continue;
         }
 
+        let _ = event_tx.send(RelayEvent::ConnectionState { mailbox_id, connected: true }).await;
         let mut got_message = false;
 
         loop {
@@ -357,6 +360,11 @@ async fn ws_task(
                                     mailbox_id,
                                     json: s.to_string(),
                                 }).await;
+                            } else if s.starts_with("{\"ps") {
+                                let _ = event_tx.send(RelayEvent::Presence {
+                                    mailbox_id,
+                                    json: s.to_string(),
+                                }).await;
                             } else if let Some(ack) = parse_ack(s) {
                                 let _ = event_tx.send(RelayEvent::Ack(ack)).await;
                             }
@@ -367,6 +375,8 @@ async fn ws_task(
                 }
             }
         }
+
+        let _ = event_tx.send(RelayEvent::ConnectionState { mailbox_id, connected: false }).await;
     }
 }
 

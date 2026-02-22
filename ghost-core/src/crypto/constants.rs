@@ -9,6 +9,9 @@ pub const VOICE_EXPORT_LABEL: &str = "ghost-voice";
 /// Label used when deriving per-sender presence encryption keys from the MLS group's shared secret.
 pub const VOICE_PRESENCE_EXPORT_LABEL: &str = "ghost-voice-presence";
 
+/// Label used when deriving per-sender online presence keys (server-wide, no channel context).
+pub const ONLINE_PRESENCE_EXPORT_LABEL: &str = "ghost-online-presence";
+
 /// Label used when deriving Ed25519 signing keys from identity seeds.
 pub const ED25519_DERIVE_LABEL: &[u8] = b"ghost-ed25519";
 
