@@ -27,6 +27,8 @@ rubato = "0.16"
 ringbuf = "0.4"
 tauri-plugin-global-shortcut = "2"
 user-idle = "0.6.0"
+aes-gcm = "0.10"
+blake3 = "1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-app-kit = { version = "0.3", features = ["NSColor", "NSWindow"] }

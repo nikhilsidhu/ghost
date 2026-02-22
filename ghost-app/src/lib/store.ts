@@ -6,6 +6,7 @@ import {
   listPinnedServers, markChannelRead,
   joinVoice, leaveVoice, setVoiceMuted, setVoiceDeafened,
   createDevSession, readDevSession, joinByInvite, getConfig,
+  getCachedAvatar,
 } from "./api";
 import { initKeybinds, onPttActiveChange } from "./keybinds";
 import { sections } from "./settings-registry";
@@ -55,6 +56,18 @@ const [expiresAt, setExpiresAt] = createSignal<number | null>(null);
 const [autoMuted, setAutoMuted] = createSignal(false);
 const presenceByServer = new Map<string, Map<string, { status: string; status_message: string | null }>>();
 const [onlinePresence, setOnlinePresence] = createSignal<Map<string, { status: string; status_message: string | null }>>(new Map());
+
+// Avatar data URLs keyed by fingerprint
+const [avatarUrls, setAvatarUrls] = createSignal<Map<string, string>>(new Map());
+const avatarUrl = (fp: string) => avatarUrls().get(fp);
+const loadAvatar = async (fp: string) => {
+  const dataUrl = await getCachedAvatar(fp).catch(() => null);
+  setAvatarUrls(prev => {
+    const next = new Map(prev);
+    if (dataUrl) { next.set(fp, dataUrl); } else { next.delete(fp); }
+    return next;
+  });
+};
 
 const rebuildPresence = () => {
   const flat = new Map<string, { status: string; status_message: string | null }>();
@@ -372,6 +385,10 @@ const initialize = async () => {
     const serverMap = new Map<string, { status: string; status_message: string | null }>();
     for (const member of members) {
       serverMap.set(member.fingerprint, { status: member.status, status_message: member.status_message });
+      // Load avatar for members that have one cached but not yet loaded
+      if (member.avatar_hash && !avatarUrl(member.fingerprint)) {
+        loadAvatar(member.fingerprint);
+      }
     }
     presenceByServer.set(server_id, serverMap);
     rebuildPresence();
@@ -401,6 +418,18 @@ const initialize = async () => {
     setIsMuted(true);
     setAutoMuted(true);
   });
+
+  listen<string>("avatar-updated", (event) => {
+    loadAvatar(event.payload);
+  });
+
+  listen<string>("avatar-cleared", (event) => {
+    setAvatarUrls(prev => { const next = new Map(prev); next.delete(event.payload); return next; });
+  });
+
+  // Load own cached avatar
+  const selfFpInit = identity()?.fingerprint;
+  if (selfFpInit) loadAvatar(selfFpInit);
 
   listen("status-message-cleared", () => {
     setOwnStatusMessage("");
@@ -449,4 +478,5 @@ export {
   joinVoiceChannel, isSpeaking, isInVoiceChannel,
   voiceParticipantChannelId, voiceMuteStates, voiceQuality,
   voiceChannelMembers,
+  avatarUrl, loadAvatar,
 };

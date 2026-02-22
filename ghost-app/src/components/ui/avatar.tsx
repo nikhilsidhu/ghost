@@ -1,7 +1,8 @@
-import { Show } from "solid-js";
+import { Show, createSignal } from "solid-js";
 import type { JSX } from "solid-js";
 import { cn } from "../../lib/cn";
 import { hashGradient, onFlareMove, onFlareLeave } from "../../lib/gradients";
+import { avatarUrl } from "../../lib/store";
 
 export type AvatarStatus = "online" | "idle" | "away";
 
@@ -23,6 +24,9 @@ interface AvatarProps {
 
 export function Avatar(props: AvatarProps) {
   const grad = () => hashGradient(props.hashKey);
+  const [imgError, setImgError] = createSignal(false);
+  const src = () => avatarUrl(props.hashKey);
+  const showImg = () => src() && !imgError();
 
   return (
     <div
@@ -40,7 +44,17 @@ export function Avatar(props: AvatarProps) {
       onMouseMove={onFlareMove}
       onMouseLeave={onFlareLeave}
     >
-      {props.children ?? props.label[0]?.toLowerCase()}
+      <Show when={showImg()} fallback={props.children ?? props.label[0]?.toLowerCase()}>
+        <img
+          src={src()}
+          alt=""
+          class={cn(
+            "absolute inset-0 w-full h-full object-cover",
+            props.square ? "rounded-[14%]" : "rounded-full",
+          )}
+          onError={() => setImgError(true)}
+        />
+      </Show>
       <Show when={props.status}>
         <div
           class="absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full border-2 border-[var(--neutral-950)]"

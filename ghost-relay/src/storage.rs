@@ -58,6 +58,14 @@ impl Storage {
                  updated_at INTEGER NOT NULL
              );
 
+             CREATE TABLE IF NOT EXISTS avatar (
+                 mailbox_id BLOB NOT NULL,
+                 fingerprint BLOB NOT NULL,
+                 data BLOB NOT NULL,
+                 updated_at INTEGER NOT NULL,
+                 PRIMARY KEY (mailbox_id, fingerprint)
+             ) WITHOUT ROWID;
+
              CREATE TABLE IF NOT EXISTS mailbox_state (
                  mailbox_id BLOB NOT NULL PRIMARY KEY,
                  current_epoch INTEGER NOT NULL DEFAULT 0,
@@ -216,6 +224,52 @@ impl Storage {
         .map_err(|e| RelayError::Storage(e.to_string()))
     }
 
+    pub fn put_avatar(
+        &self,
+        mailbox_id: &[u8; 32],
+        fingerprint: &[u8; 32],
+        data: &[u8],
+    ) -> Result<(), RelayError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO avatar (mailbox_id, fingerprint, data, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (mailbox_id, fingerprint) DO UPDATE SET data = ?3, updated_at = ?4",
+            params![mailbox_id.as_slice(), fingerprint.as_slice(), data, now_millis() as i64],
+        )
+        .map_err(|e| RelayError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn get_avatar(
+        &self,
+        mailbox_id: &[u8; 32],
+        fingerprint: &[u8; 32],
+    ) -> Result<Option<Vec<u8>>, RelayError> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT data FROM avatar WHERE mailbox_id = ?1 AND fingerprint = ?2",
+            params![mailbox_id.as_slice(), fingerprint.as_slice()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| RelayError::Storage(e.to_string()))
+    }
+
+    pub fn delete_avatar(
+        &self,
+        mailbox_id: &[u8; 32],
+        fingerprint: &[u8; 32],
+    ) -> Result<(), RelayError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM avatar WHERE mailbox_id = ?1 AND fingerprint = ?2",
+            params![mailbox_id.as_slice(), fingerprint.as_slice()],
+        )
+        .map_err(|e| RelayError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
     /// Delete log entries older than `cutoff_millis`.
     pub fn sweep_expired(&self, cutoff_millis: u64) -> Result<usize, RelayError> {
         let conn = self.conn.lock().unwrap();
@@ -344,6 +398,43 @@ mod tests {
         store.append(&mb, APP, 0, b"one").unwrap();
         store.append(&mb, APP, 0, b"two").unwrap();
         assert_eq!(store.min_seq(&mb).unwrap(), Some(1));
+    }
+
+    #[test]
+    fn avatar_put_get_delete() {
+        let store = Storage::open_in_memory().unwrap();
+        let mb = test_mailbox();
+        let fp = [0xBB; 32];
+
+        assert!(store.get_avatar(&mb, &fp).unwrap().is_none());
+
+        store.put_avatar(&mb, &fp, b"avatar-data").unwrap();
+        assert_eq!(store.get_avatar(&mb, &fp).unwrap().unwrap(), b"avatar-data");
+
+        // Upsert replaces
+        store.put_avatar(&mb, &fp, b"updated").unwrap();
+        assert_eq!(store.get_avatar(&mb, &fp).unwrap().unwrap(), b"updated");
+
+        store.delete_avatar(&mb, &fp).unwrap();
+        assert!(store.get_avatar(&mb, &fp).unwrap().is_none());
+    }
+
+    #[test]
+    fn avatar_different_fingerprints_independent() {
+        let store = Storage::open_in_memory().unwrap();
+        let mb = test_mailbox();
+        let fp_a = [0xAA; 32];
+        let fp_b = [0xBB; 32];
+
+        store.put_avatar(&mb, &fp_a, b"alice").unwrap();
+        store.put_avatar(&mb, &fp_b, b"bob").unwrap();
+
+        assert_eq!(store.get_avatar(&mb, &fp_a).unwrap().unwrap(), b"alice");
+        assert_eq!(store.get_avatar(&mb, &fp_b).unwrap().unwrap(), b"bob");
+
+        store.delete_avatar(&mb, &fp_a).unwrap();
+        assert!(store.get_avatar(&mb, &fp_a).unwrap().is_none());
+        assert_eq!(store.get_avatar(&mb, &fp_b).unwrap().unwrap(), b"bob");
     }
 
     #[test]

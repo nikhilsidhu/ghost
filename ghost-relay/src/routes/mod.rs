@@ -1,3 +1,4 @@
+mod avatar;
 mod blob;
 mod server_info;
 mod health;
@@ -17,6 +18,7 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(health::health))
         .route("/box/{mailbox_id}", post(blob::post_blob).get(blob::get_blobs))
         .route("/box/{mailbox_id}/server_info", put(server_info::put).get(server_info::get))
+        .route("/box/{mailbox_id}/avatar/{fingerprint}", put(avatar::put).get(avatar::get).delete(avatar::delete))
         .route("/ws/{mailbox_id}", get(ws::ws_upgrade))
         .route("/voice/{channel_id}", get(voice::ws_upgrade))
         .route("/invite", post(invite::register))

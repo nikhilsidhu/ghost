@@ -80,23 +80,25 @@ async fn ws_handshake(
         .unwrap();
 }
 
-/// Consume the vs_snap text frame that's always sent after replay completes.
+/// Consume the vs_snap and ps_snap text frames sent after replay completes.
 async fn consume_vs_snap(
     ws: &mut tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
 ) {
-    let snap = tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            let m = ws.next().await.unwrap().unwrap();
-            if let Message::Text(t) = m {
-                break t.to_string();
+    for expected in &["vs_snap", "ps_snap"] {
+        let snap = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let m = ws.next().await.unwrap().unwrap();
+                if let Message::Text(t) = m {
+                    break t.to_string();
+                }
             }
-        }
-    })
-    .await
-    .expect("timed out waiting for vs_snap");
-    assert!(snap.starts_with("{\"vs_snap\""), "expected vs_snap, got: {snap}");
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {expected}"));
+        assert!(snap.contains(expected), "expected {expected}, got: {snap}");
+    }
 }
 
 #[tokio::test]

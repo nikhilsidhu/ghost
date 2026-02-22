@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -34,6 +35,7 @@ pub async fn run(
     relay: Arc<Mutex<RelayClient>>,
     mut events: mpsc::Receiver<RelayEvent>,
     presence: Arc<Mutex<PresenceInfo>>,
+    data_dir: PathBuf,
 ) {
     // Subscribe to all existing server mailboxes with persisted last_seen_seq
     {
@@ -73,6 +75,7 @@ pub async fn run(
 
                 match result {
                     Some((server_id, Ok(ReceiveResult::Message(msg)))) if msg.message_type == MessageType::Metadata => {
+                        let mut fetch_avatar = None;
                         match decode_metadata(&msg.content) {
                             Ok(payload) => {
                                 let c = client.lock().await;
@@ -95,10 +98,24 @@ pub async fn run(
                                     MetadataPayload::MemberAnnounce { display_name } => {
                                         let _ = c.store().update_member_name(&server_id, &msg.sender_fp, &display_name);
                                     }
+                                    MetadataPayload::AvatarUpdate { avatar_hash, avatar_key } => {
+                                        let _ = c.store().update_member_avatar(&server_id, &msg.sender_fp, &avatar_hash, &avatar_key);
+                                        fetch_avatar = Some((server_id, msg.sender_fp, avatar_hash));
+                                    }
+                                    MetadataPayload::AvatarClear => {
+                                        let _ = c.store().clear_member_avatar(&server_id, &msg.sender_fp);
+                                        let fp_hex = hex::encode(msg.sender_fp);
+                                        let _ = std::fs::remove_file(data_dir.join("avatars").join(format!("{}.webp", fp_hex)));
+                                        let _ = std::fs::remove_file(data_dir.join("avatars").join(format!("{}.hash", fp_hex)));
+                                        let _ = app.emit("avatar-cleared", fp_hex);
+                                    }
                                 }
                                 let _ = c.store().set_last_seen_seq(&mailbox_id, seq);
                             }
                             Err(e) => eprintln!("decode metadata: {e}"),
+                        }
+                        if let Some((sid, fp, hash)) = fetch_avatar {
+                            maybe_fetch_avatar(&client, &relay, &app, &data_dir, &sid, &fp, &hash).await;
                         }
                         let _ = app.emit("sync", hex::encode(server_id));
                     }
@@ -125,6 +142,8 @@ pub async fn run(
                                         display_name: hex::encode(&fp[..8]),
                                         role: MemberRole::Member,
                                         joined_at: received_at,
+                                        avatar_hash: None,
+                                        avatar_key: None,
                                     });
                                 }
                             }
@@ -183,7 +202,7 @@ pub async fn run(
             }
             RelayEvent::Presence { mailbox_id, json } => {
                 handle_online_presence(
-                    &app, &client, &mailbox_id, &json, &mut online_members, &mut pending_presence,
+                    &app, &client, &relay, &mailbox_id, &json, &mut online_members, &mut pending_presence, &data_dir,
                 ).await;
             }
             RelayEvent::ConnectionState { mailbox_id, connected } => {
@@ -429,6 +448,7 @@ struct OnlineMember {
     fingerprint: [u8; 32],
     status: &'static str,
     status_message: Option<String>,
+    avatar_hash: Option<[u8; 32]>,
 }
 
 #[derive(Serialize)]
@@ -442,6 +462,7 @@ struct OnlinePresenceMemberDto {
     fingerprint: String,
     status: String,
     status_message: Option<String>,
+    avatar_hash: Option<String>,
 }
 
 fn now_ms() -> u64 {
@@ -479,6 +500,7 @@ fn emit_online_presence(app: &AppHandle, server_id: &[u8; 32], members: &[Online
                 fingerprint: hex::encode(m.fingerprint),
                 status: m.status.to_string(),
                 status_message: m.status_message.clone(),
+                avatar_hash: m.avatar_hash.map(hex::encode),
             })
             .collect(),
     };
@@ -486,30 +508,104 @@ fn emit_online_presence(app: &AppHandle, server_id: &[u8; 32], members: &[Online
 }
 
 /// Try to decrypt a presence blob and upsert into the member list.
-/// Returns true if decryption succeeded.
-fn try_upsert_presence(
+/// Returns Some((fingerprint, avatar_hash)) if a new avatar needs fetching, None on failure.
+fn try_decrypt_presence(
     client: &GhostClient,
     server_id: &[u8; 32],
     blob: &[u8],
     members: &mut Vec<OnlineMember>,
-) -> bool {
+) -> Option<([u8; 32], Option<[u8; 32]>)> {
     match client.open_online_presence_blob(server_id, blob) {
         Ok(mut ps) => {
             filter_expired_status(&mut ps);
+            let avatar_hash = ps.avatar_hash;
             if let Some(existing) = members.iter_mut().find(|m| m.fingerprint == ps.fingerprint) {
                 existing.status = status_str(ps.status);
                 existing.status_message = ps.status_message;
+                existing.avatar_hash = ps.avatar_hash;
             } else {
                 members.push(OnlineMember {
                     fingerprint: ps.fingerprint,
                     status: status_str(ps.status),
                     status_message: ps.status_message,
+                    avatar_hash: ps.avatar_hash,
                 });
             }
-            true
+            Some((ps.fingerprint, avatar_hash))
         }
-        Err(_) => false,
+        Err(_) => None,
     }
+}
+
+/// Fetch, decrypt, and cache an avatar if we have the key but no cached file.
+async fn maybe_fetch_avatar(
+    client: &Arc<Mutex<GhostClient>>,
+    relay: &Arc<Mutex<RelayClient>>,
+    app: &AppHandle,
+    data_dir: &std::path::Path,
+    server_id: &[u8; 32],
+    fingerprint: &[u8; 32],
+    avatar_hash: &[u8; 32],
+) {
+    let avatar_dir = data_dir.join("avatars");
+    let cache_path = avatar_dir.join(format!("{}.webp", hex::encode(fingerprint)));
+    // Check sidecar file to see if we already fetched this version
+    let hash_path = avatar_dir.join(format!("{}.hash", hex::encode(fingerprint)));
+    if let Ok(stored) = std::fs::read(&hash_path) {
+        if stored == avatar_hash.as_slice() {
+            return;
+        }
+    }
+
+    // Look up the avatar key from the members table
+    let avatar_key = {
+        let c = client.lock().await;
+        c.store().get_member_avatar_key(server_id, fingerprint).ok().flatten()
+    };
+    let avatar_key = match avatar_key {
+        Some(k) => k,
+        None => return, // don't have the key yet
+    };
+
+    // Fetch the mailbox_id for this server
+    let mailbox_id = {
+        let c = client.lock().await;
+        c.mailbox_id_for_server(server_id)
+    };
+    let mailbox_id = match mailbox_id {
+        Some(m) => m,
+        None => return,
+    };
+
+    // Fetch encrypted blob from relay
+    let encrypted = {
+        let r = relay.lock().await;
+        r.get_avatar(&mailbox_id, fingerprint).await
+    };
+    let encrypted = match encrypted {
+        Ok(Some(data)) => data,
+        _ => return,
+    };
+
+    // Decrypt: [nonce:12][ciphertext+tag]
+    use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead};
+    use aes_gcm::Nonce;
+    if encrypted.len() < 28 { return; }
+    let nonce = Nonce::from_slice(&encrypted[..12]);
+    let cipher = Aes256Gcm::new((&avatar_key).into());
+    let plaintext = match cipher.decrypt(nonce, &encrypted[12..]) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+
+    // Cache to disk
+    let avatar_dir = data_dir.join("avatars");
+    let _ = std::fs::create_dir_all(&avatar_dir);
+    let _ = std::fs::write(&cache_path, &plaintext);
+    // Write hash sidecar so we know which version we have
+    let hash_path = avatar_dir.join(format!("{}.hash", hex::encode(fingerprint)));
+    let _ = std::fs::write(&hash_path, avatar_hash);
+    let _ = app.emit("avatar-updated", hex::encode(fingerprint));
 }
 
 /// Retry pending presence blobs after an epoch change (commit processed).
@@ -528,7 +624,7 @@ async fn retry_pending_presence(
     let members = online_members.entry(*server_id).or_default();
     let mut still_pending = Vec::new();
     for blob in blobs {
-        if !try_upsert_presence(&c, server_id, &blob, members) {
+        if try_decrypt_presence(&c, server_id, &blob, members).is_none() {
             still_pending.push(blob);
         }
     }
@@ -542,10 +638,12 @@ async fn retry_pending_presence(
 async fn handle_online_presence(
     app: &AppHandle,
     client: &Arc<Mutex<GhostClient>>,
+    relay: &Arc<Mutex<RelayClient>>,
     mailbox_id: &[u8; 32],
     json: &str,
     online_members: &mut HashMap<[u8; 32], Vec<OnlineMember>>,
     pending_blobs: &mut HashMap<[u8; 32], Vec<Vec<u8>>>,
+    data_dir: &std::path::Path,
 ) {
     let snap: serde_json::Value = match serde_json::from_str(json) {
         Ok(v) => v,
@@ -561,6 +659,7 @@ async fn handle_online_presence(
         };
         let mut members_list = Vec::new();
         let mut failed = Vec::new();
+        let mut avatars_to_fetch: Vec<([u8; 32], [u8; 32])> = Vec::new();
         for entry in arr {
             let p_b64 = match entry.get("p").and_then(|v| v.as_str()) {
                 Some(s) => s,
@@ -570,8 +669,10 @@ async fn handle_online_presence(
                 Ok(b) => b,
                 Err(_) => continue,
             };
-            if !try_upsert_presence(&c, &server_id, &blob, &mut members_list) {
-                failed.push(blob);
+            match try_decrypt_presence(&c, &server_id, &blob, &mut members_list) {
+                Some((fp, Some(hash))) => avatars_to_fetch.push((fp, hash)),
+                Some(_) => {}
+                None => failed.push(blob),
             }
         }
         drop(c);
@@ -583,6 +684,9 @@ async fn handle_online_presence(
             pending_blobs.remove(&server_id);
         }
         emit_online_presence(app, &server_id, online_members.get(&server_id).unwrap());
+        for (fp, hash) in avatars_to_fetch {
+            maybe_fetch_avatar(client, relay, app, data_dir, &server_id, &fp, &hash).await;
+        }
         return;
     }
 
@@ -613,10 +717,12 @@ async fn handle_online_presence(
             }
         } else {
             let members = online_members.entry(server_id).or_default();
-            if try_upsert_presence(&c, &server_id, &blob, members) {
-                // Successfully decrypted — also clear any pending blob for this member
+            if let Some((fp, hash)) = try_decrypt_presence(&c, &server_id, &blob, members) {
                 drop(c);
                 emit_online_presence(app, &server_id, members);
+                if let Some(h) = hash {
+                    maybe_fetch_avatar(client, relay, app, data_dir, &server_id, &fp, &h).await;
+                }
             } else {
                 drop(c);
                 // Buffer for retry after next commit (cap at 64 to bound memory)

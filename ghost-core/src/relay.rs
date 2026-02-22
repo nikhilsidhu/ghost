@@ -259,6 +259,80 @@ impl RelayClient {
             .map(|b| b.to_vec())
             .map_err(|e| GhostError::Network(e.to_string()))
     }
+
+    pub async fn put_avatar(
+        &self,
+        mailbox_id: &[u8; 32],
+        fingerprint: &[u8; 32],
+        data: Vec<u8>,
+    ) -> Result<()> {
+        let resp = self
+            .http
+            .put(format!(
+                "{}/box/{}/avatar/{}",
+                self.base_url,
+                URL_SAFE_NO_PAD.encode(mailbox_id),
+                hex::encode(fingerprint),
+            ))
+            .body(data)
+            .send()
+            .await
+            .map_err(|e| GhostError::Network(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(GhostError::Network(format!("put avatar: {}", resp.status())));
+        }
+        Ok(())
+    }
+
+    pub async fn get_avatar(
+        &self,
+        mailbox_id: &[u8; 32],
+        fingerprint: &[u8; 32],
+    ) -> Result<Option<Vec<u8>>> {
+        let resp = self
+            .http
+            .get(format!(
+                "{}/box/{}/avatar/{}",
+                self.base_url,
+                URL_SAFE_NO_PAD.encode(mailbox_id),
+                hex::encode(fingerprint),
+            ))
+            .send()
+            .await
+            .map_err(|e| GhostError::Network(e.to_string()))?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            return Err(GhostError::Network(format!("get avatar: {}", resp.status())));
+        }
+        resp.bytes()
+            .await
+            .map(|b| Some(b.to_vec()))
+            .map_err(|e| GhostError::Network(e.to_string()))
+    }
+
+    pub async fn delete_avatar(
+        &self,
+        mailbox_id: &[u8; 32],
+        fingerprint: &[u8; 32],
+    ) -> Result<()> {
+        let resp = self
+            .http
+            .delete(format!(
+                "{}/box/{}/avatar/{}",
+                self.base_url,
+                URL_SAFE_NO_PAD.encode(mailbox_id),
+                hex::encode(fingerprint),
+            ))
+            .send()
+            .await
+            .map_err(|e| GhostError::Network(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(GhostError::Network(format!("delete avatar: {}", resp.status())));
+        }
+        Ok(())
+    }
 }
 
 impl Drop for RelayClient {

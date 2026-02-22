@@ -34,6 +34,7 @@ fn main() {
     let idle_voice_tx = app_state.voice.cmd_tx.clone();
     let idle_config = app_state.config.clone();
     let idle_config_path = app_state.config_path.clone();
+    let data_dir = app_state.config_path.parent().unwrap().to_path_buf();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
@@ -57,6 +58,7 @@ fn main() {
                 relay,
                 inbox_rx,
                 presence,
+                data_dir,
             ));
             tauri::async_runtime::spawn(voice_task::run(
                 handle.clone(),
@@ -122,6 +124,9 @@ fn main() {
             commands::set_keybind,
             commands::set_status,
             commands::set_status_message,
+            commands::upload_avatar,
+            commands::clear_avatar,
+            commands::get_cached_avatar,
         ])
         .run(tauri::generate_context!())
         .expect("error while running ghost");

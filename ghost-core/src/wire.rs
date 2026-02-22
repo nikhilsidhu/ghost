@@ -396,6 +396,8 @@ pub fn decode_channel_op(data: &[u8]) -> Result<ChannelOpPayload> {
 // --- Member announce payload (carried in Metadata messages) ---
 
 const MEMBER_ANNOUNCE: u8 = 0x10;
+const AVATAR_UPDATE: u8 = 0x11;
+const AVATAR_CLEAR: u8 = 0x12;
 
 pub fn encode_member_announce(display_name: &str) -> Vec<u8> {
     let mut buf = Vec::new();
@@ -404,7 +406,19 @@ pub fn encode_member_announce(display_name: &str) -> Vec<u8> {
     buf
 }
 
-/// Decode a Metadata payload, returning either a channel op or a member announce name.
+pub fn encode_avatar_update(avatar_hash: &[u8; 32], avatar_key: &[u8; 32]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(1 + 32 + 32);
+    buf.push(AVATAR_UPDATE);
+    buf.extend_from_slice(avatar_hash);
+    buf.extend_from_slice(avatar_key);
+    buf
+}
+
+pub fn encode_avatar_clear() -> Vec<u8> {
+    vec![AVATAR_CLEAR]
+}
+
+/// Decode a Metadata payload.
 pub fn decode_metadata(data: &[u8]) -> Result<MetadataPayload> {
     let tag = *data.first().ok_or_else(|| GhostError::Format("empty metadata".into()))?;
     match tag {
@@ -416,6 +430,13 @@ pub fn decode_metadata(data: &[u8]) -> Result<MetadataPayload> {
             let name = read_string(data, &mut pos)?;
             Ok(MetadataPayload::MemberAnnounce { display_name: name })
         }
+        AVATAR_UPDATE => {
+            let mut pos = 1;
+            let avatar_hash = read_blob32(data, &mut pos)?;
+            let avatar_key = read_blob32(data, &mut pos)?;
+            Ok(MetadataPayload::AvatarUpdate { avatar_hash, avatar_key })
+        }
+        AVATAR_CLEAR => Ok(MetadataPayload::AvatarClear),
         _ => Err(GhostError::Format(format!("unknown metadata tag: {tag:#04x}"))),
     }
 }
@@ -423,6 +444,8 @@ pub fn decode_metadata(data: &[u8]) -> Result<MetadataPayload> {
 pub enum MetadataPayload {
     ChannelOp(ChannelOpPayload),
     MemberAnnounce { display_name: String },
+    AvatarUpdate { avatar_hash: [u8; 32], avatar_key: [u8; 32] },
+    AvatarClear,
 }
 
 // --- open_any: handle both app messages and commits from the relay ---
@@ -887,5 +910,20 @@ mod tests {
         let blob = seal(&mut group_a, &provider_a, &msg).unwrap();
         let result = open(&mut group_b, &provider_b, &blob);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn avatar_update_roundtrip() {
+        let hash = [0xAA; 32];
+        let key = [0xBB; 32];
+        let encoded = encode_avatar_update(&hash, &key);
+        let decoded = decode_metadata(&encoded).unwrap();
+        match decoded {
+            MetadataPayload::AvatarUpdate { avatar_hash, avatar_key } => {
+                assert_eq!(avatar_hash, hash);
+                assert_eq!(avatar_key, key);
+            }
+            _ => panic!("expected AvatarUpdate"),
+        }
     }
 }

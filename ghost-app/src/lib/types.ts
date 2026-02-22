@@ -115,4 +115,5 @@ export interface OnlinePresenceMember {
   fingerprint: string;
   status: "online" | "idle" | "away";
   status_message: string | null;
+  avatar_hash: string | null;
 }

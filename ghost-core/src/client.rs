@@ -157,6 +157,8 @@ impl GhostClient {
             display_name: self.identity.display_name.clone(),
             role: MemberRole::Creator,
             joined_at: timestamp,
+            avatar_hash: None,
+            avatar_key: None,
         })?;
 
         let mailbox_id = mls_group_mailbox_id(ghost_group.group_id());
@@ -300,6 +302,8 @@ impl GhostClient {
             display_name: invitee_name.to_string(),
             role: MemberRole::Member,
             joined_at: timestamp,
+            avatar_hash: None,
+            avatar_key: None,
         })?;
 
         Ok((Outbound { mailbox_id, blob: commit_blob }, welcome_bytes))
@@ -343,6 +347,8 @@ impl GhostClient {
             display_name: self.identity.display_name.clone(),
             role: MemberRole::Member,
             joined_at: timestamp,
+            avatar_hash: None,
+            avatar_key: None,
         })?;
 
         let mailbox_id = mls_group_mailbox_id(ghost_group.group_id());
@@ -459,6 +465,8 @@ impl GhostClient {
                 display_name: m.display_name.clone(),
                 role: m.role.clone(),
                 joined_at: timestamp,
+                avatar_hash: None,
+                avatar_key: None,
             })?;
         }
 
@@ -468,6 +476,8 @@ impl GhostClient {
             display_name: self.identity.display_name.clone(),
             role: MemberRole::Member,
             joined_at: timestamp,
+            avatar_hash: None,
+            avatar_key: None,
         })?;
 
         let mailbox_id = mls_group_mailbox_id(ghost_group.group_id());

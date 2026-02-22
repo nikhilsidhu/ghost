@@ -1,10 +1,11 @@
 import { createSignal, createEffect, on, onCleanup, For, Show } from "solid-js";
 import { Avatar } from "./ui/avatar";
-import { X, Fingerprint, Check, Infinity, Timer } from "lucide-solid";
+import { ImageCrop, CROP_AREA_HEIGHT } from "./ui/image-crop";
+import { X, FingerprintPattern, Check, Infinity, Timer, Camera } from "lucide-solid";
 import { Tooltip } from "./ui/tooltip";
 import { cn } from "../lib/cn";
-import { identity, profileOpen, setProfileOpen, ownStatus, setOwnStatus, ownStatusMessage, setOwnStatusMessage, selectedExpiry, setSelectedExpiry, expiresAt, setExpiresAt, rebuildPresence, setAutoMuted } from "../lib/store";
-import { setDisplayName, setStatus as apiSetStatus, setStatusMessage as apiSetStatusMessage } from "../lib/api";
+import { identity, profileOpen, setProfileOpen, ownStatus, setOwnStatus, ownStatusMessage, setOwnStatusMessage, selectedExpiry, setSelectedExpiry, expiresAt, setExpiresAt, rebuildPresence, setAutoMuted, updateIdentity, avatarUrl, loadAvatar } from "../lib/store";
+import { setDisplayName, setStatus as apiSetStatus, setStatusMessage as apiSetStatusMessage, uploadAvatar, clearAvatar } from "../lib/api";
 
 const STATUS_OPTIONS = [
   { value: "online", label: "Online", color: "var(--emerald-400)" },
@@ -41,7 +42,11 @@ export function ProfilePanel() {
   const [copied, setCopied] = createSignal(false);
   const [remaining, setRemaining] = createSignal<string | null>(null);
 
-  // Countdown timer — ticks every second when an expiry is active
+  const [cropMode, setCropMode] = createSignal(false);
+  const [cropImage, setCropImage] = createSignal<HTMLImageElement | null>(null);
+  const [uploading, setUploading] = createSignal(false);
+  let fileInput!: HTMLInputElement;
+
   createEffect(on(expiresAt, (exp) => {
     if (!exp) { setRemaining(null); return; }
     const tick = () => {
@@ -57,6 +62,16 @@ export function ProfilePanel() {
     tick();
     const id = setInterval(tick, 1_000);
     onCleanup(() => clearInterval(id));
+  }));
+
+  // Cancel crop when profile closes
+  createEffect(on(() => profileOpen(), (open) => {
+    if (!open && cropMode()) {
+      const img = cropImage();
+      if (img) URL.revokeObjectURL(img.src);
+      setCropImage(null);
+      setCropMode(false);
+    }
   }));
 
   const copyFingerprint = () => {
@@ -76,6 +91,7 @@ export function ProfilePanel() {
     const name = nameInput().trim();
     if (name && name !== identity()?.display_name) {
       await setDisplayName(name).catch(() => {});
+      await updateIdentity();
     }
     setEditingName(false);
   };
@@ -121,6 +137,55 @@ export function ProfilePanel() {
     commitStatusMessage();
   };
 
+  const onAvatarClick = () => {
+    if (cropMode()) return;
+    fileInput.click();
+  };
+
+  const onClearAvatar = async (e: MouseEvent) => {
+    e.stopPropagation();
+    try {
+      await clearAvatar();
+      await loadAvatar(identity()!.fingerprint);
+    } catch (err) {
+      console.error("clear avatar failed:", err);
+    }
+  };
+
+  const onFileSelect = (e: Event) => {
+    const file = (e.target as HTMLInputElement).files?.[0];
+    if (!file) return;
+    fileInput.value = "";
+
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      setCropImage(img);
+      setCropMode(true);
+    };
+    img.src = url;
+  };
+
+  const dismissCrop = () => {
+    const img = cropImage();
+    if (img) URL.revokeObjectURL(img.src);
+    setCropImage(null);
+    setCropMode(false);
+  };
+
+  const onCropConfirm = async (bytes: number[]) => {
+    setUploading(true);
+    try {
+      await uploadAvatar(bytes);
+      await loadAvatar(identity()!.fingerprint);
+      dismissCrop();
+    } catch (e) {
+      console.error("avatar upload failed:", e);
+    } finally {
+      setUploading(false);
+    }
+  };
+
   const pillClass = (active: boolean) => cn(
     "flex-1 flex items-center justify-center gap-1.5 px-2 py-1 rounded-md text-xs cursor-pointer outline-none transition-colors duration-[var(--duration-fast)]",
     active
@@ -130,13 +195,25 @@ export function ProfilePanel() {
 
   return (
     <div
-      class="absolute bottom-0 left-0 right-0 z-30"
+      class={cn(
+        "absolute bottom-0 left-0 right-0 z-30",
+        !profileOpen() && "pointer-events-none",
+      )}
       style={{
-        "max-height": profileOpen() ? "400px" : "0px",
-        transition: "max-height var(--duration-slow) var(--ease-out)",
-        overflow: "hidden",
+        transform: profileOpen() ? "translateY(0)" : "translateY(100%)",
+        transition: "transform var(--duration-slow) var(--ease-out)",
       }}
     >
+      {/* Hidden file input */}
+      <input
+        ref={fileInput!}
+        type="file"
+        accept="image/jpeg,image/png,image/webp"
+        class="hidden"
+        onChange={onFileSelect}
+      />
+
+      {/* Top fade */}
       <div
         class="h-8 pointer-events-none"
         style={{ background: "linear-gradient(to bottom, transparent, var(--neutral-950))" }}
@@ -151,11 +228,30 @@ export function ProfilePanel() {
             <div class="flex flex-col gap-3">
               {/* Avatar + name + fingerprint + close */}
               <div class="flex items-center gap-3">
-                <Avatar
-                  hashKey={id().fingerprint}
-                  label={id().display_name}
-                  class="w-12 h-12 text-base flex-shrink-0"
-                />
+                <div class="flex-shrink-0 relative group/avatar">
+                  <button
+                    class="cursor-pointer"
+                    onClick={onAvatarClick}
+                  >
+                    <Avatar
+                      hashKey={id().fingerprint}
+                      label={id().display_name}
+                      class="w-12 h-12 text-base"
+                    />
+                    <div class="absolute inset-0 rounded-full flex items-center justify-center bg-black/50 opacity-0 group-hover/avatar:opacity-100 transition-opacity duration-150">
+                      <Camera size={16} class="text-[var(--neutral-200)]" />
+                    </div>
+                  </button>
+                  <Show when={avatarUrl(id().fingerprint)}>
+                    <button
+                      class="absolute -top-1 -right-1 w-4 h-4 rounded-full bg-[var(--neutral-800)] border border-[var(--neutral-600)] flex items-center justify-center opacity-0 group-hover/avatar:opacity-100 transition-opacity duration-150 cursor-pointer hover:bg-[var(--neutral-700)]"
+                      onClick={onClearAvatar}
+                      title="remove avatar"
+                    >
+                      <X size={10} class="text-[var(--neutral-300)]" />
+                    </button>
+                  </Show>
+                </div>
                 <div class="flex-1 min-w-0">
                   <Show
                     when={editingName()}
@@ -184,7 +280,7 @@ export function ProfilePanel() {
                   onClick={copyFingerprint}
                   title="copy fingerprint"
                 >
-                  {copied() ? <Check size={14} /> : <Fingerprint size={14} />}
+                  {copied() ? <Check size={14} /> : <FingerprintPattern size={14} />}
                 </button>
                 <button
                   class="w-6 h-6 flex items-center justify-center rounded-md text-[var(--neutral-500)] hover:text-[var(--neutral-300)] cursor-pointer hover:bg-[var(--hover)] flex-shrink-0"
@@ -270,6 +366,26 @@ export function ProfilePanel() {
                     </button>
                   </div>
                 </div>
+              </div>
+
+              {/* Crop area */}
+              <div
+                class="overflow-hidden"
+                style={{
+                  height: cropMode() ? `${CROP_AREA_HEIGHT}px` : "0px",
+                  transition: "height var(--duration-slow) var(--ease-out)",
+                }}
+              >
+                <Show when={cropImage()}>
+                  {(img) => (
+                    <ImageCrop
+                      image={img()}
+                      uploading={uploading()}
+                      onConfirm={onCropConfirm}
+                      onCancel={dismissCrop}
+                    />
+                  )}
+                </Show>
               </div>
             </div>
           )}

@@ -114,6 +114,14 @@ export const setStatus = (status: string) =>
 export const setStatusMessage = (message: string | null, expiry: number | null) =>
   invoke<void>("set_status_message", { message, expiry });
 
+// Avatars
+export const uploadAvatar = (data: number[]) =>
+  invoke<void>("upload_avatar", { data });
+export const clearAvatar = () =>
+  invoke<void>("clear_avatar");
+export const getCachedAvatar = (fingerprintHex: string) =>
+  invoke<string | null>("get_cached_avatar", { fingerprintHex });
+
 // Dev testing
 export const createDevSession = () => invoke<Server>("create_dev_session");
 export const readDevSession = () => invoke<DevSession | null>("read_dev_session");

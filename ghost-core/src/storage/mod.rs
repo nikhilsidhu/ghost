@@ -221,6 +221,8 @@ pub struct Member {
     pub display_name: String,
     pub role: MemberRole,
     pub joined_at: u64,
+    pub avatar_hash: Option<[u8; 32]>,
+    pub avatar_key: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Clone)]
@@ -280,6 +282,8 @@ mod tests {
             display_name: "user".to_string(),
             role,
             joined_at: 2000,
+            avatar_hash: None,
+            avatar_key: None,
         }
     }
 

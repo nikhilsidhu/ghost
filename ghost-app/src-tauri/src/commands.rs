@@ -5,7 +5,7 @@ use rand::RngCore;
 use tauri::State;
 
 use ghost_core::storage::{Channel, ChannelKind, Server, ServerKind, Member, MemberRole, StoredMessage};
-use ghost_core::wire::{encode_channel_op, encode_member_announce, ChannelOpPayload};
+use ghost_core::wire::{encode_avatar_clear, encode_avatar_update, encode_channel_op, encode_member_announce, ChannelOpPayload};
 
 use ghost_core::mls::presence::OnlineStatus;
 
@@ -511,10 +511,156 @@ pub async fn set_display_name(
     let mut cfg = state.config.lock().await;
     cfg.display_name = Some(name.clone());
     cfg.save(&state.config_path)?;
+    drop(cfg);
 
-    let mut client = state.client.lock().await;
-    client.set_display_name(name);
+    let outbounds = {
+        let mut client = state.client.lock().await;
+        client.set_display_name(name.clone());
+        let payload = encode_member_announce(&name);
+        let mut out = Vec::new();
+        for (server_id, _) in client.server_mailboxes() {
+            if let Ok(o) = client.send_control(&server_id, payload.clone()) {
+                out.push(o);
+            }
+        }
+        out
+    };
+    let relay = state.relay.lock().await;
+    for o in outbounds {
+        let _ = relay.send(&o.mailbox_id, o.blob).await;
+    }
     Ok(())
+}
+
+#[tauri::command]
+pub async fn upload_avatar(
+    data: Vec<u8>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    use aes_gcm::{Aes256Gcm, KeyInit, aead::{Aead, AeadCore, OsRng}};
+
+    // Generate random encryption key, encrypt the avatar blob
+    let mut avatar_key = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut avatar_key);
+    let cipher = Aes256Gcm::new((&avatar_key).into());
+    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+    let ciphertext = cipher
+        .encrypt(&nonce, data.as_ref())
+        .map_err(|e| format!("encrypt avatar: {e}"))?;
+    let mut encrypted = Vec::with_capacity(12 + ciphertext.len());
+    encrypted.extend_from_slice(&nonce);
+    encrypted.extend_from_slice(&ciphertext);
+
+    let avatar_hash: [u8; 32] = blake3::hash(&encrypted).into();
+
+    // Upload to relay + send MLS metadata for each server
+    let (outbounds, fingerprint) = {
+        let mut client = state.client.lock().await;
+        let fp = *client.fingerprint();
+        let payload = encode_avatar_update(&avatar_hash, &avatar_key);
+        let mut out = Vec::new();
+        for (server_id, _) in client.server_mailboxes() {
+            // Store key locally so we can decrypt our own avatar
+            let _ = client.store().update_member_avatar(&server_id, &fp, &avatar_hash, &avatar_key);
+            if let Ok(o) = client.send_control(&server_id, payload.clone()) {
+                out.push(o);
+            }
+        }
+        (out, fp)
+    };
+    {
+        let relay = state.relay.lock().await;
+        for o in &outbounds {
+            // Upload the encrypted blob per mailbox
+            let _ = relay.put_avatar(&o.mailbox_id, &fingerprint, encrypted.clone()).await;
+            // Send the MLS metadata message
+            let _ = relay.send(&o.mailbox_id, o.blob.clone()).await;
+        }
+    }
+
+    // Cache locally
+    let avatar_dir = state.config_path.parent().unwrap().join("avatars");
+    let _ = std::fs::create_dir_all(&avatar_dir);
+    let _ = std::fs::write(avatar_dir.join(format!("{}.webp", hex::encode(fingerprint))), &data);
+
+    // Update presence so online members see the new avatar_hash immediately
+    {
+        let mut p = state.presence.lock().await;
+        p.avatar_hash = Some(avatar_hash);
+        let info = p.clone();
+        drop(p);
+        presence::broadcast_presence(&state.client, &state.relay, &info).await;
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn clear_avatar(
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let (outbounds, fingerprint) = {
+        let mut client = state.client.lock().await;
+        let fp = *client.fingerprint();
+        let payload = encode_avatar_clear();
+        let mut out = Vec::new();
+        for (server_id, _) in client.server_mailboxes() {
+            let _ = client.store().clear_member_avatar(&server_id, &fp);
+            if let Ok(o) = client.send_control(&server_id, payload.clone()) {
+                out.push(o);
+            }
+        }
+        (out, fp)
+    };
+    {
+        let relay = state.relay.lock().await;
+        for o in &outbounds {
+            let _ = relay.delete_avatar(&o.mailbox_id, &fingerprint).await;
+            let _ = relay.send(&o.mailbox_id, o.blob.clone()).await;
+        }
+    }
+
+    // Delete local cache
+    let avatar_dir = state.config_path.parent().unwrap().join("avatars");
+    let fp_hex = hex::encode(fingerprint);
+    let _ = std::fs::remove_file(avatar_dir.join(format!("{}.webp", fp_hex)));
+    let _ = std::fs::remove_file(avatar_dir.join(format!("{}.hash", fp_hex)));
+
+    // Clear presence avatar_hash
+    {
+        let mut p = state.presence.lock().await;
+        p.avatar_hash = None;
+        let info = p.clone();
+        drop(p);
+        presence::broadcast_presence(&state.client, &state.relay, &info).await;
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn get_cached_avatar(
+    fingerprint_hex: String,
+    state: State<'_, AppState>,
+) -> Result<Option<String>, String> {
+    let avatar_dir = state.config_path.parent().unwrap().join("avatars");
+    let path = avatar_dir.join(format!("{}.webp", fingerprint_hex));
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            let mime = if bytes.starts_with(b"GIF") {
+                "image/gif"
+            } else if bytes.starts_with(b"\x89PNG") {
+                "image/png"
+            } else if bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xD8 {
+                "image/jpeg"
+            } else {
+                "image/webp"
+            };
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            Ok(Some(format!("data:{};base64,{}", mime, b64)))
+        }
+        Err(_) => Ok(None),
+    }
 }
 
 #[tauri::command]
@@ -641,10 +787,10 @@ pub async fn seed_test_data(state: State<'_, AppState>) -> Result<(), String> {
     store.insert_channel(&Channel { channel_id: g1_random, server_id: g1, name: "random".into(), kind: ChannelKind::Text, position: 1 }).map_err(|e| e.to_string())?;
     store.insert_channel(&Channel { channel_id: g1_bugs, server_id: g1, name: "bugs".into(), kind: ChannelKind::Text, position: 2 }).map_err(|e| e.to_string())?;
     store.insert_channel(&Channel { channel_id: g1_voice, server_id: g1, name: "standup".into(), kind: ChannelKind::Voice, position: 3 }).map_err(|e| e.to_string())?;
-    store.insert_member(&Member { server_id: g1, fingerprint: own_fp, display_name: client.identity().display_name.clone(), role: MemberRole::Creator, joined_at: now - 86_400_000 }).map_err(|e| e.to_string())?;
-    store.insert_member(&Member { server_id: g1, fingerprint: alice_fp, display_name: "alice".into(), role: MemberRole::Member, joined_at: now - 82_000_000 }).map_err(|e| e.to_string())?;
-    store.insert_member(&Member { server_id: g1, fingerprint: bob_fp, display_name: "bob".into(), role: MemberRole::Member, joined_at: now - 80_000_000 }).map_err(|e| e.to_string())?;
-    store.insert_member(&Member { server_id: g1, fingerprint: carol_fp, display_name: "carol".into(), role: MemberRole::Member, joined_at: now - 78_000_000 }).map_err(|e| e.to_string())?;
+    store.insert_member(&Member { server_id: g1, fingerprint: own_fp, display_name: client.identity().display_name.clone(), role: MemberRole::Creator, joined_at: now - 86_400_000, avatar_hash: None, avatar_key: None }).map_err(|e| e.to_string())?;
+    store.insert_member(&Member { server_id: g1, fingerprint: alice_fp, display_name: "alice".into(), role: MemberRole::Member, joined_at: now - 82_000_000, avatar_hash: None, avatar_key: None }).map_err(|e| e.to_string())?;
+    store.insert_member(&Member { server_id: g1, fingerprint: bob_fp, display_name: "bob".into(), role: MemberRole::Member, joined_at: now - 80_000_000, avatar_hash: None, avatar_key: None }).map_err(|e| e.to_string())?;
+    store.insert_member(&Member { server_id: g1, fingerprint: carol_fp, display_name: "carol".into(), role: MemberRole::Member, joined_at: now - 78_000_000, avatar_hash: None, avatar_key: None }).map_err(|e| e.to_string())?;
 
     // Messages in #general — conversation about the project
     let msgs: &[(&[u8; 32], &str)] = &[
@@ -699,9 +845,9 @@ pub async fn seed_test_data(state: State<'_, AppState>) -> Result<(), String> {
     store.insert_channel(&Channel { channel_id: g2_inspo, server_id: g2, name: "inspiration".into(), kind: ChannelKind::Text, position: 0 }).map_err(|e| e.to_string())?;
     store.insert_channel(&Channel { channel_id: g2_feedback, server_id: g2, name: "feedback".into(), kind: ChannelKind::Text, position: 1 }).map_err(|e| e.to_string())?;
     store.insert_channel(&Channel { channel_id: g2_voice, server_id: g2, name: "voice-chat".into(), kind: ChannelKind::Voice, position: 2 }).map_err(|e| e.to_string())?;
-    store.insert_member(&Member { server_id: g2, fingerprint: alice_fp, display_name: "alice".into(), role: MemberRole::Creator, joined_at: now - 172_800_000 }).map_err(|e| e.to_string())?;
-    store.insert_member(&Member { server_id: g2, fingerprint: own_fp, display_name: client.identity().display_name.clone(), role: MemberRole::Member, joined_at: now - 170_000_000 }).map_err(|e| e.to_string())?;
-    store.insert_member(&Member { server_id: g2, fingerprint: dave_fp, display_name: "dave".into(), role: MemberRole::Member, joined_at: now - 168_000_000 }).map_err(|e| e.to_string())?;
+    store.insert_member(&Member { server_id: g2, fingerprint: alice_fp, display_name: "alice".into(), role: MemberRole::Creator, joined_at: now - 172_800_000, avatar_hash: None, avatar_key: None }).map_err(|e| e.to_string())?;
+    store.insert_member(&Member { server_id: g2, fingerprint: own_fp, display_name: client.identity().display_name.clone(), role: MemberRole::Member, joined_at: now - 170_000_000, avatar_hash: None, avatar_key: None }).map_err(|e| e.to_string())?;
+    store.insert_member(&Member { server_id: g2, fingerprint: dave_fp, display_name: "dave".into(), role: MemberRole::Member, joined_at: now - 168_000_000, avatar_hash: None, avatar_key: None }).map_err(|e| e.to_string())?;
 
     let inspo_msgs: &[(&[u8; 32], &str)] = &[
         (&alice_fp, "found this amazing dark UI kit — pure black with accent colors"),
@@ -727,11 +873,11 @@ pub async fn seed_test_data(state: State<'_, AppState>) -> Result<(), String> {
     let g3_listen = id();
     store.insert_channel(&Channel { channel_id: g3_recs, server_id: g3, name: "recommendations".into(), kind: ChannelKind::Text, position: 0 }).map_err(|e| e.to_string())?;
     store.insert_channel(&Channel { channel_id: g3_listen, server_id: g3, name: "listening-party".into(), kind: ChannelKind::Voice, position: 1 }).map_err(|e| e.to_string())?;
-    store.insert_member(&Member { server_id: g3, fingerprint: carol_fp, display_name: "carol".into(), role: MemberRole::Creator, joined_at: now - 259_200_000 }).map_err(|e| e.to_string())?;
-    store.insert_member(&Member { server_id: g3, fingerprint: own_fp, display_name: client.identity().display_name.clone(), role: MemberRole::Member, joined_at: now - 250_000_000 }).map_err(|e| e.to_string())?;
-    store.insert_member(&Member { server_id: g3, fingerprint: alice_fp, display_name: "alice".into(), role: MemberRole::Member, joined_at: now - 248_000_000 }).map_err(|e| e.to_string())?;
-    store.insert_member(&Member { server_id: g3, fingerprint: bob_fp, display_name: "bob".into(), role: MemberRole::Member, joined_at: now - 246_000_000 }).map_err(|e| e.to_string())?;
-    store.insert_member(&Member { server_id: g3, fingerprint: eve_fp, display_name: "eve".into(), role: MemberRole::Member, joined_at: now - 244_000_000 }).map_err(|e| e.to_string())?;
+    store.insert_member(&Member { server_id: g3, fingerprint: carol_fp, display_name: "carol".into(), role: MemberRole::Creator, joined_at: now - 259_200_000, avatar_hash: None, avatar_key: None }).map_err(|e| e.to_string())?;
+    store.insert_member(&Member { server_id: g3, fingerprint: own_fp, display_name: client.identity().display_name.clone(), role: MemberRole::Member, joined_at: now - 250_000_000, avatar_hash: None, avatar_key: None }).map_err(|e| e.to_string())?;
+    store.insert_member(&Member { server_id: g3, fingerprint: alice_fp, display_name: "alice".into(), role: MemberRole::Member, joined_at: now - 248_000_000, avatar_hash: None, avatar_key: None }).map_err(|e| e.to_string())?;
+    store.insert_member(&Member { server_id: g3, fingerprint: bob_fp, display_name: "bob".into(), role: MemberRole::Member, joined_at: now - 246_000_000, avatar_hash: None, avatar_key: None }).map_err(|e| e.to_string())?;
+    store.insert_member(&Member { server_id: g3, fingerprint: eve_fp, display_name: "eve".into(), role: MemberRole::Member, joined_at: now - 244_000_000, avatar_hash: None, avatar_key: None }).map_err(|e| e.to_string())?;
 
     let rec_msgs: &[(&[u8; 32], &str)] = &[
         (&carol_fp, "new burial album dropped"),
@@ -757,8 +903,8 @@ pub async fn seed_test_data(state: State<'_, AppState>) -> Result<(), String> {
     let dm1_ch = id();
     store.insert_server(&Server { server_id: dm1, name: "alice".into(), kind: ServerKind::Dm, creator_fp: own_fp, created_at: now - 50_000_000 }).map_err(|e| e.to_string())?;
     store.insert_channel(&Channel { channel_id: dm1_ch, server_id: dm1, name: "messages".into(), kind: ChannelKind::Text, position: 0 }).map_err(|e| e.to_string())?;
-    store.insert_member(&Member { server_id: dm1, fingerprint: own_fp, display_name: client.identity().display_name.clone(), role: MemberRole::Creator, joined_at: now - 50_000_000 }).map_err(|e| e.to_string())?;
-    store.insert_member(&Member { server_id: dm1, fingerprint: alice_fp, display_name: "alice".into(), role: MemberRole::Member, joined_at: now - 49_000_000 }).map_err(|e| e.to_string())?;
+    store.insert_member(&Member { server_id: dm1, fingerprint: own_fp, display_name: client.identity().display_name.clone(), role: MemberRole::Creator, joined_at: now - 50_000_000, avatar_hash: None, avatar_key: None }).map_err(|e| e.to_string())?;
+    store.insert_member(&Member { server_id: dm1, fingerprint: alice_fp, display_name: "alice".into(), role: MemberRole::Member, joined_at: now - 49_000_000, avatar_hash: None, avatar_key: None }).map_err(|e| e.to_string())?;
     let dm1_msgs: &[(&[u8; 32], &str)] = &[
         (&alice_fp, "hey, got a sec?"),
         (&own_fp, "yeah what's up"),
@@ -780,8 +926,8 @@ pub async fn seed_test_data(state: State<'_, AppState>) -> Result<(), String> {
     let dm2_ch = id();
     store.insert_server(&Server { server_id: dm2, name: "bob".into(), kind: ServerKind::Dm, creator_fp: bob_fp, created_at: now - 40_000_000 }).map_err(|e| e.to_string())?;
     store.insert_channel(&Channel { channel_id: dm2_ch, server_id: dm2, name: "messages".into(), kind: ChannelKind::Text, position: 0 }).map_err(|e| e.to_string())?;
-    store.insert_member(&Member { server_id: dm2, fingerprint: own_fp, display_name: client.identity().display_name.clone(), role: MemberRole::Member, joined_at: now - 39_000_000 }).map_err(|e| e.to_string())?;
-    store.insert_member(&Member { server_id: dm2, fingerprint: bob_fp, display_name: "bob".into(), role: MemberRole::Creator, joined_at: now - 40_000_000 }).map_err(|e| e.to_string())?;
+    store.insert_member(&Member { server_id: dm2, fingerprint: own_fp, display_name: client.identity().display_name.clone(), role: MemberRole::Member, joined_at: now - 39_000_000, avatar_hash: None, avatar_key: None }).map_err(|e| e.to_string())?;
+    store.insert_member(&Member { server_id: dm2, fingerprint: bob_fp, display_name: "bob".into(), role: MemberRole::Creator, joined_at: now - 40_000_000, avatar_hash: None, avatar_key: None }).map_err(|e| e.to_string())?;
     let dm2_msgs: &[(&[u8; 32], &str)] = &[
         (&bob_fp, "that voice codec patch is wild"),
         (&own_fp, "right? opus is doing heavy lifting"),
