@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -46,6 +46,9 @@ impl From<u8> for AgcMode {
 // 0 = voice activity, 1 = push to talk
 pub const INPUT_MODE_VA: u8 = 0;
 pub const INPUT_MODE_PTT: u8 = 1;
+
+// CELT-only fullband 20ms mono silence — resets the decoder's prediction state cleanly
+const OPUS_SILENCE: [u8; 3] = [0xF8, 0xFF, 0xFE];
 
 pub struct AudioControls {
     pub muted: AtomicBool,
@@ -718,6 +721,8 @@ fn run_audio_thread(
     let mut agc = Agc::new();
     let mut sequence: u32 = 0;
     let mut vad_hangover: u32 = 0;
+    let mut was_speaking = false;
+    let mut pre_roll: VecDeque<Vec<u8>> = VecDeque::with_capacity(PRE_ROLL_FRAMES);
 
     let mut capture_device_frame = if streams.input_rate != OPUS_SAMPLE_RATE {
         (streams.input_rate as usize * OPUS_FRAME_MS as usize) / 1000
@@ -854,17 +859,63 @@ fn run_audio_thread(
                 if agc_mode == AgcMode::Auto {
                     agc.process(&mut frame_48k);
                 }
+
+                let speaking = mode == INPUT_MODE_PTT || vad_hangover > 0;
+
+                // Always encode to keep Opus encoder state warm
                 if let Ok(len) = encoder.encode_float(&frame_48k, &mut encode_buf) {
                     if let Ok(encrypted) = encrypt_voice_frame(&own_key, sequence, &encode_buf[..len]) {
                         let pkt = build_packet(&channel_id, own_slot_id, sequence, &encrypted);
-                        let _ = outbound_tx.try_send(pkt);
                         sequence = sequence.wrapping_add(1);
-                        diag_frames_sent += 1;
+
+                        if speaking {
+                            if !was_speaking {
+                                // Speech onset: flush pre-roll to capture leading edge
+                                for pre_pkt in pre_roll.drain(..) {
+                                    let _ = outbound_tx.try_send(pre_pkt);
+                                    diag_frames_sent += 1;
+                                }
+                            }
+                            was_speaking = true;
+                            let _ = outbound_tx.try_send(pkt);
+                            diag_frames_sent += 1;
+                        } else {
+                            if was_speaking {
+                                // Speech end: send silence frames for clean decoder reset
+                                for _ in 0..SILENCE_FRAME_COUNT {
+                                    if let Ok(enc) = encrypt_voice_frame(&own_key, sequence, &OPUS_SILENCE) {
+                                        let spkt = build_packet(&channel_id, own_slot_id, sequence, &enc);
+                                        let _ = outbound_tx.try_send(spkt);
+                                        sequence = sequence.wrapping_add(1);
+                                        diag_frames_sent += 1;
+                                    }
+                                }
+                                was_speaking = false;
+                            }
+                            // Buffer for pre-roll
+                            if pre_roll.len() >= PRE_ROLL_FRAMES {
+                                pre_roll.pop_front();
+                            }
+                            pre_roll.push_back(pkt);
+                        }
                     }
                 }
             } else {
                 vad_hangover = 0;
                 controls.speaking.store(false, Ordering::Relaxed);
+                // Muted or PTT released: send silence frames if we were speaking
+                if was_speaking {
+                    for _ in 0..SILENCE_FRAME_COUNT {
+                        if let Ok(enc) = encrypt_voice_frame(&own_key, sequence, &OPUS_SILENCE) {
+                            let spkt = build_packet(&channel_id, own_slot_id, sequence, &enc);
+                            let _ = outbound_tx.try_send(spkt);
+                            sequence = sequence.wrapping_add(1);
+                            diag_frames_sent += 1;
+                        }
+                    }
+                    was_speaking = false;
+                }
+                pre_roll.clear();
             }
         }
 

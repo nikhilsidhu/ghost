@@ -28,6 +28,12 @@ pub const VAD_THRESHOLD: f32 = 0.85;
 // Continue transmitting for this many frames after voice activity drops (prevents clipping word ends)
 pub const VAD_HANGOVER_FRAMES: u32 = 15; // ~300ms at 50fps
 
+// Silence frames sent at end of talk spurt to cleanly reset the receiver's Opus decoder
+pub const SILENCE_FRAME_COUNT: usize = 3;
+
+// Pre-roll buffer: frames kept so speech onset isn't clipped when VAD triggers
+pub const PRE_ROLL_FRAMES: usize = 3;
+
 // Shared buffer holds ~1 second of audio between device callbacks and processing thread
 pub const RING_CAPACITY: usize = 48_000;
 
