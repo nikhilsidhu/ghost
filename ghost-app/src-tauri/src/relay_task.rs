@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
@@ -53,6 +54,8 @@ pub async fn run(
     let mut connected_mailboxes: HashSet<[u8; 32]> = HashSet::new();
     // Online presence per server: server_id → list of online members
     let mut online_members: HashMap<[u8; 32], Vec<OnlineMember>> = HashMap::new();
+    // Presence blobs that failed trial decryption (epoch mismatch), retried after commits
+    let mut pending_presence: HashMap<[u8; 32], Vec<Vec<u8>>> = HashMap::new();
 
     while let Some(event) = events.recv().await {
         match event {
@@ -132,6 +135,7 @@ pub async fn run(
                         }
                         drop(c);
                         rebroadcast_presence(&client, &relay, &mailbox_id, &presence).await;
+                        retry_pending_presence(&app, &client, &server_id, &mut online_members, &mut pending_presence).await;
                         let _ = app.emit("sync", hex::encode(server_id));
                     }
                     Some((server_id, Ok(ReceiveResult::Kicked))) => {
@@ -152,6 +156,7 @@ pub async fn run(
                         }
                         drop(c);
                         rebroadcast_presence(&client, &relay, &mailbox_id, &presence).await;
+                        retry_pending_presence(&app, &client, &server_id, &mut online_members, &mut pending_presence).await;
                         let _ = app.emit("sync", hex::encode(server_id));
                     }
                     Some((_, Ok(ReceiveResult::Skipped))) => {
@@ -159,13 +164,10 @@ pub async fn run(
                         let _ = c.store().set_last_seen_seq(&mailbox_id, seq);
                     }
                     Some((_, Err(e))) => {
-                        let msg = e.to_string();
-                        if msg.contains("epoch") || msg.contains("Epoch") {
-                            let c = client.lock().await;
-                            let _ = c.store().set_last_seen_seq(&mailbox_id, seq);
-                        } else {
-                            eprintln!("relay: receive error seq={seq}: {e}");
-                        }
+                        eprintln!("relay: receive error seq={seq}: {e}");
+                        // Advance seq so we don't re-process this blob on reconnect
+                        let c = client.lock().await;
+                        let _ = c.store().set_last_seen_seq(&mailbox_id, seq);
                     }
                     None => {}
                 }
@@ -181,7 +183,7 @@ pub async fn run(
             }
             RelayEvent::Presence { mailbox_id, json } => {
                 handle_online_presence(
-                    &app, &client, &mailbox_id, &json, &mut online_members,
+                    &app, &client, &mailbox_id, &json, &mut online_members, &mut pending_presence,
                 ).await;
             }
             RelayEvent::ConnectionState { mailbox_id, connected } => {
@@ -442,6 +444,23 @@ struct OnlinePresenceMemberDto {
     status_message: Option<String>,
 }
 
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// Strip expired status messages from received presence (handles crashed senders).
+fn filter_expired_status(ps: &mut ghost_core::mls::presence::OnlinePresence) {
+    if let Some(exp) = ps.status_expiry {
+        if now_ms() >= exp {
+            ps.status_message = None;
+            ps.status_expiry = None;
+        }
+    }
+}
+
 fn status_str(s: OnlineStatus) -> &'static str {
     match s {
         OnlineStatus::Online => "online",
@@ -466,12 +485,67 @@ fn emit_online_presence(app: &AppHandle, server_id: &[u8; 32], members: &[Online
     let _ = app.emit("online-presence", &event);
 }
 
+/// Try to decrypt a presence blob and upsert into the member list.
+/// Returns true if decryption succeeded.
+fn try_upsert_presence(
+    client: &GhostClient,
+    server_id: &[u8; 32],
+    blob: &[u8],
+    members: &mut Vec<OnlineMember>,
+) -> bool {
+    match client.open_online_presence_blob(server_id, blob) {
+        Ok(mut ps) => {
+            filter_expired_status(&mut ps);
+            if let Some(existing) = members.iter_mut().find(|m| m.fingerprint == ps.fingerprint) {
+                existing.status = status_str(ps.status);
+                existing.status_message = ps.status_message;
+            } else {
+                members.push(OnlineMember {
+                    fingerprint: ps.fingerprint,
+                    status: status_str(ps.status),
+                    status_message: ps.status_message,
+                });
+            }
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Retry pending presence blobs after an epoch change (commit processed).
+async fn retry_pending_presence(
+    app: &AppHandle,
+    client: &Arc<Mutex<GhostClient>>,
+    server_id: &[u8; 32],
+    online_members: &mut HashMap<[u8; 32], Vec<OnlineMember>>,
+    pending: &mut HashMap<[u8; 32], Vec<Vec<u8>>>,
+) {
+    let blobs = match pending.remove(server_id) {
+        Some(b) if !b.is_empty() => b,
+        _ => return,
+    };
+    let c = client.lock().await;
+    let members = online_members.entry(*server_id).or_default();
+    let mut still_pending = Vec::new();
+    for blob in blobs {
+        if !try_upsert_presence(&c, server_id, &blob, members) {
+            still_pending.push(blob);
+        }
+    }
+    drop(c);
+    if !still_pending.is_empty() {
+        pending.insert(*server_id, still_pending);
+    }
+    emit_online_presence(app, server_id, members);
+}
+
 async fn handle_online_presence(
     app: &AppHandle,
     client: &Arc<Mutex<GhostClient>>,
     mailbox_id: &[u8; 32],
     json: &str,
     online_members: &mut HashMap<[u8; 32], Vec<OnlineMember>>,
+    pending_blobs: &mut HashMap<[u8; 32], Vec<Vec<u8>>>,
 ) {
     let snap: serde_json::Value = match serde_json::from_str(json) {
         Ok(v) => v,
@@ -486,6 +560,7 @@ async fn handle_online_presence(
             None => return,
         };
         let mut members_list = Vec::new();
+        let mut failed = Vec::new();
         for entry in arr {
             let p_b64 = match entry.get("p").and_then(|v| v.as_str()) {
                 Some(s) => s,
@@ -495,16 +570,18 @@ async fn handle_online_presence(
                 Ok(b) => b,
                 Err(_) => continue,
             };
-            if let Ok(ps) = c.open_online_presence_blob(&server_id, &blob) {
-                members_list.push(OnlineMember {
-                    fingerprint: ps.fingerprint,
-                    status: status_str(ps.status),
-                    status_message: ps.status_message,
-                });
+            if !try_upsert_presence(&c, &server_id, &blob, &mut members_list) {
+                failed.push(blob);
             }
         }
         drop(c);
         online_members.insert(server_id, members_list);
+        if !failed.is_empty() {
+            failed.truncate(64);
+            pending_blobs.insert(server_id, failed);
+        } else {
+            pending_blobs.remove(&server_id);
+        }
         emit_online_presence(app, &server_id, online_members.get(&server_id).unwrap());
         return;
     }
@@ -526,22 +603,28 @@ async fn handle_online_presence(
             Some(sid) => sid,
             None => return,
         };
-        if let Ok(ps) = c.open_online_presence_blob(&server_id, &blob) {
-            drop(c);
-            let members = online_members.entry(server_id).or_default();
-            if leave {
+        if leave {
+            // Decrypt just to identify who left
+            if let Ok(ps) = c.open_online_presence_blob(&server_id, &blob) {
+                drop(c);
+                let members = online_members.entry(server_id).or_default();
                 members.retain(|m| m.fingerprint != ps.fingerprint);
-            } else if let Some(existing) = members.iter_mut().find(|m| m.fingerprint == ps.fingerprint) {
-                existing.status = status_str(ps.status);
-                existing.status_message = ps.status_message;
-            } else {
-                members.push(OnlineMember {
-                    fingerprint: ps.fingerprint,
-                    status: status_str(ps.status),
-                    status_message: ps.status_message,
-                });
+                emit_online_presence(app, &server_id, members);
             }
-            emit_online_presence(app, &server_id, members);
+        } else {
+            let members = online_members.entry(server_id).or_default();
+            if try_upsert_presence(&c, &server_id, &blob, members) {
+                // Successfully decrypted — also clear any pending blob for this member
+                drop(c);
+                emit_online_presence(app, &server_id, members);
+            } else {
+                drop(c);
+                // Buffer for retry after next commit (cap at 64 to bound memory)
+                let pending = pending_blobs.entry(server_id).or_default();
+                if pending.len() < 64 {
+                    pending.push(blob);
+                }
+            }
         }
     }
 }

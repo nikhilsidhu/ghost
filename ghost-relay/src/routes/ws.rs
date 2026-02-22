@@ -73,8 +73,9 @@ async fn ws_connection(socket: WebSocket, mailbox_id: [u8; 32], state: AppState)
     };
 
     // Detect gap: client asked for entries that have already been swept
+    let mut has_gap = false;
     if last_seen > 0 {
-        let has_gap = match state.storage.min_seq(&mailbox_id) {
+        has_gap = match state.storage.min_seq(&mailbox_id) {
             Ok(Some(min)) => last_seen + 1 < min,
             Ok(None) => true,
             Err(_) => false,
@@ -86,20 +87,36 @@ async fn ws_connection(socket: WebSocket, mailbox_id: [u8; 32], state: AppState)
         }
     }
 
-    // Replay missed entries
-    loop {
-        let entries = match state.storage.read_from(&mailbox_id, last_seen, WS_MAX_FANOUT_BATCH) {
-            Ok(e) => e,
-            Err(_) => break,
-        };
-        if entries.is_empty() {
-            break;
+    if has_gap {
+        // Don't replay old entries — client will do gap recovery (external commit)
+        // and those old entries are unprocessable after MLS state is rebuilt.
+        // Advance last_seen to HEAD so the live loop only delivers new entries.
+        loop {
+            let entries = match state.storage.read_from(&mailbox_id, last_seen, WS_MAX_FANOUT_BATCH) {
+                Ok(e) => e,
+                Err(_) => break,
+            };
+            if entries.is_empty() {
+                break;
+            }
+            last_seen = entries.last().unwrap().seq;
         }
-        for entry in &entries {
-            last_seen = entry.seq;
-            let frame = encode_frame(entry.seq, entry.received_at, &entry.payload);
-            if sink.send(Message::binary(frame)).await.is_err() {
-                return;
+    } else {
+        // Replay missed entries
+        loop {
+            let entries = match state.storage.read_from(&mailbox_id, last_seen, WS_MAX_FANOUT_BATCH) {
+                Ok(e) => e,
+                Err(_) => break,
+            };
+            if entries.is_empty() {
+                break;
+            }
+            for entry in &entries {
+                last_seen = entry.seq;
+                let frame = encode_frame(entry.seq, entry.received_at, &entry.payload);
+                if sink.send(Message::binary(frame)).await.is_err() {
+                    return;
+                }
             }
         }
     }

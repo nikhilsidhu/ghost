@@ -487,6 +487,7 @@ pub async fn get_config(state: State<'_, AppState>) -> Result<ConfigDto, String>
         _ => "auto",
     };
     let input_mode = cfg.input_mode.as_deref().unwrap_or("voice_activity");
+    let status = cfg.status.as_deref().unwrap_or("online");
     Ok(ConfigDto {
         display_name: cfg.display_name.clone(),
         relay_url: cfg.relay_url.clone(),
@@ -497,6 +498,8 @@ pub async fn get_config(state: State<'_, AppState>) -> Result<ConfigDto, String>
         input_mode: input_mode.to_string(),
         vad_threshold: cfg.vad_threshold.unwrap_or(crate::constants::VAD_THRESHOLD),
         input_gain: cfg.input_gain.unwrap_or(1.0),
+        status: status.to_string(),
+        status_message: cfg.status_message.clone(),
     })
 }
 
@@ -1140,6 +1143,12 @@ pub async fn set_status(status: String, state: State<'_, AppState>) -> Result<()
         p.clone()
     };
     presence::broadcast_presence(&state.client, &state.relay, &info).await;
+    // Persist manual status (not idle — that's automatic)
+    if os != OnlineStatus::Idle {
+        let mut cfg = state.config.lock().await;
+        cfg.status = Some(status);
+        let _ = cfg.save(&state.config_path);
+    }
     Ok(())
 }
 
@@ -1151,10 +1160,14 @@ pub async fn set_status_message(
 ) -> Result<(), String> {
     let info = {
         let mut p = state.presence.lock().await;
-        p.status_message = message;
+        p.status_message = message.clone();
         p.status_expiry = expiry;
         p.clone()
     };
     presence::broadcast_presence(&state.client, &state.relay, &info).await;
+    let mut cfg = state.config.lock().await;
+    cfg.status_message = message;
+    cfg.status_expiry = expiry;
+    let _ = cfg.save(&state.config_path);
     Ok(())
 }

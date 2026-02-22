@@ -20,6 +20,9 @@ pub struct GhostConfig {
     pub vad_threshold: Option<f32>,
     pub input_gain: Option<f32>,
     pub keybinds: Option<KeybindConfig>,
+    pub status: Option<String>,
+    pub status_message: Option<String>,
+    pub status_expiry: Option<u64>,
 }
 
 impl GhostConfig {

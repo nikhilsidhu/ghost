@@ -15,7 +15,7 @@ pub struct AppState {
     pub relay_url: String,
     pub http: reqwest::Client,
     pub config_path: PathBuf,
-    pub config: Mutex<GhostConfig>,
+    pub config: Arc<Mutex<GhostConfig>>,
     pub voice: VoiceHandle,
     pub presence: Arc<Mutex<PresenceInfo>>,
 }

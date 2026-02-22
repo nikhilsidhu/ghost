@@ -45,6 +45,8 @@ export interface Config {
   input_mode: string;
   vad_threshold: number;
   input_gain: number;
+  status: string;
+  status_message: string | null;
 }
 
 export interface AudioDevices {

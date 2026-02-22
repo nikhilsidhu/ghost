@@ -50,6 +50,9 @@ const [relayConnected, setRelayConnected] = createSignal(false);
 const INVISIBLE = "invisible" as const;
 const [ownStatus, setOwnStatus] = createSignal<string>("online");
 const [ownStatusMessage, setOwnStatusMessage] = createSignal<string>("");
+const [selectedExpiry, setSelectedExpiry] = createSignal<number>(0);
+const [expiresAt, setExpiresAt] = createSignal<number | null>(null);
+const [autoMuted, setAutoMuted] = createSignal(false);
 const presenceByServer = new Map<string, Map<string, { status: string; status_message: string | null }>>();
 const [onlinePresence, setOnlinePresence] = createSignal<Map<string, { status: string; status_message: string | null }>>(new Map());
 
@@ -382,7 +385,29 @@ const initialize = async () => {
 
   onPttActiveChange((active) => setIsPttKeyHeld(active));
   initKeybinds().catch((e) => console.error("keybinds init failed:", e));
-  getConfig().then((c) => setIsPttMode(c.input_mode === "push_to_talk")).catch(() => {});
+  getConfig().then((c) => {
+    setIsPttMode(c.input_mode === "push_to_talk");
+    if (c.status) setOwnStatus(c.status);
+    if (c.status_message) setOwnStatusMessage(c.status_message);
+    rebuildPresence();
+  }).catch(() => {});
+
+  listen<string>("idle-transition", (event) => {
+    setOwnStatus(event.payload);
+    rebuildPresence();
+  });
+
+  listen<boolean>("auto-muted", () => {
+    setIsMuted(true);
+    setAutoMuted(true);
+  });
+
+  listen("status-message-cleared", () => {
+    setOwnStatusMessage("");
+    setSelectedExpiry(0);
+    setExpiresAt(null);
+    rebuildPresence();
+  });
 
   // Dev mode: instance 1 creates a dev server, others poll and auto-join
   if (import.meta.env.DEV) {
@@ -418,7 +443,7 @@ export {
   setInviteLink, setShowInfo, setDesiredChannelKind,
   settingsOpen, settingsCategory, setSettingsCategory, toggleSettings,
   profileOpen, setProfileOpen, toggleProfile, relayConnected, onlinePresence,
-  INVISIBLE, ownStatus, setOwnStatus, ownStatusMessage, setOwnStatusMessage, rebuildPresence,
+  INVISIBLE, ownStatus, setOwnStatus, ownStatusMessage, setOwnStatusMessage, selectedExpiry, setSelectedExpiry, expiresAt, setExpiresAt, rebuildPresence, autoMuted, setAutoMuted,
   isInCall, isMuted, isDeafened, isPttMode, setIsPttMode, isPttKeyHeld, pttMuteAttempt, toggleMute, toggleDeafen, endCall,
   voiceChannelId, voiceServerId, voiceParticipants, speakingSet, voiceError,
   joinVoiceChannel, isSpeaking, isInVoiceChannel,

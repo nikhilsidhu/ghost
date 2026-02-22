@@ -7,6 +7,7 @@ mod config;
 mod constants;
 mod device_watcher;
 mod dto;
+mod idle_task;
 mod presence;
 mod relay_task;
 mod setup;
@@ -23,10 +24,16 @@ fn main() {
         voice_state_tx,
     } = setup::initialize();
     let client = app_state.client.clone();
+    let idle_client = app_state.client.clone();
     let voice_client = app_state.client.clone();
     let relay = app_state.relay.clone();
+    let idle_relay = app_state.relay.clone();
     let voice_relay = app_state.relay.clone();
     let presence = app_state.presence.clone();
+    let idle_presence = app_state.presence.clone();
+    let idle_voice_tx = app_state.voice.cmd_tx.clone();
+    let idle_config = app_state.config.clone();
+    let idle_config_path = app_state.config_path.clone();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
@@ -52,11 +59,20 @@ fn main() {
                 presence,
             ));
             tauri::async_runtime::spawn(voice_task::run(
-                handle,
+                handle.clone(),
                 voice_client,
                 voice_relay,
                 voice_cmd_rx,
                 voice_state_tx,
+            ));
+            tauri::async_runtime::spawn(idle_task::run(
+                handle,
+                idle_client,
+                idle_relay,
+                idle_presence,
+                idle_voice_tx,
+                idle_config,
+                idle_config_path,
             ));
 
             Ok(())

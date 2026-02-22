@@ -136,6 +136,8 @@ pub struct ConfigDto {
     pub input_mode: String,
     pub vad_threshold: f32,
     pub input_gain: f32,
+    pub status: String,
+    pub status_message: Option<String>,
 }
 
 #[derive(Serialize)]

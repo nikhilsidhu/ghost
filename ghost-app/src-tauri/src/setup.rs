@@ -7,6 +7,8 @@ use ghost_core::identity::Identity;
 use ghost_core::relay::{RelayClient, RelayEvent};
 use tokio::sync::{mpsc, watch, Mutex};
 
+use ghost_core::mls::presence::OnlineStatus;
+
 use crate::config::{self, GhostConfig};
 use crate::constants::VOICE_CMD_CHANNEL_SIZE;
 use crate::presence::PresenceInfo;
@@ -76,7 +78,7 @@ pub fn initialize() -> SetupResult {
     fs::create_dir_all(&dir).expect("failed to create ~/.ghost");
 
     let cfg_path = config::config_path(&dir);
-    let cfg = GhostConfig::load(&cfg_path);
+    let mut cfg = GhostConfig::load(&cfg_path);
 
     let seed = load_or_create_seed();
     let mut client = GhostClient::open(seed, &db_path()).expect("failed to open database");
@@ -99,17 +101,40 @@ pub fn initialize() -> SetupResult {
     let (voice_cmd_tx, voice_cmd_rx) = mpsc::channel(VOICE_CMD_CHANNEL_SIZE);
     let (voice_state_tx, _voice_state_rx) = watch::channel(VoiceStateEvent::default());
 
+    // Check if persisted status message has expired
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let expired = cfg.status_expiry.map_or(false, |exp| now_ms >= exp);
+    if expired {
+        cfg.status_message = None;
+        cfg.status_expiry = None;
+        let _ = cfg.save(&cfg_path);
+    }
+
+    let initial_presence = PresenceInfo {
+        status: match cfg.status.as_deref() {
+            Some("away") => OnlineStatus::Away,
+            Some("invisible") => OnlineStatus::Invisible,
+            _ => OnlineStatus::Online,
+        },
+        status_message: cfg.status_message.clone(),
+        status_expiry: cfg.status_expiry,
+        ..Default::default()
+    };
+
     let state = AppState {
         client: Arc::new(Mutex::new(client)),
         relay: Arc::new(Mutex::new(relay)),
         relay_url,
         http: reqwest::Client::new(),
         config_path: cfg_path,
-        config: Mutex::new(cfg),
+        config: Arc::new(Mutex::new(cfg)),
         voice: VoiceHandle {
             cmd_tx: voice_cmd_tx,
         },
-        presence: Arc::new(Mutex::new(PresenceInfo::default())),
+        presence: Arc::new(Mutex::new(initial_presence)),
     };
 
     SetupResult {
