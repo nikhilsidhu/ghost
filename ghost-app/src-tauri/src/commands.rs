@@ -1397,3 +1397,366 @@ pub async fn revoke_device(
     relay.put_idlog_entry(&account_fp, payload).await.map_err(|e| e.to_string())?;
     Ok(())
 }
+
+// ── Device pairing ──────────────────────────────────────────────────
+
+fn pairing_seal(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, String> {
+    use aes_gcm::aead::{Aead, AeadCore, OsRng};
+    use aes_gcm::{Aes256Gcm, KeyInit};
+    let cipher = Aes256Gcm::new(key.into());
+    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+    let ct = cipher.encrypt(&nonce, plaintext)
+        .map_err(|e| format!("pairing seal: {e}"))?;
+    let mut blob = Vec::with_capacity(12 + ct.len());
+    blob.extend_from_slice(&nonce);
+    blob.extend_from_slice(&ct);
+    Ok(blob)
+}
+
+fn pairing_open(key: &[u8; 32], blob: &[u8]) -> Result<Vec<u8>, String> {
+    use aes_gcm::aead::Aead;
+    use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+    if blob.len() < 12 {
+        return Err("pairing blob too short".into());
+    }
+    let nonce = Nonce::from_slice(&blob[..12]);
+    let cipher = Aes256Gcm::new(key.into());
+    cipher.decrypt(nonce, &blob[12..])
+        .map_err(|e| format!("pairing open: {e}"))
+}
+
+/// Start pairing: generate secret, post offer, return pairing code.
+#[tauri::command]
+pub async fn start_pairing(state: State<'_, AppState>) -> Result<String, String> {
+    let mut secret = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut secret);
+
+    // Offer payload: JSON with account config the new device needs
+    let display_name = {
+        let cfg = state.config.lock().await;
+        cfg.display_name.clone().unwrap_or_default()
+    };
+    let offer_json = serde_json::json!({
+        "relay_url": state.relay_url,
+        "display_name": display_name,
+    });
+    let offer_plaintext = serde_json::to_vec(&offer_json).map_err(|e| e.to_string())?;
+    let offer_blob = pairing_seal(&secret, &offer_plaintext)?;
+
+    let account_fp = {
+        let client = state.client.lock().await;
+        *client.fingerprint()
+    };
+
+    let relay = state.relay.lock().await;
+    relay.post_pairing_offer(&account_fp, offer_blob)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    *state.pairing_secret.lock().await = Some(secret);
+
+    let code = format!(
+        "{}#{}#{}",
+        state.relay_url,
+        hex::encode(account_fp),
+        hex::encode(secret),
+    );
+    Ok(code)
+}
+
+/// Poll for pairing response. Returns the new device label if complete, None if still waiting.
+#[tauri::command]
+pub async fn check_pairing(state: State<'_, AppState>) -> Result<Option<String>, String> {
+    use ghost_core::identity::log::{validate_chain, create_add_device, LogEntry};
+
+    let secret = {
+        let guard = state.pairing_secret.lock().await;
+        match *guard {
+            Some(s) => s,
+            None => return Err("no active pairing session".into()),
+        }
+    };
+
+    let account_fp = {
+        let client = state.client.lock().await;
+        *client.fingerprint()
+    };
+
+    // Poll relay
+    let response_blob = {
+        let relay = state.relay.lock().await;
+        relay.get_pairing_response(&account_fp)
+            .await
+            .map_err(|e| e.to_string())?
+    };
+
+    let response_blob = match response_blob {
+        Some(b) => b,
+        None => return Ok(None),
+    };
+
+    // Decrypt response: [signing_key:32][label_bytes...]
+    let plaintext = pairing_open(&secret, &response_blob)?;
+    if plaintext.len() < 33 {
+        return Err("pairing response too short".into());
+    }
+    let new_sk_bytes: [u8; 32] = plaintext[..32].try_into().unwrap();
+    let new_device_label = String::from_utf8(plaintext[32..].to_vec())
+        .map_err(|_| "invalid label in pairing response")?;
+
+    let new_device_key = ed25519_dalek::SigningKey::from_bytes(&new_sk_bytes);
+
+    // Fetch current identity log to get state
+    let blobs = {
+        let relay = state.relay.lock().await;
+        relay.get_idlog(&account_fp, 0).await.map_err(|e| e.to_string())?
+    };
+    let entries: Vec<LogEntry> = blobs
+        .iter()
+        .map(|b| LogEntry::from_bytes(&b.payload).map_err(|e| e.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let log_state = validate_chain(&entries).map_err(|e| e.to_string())?;
+
+    // Create AddDevice entry (dual-signed)
+    let authorizer_key = {
+        let client = state.client.lock().await;
+        ed25519_dalek::SigningKey::from_bytes(&client.identity().signing_key.to_bytes())
+    };
+    let add_entry = create_add_device(&log_state, &authorizer_key, &new_device_key, &new_device_label);
+    let payload = add_entry.to_bytes();
+
+    // Push to relay
+    {
+        let relay = state.relay.lock().await;
+        relay.put_idlog_entry(&account_fp, payload).await.map_err(|e| e.to_string())?;
+    }
+
+    // Clear pairing secret
+    *state.pairing_secret.lock().await = None;
+
+    Ok(Some(new_device_label))
+}
+
+/// Cancel an active pairing session.
+#[tauri::command]
+pub async fn cancel_pairing(state: State<'_, AppState>) -> Result<(), String> {
+    *state.pairing_secret.lock().await = None;
+    Ok(())
+}
+
+// ── Join as new device ──────────────────────────────────────────────
+
+/// New-device side of pairing: parse code, fetch offer, post response, wait for
+/// confirmation, write credentials, hot-swap identity in place.
+#[tauri::command]
+pub async fn join_as_new_device(
+    pairing_code: String,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    use ghost_core::identity::log::{LogEntry, validate_chain};
+
+    // 1. Parse pairing code: relay_url#account_fp_hex#secret_hex
+    let parts: Vec<&str> = pairing_code.splitn(3, '#').collect();
+    if parts.len() != 3 {
+        return Err("invalid pairing code".into());
+    }
+    let relay_url = parts[0];
+    let account_fp_hex = parts[1];
+    let secret_hex = parts[2];
+
+    let account_fp: [u8; 32] = hex::decode(account_fp_hex)
+        .map_err(|e| format!("bad fingerprint: {e}"))?
+        .try_into()
+        .map_err(|_| "fingerprint must be 32 bytes")?;
+    let secret: [u8; 32] = hex::decode(secret_hex)
+        .map_err(|e| format!("bad secret: {e}"))?
+        .try_into()
+        .map_err(|_| "secret must be 32 bytes")?;
+
+    // 2. Fetch and decrypt the offer to get account config
+    let offer_blob = state
+        .http
+        .get(format!("{}/pair/{}", relay_url, account_fp_hex))
+        .send()
+        .await
+        .map_err(|e| format!("fetch offer: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("fetch offer: {e}"))?
+        .bytes()
+        .await
+        .map_err(|e| format!("read offer: {e}"))?;
+    let offer_pt = pairing_open(&secret, &offer_blob)?;
+    let offer: serde_json::Value = serde_json::from_slice(&offer_pt)
+        .map_err(|e| format!("parse offer: {e}"))?;
+    let display_name = offer["display_name"].as_str().unwrap_or("");
+
+    // 3. Generate new device key
+    let device_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+    let device_vk_bytes = device_key.verifying_key().to_bytes();
+    let label = crate::setup::device_label();
+
+    // 4. Encrypt and post response: [signing_key:32][label_bytes]
+    let mut response_pt = Vec::with_capacity(32 + label.len());
+    response_pt.extend_from_slice(&device_key.to_bytes());
+    response_pt.extend_from_slice(label.as_bytes());
+    let response_blob = pairing_seal(&secret, &response_pt)?;
+
+    state
+        .http
+        .post(format!("{}/pair/{}/respond", relay_url, account_fp_hex))
+        .body(response_blob)
+        .send()
+        .await
+        .map_err(|e| format!("post pairing response: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("post pairing response: {e}"))?;
+
+    // 5. Poll identity log until our device key appears
+    for _ in 0..90 {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+        let resp = state
+            .http
+            .get(format!("{}/idlog/{}", relay_url, account_fp_hex))
+            .send()
+            .await
+            .map_err(|e| format!("fetch idlog: {e}"))?;
+        if !resp.status().is_success() {
+            continue;
+        }
+
+        #[derive(serde::Deserialize)]
+        struct Entry {
+            payload: String,
+        }
+        let entries: Vec<Entry> = resp.json().await.map_err(|e| format!("parse idlog: {e}"))?;
+        let parsed: std::result::Result<Vec<LogEntry>, _> = entries
+            .iter()
+            .map(|e| {
+                let bytes = base64::Engine::decode(
+                    &base64::engine::general_purpose::STANDARD,
+                    &e.payload,
+                )
+                .map_err(|e| format!("base64: {e}"))?;
+                LogEntry::from_bytes(&bytes).map_err(|e| e.to_string())
+            })
+            .collect();
+
+        if let Ok(log_entries) = parsed {
+            if let Ok(log_state) = validate_chain(&log_entries) {
+                if log_state.devices.contains_key(&device_vk_bytes) {
+                    // 6. Write credentials to disk/keyring for next launch
+                    let mut db_key = [0u8; 32];
+                    let mut mls_db_key = [0u8; 32];
+                    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut db_key);
+                    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut mls_db_key);
+
+                    write_linked_credentials(
+                        &account_fp,
+                        &device_key,
+                        &db_key,
+                        &mls_db_key,
+                    )?;
+
+                    // 7. Delete old DB, WAL/SHM files, and genesis
+                    let db = crate::setup::db_path();
+                    let mls_db = db.with_extension("mls.db");
+                    for path in [&db, &mls_db] {
+                        let _ = std::fs::remove_file(path);
+                        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+                        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+                    }
+                    let _ = std::fs::remove_file(crate::setup::genesis_pending_path());
+
+                    // 8. Save config
+                    let relay_url_owned = relay_url.to_string();
+                    {
+                        let mut cfg = state.config.lock().await;
+                        if !display_name.is_empty() {
+                            cfg.display_name = Some(display_name.to_string());
+                        }
+                        cfg.relay_url = Some(relay_url_owned.clone());
+                        cfg.save(&state.config_path)?;
+                    }
+
+                    // 9. Hot-swap: open new client with linked identity
+                    let new_identity = ghost_core::identity::Identity::from_device(
+                        account_fp,
+                        ed25519_dalek::SigningKey::from_bytes(&device_key.to_bytes()),
+                    );
+                    let mut new_client = ghost_core::client::GhostClient::open(
+                        new_identity, db_key, mls_db_key, &crate::setup::db_path(),
+                    ).map_err(|e| format!("open new client: {e}"))?;
+                    if !display_name.is_empty() {
+                        new_client.set_display_name(display_name.to_string());
+                    }
+                    *state.client.lock().await = new_client;
+
+                    // 10. Replace relay — drops old sender, old relay_task exits
+                    let (new_relay, new_inbox_rx) =
+                        ghost_core::relay::RelayClient::new(&relay_url_owned);
+                    *state.relay.lock().await = new_relay;
+
+                    // 11. Spawn new relay_task for the linked identity
+                    let data_dir = state.config_path.parent().unwrap().to_path_buf();
+                    tauri::async_runtime::spawn(crate::relay_task::run(
+                        app.clone(),
+                        state.client.clone(),
+                        state.relay.clone(),
+                        new_inbox_rx,
+                        state.presence.clone(),
+                        data_dir,
+                    ));
+
+                    return Ok(relay_url_owned);
+                }
+            }
+        }
+    }
+
+    Err("timed out waiting for device to be added".into())
+}
+
+#[cfg(debug_assertions)]
+fn write_linked_credentials(
+    account_fp: &[u8; 32],
+    device_key: &ed25519_dalek::SigningKey,
+    db_key: &[u8; 32],
+    mls_db_key: &[u8; 32],
+) -> Result<(), String> {
+    let mut blob = Vec::with_capacity(ghost_core::identity::keyring_store::DEVICE_BLOB_SIZE);
+    blob.extend_from_slice(account_fp);
+    blob.extend_from_slice(&device_key.to_bytes());
+    blob.extend_from_slice(db_key);
+    blob.extend_from_slice(mls_db_key);
+    std::fs::write(crate::setup::device_file(), &blob)
+        .map_err(|e| format!("write device.key: {e}"))
+}
+
+#[cfg(not(debug_assertions))]
+fn write_linked_credentials(
+    account_fp: &[u8; 32],
+    device_key: &ed25519_dalek::SigningKey,
+    db_key: &[u8; 32],
+    mls_db_key: &[u8; 32],
+) -> Result<(), String> {
+    use ghost_core::identity::keyring_store::{self, StoredDevice};
+    use ghost_core::crypto::FINGERPRINT_SHORT_BYTES;
+
+    let fp_short = hex::encode(&account_fp[..FINGERPRINT_SHORT_BYTES]);
+    let stored = StoredDevice {
+        fingerprint: *account_fp,
+        signing_key: ed25519_dalek::SigningKey::from_bytes(&device_key.to_bytes()),
+        db_key: *db_key,
+        mls_db_key: *mls_db_key,
+    };
+    keyring_store::store(&fp_short, &stored).map_err(|e| format!("keyring store: {e}"))?;
+    let fp_file = crate::setup::ghost_dir().join("identity.txt");
+    std::fs::write(&fp_file, &fp_short).map_err(|e| format!("write identity.txt: {e}"))
+}
+
+#[tauri::command]
+pub fn exit_app(app: tauri::AppHandle) {
+    app.exit(0);
+}

@@ -129,6 +129,11 @@ fn main() {
             commands::get_cached_avatar,
             commands::get_devices,
             commands::revoke_device,
+            commands::start_pairing,
+            commands::check_pairing,
+            commands::cancel_pairing,
+            commands::join_as_new_device,
+            commands::exit_app,
         ])
         .run(tauri::generate_context!())
         .expect("error while running ghost");

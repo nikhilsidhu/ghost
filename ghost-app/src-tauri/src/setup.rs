@@ -15,23 +15,34 @@ use crate::presence::PresenceInfo;
 use crate::state::AppState;
 use crate::voice_task::{VoiceCommand, VoiceHandle, VoiceStateEvent};
 
-fn ghost_dir() -> PathBuf {
+pub(crate) fn ghost_dir() -> PathBuf {
     match std::env::var("GHOST_DATA_DIR") {
         Ok(dir) => PathBuf::from(dir),
         Err(_) => dirs::home_dir().expect("no home directory").join(".ghost"),
     }
 }
 
-fn device_file() -> PathBuf {
+pub(crate) fn device_file() -> PathBuf {
     ghost_dir().join("device.key")
 }
 
-fn db_path() -> PathBuf {
+pub(crate) fn db_path() -> PathBuf {
     ghost_dir().join("ghost.db")
 }
 
-fn genesis_pending_path() -> PathBuf {
+pub(crate) fn genesis_pending_path() -> PathBuf {
     ghost_dir().join("genesis.pending")
+}
+
+pub(crate) fn device_label() -> &'static str {
+    match std::env::consts::OS {
+        "macos" => "macOS",
+        "windows" => "Windows",
+        "linux" => "Linux",
+        "ios" => "iOS",
+        "android" => "Android",
+        other => other,
+    }
 }
 
 /// In debug builds, store device credentials in a file to avoid keychain popups on every recompile.
@@ -50,7 +61,7 @@ fn load_or_create_device() -> (Identity, [u8; 32], [u8; 32]) {
         let identity = Identity::from_device(fingerprint, signing_key);
         (identity, db_key, mls_db_key)
     } else {
-        let creation = Identity::create_account("dev-device")
+        let creation = Identity::create_account(device_label())
             .expect("failed to create account");
         // Copy out what we need before AccountCreation drops (zeroizes seed)
         let fingerprint = creation.identity.fingerprint;
@@ -88,7 +99,7 @@ fn load_or_create_device() -> (Identity, [u8; 32], [u8; 32]) {
             (identity, device.db_key, device.mls_db_key)
         }
         Err(_) => {
-            let creation = Identity::create_account("device")
+            let creation = Identity::create_account(device_label())
                 .expect("failed to create account");
             // Copy out what we need before AccountCreation drops (zeroizes seed)
             let fingerprint = creation.identity.fingerprint;
@@ -198,6 +209,7 @@ pub fn initialize() -> SetupResult {
             cmd_tx: voice_cmd_tx,
         },
         presence: Arc::new(Mutex::new(initial_presence)),
+        pairing_secret: Arc::new(Mutex::new(None)),
     };
 
     SetupResult {

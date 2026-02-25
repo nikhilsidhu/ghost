@@ -88,6 +88,21 @@ pub async fn get_response(
     }
 }
 
+/// GET /pair/{account_fp} — new device fetches the offer.
+pub async fn get_offer(
+    State(state): State<AppState>,
+    Path(account_fp_hex): Path<String>,
+) -> Result<impl IntoResponse> {
+    let account_fp = decode_account_fp(&account_fp_hex)?;
+
+    let map = state.pairing.read().await;
+    let session = map.get(&account_fp).ok_or(RelayError::NotFound)?;
+    if Instant::now() >= session.expires_at {
+        return Err(RelayError::NotFound);
+    }
+    Ok((StatusCode::OK, session.offer.clone()))
+}
+
 /// Reap expired pairing sessions. Call from a background task.
 pub async fn reap_expired(state: &AppState) {
     let mut map = state.pairing.write().await;

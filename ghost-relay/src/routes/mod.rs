@@ -32,7 +32,7 @@ pub fn router(state: AppState) -> Router {
         .route("/box/{mailbox_id}/server_info", put(server_info::put).get(server_info::get))
         .route("/box/{mailbox_id}/avatar/{fingerprint}", put(avatar::put).get(avatar::get).delete(avatar::delete))
         .route("/idlog/{account_fp}", put(idlog::put).get(idlog::get))
-        .route("/pair/{account_fp}", post(pair::post_offer))
+        .route("/pair/{account_fp}", post(pair::post_offer).get(pair::get_offer))
         .route("/pair/{account_fp}/respond", post(pair::post_respond))
         .route("/pair/{account_fp}/response", get(pair::get_response))
         .route("/recovery/{account_fp}", put(recovery::put).get(recovery::get))

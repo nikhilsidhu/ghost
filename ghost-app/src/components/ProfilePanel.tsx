@@ -284,13 +284,14 @@ export function ProfilePanel() {
                     />
                   </Show>
                 </div>
-                <button
-                  class="flex items-center justify-center text-[var(--neutral-500)] hover:text-[var(--neutral-400)] cursor-pointer flex-shrink-0"
-                  onClick={copyFingerprint}
-                  title="copy fingerprint"
-                >
-                  {copied() ? <Check size={14} /> : <FingerprintPattern size={14} />}
-                </button>
+                <Tooltip label="copy fingerprint" placement="top">
+                  <button
+                    class="flex items-center justify-center text-[var(--neutral-500)] hover:text-[var(--neutral-400)] cursor-pointer flex-shrink-0"
+                    onClick={copyFingerprint}
+                  >
+                    {copied() ? <Check size={14} class="text-[var(--emerald-400)]" /> : <FingerprintPattern size={14} />}
+                  </button>
+                </Tooltip>
                 <button
                   class="w-6 h-6 flex items-center justify-center rounded-md text-[var(--neutral-500)] hover:text-[var(--neutral-300)] cursor-pointer hover:bg-[var(--hover)] flex-shrink-0"
                   onClick={() => setProfileOpen(false)}

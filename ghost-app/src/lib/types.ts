@@ -106,6 +106,14 @@ export interface KeybindConfig {
   push_to_talk: string | null;
 }
 
+export interface Device {
+  device_key: string;
+  label: string;
+  added_at_seq: number;
+  is_active: boolean;
+  is_current: boolean;
+}
+
 export interface OnlinePresenceEvent {
   server_id: string;
   members: OnlinePresenceMember[];

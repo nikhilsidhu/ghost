@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Identity, Server, Channel, Member, Message, Invite, Config, AudioDevices, DevSession, KeybindConfig } from "./types";
+import type { Identity, Server, Channel, Member, Message, Invite, Config, AudioDevices, DevSession, KeybindConfig, Device } from "./types";
 
 export const getIdentity = () => invoke<Identity>("get_identity");
 
@@ -122,6 +122,17 @@ export const clearAvatar = () =>
 export const getCachedAvatar = (fingerprintHex: string) =>
   invoke<string | null>("get_cached_avatar", { fingerprintHex });
 
+// Devices
+export const getDevices = () => invoke<Device[]>("get_devices");
+export const revokeDevice = (deviceKeyHex: string) =>
+  invoke<void>("revoke_device", { deviceKeyHex });
+export const startPairing = () => invoke<string>("start_pairing");
+export const checkPairing = () => invoke<string | null>("check_pairing");
+export const cancelPairing = () => invoke<void>("cancel_pairing");
+
+// Device linking (new device side)
+export const joinAsNewDevice = (pairingCode: string) =>
+  invoke<string>("join_as_new_device", { pairingCode });
 // Dev testing
 export const createDevSession = () => invoke<Server>("create_dev_session");
 export const readDevSession = () => invoke<DevSession | null>("read_dev_session");

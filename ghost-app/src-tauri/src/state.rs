@@ -18,4 +18,5 @@ pub struct AppState {
     pub config: Arc<Mutex<GhostConfig>>,
     pub voice: VoiceHandle,
     pub presence: Arc<Mutex<PresenceInfo>>,
+    pub pairing_secret: Arc<Mutex<Option<[u8; 32]>>>,
 }
