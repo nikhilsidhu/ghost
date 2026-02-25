@@ -127,6 +127,8 @@ fn main() {
             commands::upload_avatar,
             commands::clear_avatar,
             commands::get_cached_avatar,
+            commands::get_devices,
+            commands::revoke_device,
         ])
         .run(tauri::generate_context!())
         .expect("error while running ghost");

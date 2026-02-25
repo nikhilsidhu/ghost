@@ -17,6 +17,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tower-http = { version = "0.6", features = ["limit"] }
 dashmap = "6"
+blake3 = "1"
 hex = "0.4"
 smallvec = "1"
 ghost-wire = { path = "../ghost-wire" }

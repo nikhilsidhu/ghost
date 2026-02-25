@@ -1838,6 +1838,7 @@ dependencies = [
  "coreaudio-sys",
  "cpal",
  "dirs",
+ "ed25519-dalek",
  "futures-util",
  "ghost-core",
  "ghost-wire",
@@ -1894,6 +1895,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite 0.26.2",
  "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]
@@ -1902,6 +1904,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
+ "blake3",
  "bytes",
  "dashmap",
  "futures-util",

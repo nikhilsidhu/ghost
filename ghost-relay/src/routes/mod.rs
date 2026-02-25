@@ -1,5 +1,8 @@
 mod avatar;
 mod blob;
+mod idlog;
+pub(crate) mod pair;
+mod recovery;
 mod server_info;
 mod health;
 mod invite;
@@ -10,7 +13,16 @@ use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post, put};
 use axum::Router;
 
+use crate::error::{RelayError, Result};
 use crate::state::AppState;
+
+pub(crate) fn decode_account_fp(hex: &str) -> Result<[u8; 32]> {
+    let bytes = hex::decode(hex)
+        .map_err(|_| RelayError::BadRequest("invalid hex account fingerprint".into()))?;
+    bytes
+        .try_into()
+        .map_err(|_| RelayError::BadRequest("account fingerprint must be 32 bytes".into()))
+}
 
 pub fn router(state: AppState) -> Router {
     let max_body = state.config.max_blob_size;
@@ -19,6 +31,11 @@ pub fn router(state: AppState) -> Router {
         .route("/box/{mailbox_id}", post(blob::post_blob).get(blob::get_blobs))
         .route("/box/{mailbox_id}/server_info", put(server_info::put).get(server_info::get))
         .route("/box/{mailbox_id}/avatar/{fingerprint}", put(avatar::put).get(avatar::get).delete(avatar::delete))
+        .route("/idlog/{account_fp}", put(idlog::put).get(idlog::get))
+        .route("/pair/{account_fp}", post(pair::post_offer))
+        .route("/pair/{account_fp}/respond", post(pair::post_respond))
+        .route("/pair/{account_fp}/response", get(pair::get_response))
+        .route("/recovery/{account_fp}", put(recovery::put).get(recovery::get))
         .route("/ws/{mailbox_id}", get(ws::ws_upgrade))
         .route("/voice/{channel_id}", get(voice::ws_upgrade))
         .route("/invite", post(invite::register))

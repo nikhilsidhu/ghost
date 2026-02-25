@@ -15,6 +15,17 @@ use crate::error::{GhostError, Result};
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
+pub struct IdLogBlob {
+    pub seq: u64,
+    pub payload: Vec<u8>,
+}
+
+#[derive(serde::Deserialize)]
+struct IdLogBlobJson {
+    seq: u64,
+    payload: String,
+}
+
 pub struct IncomingBlob {
     pub mailbox_id: [u8; 32],
     pub seq: u64,
@@ -332,6 +343,193 @@ impl RelayClient {
             return Err(GhostError::Network(format!("delete avatar: {}", resp.status())));
         }
         Ok(())
+    }
+
+    /// Push an identity log entry to the relay.
+    pub async fn put_idlog_entry(
+        &self,
+        account_fp: &[u8; 32],
+        payload: Vec<u8>,
+    ) -> Result<()> {
+        let resp = self
+            .http
+            .put(format!(
+                "{}/idlog/{}",
+                self.base_url,
+                hex::encode(account_fp),
+            ))
+            .body(payload)
+            .send()
+            .await
+            .map_err(|e| GhostError::Network(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(GhostError::Network(format!("put idlog: {}", resp.status())));
+        }
+        Ok(())
+    }
+
+    /// Fetch identity log entries from the relay, optionally after a given seq.
+    pub async fn get_idlog(
+        &self,
+        account_fp: &[u8; 32],
+        after_seq: u64,
+    ) -> Result<Vec<IdLogBlob>> {
+        let mut url = format!(
+            "{}/idlog/{}",
+            self.base_url,
+            hex::encode(account_fp),
+        );
+        if after_seq > 0 {
+            url.push_str(&format!("?after_seq={after_seq}"));
+        }
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| GhostError::Network(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(GhostError::Network(format!("get idlog: {}", resp.status())));
+        }
+        let entries: Vec<IdLogBlobJson> = resp
+            .json()
+            .await
+            .map_err(|e| GhostError::Network(e.to_string()))?;
+        entries
+            .into_iter()
+            .map(|e| {
+                let payload = base64::engine::general_purpose::STANDARD
+                    .decode(&e.payload)
+                    .map_err(|e| GhostError::Network(format!("base64 decode: {e}")))?;
+                Ok(IdLogBlob {
+                    seq: e.seq,
+                    payload,
+                })
+            })
+            .collect()
+    }
+
+    /// Post a pairing offer (existing device → relay).
+    pub async fn post_pairing_offer(
+        &self,
+        account_fp: &[u8; 32],
+        payload: Vec<u8>,
+    ) -> Result<()> {
+        let resp = self
+            .http
+            .post(format!(
+                "{}/pair/{}",
+                self.base_url,
+                hex::encode(account_fp),
+            ))
+            .body(payload)
+            .send()
+            .await
+            .map_err(|e| GhostError::Network(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(GhostError::Network(format!("post pairing offer: {}", resp.status())));
+        }
+        Ok(())
+    }
+
+    /// Post a pairing response (new device → relay).
+    pub async fn post_pairing_response(
+        &self,
+        account_fp: &[u8; 32],
+        payload: Vec<u8>,
+    ) -> Result<()> {
+        let resp = self
+            .http
+            .post(format!(
+                "{}/pair/{}/respond",
+                self.base_url,
+                hex::encode(account_fp),
+            ))
+            .body(payload)
+            .send()
+            .await
+            .map_err(|e| GhostError::Network(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(GhostError::Network(format!("post pairing response: {}", resp.status())));
+        }
+        Ok(())
+    }
+
+    /// Poll for a pairing response (existing device polls relay).
+    pub async fn get_pairing_response(
+        &self,
+        account_fp: &[u8; 32],
+    ) -> Result<Option<Vec<u8>>> {
+        let resp = self
+            .http
+            .get(format!(
+                "{}/pair/{}/response",
+                self.base_url,
+                hex::encode(account_fp),
+            ))
+            .send()
+            .await
+            .map_err(|e| GhostError::Network(e.to_string()))?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            return Err(GhostError::Network(format!("get pairing response: {}", resp.status())));
+        }
+        resp.bytes()
+            .await
+            .map(|b| Some(b.to_vec()))
+            .map_err(|e| GhostError::Network(e.to_string()))
+    }
+
+    /// Store encrypted recovery blob on relay.
+    pub async fn put_recovery_blob(
+        &self,
+        account_fp: &[u8; 32],
+        data: Vec<u8>,
+    ) -> Result<()> {
+        let resp = self
+            .http
+            .put(format!(
+                "{}/recovery/{}",
+                self.base_url,
+                hex::encode(account_fp),
+            ))
+            .body(data)
+            .send()
+            .await
+            .map_err(|e| GhostError::Network(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(GhostError::Network(format!("put recovery: {}", resp.status())));
+        }
+        Ok(())
+    }
+
+    /// Fetch encrypted recovery blob from relay.
+    pub async fn get_recovery_blob(
+        &self,
+        account_fp: &[u8; 32],
+    ) -> Result<Option<Vec<u8>>> {
+        let resp = self
+            .http
+            .get(format!(
+                "{}/recovery/{}",
+                self.base_url,
+                hex::encode(account_fp),
+            ))
+            .send()
+            .await
+            .map_err(|e| GhostError::Network(e.to_string()))?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            return Err(GhostError::Network(format!("get recovery: {}", resp.status())));
+        }
+        resp.bytes()
+            .await
+            .map(|b| Some(b.to_vec()))
+            .map_err(|e| GhostError::Network(e.to_string()))
     }
 }
 

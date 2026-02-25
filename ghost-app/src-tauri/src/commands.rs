@@ -11,7 +11,7 @@ use ghost_core::mls::presence::OnlineStatus;
 
 use crate::constants::{DEFAULT_PAGE_SIZE, INVITE_EXPIRY_MS, SEQ_HEADER};
 use crate::config::KeybindConfig;
-use crate::dto::{ChannelDto, ConfigDto, ServerDto, IdentityDto, InviteDto, KeybindConfigDto, MemberDto, MessageDto};
+use crate::dto::{ChannelDto, ConfigDto, DeviceDto, ServerDto, IdentityDto, InviteDto, KeybindConfigDto, MemberDto, MessageDto};
 use crate::presence;
 use crate::state::AppState;
 use crate::voice_task::VoiceCommand;
@@ -1317,5 +1317,83 @@ pub async fn set_status_message(
     cfg.status_message = message;
     cfg.status_expiry = expiry;
     let _ = cfg.save(&state.config_path);
+    Ok(())
+}
+
+// ── Device management ───────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn get_devices(state: State<'_, AppState>) -> Result<Vec<DeviceDto>, String> {
+    use ghost_core::identity::log::{validate_chain, LogEntry};
+
+    let (account_fp, own_device_vk) = {
+        let client = state.client.lock().await;
+        (*client.fingerprint(), client.identity().verifying_key.to_bytes())
+    };
+    let blobs = {
+        let relay = state.relay.lock().await;
+        relay.get_idlog(&account_fp, 0).await.map_err(|e| e.to_string())?
+    };
+    if blobs.is_empty() {
+        return Ok(vec![]);
+    }
+    let entries: Vec<LogEntry> = blobs
+        .iter()
+        .map(|b| LogEntry::from_bytes(&b.payload).map_err(|e| e.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let log_state = validate_chain(&entries).map_err(|e| e.to_string())?;
+    Ok(log_state
+        .devices
+        .values()
+        .map(|d| DeviceDto {
+            device_key: hex::encode(d.verifying_key),
+            label: d.label.clone(),
+            added_at_seq: d.added_at_seq,
+            is_active: d.is_active(),
+            is_current: d.verifying_key == own_device_vk,
+        })
+        .collect())
+}
+
+#[tauri::command]
+pub async fn revoke_device(
+    device_key_hex: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    use ghost_core::identity::log::{validate_chain, create_revoke_device, LogEntry};
+
+    let target_key = parse_id(&device_key_hex)?;
+
+    let (account_fp, signing_key_bytes, own_device_vk) = {
+        let client = state.client.lock().await;
+        (
+            *client.fingerprint(),
+            client.identity().signing_key.to_bytes(),
+            client.identity().verifying_key.to_bytes(),
+        )
+    };
+    if target_key == own_device_vk {
+        return Err("cannot revoke current device".into());
+    }
+    let device_signing_key = ed25519_dalek::SigningKey::from_bytes(&signing_key_bytes);
+
+    // Fetch current identity log
+    let blobs = {
+        let relay = state.relay.lock().await;
+        relay.get_idlog(&account_fp, 0).await.map_err(|e| e.to_string())?
+    };
+    let entries: Vec<LogEntry> = blobs
+        .iter()
+        .map(|b| LogEntry::from_bytes(&b.payload).map_err(|e| e.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let log_state = validate_chain(&entries).map_err(|e| e.to_string())?;
+
+    // Create revocation entry
+    let revoke_entry = create_revoke_device(&log_state, &device_signing_key, &target_key);
+    let payload = revoke_entry.to_bytes();
+
+    // Push to relay
+    let relay = state.relay.lock().await;
+    relay.put_idlog_entry(&account_fp, payload).await.map_err(|e| e.to_string())?;
     Ok(())
 }

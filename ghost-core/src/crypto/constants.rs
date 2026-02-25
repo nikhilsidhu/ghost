@@ -68,6 +68,12 @@ impl TryFrom<u8> for MessageType {
     }
 }
 
+/// Domain separator for identity log signatures.
+pub const IDLOG_SIGN_PREFIX: &[u8] = b"ghost-idlog-v1:";
+
+/// Custom MLS extension type for GroupMembership binding.
+pub const GHOST_MEMBERSHIP_EXTENSION_TYPE: u16 = 0xff00;
+
 // Tags used to derive unique IDs from a shared seed
 pub const MLS_GROUP_ID_TAG: &[u8] = b"ghost-mls";
 pub const MAILBOX_ID_TAG: &[u8] = b"ghost-mailbox";

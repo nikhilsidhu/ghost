@@ -13,7 +13,6 @@ use rusqlite::Connection;
 
 use rusqlite::types::Type;
 
-use crate::crypto::{derive_key, DB_KEY_DERIVE_LABEL};
 use crate::error::{GhostError, Result};
 
 // Extract a 32-byte BLOB from a row column into a fixed-size array.
@@ -30,10 +29,8 @@ pub struct GhostStore {
 }
 
 impl GhostStore {
-    /// Open (or create) an encrypted database at `path`, keyed from the identity seed.
-    pub fn open(seed: &[u8; 32], path: &Path) -> Result<Self> {
-        let db_key = derive_key(seed, DB_KEY_DERIVE_LABEL)?;
-
+    /// Open (or create) an encrypted database at `path`.
+    pub fn open(db_key: &[u8; 32], path: &Path) -> Result<Self> {
         let conn =
             Connection::open(path).map_err(|e| GhostError::Database(format!("open: {e}")))?;
 
@@ -53,9 +50,7 @@ impl GhostStore {
     }
 
     /// Open an in-memory encrypted database (useful for testing).
-    pub fn open_in_memory(seed: &[u8; 32]) -> Result<Self> {
-        let db_key = derive_key(seed, DB_KEY_DERIVE_LABEL)?;
-
+    pub fn open_in_memory(db_key: &[u8; 32]) -> Result<Self> {
         let conn = Connection::open_in_memory()
             .map_err(|e| GhostError::Database(format!("open in-memory: {e}")))?;
 
@@ -244,8 +239,7 @@ mod tests {
     use crate::crypto::MessageType;
 
     fn test_store() -> GhostStore {
-        let seed = [0xABu8; 32];
-        GhostStore::open_in_memory(&seed).unwrap()
+        GhostStore::open_in_memory(&[0xABu8; 32]).unwrap()
     }
 
     fn rand_id() -> [u8; 32] {
@@ -599,10 +593,10 @@ mod tests {
     fn encrypted_db_not_plain_sqlite() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.db");
-        let seed = [0xABu8; 32];
+        let db_key = [0xABu8; 32];
 
         {
-            let store = GhostStore::open(&seed, &path).unwrap();
+            let store = GhostStore::open(&db_key, &path).unwrap();
             let s = make_server("grp");
             store.insert_server(&s).unwrap();
         }
@@ -617,18 +611,18 @@ mod tests {
     fn data_persists_across_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("persist.db");
-        let seed = [0xABu8; 32];
+        let db_key = [0xABu8; 32];
         let server_id;
 
         {
-            let store = GhostStore::open(&seed, &path).unwrap();
+            let store = GhostStore::open(&db_key, &path).unwrap();
             let s = make_server("survivors");
             server_id = s.server_id;
             store.insert_server(&s).unwrap();
         }
 
-        // Reopen with same seed, data should be there
-        let store = GhostStore::open(&seed, &path).unwrap();
+        // Reopen with same key, data should be there
+        let store = GhostStore::open(&db_key, &path).unwrap();
         let got = store.get_server(&server_id).unwrap();
         assert_eq!(got.name, "survivors");
     }

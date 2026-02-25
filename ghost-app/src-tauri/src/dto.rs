@@ -145,6 +145,15 @@ pub struct KeybindConfigDto {
     pub push_to_talk: Option<String>,
 }
 
+#[derive(Serialize)]
+pub struct DeviceDto {
+    pub device_key: String,
+    pub label: String,
+    pub added_at_seq: u64,
+    pub is_active: bool,
+    pub is_current: bool,
+}
+
 impl From<&Member> for MemberDto {
     fn from(m: &Member) -> Self {
         Self {

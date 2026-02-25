@@ -35,6 +35,9 @@ pub enum GhostError {
     #[error("received own message (relay echo)")]
     SelfMessage,
 
+    #[error("identity log: {0}")]
+    IdentityLog(String),
+
     #[error("network: {0}")]
     Network(String),
 

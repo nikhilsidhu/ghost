@@ -3,6 +3,7 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 
 use ghost_core::client::GhostClient;
+use ghost_core::identity::Identity;
 use ghost_core::relay::{RelayClient, RelayEvent};
 use ghost_core::storage::ServerKind;
 use ghost_core::wire::{derive_default_channel_id, derive_mls_group_id, mls_group_mailbox_id};
@@ -31,8 +32,8 @@ async fn start_relay() -> String {
 async fn encrypted_message_through_relay() {
     let relay_url = start_relay().await;
 
-    let mut sender = GhostClient::open_in_memory([0x01; 32]).unwrap();
-    let mut receiver = GhostClient::open_in_memory([0x02; 32]).unwrap();
+    let mut sender = GhostClient::open_in_memory(Identity::from_seed([0x01; 32]).unwrap(), [0x01; 32]).unwrap();
+    let mut receiver = GhostClient::open_in_memory(Identity::from_seed([0x02; 32]).unwrap(), [0x02; 32]).unwrap();
 
     // Local MLS setup
     let server_id = sender.create_server("test", ServerKind::Server, 1000).unwrap();

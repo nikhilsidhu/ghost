@@ -5,8 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use openmls::prelude::KeyPackage;
 use rusqlite::Connection;
 
-use crate::crypto::{GhostProvider, MLS_DB_KEY_DERIVE_LABEL, MessageType};
-use crate::crypto::keys::derive_key;
+use crate::crypto::{GhostProvider, MessageType};
 use crate::error::{GhostError, Result};
 use crate::identity::Identity;
 use crate::mls::credential::generate_key_package;
@@ -20,14 +19,13 @@ use crate::wire::{
 };
 
 /// Open an encrypted SQLite connection for MLS state, separate from the app DB.
-fn open_mls_connection(seed: &[u8; 32], app_db_path: &Path) -> Result<Connection> {
+fn open_mls_connection(mls_db_key: &[u8; 32], app_db_path: &Path) -> Result<Connection> {
     let mls_path = app_db_path.with_extension("mls.db");
-    let mls_key = derive_key(seed, MLS_DB_KEY_DERIVE_LABEL)?;
 
     let conn = Connection::open(&mls_path)
         .map_err(|e| GhostError::Database(format!("open mls db: {e}")))?;
 
-    conn.pragma_update(None, "key", format!("x'{}'", hex::encode(mls_key)))
+    conn.pragma_update(None, "key", format!("x'{}'", hex::encode(mls_db_key)))
         .map_err(|e| GhostError::Database(format!("set mls key: {e}")))?;
 
     conn.pragma_update(None, "journal_mode", "WAL")
@@ -57,11 +55,10 @@ pub struct GhostClient {
 }
 
 impl GhostClient {
-    pub fn open(seed: [u8; 32], db_path: &Path) -> Result<Self> {
-        let identity = Identity::from_seed(seed)?;
-        let store = GhostStore::open(&seed, db_path)?;
+    pub fn open(identity: Identity, db_key: [u8; 32], mls_db_key: [u8; 32], db_path: &Path) -> Result<Self> {
+        let store = GhostStore::open(&db_key, db_path)?;
 
-        let mls_conn = open_mls_connection(&seed, db_path)?;
+        let mls_conn = open_mls_connection(&mls_db_key, db_path)?;
         let provider = GhostProvider::new(mls_conn)?;
 
         // Reload MLS groups that were persisted from previous sessions
@@ -90,10 +87,9 @@ impl GhostClient {
         })
     }
 
-    pub fn open_in_memory(seed: [u8; 32]) -> Result<Self> {
-        let identity = Identity::from_seed(seed)?;
+    pub fn open_in_memory(identity: Identity, db_key: [u8; 32]) -> Result<Self> {
         let provider = GhostProvider::new_in_memory()?;
-        let store = GhostStore::open_in_memory(&seed)?;
+        let store = GhostStore::open_in_memory(&db_key)?;
         Ok(Self {
             identity,
             provider,
@@ -556,19 +552,23 @@ impl GhostClient {
             GhostError::ServerNotLoaded(hex::encode(&server_id[..8]))
         })?;
 
-        // Find the target's LeafNodeIndex by matching credential identity
-        let leaf_index = group
+        // Collect ALL leaves matching target — a user may have multiple devices
+        let leaf_indices: Vec<_> = group
             .members()
-            .find(|m| {
+            .filter(|m| {
                 openmls::prelude::BasicCredential::try_from(m.credential.clone())
                     .ok()
                     .map(|bc| bc.identity() == target_fp.as_slice())
                     .unwrap_or(false)
             })
             .map(|m| m.index)
-            .ok_or_else(|| GhostError::Mls("member not found in MLS group".into()))?;
+            .collect();
 
-        let commit_blob = group.remove_member(&self.provider, leaf_index)?;
+        if leaf_indices.is_empty() {
+            return Err(GhostError::Mls("member not found in MLS group".into()));
+        }
+
+        let commit_blob = group.remove_members(&self.provider, &leaf_indices)?;
         let mailbox_id = mls_group_mailbox_id(group.group_id());
 
         self.store.remove_member(server_id, target_fp)?;
@@ -751,7 +751,20 @@ impl GhostClient {
             }
             InboundMessage::Commit { removed } => {
                 if removed.contains(&self.identity.fingerprint) {
-                    return Ok(ReceiveResult::Kicked);
+                    // With multi-device, removing one leaf isn't a kick if other leaves remain
+                    let own_fp = self.identity.fingerprint;
+                    let group = self.servers.get(server_id).ok_or_else(|| {
+                        GhostError::ServerNotLoaded(hex::encode(&server_id[..8]))
+                    })?;
+                    let still_in = group.members().any(|m| {
+                        openmls::prelude::BasicCredential::try_from(m.credential)
+                            .ok()
+                            .map(|bc| bc.identity() == own_fp.as_slice())
+                            .unwrap_or(false)
+                    });
+                    if !still_in {
+                        return Ok(ReceiveResult::Kicked);
+                    }
                 }
                 if removed.is_empty() {
                     Ok(ReceiveResult::CommitProcessed)
@@ -767,10 +780,15 @@ impl GhostClient {
 mod tests {
     use super::*;
 
+    fn test_client(seed: [u8; 32]) -> GhostClient {
+        let identity = Identity::from_seed(seed).unwrap();
+        GhostClient::open_in_memory(identity, seed).unwrap()
+    }
+
     /// Returns (creator, joiner, server_id) with both clients in a shared MLS group.
     fn setup_two_clients() -> (GhostClient, GhostClient, [u8; 32]) {
-        let mut c1 = GhostClient::open_in_memory([0x01; 32]).unwrap();
-        let mut c2 = GhostClient::open_in_memory([0x02; 32]).unwrap();
+        let mut c1 = test_client([0x01; 32]);
+        let mut c2 = test_client([0x02; 32]);
 
         let server_id = c1.create_server("test", ServerKind::Server, 1000).unwrap();
 
@@ -787,20 +805,20 @@ mod tests {
 
     #[test]
     fn open_in_memory_succeeds() {
-        let client = GhostClient::open_in_memory([0x01; 32]).unwrap();
+        let client = test_client([0x01; 32]);
         assert_eq!(client.fingerprint().len(), 32);
     }
 
     #[test]
     fn different_seeds_different_fingerprints() {
-        let a = GhostClient::open_in_memory([0x01; 32]).unwrap();
-        let b = GhostClient::open_in_memory([0x02; 32]).unwrap();
+        let a = test_client([0x01; 32]);
+        let b = test_client([0x02; 32]);
         assert_ne!(a.fingerprint(), b.fingerprint());
     }
 
     #[test]
     fn create_server_stores_records() {
-        let mut client = GhostClient::open_in_memory([0x01; 32]).unwrap();
+        let mut client = test_client([0x01; 32]);
         let server_id = client.create_server("test-server", ServerKind::Server, 1000).unwrap();
 
         let server = client.store().get_server(&server_id).unwrap();
@@ -822,14 +840,14 @@ mod tests {
 
     #[test]
     fn send_to_unknown_server_fails() {
-        let mut client = GhostClient::open_in_memory([0x01; 32]).unwrap();
+        let mut client = test_client([0x01; 32]);
         let result = client.send_message(&[0xFF; 32], &[0xAA; 32], b"hi".to_vec(), vec![], 1000);
         assert!(matches!(result, Err(GhostError::ServerNotLoaded(_))));
     }
 
     #[test]
     fn receive_from_unknown_server_fails() {
-        let mut client = GhostClient::open_in_memory([0x01; 32]).unwrap();
+        let mut client = test_client([0x01; 32]);
         let result = client.receive_blob(&[0xFF; 32], &[0x00; 64], None);
         assert!(matches!(result, Err(GhostError::ServerNotLoaded(_))));
     }
@@ -869,8 +887,8 @@ mod tests {
 
     #[test]
     fn two_client_full_flow() {
-        let mut c1 = GhostClient::open_in_memory([0x01; 32]).unwrap();
-        let mut c2 = GhostClient::open_in_memory([0x02; 32]).unwrap();
+        let mut c1 = test_client([0x01; 32]);
+        let mut c2 = test_client([0x02; 32]);
 
         let server_id = c1.create_server("full-flow", ServerKind::Server, 1000).unwrap();
         let channel_id = derive_default_channel_id(&server_id);
@@ -923,8 +941,8 @@ mod tests {
 
     #[test]
     fn invite_full_roundtrip() {
-        let mut c1 = GhostClient::open_in_memory([0x01; 32]).unwrap();
-        let mut c2 = GhostClient::open_in_memory([0x02; 32]).unwrap();
+        let mut c1 = test_client([0x01; 32]);
+        let mut c2 = test_client([0x02; 32]);
 
         let server_id = c1.create_server("test", ServerKind::Server, 1000).unwrap();
 
@@ -956,8 +974,8 @@ mod tests {
 
     #[test]
     fn refresh_invite_payload_has_new_member() {
-        let mut c1 = GhostClient::open_in_memory([0x01; 32]).unwrap();
-        let mut c2 = GhostClient::open_in_memory([0x02; 32]).unwrap();
+        let mut c1 = test_client([0x01; 32]);
+        let mut c2 = test_client([0x02; 32]);
 
         let server_id = c1.create_server("test", ServerKind::Server, 1000).unwrap();
         let (_, payload_bytes) = c1.create_invite(&server_id).unwrap();

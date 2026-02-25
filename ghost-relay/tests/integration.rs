@@ -775,3 +775,351 @@ async fn ws_no_gap_on_fresh_subscribe() {
     .await;
     assert!(result.is_err(), "should not receive gap on fresh subscribe");
 }
+
+// --- Identity log tests ---
+
+/// Build a fake idlog payload with the given seq and prev_hash.
+/// Wire format: [seq:8][prev_hash:32][...body padding to be >40 bytes...]
+fn idlog_entry(seq: u64, prev_hash: [u8; 32]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&seq.to_be_bytes());
+    buf.extend_from_slice(&prev_hash);
+    // Pad with deterministic body bytes so entries are distinguishable
+    buf.extend_from_slice(&[seq as u8; 64]);
+    buf
+}
+
+fn idlog_url(base: &str, account_fp: &[u8; 32]) -> String {
+    format!("{base}/idlog/{}", hex::encode(account_fp))
+}
+
+#[tokio::test]
+async fn idlog_put_get_roundtrip() {
+    let base = start_server(test_config()).await;
+    let client = reqwest::Client::new();
+    let fp = [0xA1; 32];
+
+    // Genesis (seq=1, prev_hash=zeroed)
+    let entry1 = idlog_entry(1, [0u8; 32]);
+    let resp = client.put(idlog_url(&base, &fp)).body(entry1.clone()).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Fetch all
+    let entries: Vec<Value> = client
+        .get(idlog_url(&base, &fp))
+        .send().await.unwrap()
+        .json().await.unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["seq"], 1);
+
+    // Second entry (seq=2, prev_hash = blake3 of first entry's payload)
+    let prev_hash: [u8; 32] = blake3::hash(&entry1).into();
+    let entry2 = idlog_entry(2, prev_hash);
+    let resp = client.put(idlog_url(&base, &fp)).body(entry2.clone()).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Fetch after_seq=1 returns only entry 2
+    let entries: Vec<Value> = client
+        .get(format!("{}?after_seq=1", idlog_url(&base, &fp)))
+        .send().await.unwrap()
+        .json().await.unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["seq"], 2);
+
+    // Fetch all returns both
+    let entries: Vec<Value> = client
+        .get(idlog_url(&base, &fp))
+        .send().await.unwrap()
+        .json().await.unwrap();
+    assert_eq!(entries.len(), 2);
+}
+
+#[tokio::test]
+async fn idlog_rejects_bad_seq() {
+    let base = start_server(test_config()).await;
+    let client = reqwest::Client::new();
+    let fp = [0xA2; 32];
+
+    // Skip seq 1, try seq 2
+    let entry = idlog_entry(2, [0u8; 32]);
+    let resp = client.put(idlog_url(&base, &fp)).body(entry).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // Valid seq 1
+    let entry1 = idlog_entry(1, [0u8; 32]);
+    let resp = client.put(idlog_url(&base, &fp)).body(entry1.clone()).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Duplicate seq 1
+    let resp = client.put(idlog_url(&base, &fp)).body(entry1.clone()).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+    // Skip to seq 3
+    let prev_hash: [u8; 32] = blake3::hash(&entry1).into();
+    let entry3 = idlog_entry(3, prev_hash);
+    let resp = client.put(idlog_url(&base, &fp)).body(entry3).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn idlog_rejects_bad_prev_hash() {
+    let base = start_server(test_config()).await;
+    let client = reqwest::Client::new();
+    let fp = [0xA3; 32];
+
+    let entry1 = idlog_entry(1, [0u8; 32]);
+    client.put(idlog_url(&base, &fp)).body(entry1).send().await.unwrap();
+
+    // Wrong prev_hash
+    let entry2 = idlog_entry(2, [0xFF; 32]);
+    let resp = client.put(idlog_url(&base, &fp)).body(entry2).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn idlog_empty_payload_rejected() {
+    let base = start_server(test_config()).await;
+    let client = reqwest::Client::new();
+    let fp = [0xA4; 32];
+
+    let resp = client.put(idlog_url(&base, &fp)).body(Vec::new()).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn idlog_too_short_payload_rejected() {
+    let base = start_server(test_config()).await;
+    let client = reqwest::Client::new();
+    let fp = [0xA5; 32];
+
+    // Less than 40 bytes
+    let resp = client.put(idlog_url(&base, &fp)).body(vec![0u8; 30]).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn idlog_size_limit() {
+    let base = start_server(test_config()).await;
+    let client = reqwest::Client::new();
+    let fp = [0xA6; 32];
+
+    let mut big = idlog_entry(1, [0u8; 32]);
+    big.extend_from_slice(&[0u8; 5000]); // exceed 4096 limit
+    let resp = client.put(idlog_url(&base, &fp)).body(big).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn idlog_separate_accounts_independent() {
+    let base = start_server(test_config()).await;
+    let client = reqwest::Client::new();
+    let fp_a = [0xA7; 32];
+    let fp_b = [0xA8; 32];
+
+    let entry_a = idlog_entry(1, [0u8; 32]);
+    let entry_b = idlog_entry(1, [0u8; 32]);
+    client.put(idlog_url(&base, &fp_a)).body(entry_a).send().await.unwrap();
+    client.put(idlog_url(&base, &fp_b)).body(entry_b).send().await.unwrap();
+
+    let entries: Vec<Value> = client.get(idlog_url(&base, &fp_a)).send().await.unwrap().json().await.unwrap();
+    assert_eq!(entries.len(), 1);
+    let entries: Vec<Value> = client.get(idlog_url(&base, &fp_b)).send().await.unwrap().json().await.unwrap();
+    assert_eq!(entries.len(), 1);
+}
+
+#[tokio::test]
+async fn idlog_get_empty_returns_empty() {
+    let base = start_server(test_config()).await;
+    let client = reqwest::Client::new();
+    let fp = [0xA9; 32];
+
+    let entries: Vec<Value> = client.get(idlog_url(&base, &fp)).send().await.unwrap().json().await.unwrap();
+    assert_eq!(entries.len(), 0);
+}
+
+// --- Pairing tests ---
+
+fn pair_url(base: &str, fp: &[u8; 32]) -> String {
+    format!("{base}/pair/{}", hex::encode(fp))
+}
+
+#[tokio::test]
+async fn pairing_full_flow() {
+    let base = start_server(test_config()).await;
+    let client = reqwest::Client::new();
+    let fp = [0xB1; 32];
+
+    // Existing device posts offer
+    let resp = client
+        .post(pair_url(&base, &fp))
+        .body(b"encrypted-offer".to_vec())
+        .send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Poll for response — none yet
+    let resp = client
+        .get(format!("{}/response", pair_url(&base, &fp)))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // New device posts response
+    let resp = client
+        .post(format!("{}/respond", pair_url(&base, &fp)))
+        .body(b"encrypted-response".to_vec())
+        .send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    // Existing device polls — gets response, session auto-deletes
+    let resp = client
+        .get(format!("{}/response", pair_url(&base, &fp)))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.bytes().await.unwrap().as_ref(), b"encrypted-response");
+
+    // Second poll — session deleted
+    let resp = client
+        .get(format!("{}/response", pair_url(&base, &fp)))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn pairing_respond_without_offer_rejected() {
+    let base = start_server(test_config()).await;
+    let client = reqwest::Client::new();
+    let fp = [0xB2; 32];
+
+    let resp = client
+        .post(format!("{}/respond", pair_url(&base, &fp)))
+        .body(b"response".to_vec())
+        .send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn pairing_empty_payload_rejected() {
+    let base = start_server(test_config()).await;
+    let client = reqwest::Client::new();
+    let fp = [0xB3; 32];
+
+    let resp = client
+        .post(pair_url(&base, &fp))
+        .body(Vec::new())
+        .send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn pairing_oversize_rejected() {
+    let base = start_server(test_config()).await;
+    let client = reqwest::Client::new();
+    let fp = [0xB4; 32];
+
+    let resp = client
+        .post(pair_url(&base, &fp))
+        .body(vec![0u8; 5000])
+        .send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn pairing_offer_overwrite() {
+    let base = start_server(test_config()).await;
+    let client = reqwest::Client::new();
+    let fp = [0xB5; 32];
+
+    // Post offer, then overwrite with new offer
+    client.post(pair_url(&base, &fp)).body(b"offer-1".to_vec()).send().await.unwrap();
+    client.post(pair_url(&base, &fp)).body(b"offer-2".to_vec()).send().await.unwrap();
+
+    // Respond to the overwritten session — should succeed (new session exists)
+    let resp = client
+        .post(format!("{}/respond", pair_url(&base, &fp)))
+        .body(b"resp".to_vec())
+        .send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+}
+
+// --- Recovery blob tests ---
+
+fn recovery_url(base: &str, fp: &[u8; 32]) -> String {
+    format!("{base}/recovery/{}", hex::encode(fp))
+}
+
+#[tokio::test]
+async fn recovery_put_get_roundtrip() {
+    let base = start_server(test_config()).await;
+    let client = reqwest::Client::new();
+    let fp = [0xC1; 32];
+
+    let resp = client
+        .put(recovery_url(&base, &fp))
+        .body(b"encrypted-recovery-blob".to_vec())
+        .send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let resp = client
+        .get(recovery_url(&base, &fp))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.bytes().await.unwrap().as_ref(), b"encrypted-recovery-blob");
+}
+
+#[tokio::test]
+async fn recovery_get_nonexistent_returns_not_found() {
+    let base = start_server(test_config()).await;
+    let client = reqwest::Client::new();
+    let fp = [0xC2; 32];
+
+    let resp = client.get(recovery_url(&base, &fp)).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn recovery_overwrite() {
+    let base = start_server(test_config()).await;
+    let client = reqwest::Client::new();
+    let fp = [0xC3; 32];
+
+    client.put(recovery_url(&base, &fp)).body(b"v1".to_vec()).send().await.unwrap();
+    client.put(recovery_url(&base, &fp)).body(b"v2".to_vec()).send().await.unwrap();
+
+    let resp = client.get(recovery_url(&base, &fp)).send().await.unwrap();
+    assert_eq!(resp.bytes().await.unwrap().as_ref(), b"v2");
+}
+
+#[tokio::test]
+async fn recovery_empty_payload_rejected() {
+    let base = start_server(test_config()).await;
+    let client = reqwest::Client::new();
+    let fp = [0xC4; 32];
+
+    let resp = client.put(recovery_url(&base, &fp)).body(Vec::new()).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn recovery_size_limit() {
+    let base = start_server(test_config()).await;
+    let client = reqwest::Client::new();
+    let fp = [0xC5; 32];
+
+    let resp = client.put(recovery_url(&base, &fp)).body(vec![0u8; 9000]).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn recovery_separate_accounts_independent() {
+    let base = start_server(test_config()).await;
+    let client = reqwest::Client::new();
+    let fp_a = [0xC6; 32];
+    let fp_b = [0xC7; 32];
+
+    client.put(recovery_url(&base, &fp_a)).body(b"blob-a".to_vec()).send().await.unwrap();
+    client.put(recovery_url(&base, &fp_b)).body(b"blob-b".to_vec()).send().await.unwrap();
+
+    let resp = client.get(recovery_url(&base, &fp_a)).send().await.unwrap();
+    assert_eq!(resp.bytes().await.unwrap().as_ref(), b"blob-a");
+    let resp = client.get(recovery_url(&base, &fp_b)).send().await.unwrap();
+    assert_eq!(resp.bytes().await.unwrap().as_ref(), b"blob-b");
+}

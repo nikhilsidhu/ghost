@@ -3,7 +3,6 @@ use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use argon2::Argon2;
 use rand::rngs::OsRng;
 
-use super::Identity;
 use crate::error::{GhostError, Result};
 
 const VERSION: u8 = 1;
@@ -13,8 +12,8 @@ const ARGON2_MEMORY_KIB: u32 = 19 * 1024; // 19 MiB
 const ARGON2_ITERATIONS: u32 = 2;
 const ARGON2_PARALLELISM: u32 = 1;
 
-/// Encrypt identity seed with a passphrase. Returns 93 bytes.
-pub fn export(identity: &Identity, passphrase: &str) -> Result<Vec<u8>> {
+/// Encrypt a 32-byte seed with a passphrase. Returns 93 bytes.
+pub fn export_seed(seed: &[u8; 32], passphrase: &str) -> Result<Vec<u8>> {
     let mut salt = [0u8; 32];
     rand::RngCore::fill_bytes(&mut OsRng, &mut salt);
 
@@ -26,7 +25,7 @@ pub fn export(identity: &Identity, passphrase: &str) -> Result<Vec<u8>> {
     let nonce = Nonce::from_slice(&nonce_bytes);
 
     let ciphertext = cipher
-        .encrypt(nonce, identity.seed().as_ref())
+        .encrypt(nonce, seed.as_ref())
         .map_err(|e| GhostError::Export(format!("encrypt failed: {e}")))?;
 
     let mut out = Vec::with_capacity(EXPORT_LEN);
@@ -37,8 +36,8 @@ pub fn export(identity: &Identity, passphrase: &str) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Decrypt identity seed from exported bytes + passphrase.
-pub fn import(data: &[u8], passphrase: &str) -> Result<Identity> {
+/// Decrypt a 32-byte seed from exported bytes + passphrase.
+pub fn import_seed(data: &[u8], passphrase: &str) -> Result<[u8; 32]> {
     if data.len() != EXPORT_LEN {
         return Err(GhostError::Format(format!(
             "expected {EXPORT_LEN} bytes, got {}",
@@ -68,7 +67,7 @@ pub fn import(data: &[u8], passphrase: &str) -> Result<Identity> {
         .try_into()
         .map_err(|_| GhostError::InvalidKey("decrypted seed not 32 bytes".into()))?;
 
-    Identity::from_seed(seed)
+    Ok(seed)
 }
 
 // Derive an AES-256 key from a user passphrase using Argon2id, so brute-forcing exported seeds is expensive.
@@ -89,30 +88,25 @@ mod tests {
 
     #[test]
     fn export_import_roundtrip() {
-        let id = Identity::from_seed([0xBBu8; 32]).unwrap();
-        let blob = export(&id, "hunter2").unwrap();
+        let seed = [0xBBu8; 32];
+        let blob = export_seed(&seed, "hunter2").unwrap();
         assert_eq!(blob.len(), EXPORT_LEN);
 
-        let restored = import(&blob, "hunter2").unwrap();
-        assert_eq!(id.fingerprint, restored.fingerprint);
-        assert_eq!(id.verifying_key, restored.verifying_key);
-        assert_eq!(
-            id.x25519_public.as_bytes(),
-            restored.x25519_public.as_bytes()
-        );
+        let restored = import_seed(&blob, "hunter2").unwrap();
+        assert_eq!(seed, restored);
     }
 
     #[test]
     fn wrong_passphrase_fails() {
-        let id = Identity::from_seed([0xCCu8; 32]).unwrap();
-        let blob = export(&id, "correct").unwrap();
-        let err = import(&blob, "wrong").unwrap_err();
+        let seed = [0xCCu8; 32];
+        let blob = export_seed(&seed, "correct").unwrap();
+        let err = import_seed(&blob, "wrong").unwrap_err();
         assert!(matches!(err, GhostError::AuthenticationFailed));
     }
 
     #[test]
     fn bad_length_fails() {
-        let err = import(&[0u8; 50], "pass").unwrap_err();
+        let err = import_seed(&[0u8; 50], "pass").unwrap_err();
         assert!(matches!(err, GhostError::Format(_)));
     }
 
@@ -120,8 +114,7 @@ mod tests {
     fn bad_version_fails() {
         let mut blob = vec![0xFF];
         blob.extend_from_slice(&[0u8; 92]);
-        let err = import(&blob, "pass").unwrap_err();
+        let err = import_seed(&blob, "pass").unwrap_err();
         assert!(matches!(err, GhostError::Format(_)));
     }
-
 }

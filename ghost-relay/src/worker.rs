@@ -21,5 +21,8 @@ pub async fn run(state: AppState) {
             let mut invites = state.invites.write().await;
             invites.retain(|_, inv| inv.expires_at > now);
         }
+
+        // Sweep expired pairing sessions
+        crate::routes::pair::reap_expired(&state).await;
     }
 }

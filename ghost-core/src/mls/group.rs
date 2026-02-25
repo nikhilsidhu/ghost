@@ -124,15 +124,15 @@ impl GhostGroup {
         Ok((wrap_commit(&commit_bytes, epoch), welcome))
     }
 
-    /// Kick a member from the group. Returns envelope-wrapped commit bytes.
-    pub fn remove_member(
+    /// Kick one or more leaves from the group. Returns envelope-wrapped commit bytes.
+    pub fn remove_members(
         &mut self,
         provider: &GhostProvider,
-        member: LeafNodeIndex,
+        members: &[LeafNodeIndex],
     ) -> Result<Vec<u8>> {
         let (commit, _welcome, _group_info) = self
             .mls_group
-            .remove_members(provider, &self.signer, &[member])
+            .remove_members(provider, &self.signer, members)
             .map_err(|e| GhostError::Mls(format!("remove member: {e}")))?;
 
         let epoch = self.epoch();

@@ -13,6 +13,11 @@ pub struct LogEntry {
     pub payload: Vec<u8>,
 }
 
+pub struct IdLogRow {
+    pub seq: u64,
+    pub payload: Vec<u8>,
+}
+
 pub struct Storage {
     conn: Mutex<Connection>,
 }
@@ -70,6 +75,21 @@ impl Storage {
                  mailbox_id BLOB NOT NULL PRIMARY KEY,
                  current_epoch INTEGER NOT NULL DEFAULT 0,
                  next_seq INTEGER NOT NULL DEFAULT 1
+             );
+
+             CREATE TABLE IF NOT EXISTS identity_log (
+                 account_fp BLOB NOT NULL,
+                 seq INTEGER NOT NULL,
+                 prev_hash BLOB NOT NULL,
+                 payload BLOB NOT NULL,
+                 received_at INTEGER NOT NULL,
+                 PRIMARY KEY (account_fp, seq)
+             ) WITHOUT ROWID;
+
+             CREATE TABLE IF NOT EXISTS recovery_blob (
+                 account_fp BLOB NOT NULL PRIMARY KEY,
+                 data BLOB NOT NULL,
+                 updated_at INTEGER NOT NULL
              );",
         )
         .map_err(|e| RelayError::Storage(e.to_string()))?;
@@ -270,6 +290,130 @@ impl Storage {
         Ok(())
     }
 
+    /// Append an identity log entry, enforcing sequential ordering and prev_hash chain.
+    pub fn append_idlog_entry(
+        &self,
+        account_fp: &[u8; 32],
+        seq: u64,
+        prev_hash: &[u8; 32],
+        payload: &[u8],
+    ) -> Result<(), RelayError> {
+        let conn = self.conn.lock().unwrap();
+
+        // Check current head
+        let head_seq: Option<i64> = conn
+            .query_row(
+                "SELECT seq FROM identity_log
+                 WHERE account_fp = ?1
+                 ORDER BY seq DESC LIMIT 1",
+                params![account_fp.as_slice()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| RelayError::Storage(e.to_string()))?;
+
+        match head_seq {
+            Some(head_seq) => {
+                if seq != (head_seq as u64) + 1 {
+                    return Err(RelayError::Conflict);
+                }
+                // Verify prev_hash matches hash of previous entry's payload
+                let prev_payload: Vec<u8> = conn
+                    .query_row(
+                        "SELECT payload FROM identity_log
+                         WHERE account_fp = ?1 AND seq = ?2",
+                        params![account_fp.as_slice(), head_seq],
+                        |row| row.get(0),
+                    )
+                    .map_err(|e| RelayError::Storage(e.to_string()))?;
+                let expected_hash: [u8; 32] = blake3::hash(&prev_payload).into();
+                if prev_hash != &expected_hash {
+                    return Err(RelayError::BadRequest("prev_hash mismatch".into()));
+                }
+            }
+            None => {
+                if seq != 1 {
+                    return Err(RelayError::BadRequest("first entry must be seq 1".into()));
+                }
+            }
+        }
+
+        conn.execute(
+            "INSERT INTO identity_log (account_fp, seq, prev_hash, payload, received_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                account_fp.as_slice(),
+                seq as i64,
+                prev_hash.as_slice(),
+                payload,
+                now_millis() as i64,
+            ],
+        )
+        .map_err(|e| RelayError::Storage(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Get identity log entries for an account, optionally after a given seq.
+    pub fn get_idlog(
+        &self,
+        account_fp: &[u8; 32],
+        after_seq: u64,
+    ) -> Result<Vec<IdLogRow>, RelayError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT seq, payload FROM identity_log
+                 WHERE account_fp = ?1 AND seq > ?2
+                 ORDER BY seq",
+            )
+            .map_err(|e| RelayError::Storage(e.to_string()))?;
+
+        let rows = stmt
+            .query_map(params![account_fp.as_slice(), after_seq as i64], |row| {
+                Ok(IdLogRow {
+                    seq: row.get::<_, i64>(0)? as u64,
+                    payload: row.get(1)?,
+                })
+            })
+            .map_err(|e| RelayError::Storage(e.to_string()))?;
+
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| RelayError::Storage(e.to_string()))
+    }
+
+    /// Store or update a recovery blob for an account.
+    pub fn put_recovery_blob(
+        &self,
+        account_fp: &[u8; 32],
+        data: &[u8],
+    ) -> Result<(), RelayError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO recovery_blob (account_fp, data, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT (account_fp) DO UPDATE SET data = ?2, updated_at = ?3",
+            params![account_fp.as_slice(), data, now_millis() as i64],
+        )
+        .map_err(|e| RelayError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Get a recovery blob for an account.
+    pub fn get_recovery_blob(
+        &self,
+        account_fp: &[u8; 32],
+    ) -> Result<Option<Vec<u8>>, RelayError> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT data FROM recovery_blob WHERE account_fp = ?1",
+            params![account_fp.as_slice()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| RelayError::Storage(e.to_string()))
+    }
+
     /// Delete log entries older than `cutoff_millis`.
     pub fn sweep_expired(&self, cutoff_millis: u64) -> Result<usize, RelayError> {
         let conn = self.conn.lock().unwrap();
@@ -435,6 +579,100 @@ mod tests {
         store.delete_avatar(&mb, &fp_a).unwrap();
         assert!(store.get_avatar(&mb, &fp_a).unwrap().is_none());
         assert_eq!(store.get_avatar(&mb, &fp_b).unwrap().unwrap(), b"bob");
+    }
+
+    fn test_account() -> [u8; 32] {
+        [0xCC; 32]
+    }
+
+    // Build a fake idlog payload with the right header: [seq:8][prev_hash:32][body...]
+    fn make_idlog_payload(seq: u64, prev_hash: &[u8; 32]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&seq.to_be_bytes());
+        buf.extend_from_slice(prev_hash);
+        buf.extend_from_slice(b"test-body");
+        buf
+    }
+
+    #[test]
+    fn idlog_append_and_fetch() {
+        let store = Storage::open_in_memory().unwrap();
+        let fp = test_account();
+
+        let payload1 = make_idlog_payload(1, &[0u8; 32]);
+        store.append_idlog_entry(&fp, 1, &[0u8; 32], &payload1).unwrap();
+
+        let hash1: [u8; 32] = blake3::hash(&payload1).into();
+        let payload2 = make_idlog_payload(2, &hash1);
+        store.append_idlog_entry(&fp, 2, &hash1, &payload2).unwrap();
+
+        let all = store.get_idlog(&fp, 0).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].seq, 1);
+        assert_eq!(all[1].seq, 2);
+
+        let after1 = store.get_idlog(&fp, 1).unwrap();
+        assert_eq!(after1.len(), 1);
+        assert_eq!(after1[0].seq, 2);
+    }
+
+    #[test]
+    fn idlog_rejects_bad_seq() {
+        let store = Storage::open_in_memory().unwrap();
+        let fp = test_account();
+
+        // First entry must be seq 1
+        let payload = make_idlog_payload(2, &[0u8; 32]);
+        let err = store.append_idlog_entry(&fp, 2, &[0u8; 32], &payload).unwrap_err();
+        assert!(matches!(err, RelayError::BadRequest(_)));
+
+        // Append seq 1
+        let payload1 = make_idlog_payload(1, &[0u8; 32]);
+        store.append_idlog_entry(&fp, 1, &[0u8; 32], &payload1).unwrap();
+
+        // Skip to seq 3
+        let hash1: [u8; 32] = blake3::hash(&payload1).into();
+        let payload3 = make_idlog_payload(3, &hash1);
+        let err = store.append_idlog_entry(&fp, 3, &hash1, &payload3).unwrap_err();
+        assert!(matches!(err, RelayError::Conflict));
+    }
+
+    #[test]
+    fn idlog_rejects_bad_prev_hash() {
+        let store = Storage::open_in_memory().unwrap();
+        let fp = test_account();
+
+        let payload1 = make_idlog_payload(1, &[0u8; 32]);
+        store.append_idlog_entry(&fp, 1, &[0u8; 32], &payload1).unwrap();
+
+        // Wrong prev_hash for seq 2
+        let bad_hash = [0xFF; 32];
+        let payload2 = make_idlog_payload(2, &bad_hash);
+        let err = store.append_idlog_entry(&fp, 2, &bad_hash, &payload2).unwrap_err();
+        assert!(matches!(err, RelayError::BadRequest(_)));
+    }
+
+    #[test]
+    fn idlog_separate_accounts_independent() {
+        let store = Storage::open_in_memory().unwrap();
+        let fp_a = [0xAA; 32];
+        let fp_b = [0xBB; 32];
+
+        let p1a = make_idlog_payload(1, &[0u8; 32]);
+        store.append_idlog_entry(&fp_a, 1, &[0u8; 32], &p1a).unwrap();
+
+        let p1b = make_idlog_payload(1, &[0u8; 32]);
+        store.append_idlog_entry(&fp_b, 1, &[0u8; 32], &p1b).unwrap();
+
+        assert_eq!(store.get_idlog(&fp_a, 0).unwrap().len(), 1);
+        assert_eq!(store.get_idlog(&fp_b, 0).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn idlog_empty_returns_empty() {
+        let store = Storage::open_in_memory().unwrap();
+        let fp = test_account();
+        assert!(store.get_idlog(&fp, 0).unwrap().is_empty());
     }
 
     #[test]

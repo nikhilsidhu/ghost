@@ -34,6 +34,13 @@ pub struct OpEntry {
     pub blob: Vec<u8>,
 }
 
+/// Ephemeral pairing session for device linking (5-minute TTL, in-memory only)
+pub struct PairingSession {
+    pub offer: Vec<u8>,
+    pub response: Option<Vec<u8>>,
+    pub expires_at: Instant,
+}
+
 pub struct Inner {
     pub mailboxes: RwLock<HashMap<[u8; 32], Mailbox>>,
     pub invites: RwLock<HashMap<String, Invite>>,
@@ -46,6 +53,7 @@ pub struct Inner {
     pub storage: Storage,
     pub voice_presence: RwLock<Vec<VpEntry>>,
     pub online_presence: RwLock<Vec<OpEntry>>,
+    pub pairing: RwLock<HashMap<[u8; 32], PairingSession>>,
     pub next_conn_id: AtomicU64,
 }
 
@@ -86,6 +94,7 @@ pub fn new_state(config: Config, storage: Storage) -> AppState {
         storage,
         voice_presence: RwLock::new(Vec::new()),
         online_presence: RwLock::new(Vec::new()),
+        pairing: RwLock::new(HashMap::new()),
         next_conn_id: AtomicU64::new(1),
     })
 }

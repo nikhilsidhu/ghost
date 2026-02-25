@@ -22,46 +22,98 @@ fn ghost_dir() -> PathBuf {
     }
 }
 
-fn seed_file() -> PathBuf {
-    ghost_dir().join("seed.key")
+fn device_file() -> PathBuf {
+    ghost_dir().join("device.key")
 }
 
 fn db_path() -> PathBuf {
     ghost_dir().join("ghost.db")
 }
 
-// In debug builds, store seed in a file to avoid keychain popups on every recompile.
-// Release builds use the OS keyring.
+fn genesis_pending_path() -> PathBuf {
+    ghost_dir().join("genesis.pending")
+}
+
+/// In debug builds, store device credentials in a file to avoid keychain popups on every recompile.
 #[cfg(debug_assertions)]
-fn load_or_create_seed() -> [u8; 32] {
-    let path = seed_file();
+fn load_or_create_device() -> (Identity, [u8; 32], [u8; 32]) {
+    let path = device_file();
     if let Ok(bytes) = fs::read(&path) {
-        bytes.try_into().expect("corrupt seed.key")
+        if bytes.len() != ghost_core::identity::keyring_store::DEVICE_BLOB_SIZE {
+            panic!("corrupt device.key");
+        }
+        let fingerprint: [u8; 32] = bytes[0..32].try_into().unwrap();
+        let sk_bytes: [u8; 32] = bytes[32..64].try_into().unwrap();
+        let db_key: [u8; 32] = bytes[64..96].try_into().unwrap();
+        let mls_db_key: [u8; 32] = bytes[96..128].try_into().unwrap();
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&sk_bytes);
+        let identity = Identity::from_device(fingerprint, signing_key);
+        (identity, db_key, mls_db_key)
     } else {
-        let identity = Identity::generate().expect("failed to generate identity");
-        let seed = *identity.seed();
-        fs::write(&path, seed).expect("failed to write seed.key");
-        seed
+        let creation = Identity::create_account("dev-device")
+            .expect("failed to create account");
+        // Copy out what we need before AccountCreation drops (zeroizes seed)
+        let fingerprint = creation.identity.fingerprint;
+        let sk_bytes = creation.identity.signing_key.to_bytes();
+        let db_key = creation.db_key;
+        let mls_db_key = creation.mls_db_key;
+        let genesis_bytes = creation.genesis_entry.to_bytes();
+        // Write genesis first — if we crash after device.key but before this,
+        // the device exists but can never push its identity log to relays
+        fs::write(genesis_pending_path(), &genesis_bytes)
+            .expect("failed to write genesis.pending");
+        let mut blob = Vec::with_capacity(ghost_core::identity::keyring_store::DEVICE_BLOB_SIZE);
+        blob.extend_from_slice(&fingerprint);
+        blob.extend_from_slice(&sk_bytes);
+        blob.extend_from_slice(&db_key);
+        blob.extend_from_slice(&mls_db_key);
+        fs::write(&path, &blob).expect("failed to write device.key");
+        drop(creation);
+        let identity = Identity::from_device(fingerprint, ed25519_dalek::SigningKey::from_bytes(&sk_bytes));
+        (identity, db_key, mls_db_key)
     }
 }
 
+/// Release builds use the OS keyring.
 #[cfg(not(debug_assertions))]
-fn load_or_create_seed() -> [u8; 32] {
-    use ghost_core::identity::keyring_store;
+fn load_or_create_device() -> (Identity, [u8; 32], [u8; 32]) {
+    use ghost_core::identity::keyring_store::{self, StoredDevice};
 
     let fp_file = ghost_dir().join("identity.txt");
     match fs::read_to_string(&fp_file) {
         Ok(fp_short) => {
-            let identity = keyring_store::retrieve(fp_short.trim())
-                .expect("identity in keyring not found — delete ~/.ghost/identity.txt to reset");
-            *identity.seed()
+            let device = keyring_store::retrieve(fp_short.trim())
+                .expect("device in keyring not found — delete ~/.ghost/identity.txt to reset");
+            let identity = Identity::from_device(device.fingerprint, device.signing_key);
+            (identity, device.db_key, device.mls_db_key)
         }
         Err(_) => {
-            let identity = Identity::generate().expect("failed to generate identity");
-            keyring_store::store(&identity).expect("failed to store identity in keyring");
-            fs::write(&fp_file, identity.fingerprint_short())
+            let creation = Identity::create_account("device")
+                .expect("failed to create account");
+            // Copy out what we need before AccountCreation drops (zeroizes seed)
+            let fingerprint = creation.identity.fingerprint;
+            let sk_bytes = creation.identity.signing_key.to_bytes();
+            let db_key = creation.db_key;
+            let mls_db_key = creation.mls_db_key;
+            let fp_short = creation.identity.fingerprint_short();
+            let genesis_bytes = creation.genesis_entry.to_bytes();
+            let stored = StoredDevice {
+                fingerprint,
+                signing_key: ed25519_dalek::SigningKey::from_bytes(&sk_bytes),
+                db_key,
+                mls_db_key,
+            };
+            // Write genesis first — if we crash after keyring but before this,
+            // the device exists but can never push its identity log to relays
+            fs::write(genesis_pending_path(), &genesis_bytes)
+                .expect("failed to write genesis.pending");
+            keyring_store::store(&fp_short, &stored)
+                .expect("failed to store device in keyring");
+            fs::write(&fp_file, &fp_short)
                 .expect("failed to write identity.txt");
-            *identity.seed()
+            drop(creation);
+            let identity = Identity::from_device(fingerprint, ed25519_dalek::SigningKey::from_bytes(&sk_bytes));
+            (identity, db_key, mls_db_key)
         }
     }
 }
@@ -80,8 +132,10 @@ pub fn initialize() -> SetupResult {
     let cfg_path = config::config_path(&dir);
     let mut cfg = GhostConfig::load(&cfg_path);
 
-    let seed = load_or_create_seed();
-    let mut client = GhostClient::open(seed, &db_path()).expect("failed to open database");
+    let (identity, db_key, mls_db_key) = load_or_create_device();
+
+    let mut client = GhostClient::open(identity, db_key, mls_db_key, &db_path())
+        .expect("failed to open database");
 
     if let Some(name) = &cfg.display_name {
         client.set_display_name(name.clone());

@@ -48,6 +48,22 @@ pub async fn run(
         }
     }
 
+    // Push pending genesis entry to relay (first launch only)
+    {
+        let genesis_path = data_dir.join("genesis.pending");
+        if let Ok(payload) = std::fs::read(&genesis_path) {
+            let account_fp = {
+                let c = client.lock().await;
+                *c.fingerprint()
+            };
+            let r = relay.lock().await;
+            match r.put_idlog_entry(&account_fp, payload).await {
+                Ok(()) => { let _ = std::fs::remove_file(&genesis_path); }
+                Err(e) => eprintln!("failed to push genesis entry: {e}"),
+            }
+        }
+    }
+
     // Per-channel voice members visible to all mailbox subscribers
     let mut voice_members: HashMap<[u8; 32], Vec<PresenceState>> = HashMap::new();
     // Track which channels belong to which mailbox (so snapshots don't clobber other servers)
