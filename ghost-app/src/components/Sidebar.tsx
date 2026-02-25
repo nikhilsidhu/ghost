@@ -272,16 +272,15 @@ export function Sidebar() {
             {(id) => (
               <Tooltip label={profileOpen() ? "close profile" : id().display_name}>
                 <button
-                  class={cn(
-                    "w-[var(--size-lg)] h-[var(--size-lg)] flex items-center justify-center cursor-pointer transition-opacity duration-[var(--duration-fast)]",
-                    profileOpen() ? "opacity-100 hover:brightness-125" : "opacity-50 hover:opacity-100",
-                  )}
+                  class="w-[var(--size-lg)] h-[var(--size-lg)] flex items-center justify-center cursor-pointer group/ab"
                   onClick={toggleProfile}
                 >
                   <div class="relative w-[var(--size-md)] h-[var(--size-md)]">
                     <div
-                      class="absolute inset-0 flex items-center justify-center transition-opacity duration-200"
-                      style={{ opacity: profileOpen() ? "0" : "1" }}
+                      class={cn(
+                        "absolute inset-0 flex items-center justify-center transition-all duration-[var(--duration-fast)]",
+                        profileOpen() ? "opacity-0 pointer-events-none" : "brightness-75 group-hover/ab:brightness-100",
+                      )}
                     >
                       <Avatar
                         hashKey={id().fingerprint}
@@ -291,8 +290,10 @@ export function Sidebar() {
                       />
                     </div>
                     <div
-                      class="absolute inset-0 flex items-center justify-center text-[var(--neutral-300)] transition-opacity duration-200"
-                      style={{ opacity: profileOpen() ? "1" : "0" }}
+                      class={cn(
+                        "absolute inset-0 flex items-center justify-center text-[var(--neutral-300)] transition-all duration-200 pointer-events-none",
+                        profileOpen() ? "opacity-100 group-hover/ab:brightness-125" : "opacity-0",
+                      )}
                     >
                       <UserPen size={20} />
                     </div>
@@ -529,7 +530,6 @@ function ServerIcon(props: { server: Server; isActive: boolean; onClick: (id: st
             hashKey={props.server.server_id}
             label={props.server.name}
             square
-            active={props.isActive}
             class={cn(
               "relative w-[var(--size-md)] h-[var(--size-md)] text-sm transition-all duration-200",
               props.isActive || props.server.has_unread

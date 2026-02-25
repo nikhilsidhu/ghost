@@ -335,13 +335,11 @@ input, textarea {
   50% { transform: translateZ(0) scale(1.12); }
 }
 
-/* Avatar highlight — radial spot follows the mouse cursor + ambient glow */
+/* Avatar flare — colored radial spot follows the mouse cursor */
 .avatar-flare {
   position: relative;
-  box-shadow: 0 0 6px 1px color-mix(in srgb, var(--glow-color, transparent) 9%, transparent);
-  transition: box-shadow var(--duration-mid) ease-out;
 }
-/* Colored ambient glow — follows cursor, extends hover detection zone */
+/* Colored glow — follows cursor, extends hover zone */
 .avatar-flare::before {
   content: '';
   position: absolute;
@@ -349,8 +347,8 @@ input, textarea {
   border-radius: inherit;
   background: radial-gradient(
     circle at var(--flare-x, 50%) var(--flare-y, 50%),
-    color-mix(in srgb, var(--glow-color, transparent) 30%, transparent) 0%,
-    color-mix(in srgb, var(--glow-color, transparent) 10%, transparent) 45%,
+    color-mix(in srgb, var(--glow-color, transparent) 40%, transparent) 0%,
+    color-mix(in srgb, var(--glow-color, transparent) 14%, transparent) 45%,
     transparent 80%
   );
   filter: blur(6px);
@@ -363,14 +361,7 @@ input, textarea {
 .avatar-flare:hover::before {
   animation-play-state: running;
 }
-.avatar-flare:hover {
-  box-shadow: 0 0 10px 2px color-mix(in srgb, var(--glow-color, transparent) 19%, transparent),
-              0 0 20px 4px color-mix(in srgb, var(--glow-color, transparent) 7%, transparent);
-}
-.avatar-flare.glow-active {
-  box-shadow: 0 0 10px 2px color-mix(in srgb, var(--glow-color, transparent) 19%, transparent),
-              0 0 20px 4px color-mix(in srgb, var(--glow-color, transparent) 7%, transparent);
-}
+/* Specular highlight — tinted with extracted color */
 .avatar-flare::after {
   content: '';
   position: absolute;
@@ -379,8 +370,8 @@ input, textarea {
   pointer-events: none;
   background: radial-gradient(
     circle at var(--flare-x, 50%) var(--flare-y, 50%),
-    rgba(255, 255, 255, 0.32) 0%,
-    rgba(255, 255, 255, 0.08) 42%,
+    color-mix(in srgb, var(--glow-color, transparent) 38%, transparent) 0%,
+    color-mix(in srgb, var(--glow-color, transparent) 10%, transparent) 42%,
     transparent 68%
   );
   opacity: var(--flare-opacity, 0);
@@ -404,6 +395,6 @@ input, textarea {
   }
   .avatar-flare::after {
     transition: none;
-    background: radial-gradient(circle at 50% 50%, rgba(255, 255, 255, 0.10) 0%, transparent 70%);
+    background: radial-gradient(circle at 50% 50%, color-mix(in srgb, var(--glow-color, transparent) 10%, transparent) 0%, transparent 70%);
   }
 }

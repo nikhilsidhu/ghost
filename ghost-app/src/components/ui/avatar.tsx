@@ -1,8 +1,10 @@
-import { Show, createSignal } from "solid-js";
+import { Show, createSignal, createEffect, onCleanup } from "solid-js";
 import type { JSX } from "solid-js";
 import { cn } from "../../lib/cn";
-import { hashGradient, onFlareMove, onFlareLeave } from "../../lib/gradients";
+import { hashGradient, extractGlowColor, onFlareMove, onFlareLeave } from "../../lib/gradients";
 import { avatarUrl } from "../../lib/store";
+import { prepareGif } from "../../lib/gif";
+import type { PlaybackFrame } from "../../lib/gif";
 
 export type AvatarStatus = "online" | "idle" | "away";
 
@@ -17,7 +19,6 @@ interface AvatarProps {
   label: string;
   class?: string;
   square?: boolean;
-  active?: boolean;
   status?: AvatarStatus;
   children?: JSX.Element;
 }
@@ -25,8 +26,80 @@ interface AvatarProps {
 export function Avatar(props: AvatarProps) {
   const grad = () => hashGradient(props.hashKey);
   const [imgError, setImgError] = createSignal(false);
+  const [imgGlow, setImgGlow] = createSignal<string | null>(null);
   const src = () => avatarUrl(props.hashKey);
   const showImg = () => src() && !imgError();
+  const isGif = () => src()?.startsWith("data:image/gif") ?? false;
+
+  let canvasRef: HTMLCanvasElement | undefined;
+
+  // Static image glow extraction
+  const onImgLoad = (e: Event) => {
+    const color = extractGlowColor(e.target as HTMLImageElement);
+    setImgGlow(color);
+  };
+
+  // GIF playback: decode, composite, drive canvas + glow in one rAF loop
+  createEffect(() => {
+    if (!showImg() || !isGif()) {
+      setImgGlow(null);
+      return;
+    }
+
+    let frames: PlaybackFrame[];
+    try {
+      frames = prepareGif(src()!);
+    } catch {
+      setImgGlow(null);
+      return;
+    }
+
+    if (frames.length === 0) return;
+
+    let frameIdx = 0;
+    let lastTime = 0;
+    let rafId: number;
+
+    setImgGlow(frames[0].glowColor);
+
+    // Set canvas dimensions once — resetting per frame clears context state
+    if (canvasRef) {
+      canvasRef.width = frames[0].imageData.width;
+      canvasRef.height = frames[0].imageData.height;
+    }
+
+    const paint = () => {
+      if (!canvasRef) return;
+      const ctx = canvasRef.getContext("2d");
+      if (!ctx) return;
+      ctx.putImageData(frames[frameIdx].imageData, 0, 0);
+    };
+
+    paint();
+
+    const tick = (now: number) => {
+      if (!lastTime) lastTime = now;
+      const elapsed = now - lastTime;
+      const frame = frames[frameIdx];
+
+      if (elapsed >= frame.delay) {
+        frameIdx = (frameIdx + 1) % frames.length;
+        setImgGlow(frames[frameIdx].glowColor);
+        paint();
+        lastTime = now;
+      }
+
+      rafId = requestAnimationFrame(tick);
+    };
+
+    rafId = requestAnimationFrame(tick);
+    onCleanup(() => cancelAnimationFrame(rafId));
+  });
+
+  // Reset glow when image goes away (non-GIF path)
+  createEffect(() => {
+    if (!showImg() && !isGif()) setImgGlow(null);
+  });
 
   return (
     <div
@@ -35,25 +108,38 @@ export function Avatar(props: AvatarProps) {
         props.square ? "rounded-[14%]" : "rounded-full",
         props.class,
       )}
-      classList={{ "glow-active": props.active }}
       style={{
         background: `linear-gradient(${grad().angle}deg, ${grad().from}, ${grad().to})`,
         color: "var(--neutral-100)",
-        "--glow-color": grad().glow,
+        "--glow-color": imgGlow() ?? grad().glow,
       }}
       onMouseMove={onFlareMove}
       onMouseLeave={onFlareLeave}
     >
       <Show when={showImg()} fallback={props.children ?? props.label[0]?.toLowerCase()}>
-        <img
-          src={src()}
-          alt=""
-          class={cn(
-            "absolute inset-0 w-full h-full object-cover",
-            props.square ? "rounded-[14%]" : "rounded-full",
-          )}
-          onError={() => setImgError(true)}
-        />
+        <Show
+          when={isGif()}
+          fallback={
+            <img
+              src={src()}
+              alt=""
+              class={cn(
+                "absolute inset-0 w-full h-full object-cover",
+                props.square ? "rounded-[14%]" : "rounded-full",
+              )}
+              onError={() => setImgError(true)}
+              onLoad={onImgLoad}
+            />
+          }
+        >
+          <canvas
+            ref={canvasRef}
+            class={cn(
+              "absolute inset-0 w-full h-full object-cover",
+              props.square ? "rounded-[14%]" : "rounded-full",
+            )}
+          />
+        </Show>
       </Show>
       <Show when={props.status}>
         <div

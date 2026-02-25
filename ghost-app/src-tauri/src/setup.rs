@@ -113,6 +113,15 @@ pub fn initialize() -> SetupResult {
         let _ = cfg.save(&cfg_path);
     }
 
+    // Restore avatar_hash from any server where we have one stored
+    let own_fp = *client.fingerprint();
+    let avatar_hash = client
+        .server_mailboxes()
+        .iter()
+        .find_map(|(server_id, _)| {
+            client.store().get_member(server_id, &own_fp).ok().and_then(|m| m.avatar_hash)
+        });
+
     let initial_presence = PresenceInfo {
         status: match cfg.status.as_deref() {
             Some("away") => OnlineStatus::Away,
@@ -121,7 +130,7 @@ pub fn initialize() -> SetupResult {
         },
         status_message: cfg.status_message.clone(),
         status_expiry: cfg.status_expiry,
-        ..Default::default()
+        avatar_hash,
     };
 
     let state = AppState {

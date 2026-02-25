@@ -44,6 +44,7 @@ export function ProfilePanel() {
 
   const [cropMode, setCropMode] = createSignal(false);
   const [cropImage, setCropImage] = createSignal<HTMLImageElement | null>(null);
+  const [gifBytes, setGifBytes] = createSignal<Uint8Array | null>(null);
   const [uploading, setUploading] = createSignal(false);
   let fileInput!: HTMLInputElement;
 
@@ -152,10 +153,17 @@ export function ProfilePanel() {
     }
   };
 
-  const onFileSelect = (e: Event) => {
+  const onFileSelect = async (e: Event) => {
     const file = (e.target as HTMLInputElement).files?.[0];
     if (!file) return;
     fileInput.value = "";
+
+    if (file.type === "image/gif") {
+      const buf = await file.arrayBuffer();
+      setGifBytes(new Uint8Array(buf));
+    } else {
+      setGifBytes(null);
+    }
 
     const url = URL.createObjectURL(file);
     const img = new Image();
@@ -171,6 +179,7 @@ export function ProfilePanel() {
     if (img) URL.revokeObjectURL(img.src);
     setCropImage(null);
     setCropMode(false);
+    setGifBytes(null);
   };
 
   const onCropConfirm = async (bytes: number[]) => {
@@ -208,7 +217,7 @@ export function ProfilePanel() {
       <input
         ref={fileInput!}
         type="file"
-        accept="image/jpeg,image/png,image/webp"
+        accept="image/jpeg,image/png,image/webp,image/gif"
         class="hidden"
         onChange={onFileSelect}
       />
@@ -230,7 +239,7 @@ export function ProfilePanel() {
               <div class="flex items-center gap-3">
                 <div class="flex-shrink-0 relative group/avatar">
                   <button
-                    class="cursor-pointer"
+                    class="block cursor-pointer"
                     onClick={onAvatarClick}
                   >
                     <Avatar
@@ -238,7 +247,7 @@ export function ProfilePanel() {
                       label={id().display_name}
                       class="w-12 h-12 text-base"
                     />
-                    <div class="absolute inset-0 rounded-full flex items-center justify-center bg-black/50 opacity-0 group-hover/avatar:opacity-100 transition-opacity duration-150">
+                    <div class="absolute inset-0 rounded-full flex items-center justify-center bg-black/50 opacity-0 group-hover/avatar:opacity-100 transition-opacity duration-150 pointer-events-none">
                       <Camera size={16} class="text-[var(--neutral-200)]" />
                     </div>
                   </button>
@@ -380,6 +389,7 @@ export function ProfilePanel() {
                   {(img) => (
                     <ImageCrop
                       image={img()}
+                      gifBytes={gifBytes() ?? undefined}
                       uploading={uploading()}
                       onConfirm={onCropConfirm}
                       onCancel={dismissCrop}

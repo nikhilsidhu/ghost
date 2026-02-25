@@ -1,4 +1,5 @@
 import { createSignal } from "solid-js";
+import { cropGif } from "../../lib/gif";
 
 const CROP_SIZE = 220;
 const CROP_RADIUS = CROP_SIZE / 2;
@@ -9,6 +10,7 @@ export const CROP_AREA_HEIGHT = CROP_SIZE + GAP + BUTTONS_HEIGHT;
 
 interface ImageCropProps {
   image: HTMLImageElement;
+  gifBytes?: Uint8Array;
   uploading: boolean;
   onConfirm: (bytes: number[]) => void;
   onCancel: () => void;
@@ -79,6 +81,12 @@ export function ImageCrop(props: ImageCropProps) {
     const sx = -offsetX() / s;
     const sy = -offsetY() / s;
     const sSize = CROP_SIZE / s;
+
+    if (props.gifBytes) {
+      const cropped = cropGif(props.gifBytes, sx, sy, sSize, OUTPUT_SIZE);
+      props.onConfirm(Array.from(cropped));
+      return;
+    }
 
     const canvas = document.createElement("canvas");
     canvas.width = OUTPUT_SIZE;

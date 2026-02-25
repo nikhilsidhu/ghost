@@ -560,10 +560,10 @@ pub async fn upload_avatar(
         let payload = encode_avatar_update(&avatar_hash, &avatar_key);
         let mut out = Vec::new();
         for (server_id, _) in client.server_mailboxes() {
-            // Store key locally so we can decrypt our own avatar
             let _ = client.store().update_member_avatar(&server_id, &fp, &avatar_hash, &avatar_key);
-            if let Ok(o) = client.send_control(&server_id, payload.clone()) {
-                out.push(o);
+            match client.send_control(&server_id, payload.clone()) {
+                Ok(o) => out.push(o),
+                Err(e) => eprintln!("avatar: send_control failed for server {}: {e}", hex::encode(server_id)),
             }
         }
         (out, fp)
@@ -571,10 +571,12 @@ pub async fn upload_avatar(
     {
         let relay = state.relay.lock().await;
         for o in &outbounds {
-            // Upload the encrypted blob per mailbox
-            let _ = relay.put_avatar(&o.mailbox_id, &fingerprint, encrypted.clone()).await;
-            // Send the MLS metadata message
-            let _ = relay.send(&o.mailbox_id, o.blob.clone()).await;
+            if let Err(e) = relay.put_avatar(&o.mailbox_id, &fingerprint, encrypted.clone()).await {
+                eprintln!("avatar: put_avatar failed for mailbox {}: {e}", hex::encode(o.mailbox_id));
+            }
+            if let Err(e) = relay.send(&o.mailbox_id, o.blob.clone()).await {
+                eprintln!("avatar: send metadata failed for mailbox {}: {e}", hex::encode(o.mailbox_id));
+            }
         }
     }
 

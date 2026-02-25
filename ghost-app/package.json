@@ -15,6 +15,7 @@
     "@thisbeyond/solid-dnd": "^0.7.5",
     "clsx": "^2.1.0",
     "lucide-solid": "^0.563.0",
+    "omggif": "^1.0.10",
     "solid-js": "^1.9.0",
     "tailwind-merge": "^2.6.0",
     "uqr": "^0.1.2"
@@ -22,6 +23,7 @@
   "devDependencies": {
     "@tailwindcss/vite": "^4.0.0",
     "@tauri-apps/cli": "^2.10.0",
+    "@types/omggif": "^1.0.5",
     "tailwindcss": "^4.0.0",
     "typescript": "^5.7.0",
     "vite": "^6.0.0",

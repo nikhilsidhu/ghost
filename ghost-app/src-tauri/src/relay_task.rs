@@ -547,13 +547,13 @@ async fn maybe_fetch_avatar(
     fingerprint: &[u8; 32],
     avatar_hash: &[u8; 32],
 ) {
+    let fp_hex = hex::encode(fingerprint);
     let avatar_dir = data_dir.join("avatars");
-    let cache_path = avatar_dir.join(format!("{}.webp", hex::encode(fingerprint)));
-    // Check sidecar file to see if we already fetched this version
-    let hash_path = avatar_dir.join(format!("{}.hash", hex::encode(fingerprint)));
+    let cache_path = avatar_dir.join(format!("{fp_hex}.webp"));
+    let hash_path = avatar_dir.join(format!("{fp_hex}.hash"));
     if let Ok(stored) = std::fs::read(&hash_path) {
         if stored == avatar_hash.as_slice() {
-            return;
+            return; // already have this version
         }
     }
 
@@ -564,7 +564,10 @@ async fn maybe_fetch_avatar(
     };
     let avatar_key = match avatar_key {
         Some(k) => k,
-        None => return, // don't have the key yet
+        None => {
+            eprintln!("avatar: no key for {fp_hex}, skipping fetch");
+            return;
+        }
     };
 
     // Fetch the mailbox_id for this server
@@ -574,7 +577,10 @@ async fn maybe_fetch_avatar(
     };
     let mailbox_id = match mailbox_id {
         Some(m) => m,
-        None => return,
+        None => {
+            eprintln!("avatar: no mailbox for server {}, skipping fetch for {fp_hex}", hex::encode(server_id));
+            return;
+        }
     };
 
     // Fetch encrypted blob from relay
@@ -584,28 +590,38 @@ async fn maybe_fetch_avatar(
     };
     let encrypted = match encrypted {
         Ok(Some(data)) => data,
-        _ => return,
+        Ok(None) => {
+            eprintln!("avatar: relay returned no blob for {fp_hex}");
+            return;
+        }
+        Err(e) => {
+            eprintln!("avatar: fetch failed for {fp_hex}: {e}");
+            return;
+        }
     };
 
     // Decrypt: [nonce:12][ciphertext+tag]
     use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead};
     use aes_gcm::Nonce;
-    if encrypted.len() < 28 { return; }
+    if encrypted.len() < 28 {
+        eprintln!("avatar: blob too short for {fp_hex} ({} bytes)", encrypted.len());
+        return;
+    }
     let nonce = Nonce::from_slice(&encrypted[..12]);
     let cipher = Aes256Gcm::new((&avatar_key).into());
     let plaintext = match cipher.decrypt(nonce, &encrypted[12..]) {
         Ok(p) => p,
-        Err(_) => return,
+        Err(e) => {
+            eprintln!("avatar: decrypt failed for {fp_hex}: {e}");
+            return;
+        }
     };
 
     // Cache to disk
-    let avatar_dir = data_dir.join("avatars");
     let _ = std::fs::create_dir_all(&avatar_dir);
     let _ = std::fs::write(&cache_path, &plaintext);
-    // Write hash sidecar so we know which version we have
-    let hash_path = avatar_dir.join(format!("{}.hash", hex::encode(fingerprint)));
     let _ = std::fs::write(&hash_path, avatar_hash);
-    let _ = app.emit("avatar-updated", hex::encode(fingerprint));
+    let _ = app.emit("avatar-updated", &fp_hex);
 }
 
 /// Retry pending presence blobs after an epoch change (commit processed).
