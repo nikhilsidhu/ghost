@@ -15,7 +15,6 @@ async fn start_relay() -> String {
     let config = Config {
         port: 0,
         max_blob_size: 10 * 1024 * 1024,
-        ttl: Duration::from_secs(3600),
         voice_port: 0,
         max_voice_participants: 25,
     };

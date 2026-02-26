@@ -46,7 +46,6 @@ fn test_config() -> Config {
     Config {
         port: 0,
         max_blob_size: 1024,
-        ttl: Duration::from_secs(3600),
         voice_port: 0,
         max_voice_participants: 25,
     }
@@ -725,69 +724,6 @@ async fn server_info_overwrite() {
         .await
         .unwrap();
     assert_eq!(resp.bytes().await.unwrap().as_ref(), b"v2");
-}
-
-// --- Gap detection tests ---
-
-#[tokio::test]
-async fn ws_gap_indicator() {
-    let (base, st) = start_server_with_state(test_config()).await;
-    let client = reqwest::Client::new();
-    let mailbox_id = [0xAB; 32];
-    let url = mailbox_url(&base, &mailbox_id);
-    let ws_base = base.replace("http://", "ws://");
-    let mailbox_b64 = URL_SAFE_NO_PAD.encode(mailbox_id);
-    let ws_url = format!("{ws_base}/ws/{mailbox_b64}");
-
-    // Post blobs, then sweep them to simulate TTL expiry
-    for i in 0..3u8 {
-        client.post(&url).body(test_envelope(&[i])).send().await.unwrap();
-    }
-    st.storage.sweep_expired(i64::MAX as u64).unwrap();
-
-    // Connect with last_seen=1 — blobs are gone, should get "gap"
-    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
-    ws_handshake(&mut ws, 1).await;
-
-    let msg = tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            let m = ws.next().await.unwrap().unwrap();
-            if let Message::Text(t) = m { break t; }
-        }
-    })
-    .await
-    .expect("timed out waiting for gap indicator");
-    assert_eq!(msg.as_str(), "gap");
-}
-
-#[tokio::test]
-async fn ws_no_gap_on_fresh_subscribe() {
-    let (base, st) = start_server_with_state(test_config()).await;
-    let client = reqwest::Client::new();
-    let mailbox_id = [0xAC; 32];
-    let url = mailbox_url(&base, &mailbox_id);
-    let ws_base = base.replace("http://", "ws://");
-    let mailbox_b64 = URL_SAFE_NO_PAD.encode(mailbox_id);
-    let ws_url = format!("{ws_base}/ws/{mailbox_b64}");
-
-    // Post and sweep
-    client.post(&url).body(test_envelope(&[0])).send().await.unwrap();
-    st.storage.sweep_expired(i64::MAX as u64).unwrap();
-
-    // Connect with last_seen=0 — first subscribe, no gap expected
-    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
-    ws_handshake(&mut ws, 0).await;
-    consume_vs_snap(&mut ws).await;
-
-    // Should not receive any text "gap" — only pings should arrive
-    let result = tokio::time::timeout(Duration::from_millis(200), async {
-        loop {
-            let m = ws.next().await.unwrap().unwrap();
-            if let Message::Text(t) = m { return t; }
-        }
-    })
-    .await;
-    assert!(result.is_err(), "should not receive gap on fresh subscribe");
 }
 
 // --- Identity log tests ---

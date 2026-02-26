@@ -3,77 +3,12 @@ use rusqlite::Connection;
 use crate::crypto::MessageType;
 use crate::error::{GhostError, Result};
 
-const CURRENT_VERSION: u32 = 4;
-
 pub fn initialize(conn: &Connection) -> Result<()> {
-    let version = get_version(conn)?;
-    if version == 0 {
-        create_tables(conn)?;
-        set_version(conn, CURRENT_VERSION)?;
-    } else if version != CURRENT_VERSION {
-        // Pre-release: nuke and recreate
-        drop_all(conn)?;
-        create_tables(conn)?;
-        set_version(conn, CURRENT_VERSION)?;
-    }
-    Ok(())
-}
-
-fn get_version(conn: &Connection) -> Result<u32> {
-    // schema_version table may not exist yet
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);"
-    )
-    .map_err(|e| GhostError::Database(format!("create schema_version: {e}")))?;
-
-    let count: u32 = conn
-        .query_row("SELECT COUNT(*) FROM schema_version", [], |row| row.get(0))
-        .map_err(|e| GhostError::Database(format!("query schema_version: {e}")))?;
-
-    if count == 0 {
-        return Ok(0);
-    }
-
-    conn.query_row("SELECT version FROM schema_version", [], |row| row.get(0))
-        .map_err(|e| GhostError::Database(format!("read version: {e}")))
-}
-
-fn set_version(conn: &Connection, version: u32) -> Result<()> {
-    conn.execute("DELETE FROM schema_version", [])
-        .map_err(|e| GhostError::Database(format!("clear version: {e}")))?;
-    conn.execute("INSERT INTO schema_version (version) VALUES (?1)", [version])
-        .map_err(|e| GhostError::Database(format!("set version: {e}")))?;
-    Ok(())
-}
-
-fn drop_all(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
-        "DROP TABLE IF EXISTS messages_fts;
-         DROP TABLE IF EXISTS message_references;
-         DROP TABLE IF EXISTS messages;
-         DROP TABLE IF EXISTS channel_read_state;
-         DROP TABLE IF EXISTS members;
-         DROP TABLE IF EXISTS channels;
-         DROP TABLE IF EXISTS pinned_servers;
-         DROP TABLE IF EXISTS pinned_groups;
-         DROP TABLE IF EXISTS servers;
-         DROP TABLE IF EXISTS groups;
-         DROP TABLE IF EXISTS relay_state;
-         DROP TABLE IF EXISTS device_config;
-         DROP TABLE IF EXISTS schema_version;"
-    )
-    .map_err(|e| GhostError::Database(format!("drop tables: {e}")))?;
-    conn.execute_batch("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);")
-        .map_err(|e| GhostError::Database(format!("recreate schema_version: {e}")))?;
-    Ok(())
-}
-
-fn create_tables(conn: &Connection) -> Result<()> {
     let text = MessageType::Text as u8;
 
     conn.execute_batch(&format!(
         "
-        CREATE TABLE servers (
+        CREATE TABLE IF NOT EXISTS servers (
             server_id  BLOB    PRIMARY KEY,
             name       TEXT    NOT NULL,
             kind       TEXT    NOT NULL DEFAULT 'server' CHECK(kind IN ('server', 'group', 'dm')),
@@ -81,7 +16,7 @@ fn create_tables(conn: &Connection) -> Result<()> {
             created_at INTEGER NOT NULL
         );
 
-        CREATE TABLE channels (
+        CREATE TABLE IF NOT EXISTS channels (
             channel_id BLOB    PRIMARY KEY,
             server_id  BLOB    NOT NULL REFERENCES servers(server_id) ON DELETE CASCADE,
             name       TEXT    NOT NULL,
@@ -89,7 +24,7 @@ fn create_tables(conn: &Connection) -> Result<()> {
             position   INTEGER NOT NULL
         );
 
-        CREATE TABLE members (
+        CREATE TABLE IF NOT EXISTS members (
             server_id    BLOB    NOT NULL REFERENCES servers(server_id) ON DELETE CASCADE,
             fingerprint  BLOB    NOT NULL,
             display_name TEXT    NOT NULL,
@@ -100,7 +35,7 @@ fn create_tables(conn: &Connection) -> Result<()> {
             PRIMARY KEY (server_id, fingerprint)
         );
 
-        CREATE TABLE messages (
+        CREATE TABLE IF NOT EXISTS messages (
             message_id   BLOB    PRIMARY KEY,
             channel_id   BLOB    NOT NULL REFERENCES channels(channel_id) ON DELETE CASCADE,
             sender_fp    BLOB    NOT NULL,
@@ -111,64 +46,64 @@ fn create_tables(conn: &Connection) -> Result<()> {
             expires_at   INTEGER
         );
 
-        CREATE INDEX idx_messages_channel_recv ON messages(channel_id, received_at DESC);
-        CREATE INDEX idx_messages_expires ON messages(expires_at) WHERE expires_at IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_messages_channel_recv ON messages(channel_id, received_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_messages_expires ON messages(expires_at) WHERE expires_at IS NOT NULL;
 
-        CREATE TABLE message_references (
+        CREATE TABLE IF NOT EXISTS message_references (
             message_id    BLOB NOT NULL REFERENCES messages(message_id) ON DELETE CASCADE,
             referenced_id BLOB NOT NULL,
             PRIMARY KEY (message_id, referenced_id)
         );
 
-        CREATE VIRTUAL TABLE messages_fts USING fts5(
+        CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
             content,
             content='messages',
             content_rowid='rowid'
         );
 
-        -- FTS index for text messages
-        CREATE TRIGGER messages_fts_insert AFTER INSERT ON messages
+        CREATE TRIGGER IF NOT EXISTS messages_fts_insert AFTER INSERT ON messages
         WHEN NEW.message_type = {text}
         BEGIN
             INSERT INTO messages_fts(rowid, content) VALUES (NEW.rowid, NEW.content);
         END;
 
-        CREATE TRIGGER messages_fts_delete AFTER DELETE ON messages
+        CREATE TRIGGER IF NOT EXISTS messages_fts_delete AFTER DELETE ON messages
         WHEN OLD.message_type = {text}
         BEGIN
             INSERT INTO messages_fts(messages_fts, rowid, content) VALUES ('delete', OLD.rowid, OLD.content);
         END;
 
-        CREATE TRIGGER messages_fts_update_del BEFORE UPDATE ON messages
+        CREATE TRIGGER IF NOT EXISTS messages_fts_update_del BEFORE UPDATE ON messages
         WHEN OLD.message_type = {text}
         BEGIN
             INSERT INTO messages_fts(messages_fts, rowid, content) VALUES ('delete', OLD.rowid, OLD.content);
         END;
 
-        CREATE TRIGGER messages_fts_update_ins AFTER UPDATE ON messages
+        CREATE TRIGGER IF NOT EXISTS messages_fts_update_ins AFTER UPDATE ON messages
         WHEN NEW.message_type = {text}
         BEGIN
             INSERT INTO messages_fts(rowid, content) VALUES (NEW.rowid, NEW.content);
         END;
 
-        CREATE TABLE pinned_servers (
-            server_id BLOB PRIMARY KEY REFERENCES servers(server_id) ON DELETE CASCADE,
-            pinned_at INTEGER NOT NULL
-        );
-
-        CREATE TABLE channel_read_state (
+        CREATE TABLE IF NOT EXISTS channel_read_state (
             channel_id   BLOB PRIMARY KEY REFERENCES channels(channel_id) ON DELETE CASCADE,
             last_read_ts INTEGER NOT NULL
         );
 
-        CREATE TABLE relay_state (
+        CREATE TABLE IF NOT EXISTS relay_state (
             mailbox_id    BLOB PRIMARY KEY,
             last_seen_seq INTEGER NOT NULL DEFAULT 0
         );
 
-        CREATE TABLE device_config (
+        CREATE TABLE IF NOT EXISTS device_config (
             key   TEXT PRIMARY KEY,
             value BLOB NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS sync_state (
+            key   TEXT PRIMARY KEY,
+            value BLOB,
+            ts    INTEGER NOT NULL
         );
         "
     ))

@@ -3,9 +3,9 @@ pub mod device_config;
 pub mod servers;
 pub mod members;
 pub mod messages;
-pub mod pins;
 pub mod read_state;
 pub mod relay_state;
+pub mod sync_state;
 mod schema;
 
 use std::path::Path;
@@ -558,36 +558,6 @@ mod tests {
         assert_eq!(got.sender_fp, m.fingerprint);
     }
 
-    // -- Pin tests --
-
-    #[test]
-    fn pin_unpin_server() {
-        let store = test_store();
-        let s = make_server("pinnable");
-        store.insert_server(&s).unwrap();
-
-        store.pin_server(&s.server_id, 5000).unwrap();
-        assert!(store.is_pinned(&s.server_id).unwrap());
-
-        let pins = store.list_pinned_server_ids().unwrap();
-        assert_eq!(pins.len(), 1);
-        assert_eq!(pins[0], s.server_id);
-
-        store.unpin_server(&s.server_id).unwrap();
-        assert!(!store.is_pinned(&s.server_id).unwrap());
-        assert!(store.list_pinned_server_ids().unwrap().is_empty());
-    }
-
-    #[test]
-    fn pin_cascades_on_server_delete() {
-        let store = test_store();
-        let s = make_server("temp");
-        store.insert_server(&s).unwrap();
-        store.pin_server(&s.server_id, 5000).unwrap();
-        store.delete_server(&s.server_id).unwrap();
-        assert!(store.list_pinned_server_ids().unwrap().is_empty());
-    }
-
     // -- Encrypted DB tests --
 
     #[test]
@@ -697,5 +667,83 @@ mod tests {
         // Unbalanced quote — FTS5 may error, but must not panic
         let _ = store.search_messages(&c.channel_id, "\"unclosed");
         let _ = store.search_messages(&c.channel_id, "OR AND NOT");
+    }
+
+    // -- Sync state tests --
+
+    #[test]
+    fn sync_set_get_roundtrip() {
+        let store = test_store();
+        let applied = store.sync_set("order:servers", b"hello", 100).unwrap();
+        assert!(applied);
+        let (value, ts) = store.sync_get("order:servers").unwrap().unwrap();
+        assert_eq!(value.unwrap(), b"hello");
+        assert_eq!(ts, 100);
+    }
+
+    #[test]
+    fn sync_set_newer_wins() {
+        let store = test_store();
+        store.sync_set("k", b"old", 100).unwrap();
+        let applied = store.sync_set("k", b"new", 200).unwrap();
+        assert!(applied);
+        let (value, ts) = store.sync_get("k").unwrap().unwrap();
+        assert_eq!(value.unwrap(), b"new");
+        assert_eq!(ts, 200);
+    }
+
+    #[test]
+    fn sync_set_older_loses() {
+        let store = test_store();
+        store.sync_set("k", b"winner", 200).unwrap();
+        let applied = store.sync_set("k", b"loser", 100).unwrap();
+        assert!(!applied);
+        let (value, _) = store.sync_get("k").unwrap().unwrap();
+        assert_eq!(value.unwrap(), b"winner");
+    }
+
+    #[test]
+    fn sync_remove_tombstone() {
+        let store = test_store();
+        store.sync_set("k", b"val", 100).unwrap();
+        let applied = store.sync_remove("k", 200).unwrap();
+        assert!(applied);
+        let (value, ts) = store.sync_get("k").unwrap().unwrap();
+        assert!(value.is_none());
+        assert_eq!(ts, 200);
+    }
+
+    #[test]
+    fn sync_remove_older_loses() {
+        let store = test_store();
+        store.sync_set("k", b"val", 200).unwrap();
+        let applied = store.sync_remove("k", 100).unwrap();
+        assert!(!applied);
+        let (value, _) = store.sync_get("k").unwrap().unwrap();
+        assert_eq!(value.unwrap(), b"val");
+    }
+
+    #[test]
+    fn sync_dump_import_roundtrip() {
+        let store1 = test_store();
+        store1.sync_set("order:servers", b"\x01", 100).unwrap();
+        store1.sync_set("read:bb", b"\x02", 200).unwrap();
+        store1.sync_remove("order:channels", 150).unwrap();
+
+        let dump = store1.sync_dump().unwrap();
+        assert_eq!(dump.len(), 3);
+
+        let store2 = test_store();
+        store2.sync_import(&dump).unwrap();
+
+        let (v1, t1) = store2.sync_get("order:servers").unwrap().unwrap();
+        assert_eq!(v1.unwrap(), b"\x01");
+        assert_eq!(t1, 100);
+
+        let (v2, _) = store2.sync_get("read:bb").unwrap().unwrap();
+        assert_eq!(v2.unwrap(), b"\x02");
+
+        let (v3, _) = store2.sync_get("order:channels").unwrap().unwrap();
+        assert!(v3.is_none()); // tombstone
     }
 }

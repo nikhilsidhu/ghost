@@ -17,14 +17,11 @@ export const listChannels = (serverId: string) =>
 export const listMembers = (serverId: string) =>
   invoke<Member[]>("list_members", { serverId });
 
-export const pinServer = (serverId: string) =>
-  invoke<void>("pin_server", { serverId });
+export const saveServerOrder = (order: string[]) =>
+  invoke<void>("save_server_order", { order });
 
-export const unpinServer = (serverId: string) =>
-  invoke<void>("unpin_server", { serverId });
-
-export const listPinnedServers = () =>
-  invoke<string[]>("list_pinned_servers");
+export const getServerOrder = () =>
+  invoke<string[]>("get_server_order");
 
 export const listMessages = (channelId: string, before?: number, limit?: number) =>
   invoke<Message[]>("list_messages", { channelId, before, limit });

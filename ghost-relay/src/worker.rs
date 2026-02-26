@@ -11,10 +11,6 @@ pub async fn run(state: AppState) {
         interval.tick().await;
 
         let now = now_millis();
-        let ttl_ms = state.config.ttl.as_millis() as u64;
-        let cutoff = now.saturating_sub(ttl_ms);
-
-        let _ = state.storage.sweep_expired(cutoff);
 
         // Sweep expired invites
         {

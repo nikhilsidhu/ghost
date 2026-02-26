@@ -352,6 +352,7 @@ pub enum SyncMessageType {
     ServerProvisioned = 0x01,
     ServerLeft = 0x02,
     VoiceTakeover = 0x03,
+    MutationSync = 0x04,
 }
 
 /// Encrypt a sync message with AES-256-GCM. Returns nonce || ciphertext.
@@ -413,6 +414,111 @@ pub fn sync_verify(signed: &[u8]) -> Result<([u8; 32], Vec<u8>)> {
         .map_err(|e| GhostError::Format(format!("sync signature invalid: {e}")))?;
 
     Ok((vk_bytes, payload.to_vec()))
+}
+
+// --- Mutation sync wire format ---
+
+pub const MUTATION_SET: u8 = 0x01;
+pub const MUTATION_REMOVE: u8 = 0x02;
+pub const SYNC_KEY_SERVER_ORDER: &str = "order:servers";
+pub const SYNC_KEY_READ_PREFIX: &str = "read:";
+
+/// Encode a mutation: [op:1][ts:8 BE][key_len:2 BE][key bytes][value bytes]
+pub fn encode_mutation(op: u8, ts: u64, key: &str, value: &[u8]) -> Vec<u8> {
+    let key_bytes = key.as_bytes();
+    let mut buf = Vec::with_capacity(1 + 8 + 2 + key_bytes.len() + value.len());
+    buf.push(op);
+    buf.extend_from_slice(&ts.to_be_bytes());
+    buf.extend_from_slice(&(key_bytes.len() as u16).to_be_bytes());
+    buf.extend_from_slice(key_bytes);
+    buf.extend_from_slice(value);
+    buf
+}
+
+/// Decode a mutation. Returns (op, ts, key, value).
+pub fn decode_mutation(data: &[u8]) -> Result<(u8, u64, String, Vec<u8>)> {
+    if data.len() < 11 {
+        return Err(GhostError::Format("mutation too short".into()));
+    }
+    let op = data[0];
+    let ts = u64::from_be_bytes(data[1..9].try_into().unwrap());
+    let key_len = u16::from_be_bytes(data[9..11].try_into().unwrap()) as usize;
+    if data.len() < 11 + key_len {
+        return Err(GhostError::Format("mutation key truncated".into()));
+    }
+    let key = std::str::from_utf8(&data[11..11 + key_len])
+        .map_err(|e| GhostError::Format(format!("mutation key: {e}")))?
+        .to_string();
+    let value = data[11 + key_len..].to_vec();
+    Ok((op, ts, key, value))
+}
+
+/// Encode a sync state dump for provision blob.
+/// Wire: [count:2 BE] then for each: [key_len:2 BE][key][ts:8 BE][value_len:2 BE][value]
+/// value_len 0xFFFF = NULL tombstone.
+pub fn encode_sync_state_dump(entries: &[(String, Option<Vec<u8>>, u64)]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&(entries.len() as u16).to_be_bytes());
+    for (key, value, ts) in entries {
+        let kb = key.as_bytes();
+        buf.extend_from_slice(&(kb.len() as u16).to_be_bytes());
+        buf.extend_from_slice(kb);
+        buf.extend_from_slice(&ts.to_be_bytes());
+        match value {
+            Some(v) => {
+                buf.extend_from_slice(&(v.len() as u16).to_be_bytes());
+                buf.extend_from_slice(v);
+            }
+            None => {
+                buf.extend_from_slice(&0xFFFFu16.to_be_bytes());
+            }
+        }
+    }
+    buf
+}
+
+/// Decode a sync state dump from provision blob.
+pub fn decode_sync_state_dump(data: &[u8]) -> Result<Vec<(String, Option<Vec<u8>>, u64)>> {
+    if data.len() < 2 {
+        return Err(GhostError::Format("sync dump too short".into()));
+    }
+    let count = u16::from_be_bytes(data[0..2].try_into().unwrap()) as usize;
+    let mut pos = 2;
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        if pos + 2 > data.len() {
+            return Err(GhostError::Format("sync dump: key_len truncated".into()));
+        }
+        let key_len = u16::from_be_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
+        pos += 2;
+        if pos + key_len > data.len() {
+            return Err(GhostError::Format("sync dump: key truncated".into()));
+        }
+        let key = std::str::from_utf8(&data[pos..pos + key_len])
+            .map_err(|e| GhostError::Format(format!("sync dump key: {e}")))?
+            .to_string();
+        pos += key_len;
+        if pos + 8 > data.len() {
+            return Err(GhostError::Format("sync dump: ts truncated".into()));
+        }
+        let ts = u64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
+        pos += 8;
+        if pos + 2 > data.len() {
+            return Err(GhostError::Format("sync dump: value_len truncated".into()));
+        }
+        let value_len = u16::from_be_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
+        pos += 2;
+        if value_len == 0xFFFF {
+            entries.push((key, None, ts));
+        } else {
+            if pos + value_len > data.len() {
+                return Err(GhostError::Format("sync dump: value truncated".into()));
+            }
+            entries.push((key, Some(data[pos..pos + value_len].to_vec()), ts));
+            pos += value_len;
+        }
+    }
+    Ok(entries)
 }
 
 /// Wrap a sync ciphertext in a relay-compatible envelope.
@@ -1117,5 +1223,40 @@ mod tests {
     #[test]
     fn sync_verify_rejects_too_short() {
         assert!(sync_verify(&[0u8; 95]).is_err());
+    }
+
+    #[test]
+    fn mutation_encode_decode_set() {
+        let encoded = encode_mutation(MUTATION_SET, 12345, "order:servers", &[0x01, 0x02]);
+        let (op, ts, key, value) = decode_mutation(&encoded).unwrap();
+        assert_eq!(op, MUTATION_SET);
+        assert_eq!(ts, 12345);
+        assert_eq!(key, "order:servers");
+        assert_eq!(value, &[0x01, 0x02]);
+    }
+
+    #[test]
+    fn mutation_encode_decode_remove() {
+        let encoded = encode_mutation(MUTATION_REMOVE, 99999, "read:ccdd", &[]);
+        let (op, ts, key, value) = decode_mutation(&encoded).unwrap();
+        assert_eq!(op, MUTATION_REMOVE);
+        assert_eq!(ts, 99999);
+        assert_eq!(key, "read:ccdd");
+        assert!(value.is_empty());
+    }
+
+    #[test]
+    fn sync_state_dump_roundtrip() {
+        let entries = vec![
+            ("order:servers".to_string(), Some(vec![0x01]), 100),
+            ("read:bb".to_string(), Some(vec![0x02, 0x03]), 200),
+            ("order:channels".to_string(), None, 150), // tombstone
+        ];
+        let encoded = encode_sync_state_dump(&entries);
+        let decoded = decode_sync_state_dump(&encoded).unwrap();
+        assert_eq!(decoded.len(), 3);
+        assert_eq!(decoded[0], entries[0]);
+        assert_eq!(decoded[1], entries[1]);
+        assert_eq!(decoded[2], entries[2]);
     }
 }

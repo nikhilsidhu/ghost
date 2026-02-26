@@ -4,6 +4,7 @@ mod idlog;
 pub(crate) mod pair;
 mod recovery;
 mod server_info;
+mod sync_state;
 mod health;
 mod invite;
 mod voice;
@@ -37,6 +38,7 @@ pub fn router(state: AppState) -> Router {
         .route("/pair/{account_fp}/response", get(pair::get_response))
         .route("/pair/{account_fp}/provision", put(pair::put_provision).get(pair::get_provision))
         .route("/recovery/{account_fp}", put(recovery::put).get(recovery::get))
+        .route("/sync_state/{account_fp}", put(sync_state::put).get(sync_state::get))
         .route("/ws/{mailbox_id}", get(ws::ws_upgrade))
         .route("/voice/{channel_id}", get(voice::ws_upgrade))
         .route("/invite", post(invite::register))

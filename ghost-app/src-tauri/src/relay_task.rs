@@ -11,13 +11,18 @@ use ghost_core::mls::presence::OnlineStatus;
 use ghost_core::mls::voice::PresenceState;
 use ghost_core::relay::{RelayClient, RelayEvent};
 use ghost_core::storage::{Channel, Member, MemberRole};
-use ghost_core::wire::{decode_metadata, ChannelOpPayload, MetadataPayload, ProvisionPayload, sync_mailbox_id, sync_open, sync_verify};
+use ghost_core::wire::{decode_metadata, ChannelOpPayload, MetadataPayload, ProvisionPayload, SyncMessageType, sync_mailbox_id, sync_open, sync_verify};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 use tokio::sync::{mpsc, Mutex};
 
 use crate::dto::MessageDto;
 use crate::presence::{self, PresenceInfo};
+
+fn parse_hex32(hex: &str) -> std::result::Result<[u8; 32], String> {
+    let bytes = hex::decode(hex).map_err(|e| e.to_string())?;
+    bytes.try_into().map_err(|_| "not 32 bytes".into())
+}
 
 async fn rebroadcast_presence(
     client: &Arc<Mutex<GhostClient>>,
@@ -258,6 +263,15 @@ pub async fn run(
                 if connected {
                     connected_mailboxes.insert(mailbox_id);
                     rebroadcast_presence(&client, &relay, &mailbox_id, &presence).await;
+                    // On sync mailbox connect: GET snapshot, import, PUT merged state (background)
+                    if mailbox_id == sync_mb {
+                        let app2 = app.clone();
+                        let client2 = client.clone();
+                        let relay2 = relay.clone();
+                        tokio::spawn(async move {
+                            fetch_and_merge_sync_state(&app2, &client2, &relay2).await;
+                        });
+                    }
                 } else {
                     connected_mailboxes.remove(&mailbox_id);
                 }
@@ -282,11 +296,10 @@ async fn handle_sync_blob(
     }
     let sealed = &envelope_blob[ghost_wire::ENVELOPE_HEADER_SIZE..];
 
-    // Decrypt
     let decrypted = match sync_open(sync_key, sealed) {
         Ok(pt) => pt,
         Err(e) => {
-            eprintln!("sync: decrypt failed: {e}");
+            eprintln!("sync: decrypt failed, skipping: {e}");
             return;
         }
     };
@@ -334,7 +347,6 @@ async fn handle_sync_blob(
     let msg_type = plaintext[0];
     let body = &plaintext[1..];
 
-    use ghost_core::wire::SyncMessageType;
     match msg_type {
         x if x == SyncMessageType::ServerProvisioned as u8 => {
             // ServerProvisioned — join via external commit
@@ -460,9 +472,148 @@ async fn handle_sync_blob(
             let channel_id: [u8; 32] = body[..32].try_into().unwrap();
             let _ = app.emit("voice-takeover", hex::encode(channel_id));
         }
+        x if x == SyncMessageType::MutationSync as u8 => {
+            use ghost_core::wire::{decode_mutation, MUTATION_SET, MUTATION_REMOVE};
+            let (op, ts, key, value) = match decode_mutation(body) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("sync: bad mutation: {e}");
+                    return;
+                }
+            };
+
+            let applied = {
+                let c = client.lock().await;
+                match op {
+                    MUTATION_SET => c.sync_set(&key, &value, ts).unwrap_or(false),
+                    MUTATION_REMOVE => c.sync_remove(&key, ts).unwrap_or(false),
+                    _ => false,
+                }
+            };
+            if !applied { return; }
+
+            // Apply side effects to data tables
+            if key == ghost_core::wire::SYNC_KEY_SERVER_ORDER {
+                let _ = app.emit("sync-server-order", "");
+            } else if let Some(id_hex) = key.strip_prefix(ghost_core::wire::SYNC_KEY_READ_PREFIX) {
+                if op == MUTATION_SET && value.len() == 8 {
+                    let read_ts = u64::from_be_bytes(value[..8].try_into().unwrap());
+                    if let Ok(cid) = parse_hex32(id_hex) {
+                        let c = client.lock().await;
+                        let _ = c.store().mark_channel_read(&cid, read_ts);
+                    }
+                }
+                let _ = app.emit("sync-read-state", "");
+            }
+        }
         _ => {
             eprintln!("sync: unknown message type {msg_type:#04x}");
         }
+    }
+}
+
+/// On sync mailbox connect: GET relay snapshot, LWW-import, apply side effects, PUT merged state back.
+async fn fetch_and_merge_sync_state(
+    app: &AppHandle,
+    client: &Arc<Mutex<GhostClient>>,
+    relay: &Arc<Mutex<RelayClient>>,
+) {
+    use ghost_core::wire::{decode_sync_state_dump, encode_sync_state_dump, sync_open, sync_seal, SYNC_KEY_SERVER_ORDER, SYNC_KEY_READ_PREFIX};
+
+    let (sync_key, account_fp) = {
+        let c = client.lock().await;
+        match c.sync_key() {
+            Some(k) => (k, *c.fingerprint()),
+            None => return,
+        }
+    };
+
+    // GET encrypted snapshot from relay (lock dropped before branching)
+    let get_result = {
+        let r = relay.lock().await;
+        r.get_sync_state(&account_fp).await
+    };
+
+    let sealed = match get_result {
+        Ok(Some(data)) => data,
+        Ok(None) => {
+            // No snapshot yet — push our local state as the initial one
+            let dump_blob = {
+                let c = client.lock().await;
+                let entries = c.sync_dump().unwrap_or_default();
+                encode_sync_state_dump(&entries)
+            };
+            if let Ok(s) = sync_seal(&sync_key, &dump_blob) {
+                let r = relay.lock().await;
+                let _ = r.put_sync_state(&account_fp, s).await;
+            }
+            return;
+        }
+        Err(e) => {
+            eprintln!("sync: failed to GET sync_state: {e}");
+            return;
+        }
+    };
+
+    // Decrypt
+    let dump_bytes = match sync_open(&sync_key, &sealed) {
+        Ok(pt) => pt,
+        Err(e) => {
+            eprintln!("sync: failed to decrypt sync_state snapshot: {e}");
+            return;
+        }
+    };
+
+    // Decode
+    let entries = match decode_sync_state_dump(&dump_bytes) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("sync: failed to decode sync_state snapshot: {e}");
+            return;
+        }
+    };
+
+    // Import via LWW and apply side effects
+    let mut order_changed = false;
+    let mut read_changed = false;
+
+    {
+        let c = client.lock().await;
+        c.sync_import(&entries).unwrap_or_default();
+
+        for (key, value, _ts) in &entries {
+            if key == SYNC_KEY_SERVER_ORDER {
+                order_changed = true;
+            } else if let Some(id_hex) = key.strip_prefix(SYNC_KEY_READ_PREFIX) {
+                if let Some(val) = value {
+                    if val.len() == 8 {
+                        let read_ts = u64::from_be_bytes(val[..8].try_into().unwrap());
+                        if let Ok(cid) = parse_hex32(id_hex) {
+                            let _ = c.store().mark_channel_read(&cid, read_ts);
+                        }
+                    }
+                }
+                read_changed = true;
+            }
+        }
+    }
+
+    if order_changed {
+        let _ = app.emit("sync-server-order", "");
+    }
+    if read_changed {
+        let _ = app.emit("sync-read-state", "");
+    }
+
+    // PUT our merged state back
+    let merged_blob = {
+        let c = client.lock().await;
+        let merged = c.sync_dump().unwrap_or_default();
+        encode_sync_state_dump(&merged)
+    };
+    if let Ok(s) = sync_seal(&sync_key, &merged_blob) {
+        let r = relay.lock().await;
+        let _ = r.put_sync_state(&account_fp, s).await;
     }
 }
 

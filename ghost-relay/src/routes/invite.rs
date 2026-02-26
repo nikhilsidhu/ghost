@@ -26,7 +26,7 @@ pub async fn register(
 
     // Clamp expiry so clients can't keep invites alive forever
     let now = now_millis();
-    let max_expires = now + state.config.ttl.as_millis() as u64;
+    let max_expires = now + 72 * 3600 * 1000; // 72h max invite lifetime
     let expires_at = body.expires_at.min(max_expires);
 
     let mut invites = state.invites.write().await;

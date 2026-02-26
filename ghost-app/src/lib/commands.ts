@@ -1,6 +1,6 @@
 import {
   servers, selectedServerId, channels, allChannels,
-  pinnedServerIds, desiredChannelKind, contacts,
+  desiredChannelKind, contacts,
   selectServer, selectChannel, selectDm, refreshServers, refreshChannels, refreshAllMembers,
   updateIdentity, setInviteLink, setShowInfo, setDesiredChannelKind,
 } from "./store";
@@ -58,9 +58,7 @@ const serverProvider: SearchProvider = (q) => {
         return aStarts - bStarts;
       });
   }
-  const pinned = sList.filter((s) => pinnedServerIds().has(s.server_id));
-  const rest = sList.filter((s) => !pinnedServerIds().has(s.server_id));
-  return [...pinned, ...rest].map((s) => ({
+  return sList.map((s) => ({
     id: s.server_id,
     label: s.name,
     iconKey: s.server_id,

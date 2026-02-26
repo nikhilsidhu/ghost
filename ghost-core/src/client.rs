@@ -127,6 +127,26 @@ impl GhostClient {
         self.store.set_config_blob("sync_key", &key)
     }
 
+    pub fn sync_get(&self, key: &str) -> Result<Option<(Option<Vec<u8>>, u64)>> {
+        self.store.sync_get(key)
+    }
+
+    pub fn sync_set(&self, key: &str, value: &[u8], ts: u64) -> Result<bool> {
+        self.store.sync_set(key, value, ts)
+    }
+
+    pub fn sync_remove(&self, key: &str, ts: u64) -> Result<bool> {
+        self.store.sync_remove(key, ts)
+    }
+
+    pub fn sync_dump(&self) -> Result<Vec<(String, Option<Vec<u8>>, u64)>> {
+        self.store.sync_dump()
+    }
+
+    pub fn sync_import(&self, entries: &[(String, Option<Vec<u8>>, u64)]) -> Result<()> {
+        self.store.sync_import(entries)
+    }
+
     /// Export server metadata for provisioning a sibling device (no role check).
     pub fn export_provision_payload(&self, server_id: &[u8; 32]) -> Result<ProvisionPayload> {
         let group = self.servers.get(server_id).ok_or_else(|| {

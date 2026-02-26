@@ -538,6 +538,56 @@ impl RelayClient {
         Ok(())
     }
 
+    /// Store encrypted sync state snapshot on relay.
+    pub async fn put_sync_state(
+        &self,
+        account_fp: &[u8; 32],
+        data: Vec<u8>,
+    ) -> Result<()> {
+        let resp = self
+            .http
+            .put(format!(
+                "{}/sync_state/{}",
+                self.base_url,
+                hex::encode(account_fp),
+            ))
+            .body(data)
+            .send()
+            .await
+            .map_err(|e| GhostError::Network(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(GhostError::Network(format!("put sync_state: {}", resp.status())));
+        }
+        Ok(())
+    }
+
+    /// Fetch encrypted sync state snapshot from relay.
+    pub async fn get_sync_state(
+        &self,
+        account_fp: &[u8; 32],
+    ) -> Result<Option<Vec<u8>>> {
+        let resp = self
+            .http
+            .get(format!(
+                "{}/sync_state/{}",
+                self.base_url,
+                hex::encode(account_fp),
+            ))
+            .send()
+            .await
+            .map_err(|e| GhostError::Network(e.to_string()))?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            return Err(GhostError::Network(format!("get sync_state: {}", resp.status())));
+        }
+        resp.bytes()
+            .await
+            .map(|b| Some(b.to_vec()))
+            .map_err(|e| GhostError::Network(e.to_string()))
+    }
+
     /// Fetch encrypted recovery blob from relay.
     pub async fn get_recovery_blob(
         &self,

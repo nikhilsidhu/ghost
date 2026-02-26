@@ -55,8 +55,6 @@ impl Storage {
                  PRIMARY KEY (mailbox_id, seq)
              ) WITHOUT ROWID;
 
-             CREATE INDEX IF NOT EXISTS idx_log_expiry ON log(received_at);
-
              CREATE TABLE IF NOT EXISTS server_info (
                  mailbox_id BLOB PRIMARY KEY,
                  data BLOB NOT NULL,
@@ -87,6 +85,12 @@ impl Storage {
              ) WITHOUT ROWID;
 
              CREATE TABLE IF NOT EXISTS recovery_blob (
+                 account_fp BLOB NOT NULL PRIMARY KEY,
+                 data BLOB NOT NULL,
+                 updated_at INTEGER NOT NULL
+             );
+
+             CREATE TABLE IF NOT EXISTS sync_state (
                  account_fp BLOB NOT NULL PRIMARY KEY,
                  data BLOB NOT NULL,
                  updated_at INTEGER NOT NULL
@@ -442,17 +446,29 @@ impl Storage {
         .map_err(|e| RelayError::Storage(e.to_string()))
     }
 
-    /// Delete log entries older than `cutoff_millis`.
-    pub fn sweep_expired(&self, cutoff_millis: u64) -> Result<usize, RelayError> {
+    pub fn put_sync_state(&self, account_fp: &[u8; 32], data: &[u8]) -> Result<(), RelayError> {
         let conn = self.conn.lock().unwrap();
-        let deleted = conn
-            .execute(
-                "DELETE FROM log WHERE received_at < ?1",
-                params![cutoff_millis as i64],
-            )
-            .map_err(|e| RelayError::Storage(e.to_string()))?;
-        Ok(deleted)
+        conn.execute(
+            "INSERT INTO sync_state (account_fp, data, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT (account_fp) DO UPDATE SET data = ?2, updated_at = ?3",
+            params![account_fp.as_slice(), data, now_millis() as i64],
+        )
+        .map_err(|e| RelayError::Storage(e.to_string()))?;
+        Ok(())
     }
+
+    pub fn get_sync_state(&self, account_fp: &[u8; 32]) -> Result<Option<Vec<u8>>, RelayError> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT data FROM sync_state WHERE account_fp = ?1",
+            params![account_fp.as_slice()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| RelayError::Storage(e.to_string()))
+    }
+
 }
 
 #[cfg(test)]
@@ -729,21 +745,4 @@ mod tests {
         assert!(store.get_idlog(&fp, 0).unwrap().is_empty());
     }
 
-    #[test]
-    fn sweep_removes_old_entries() {
-        let store = Storage::open_in_memory().unwrap();
-        let mb = test_mailbox();
-        store.append(&mb, APP, 0, b"old").unwrap();
-        store.append(&mb, APP, 0, b"new").unwrap();
-
-        let entries = store.read_from(&mb, 0, 100).unwrap();
-        let cutoff = entries[0].received_at + 1;
-
-        // Both have ~same timestamp, so sweep with future cutoff removes all
-        let deleted = store.sweep_expired(cutoff + 1000).unwrap();
-        assert_eq!(deleted, 2);
-
-        let remaining = store.read_from(&mb, 0, 100).unwrap();
-        assert!(remaining.is_empty());
-    }
 }

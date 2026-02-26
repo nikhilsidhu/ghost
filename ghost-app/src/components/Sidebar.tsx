@@ -1,4 +1,4 @@
-import { createSignal, createEffect, on, onCleanup, For, Show } from "solid-js";
+import { createSignal, createEffect, on, onMount, onCleanup, For, Show } from "solid-js";
 import type { JSX } from "solid-js";
 import type { Server, Channel } from "../lib/types";
 import { hashGradient } from "../lib/gradients";
@@ -21,6 +21,8 @@ import {
 import { sections } from "../lib/settings-registry";
 import "../lib/settings";
 import { handleCreateChannel, handleCreateDm } from "../lib/commands";
+import { saveServerOrder, getServerOrder } from "../lib/api";
+import { listen } from "@tauri-apps/api/event";
 import { SettingsPanel } from "./SettingsPanel";
 import { ProfilePanel } from "./ProfilePanel";
 import { VoiceDock, VoiceChannelItem, VoiceParticipantList } from "./VoiceControls";
@@ -46,6 +48,19 @@ export function Sidebar() {
   const [channelOrder, setChannelOrder] = createSignal<string[]>([]);
   const [activeServerId, setActiveServerId] = createSignal<string | null>(null);
   const [activeChannelId, setActiveChannelId] = createSignal<string | null>(null);
+  const [orderLoaded, setOrderLoaded] = createSignal(false);
+
+  onMount(async () => {
+    const saved = await getServerOrder();
+    if (saved.length > 0) setServerOrder(saved);
+    setOrderLoaded(true);
+
+    const unlisten = await listen("sync-server-order", async () => {
+      const synced = await getServerOrder();
+      if (synced.length > 0) setServerOrder(synced);
+    });
+    onCleanup(unlisten);
+  });
 
   createEffect(on(selectedServerId, () => {
     setTextCollapsed(false);
@@ -53,6 +68,7 @@ export function Sidebar() {
   }));
 
   createEffect(on(servers, (gs) => {
+    if (!orderLoaded()) return;
     const current = serverOrder();
     const ids = gs.map((g) => g.server_id);
     const ordered = current.filter((id) => ids.includes(id));
@@ -115,6 +131,7 @@ export function Sidebar() {
           order.splice(fromIdx, 1);
           order.splice(toIdx, 0, from);
           setServerOrder(order);
+          saveServerOrder(order);
         }
       }
     }

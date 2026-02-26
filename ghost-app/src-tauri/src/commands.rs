@@ -60,6 +60,29 @@ async fn post_sync_message(state: &AppState, msg_type: u8, payload: &[u8]) {
     let _ = r.send(&mailbox_id, envelope).await;
 }
 
+/// Dump local sync state, encrypt, and PUT to relay as a snapshot for recovery.
+async fn push_sync_snapshot(state: &AppState) {
+    use ghost_core::wire::{encode_sync_state_dump, sync_seal};
+
+    let (sync_key, account_fp, dump_blob) = {
+        let c = state.client.lock().await;
+        let sk = match c.sync_key() {
+            Some(k) => k,
+            None => return,
+        };
+        let entries = c.sync_dump().unwrap_or_default();
+        (sk, *c.fingerprint(), encode_sync_state_dump(&entries))
+    };
+
+    let sealed = match sync_seal(&sync_key, &dump_blob) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+
+    let r = state.relay.lock().await;
+    let _ = r.put_sync_state(&account_fp, sealed).await;
+}
+
 #[tauri::command]
 pub async fn get_identity(state: State<'_, AppState>) -> Result<IdentityDto, String> {
     let client = state.client.lock().await;
@@ -188,33 +211,28 @@ pub async fn list_members(
 }
 
 #[tauri::command]
-pub async fn pin_server(server_id: String, state: State<'_, AppState>) -> Result<(), String> {
-    let sid = parse_id(&server_id)?;
-    let client = state.client.lock().await;
-    client
-        .store()
-        .pin_server(&sid, now_millis())
-        .map_err(|e| e.to_string())
+pub async fn save_server_order(order: Vec<String>, state: State<'_, AppState>) -> Result<(), String> {
+    use ghost_core::wire::{encode_mutation, MUTATION_SET, SyncMessageType, SYNC_KEY_SERVER_ORDER};
+    let ts = now_millis();
+    let value = serde_json::to_vec(&order).map_err(|e| e.to_string())?;
+    {
+        let client = state.client.lock().await;
+        let _ = client.sync_set(SYNC_KEY_SERVER_ORDER, &value, ts);
+    }
+    post_sync_message(&state, SyncMessageType::MutationSync as u8, &encode_mutation(MUTATION_SET, ts, SYNC_KEY_SERVER_ORDER, &value)).await;
+    push_sync_snapshot(&state).await;
+    Ok(())
 }
 
 #[tauri::command]
-pub async fn unpin_server(server_id: String, state: State<'_, AppState>) -> Result<(), String> {
-    let sid = parse_id(&server_id)?;
+pub async fn get_server_order(state: State<'_, AppState>) -> Result<Vec<String>, String> {
     let client = state.client.lock().await;
-    client
-        .store()
-        .unpin_server(&sid)
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub async fn list_pinned_servers(state: State<'_, AppState>) -> Result<Vec<String>, String> {
-    let client = state.client.lock().await;
-    let ids = client
-        .store()
-        .list_pinned_server_ids()
-        .map_err(|e| e.to_string())?;
-    Ok(ids.iter().map(hex::encode).collect())
+    match client.sync_get(ghost_core::wire::SYNC_KEY_SERVER_ORDER) {
+        Ok(Some((Some(value), _))) => {
+            serde_json::from_slice(&value).map_err(|e| e.to_string())
+        }
+        _ => Ok(vec![]),
+    }
 }
 
 #[tauri::command]
@@ -388,12 +406,18 @@ pub async fn mark_channel_read(
     channel_id: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    use ghost_core::wire::{encode_mutation, MUTATION_SET, SyncMessageType, SYNC_KEY_READ_PREFIX};
     let cid = parse_id(&channel_id)?;
-    let client = state.client.lock().await;
-    client
-        .store()
-        .mark_channel_read(&cid, now_millis())
-        .map_err(|e| e.to_string())
+    let ts = now_millis();
+    let key = format!("{SYNC_KEY_READ_PREFIX}{channel_id}");
+    {
+        let client = state.client.lock().await;
+        client.store().mark_channel_read(&cid, ts).map_err(|e| e.to_string())?;
+        let _ = client.sync_set(&key, &ts.to_be_bytes(), ts);
+    }
+    post_sync_message(&state, SyncMessageType::MutationSync as u8, &encode_mutation(MUTATION_SET, ts, &key, &ts.to_be_bytes())).await;
+    push_sync_snapshot(&state).await;
+    Ok(())
 }
 
 #[tauri::command]
@@ -1024,9 +1048,6 @@ pub async fn seed_test_data(state: State<'_, AppState>) -> Result<(), String> {
             expires_at: None, references: vec![],
         }).map_err(|e| e.to_string())?;
     }
-
-    // Pin the first server
-    store.pin_server(&g1, now).map_err(|e| e.to_string())?;
 
     Ok(())
 }
@@ -1660,6 +1681,28 @@ async fn consume_provision(
         }
     }
 
+    // Import sync state if present (new provision format)
+    if pos < plaintext.len() {
+        if let Ok(sync_entries) = ghost_core::wire::decode_sync_state_dump(&plaintext[pos..]) {
+            let client = state.client.lock().await;
+            let _ = client.sync_import(&sync_entries);
+
+            // Apply side effects to data tables
+            for (key, value, _ts) in &sync_entries {
+                if let Some(id_hex) = key.strip_prefix(ghost_core::wire::SYNC_KEY_READ_PREFIX) {
+                    if let Some(val) = value {
+                        if val.len() == 8 {
+                            let read_ts = u64::from_be_bytes(val[..8].try_into().unwrap());
+                            if let Ok(cid) = parse_id(id_hex) {
+                                let _ = client.store().mark_channel_read(&cid, read_ts);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -1788,7 +1831,7 @@ pub async fn check_pairing(state: State<'_, AppState>) -> Result<Option<String>,
             }
         }
 
-        // Serialize: [sync_key:32][count:u16][len:u32 + payload_bytes]...
+        // Serialize: [sync_key:32][count:u16][len:u32 + payload_bytes]...[sync_state_dump]
         let mut provision_pt = Vec::new();
         provision_pt.extend_from_slice(&sync_key);
         provision_pt.extend_from_slice(&(payloads.len() as u16).to_be_bytes());
@@ -1796,6 +1839,10 @@ pub async fn check_pairing(state: State<'_, AppState>) -> Result<Option<String>,
             provision_pt.extend_from_slice(&(p.len() as u32).to_be_bytes());
             provision_pt.extend_from_slice(p);
         }
+
+        // Append sync_state dump
+        let sync_entries = client.sync_dump().unwrap_or_default();
+        provision_pt.extend_from_slice(&ghost_core::wire::encode_sync_state_dump(&sync_entries));
 
         pairing_seal(&secret, &provision_pt)?
     };

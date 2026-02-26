@@ -3,7 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import type { Identity, Server, Channel, Member, Message, VoiceState, VoiceParticipants, VoiceSpeaking, VoiceMuteState, VoiceQuality, OnlinePresenceEvent } from "./types";
 import {
   getIdentity, listServers, listChannels, listMembers,
-  listPinnedServers, markChannelRead,
+  markChannelRead,
   joinVoice, leaveVoice, setVoiceMuted, setVoiceDeafened,
   getConfig,
   getCachedAvatar,
@@ -32,7 +32,6 @@ const [servers, setServers] = createSignal<Server[]>([]);
 const [selectedServerId, setSelectedServerId] = createSignal<string | null>(null);
 const [channels, setChannels] = createSignal<Channel[]>([]);
 const [members, setMembers] = createSignal<Member[]>([]);
-const [pinnedServerIds, setPinnedServerIds] = createSignal<Set<string>>(new Set());
 const [selectedChannelId, setSelectedChannelId] = createSignal<string | null>(null);
 const [allChannels, setAllChannels] = createSignal<Channel[]>([]);
 const [allMembers, setAllMembers] = createSignal<Member[]>([]);
@@ -183,9 +182,6 @@ const refreshAllMembers = async () => {
   setAllMembers(results.flat());
 };
 
-const refreshPins = async () => {
-  setPinnedServerIds(new Set(await listPinnedServers()));
-};
 
 const refreshMembers = async () => {
   const sid = selectedServerId();
@@ -254,7 +250,6 @@ const updateIdentity = async () => {
 const initialize = async () => {
   await updateIdentity();
   await refreshServers();
-  await refreshPins();
   await refreshAllChannels();
   await refreshAllMembers();
 
@@ -278,6 +273,11 @@ const initialize = async () => {
 
   listen<string>("display-name-sync", () => {
     updateIdentity();
+  });
+
+  listen("sync-read-state", () => {
+    refreshChannels();
+    refreshServers();
   });
 
   listen<Message>("message", (event) => {
@@ -443,13 +443,13 @@ const initialize = async () => {
 
 export {
   identity, servers, selectedServerId, channels, members,
-  pinnedServerIds, selectedChannelId, allChannels,
+  selectedChannelId, allChannels,
   inviteLink, showInfo, desiredChannelKind,
   selectedServer, selectedChannelName,
   dmViewActive, dms, serverList, contacts,
   selectServer, selectChannel, selectDm, activateDmView,
   updateIdentity, initialize,
-  refreshServers, refreshChannels, refreshPins, refreshAllChannels, refreshAllMembers,
+  refreshServers, refreshChannels, refreshAllChannels, refreshAllMembers,
   setInviteLink, setShowInfo, setDesiredChannelKind,
   settingsOpen, settingsCategory, setSettingsCategory, toggleSettings,
   profileOpen, setProfileOpen, toggleProfile, relayConnected, onlinePresence,
