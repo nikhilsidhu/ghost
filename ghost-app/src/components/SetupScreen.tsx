@@ -1,6 +1,7 @@
-import { createSignal, Show } from "solid-js";
+import { createSignal, Show, onCleanup } from "solid-js";
 import { setDisplayName, setRelayUrl, joinByInvite, joinAsNewDevice } from "../lib/api";
 import { Loader, MonitorSmartphone, ArrowLeft } from "lucide-solid";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 interface Props {
   onComplete: () => void;
@@ -54,21 +55,55 @@ export function SetupScreen(props: Props) {
     }
   };
 
+  let statusUnlisten: UnlistenFn | undefined;
+  onCleanup(() => statusUnlisten?.());
+
+  const validatePairingCode = (code: string): string | null => {
+    const parts = code.split("#");
+    if (parts.length !== 3) return "invalid format — should be relay_url#fingerprint#secret";
+    if (!parts[0].startsWith("http")) return "invalid relay url in pairing code";
+    if (parts[1].length !== 64) return "invalid fingerprint in pairing code";
+    if (parts[2].length !== 64) return "invalid secret in pairing code";
+    return null;
+  };
+
   const handleLinkDevice = async () => {
     const code = pairingCode().trim();
     if (!code) return;
 
+    const validationError = validatePairingCode(code);
+    if (validationError) {
+      setError(validationError);
+      return;
+    }
+
     setLoading(true);
     setError(null);
-    setLinkStatus("connecting to relay…");
+    setLinkStatus("connecting…");
+
+    statusUnlisten = await listen<string>("link-status", (e) => {
+      setLinkStatus(e.payload);
+    });
 
     try {
       await joinAsNewDevice(code);
       props.onComplete();
     } catch (e: any) {
-      setError(String(e));
+      const msg = String(e);
+      if (msg.includes("fetch offer: ")) {
+        setError("couldn't reach relay. check your connection and try again.");
+      } else if (msg.includes("404") || msg.includes("NotFound")) {
+        setError("pairing code expired. generate a new code on your other device.");
+      } else if (msg.includes("timed out")) {
+        setError("other device didn't respond. try again.");
+      } else {
+        setError(msg);
+      }
       setLinkStatus(null);
       setLoading(false);
+    } finally {
+      statusUnlisten?.();
+      statusUnlisten = undefined;
     }
   };
 

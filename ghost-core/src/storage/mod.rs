@@ -1,4 +1,5 @@
 pub mod channels;
+pub mod device_config;
 pub mod servers;
 pub mod members;
 pub mod messages;

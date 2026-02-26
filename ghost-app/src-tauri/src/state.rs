@@ -12,7 +12,7 @@ use crate::voice_task::VoiceHandle;
 pub struct AppState {
     pub client: Arc<Mutex<GhostClient>>,
     pub relay: Arc<Mutex<RelayClient>>,
-    pub relay_url: String,
+    pub relay_url: Arc<Mutex<String>>,
     pub http: reqwest::Client,
     pub config_path: PathBuf,
     pub config: Arc<Mutex<GhostConfig>>,

@@ -38,6 +38,24 @@ impl GhostStore {
         Ok(())
     }
 
+    pub fn insert_member_if_not_exists(&self, member: &Member) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO members (server_id, fingerprint, display_name, role, joined_at, avatar_hash, avatar_key) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    member.server_id.as_slice(),
+                    member.fingerprint.as_slice(),
+                    member.display_name,
+                    member.role.as_str(),
+                    member.joined_at,
+                    member.avatar_hash.map(|h| h.to_vec()),
+                    member.avatar_key.map(|k| k.to_vec()),
+                ],
+            )
+            .map_err(|e| GhostError::Database(format!("insert member if not exists: {e}")))?;
+        Ok(())
+    }
+
     pub fn get_member(&self, server_id: &[u8; 32], fingerprint: &[u8; 32]) -> Result<Member> {
         self.conn
             .query_row(

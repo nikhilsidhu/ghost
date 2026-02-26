@@ -19,6 +19,22 @@ impl GhostStore {
         Ok(())
     }
 
+    pub fn insert_server_if_not_exists(&self, server: &Server) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO servers (server_id, name, kind, creator_fp, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    server.server_id.as_slice(),
+                    server.name,
+                    server.kind.as_str(),
+                    server.creator_fp.as_slice(),
+                    server.created_at,
+                ],
+            )
+            .map_err(|e| GhostError::Database(format!("insert server if not exists: {e}")))?;
+        Ok(())
+    }
+
     pub fn get_server(&self, server_id: &[u8; 32]) -> Result<Server> {
         self.conn
             .query_row(

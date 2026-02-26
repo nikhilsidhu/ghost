@@ -15,7 +15,7 @@ use crate::storage::{
 };
 use crate::wire::{
     derive_default_channel_id, mls_group_mailbox_id, open, open_any, seal, ApplicationMessage,
-    InboundMessage, InviteChannel, InviteMember, InvitePayload, Outbound,
+    InboundMessage, InviteChannel, InviteMember, InvitePayload, Outbound, ProvisionPayload,
 };
 
 /// Open an encrypted SQLite connection for MLS state, separate from the app DB.
@@ -113,6 +113,122 @@ impl GhostClient {
 
     pub fn set_display_name(&mut self, name: String) {
         self.identity.display_name = name;
+    }
+
+    pub fn sync_key(&self) -> Option<[u8; 32]> {
+        self.store
+            .get_config_blob("sync_key")
+            .ok()
+            .flatten()
+            .and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok())
+    }
+
+    pub fn set_sync_key(&self, key: [u8; 32]) -> Result<()> {
+        self.store.set_config_blob("sync_key", &key)
+    }
+
+    /// Export server metadata for provisioning a sibling device (no role check).
+    pub fn export_provision_payload(&self, server_id: &[u8; 32]) -> Result<ProvisionPayload> {
+        let group = self.servers.get(server_id).ok_or_else(|| {
+            GhostError::ServerNotLoaded(hex::encode(&server_id[..8]))
+        })?;
+        let meta = self.store.get_server(server_id)?;
+        let members = self.store.list_members(server_id)?;
+        let channels = self.store.list_channels(server_id)?;
+        let mailbox_id = mls_group_mailbox_id(group.group_id());
+
+        Ok(ProvisionPayload {
+            server_id: *server_id,
+            server_name: meta.name,
+            kind: meta.kind,
+            members: members
+                .iter()
+                .map(|m| InviteMember {
+                    fingerprint: m.fingerprint,
+                    display_name: m.display_name.clone(),
+                    role: m.role,
+                })
+                .collect(),
+            channels: channels
+                .iter()
+                .map(|c| InviteChannel {
+                    channel_id: c.channel_id,
+                    name: c.name.clone(),
+                    kind: c.kind,
+                    position: c.position,
+                })
+                .collect(),
+            mailbox_id,
+        })
+    }
+
+    /// Join a server from a provision payload + fresh GroupInfo (handles duplicates).
+    /// Returns (commit_bytes_to_broadcast, mailbox_id).
+    pub fn join_from_provision(
+        &mut self,
+        payload: &ProvisionPayload,
+        group_info_bytes: &[u8],
+        timestamp: u64,
+    ) -> Result<(Vec<u8>, [u8; 32])> {
+        let (ghost_group, commit_bytes) = GhostGroup::join_by_external_commit(
+            &self.provider,
+            &self.identity,
+            group_info_bytes,
+        )?;
+
+        let creator_fp = payload
+            .members
+            .iter()
+            .find(|m| m.role == MemberRole::Creator)
+            .map(|m| m.fingerprint)
+            .unwrap_or([0u8; 32]);
+
+        self.store.insert_server_if_not_exists(&Server {
+            server_id: payload.server_id,
+            name: payload.server_name.clone(),
+            kind: payload.kind,
+            creator_fp,
+            created_at: timestamp,
+        })?;
+
+        for ch in &payload.channels {
+            self.store.insert_channel_if_not_exists(&Channel {
+                channel_id: ch.channel_id,
+                server_id: payload.server_id,
+                name: ch.name.clone(),
+                kind: ch.kind,
+                position: ch.position,
+            })?;
+        }
+
+        for m in &payload.members {
+            self.store.insert_member_if_not_exists(&Member {
+                server_id: payload.server_id,
+                fingerprint: m.fingerprint,
+                display_name: m.display_name.clone(),
+                role: m.role,
+                joined_at: timestamp,
+                avatar_hash: None,
+                avatar_key: None,
+            })?;
+        }
+
+        // Insert self as member
+        self.store.insert_member_if_not_exists(&Member {
+            server_id: payload.server_id,
+            fingerprint: self.identity.fingerprint,
+            display_name: self.identity.display_name.clone(),
+            role: MemberRole::Member,
+            joined_at: timestamp,
+            avatar_hash: None,
+            avatar_key: None,
+        })?;
+
+        let mailbox_id = mls_group_mailbox_id(ghost_group.group_id());
+        self.servers.insert(payload.server_id, ghost_group);
+        self.mailbox_map.insert(mailbox_id, payload.server_id);
+
+        Ok((commit_bytes, mailbox_id))
     }
 
     pub fn generate_key_package(&self) -> Result<KeyPackage> {
@@ -576,17 +692,47 @@ impl GhostClient {
         Ok(Outbound { mailbox_id, blob: commit_blob })
     }
 
+    /// Remove a specific device's leaf from all MLS groups by its verifying key.
+    /// Returns a list of (mailbox_id, commit_blob) to broadcast.
+    pub fn revoke_device_leaves(&mut self, device_vk: &[u8; 32]) -> Vec<Outbound> {
+        let server_ids: Vec<[u8; 32]> = self.servers.keys().copied().collect();
+        let mut outbound = Vec::new();
+        for sid in server_ids {
+            let group = match self.servers.get_mut(&sid) {
+                Some(g) => g,
+                None => continue,
+            };
+            let leaf_indices: Vec<_> = group
+                .members()
+                .filter(|m| m.signature_key.as_slice() == device_vk.as_slice())
+                .map(|m| m.index)
+                .collect();
+            if leaf_indices.is_empty() {
+                continue;
+            }
+            match group.remove_members(&self.provider, &leaf_indices) {
+                Ok(commit_blob) => {
+                    let mailbox_id = mls_group_mailbox_id(group.group_id());
+                    outbound.push(Outbound { mailbox_id, blob: commit_blob });
+                }
+                Err(e) => eprintln!("revoke: remove from {}: {e}", hex::encode(&sid[..8])),
+            }
+        }
+        outbound
+    }
+
     /// Derive a per-sender encryption key for voice in this server+channel.
     pub fn derive_voice_key(
         &self,
         server_id: &[u8; 32],
         channel_id: &[u8; 32],
         sender_fp: &[u8; 32],
+        device_vk: &[u8; 32],
     ) -> Result<[u8; 32]> {
         let group = self.servers.get(server_id).ok_or_else(|| {
             GhostError::ServerNotLoaded(hex::encode(&server_id[..8]))
         })?;
-        crate::mls::voice::derive_voice_key(group, &self.provider, channel_id, sender_fp)
+        crate::mls::voice::derive_voice_key(group, &self.provider, channel_id, sender_fp, device_vk)
     }
 
     /// Derive a per-sender presence encryption key for a voice channel.
@@ -615,6 +761,7 @@ impl GhostClient {
             fingerprint: self.identity.fingerprint,
             muted,
             deafened,
+            device_vk: *self.identity.verifying_key.as_bytes(),
         };
         crate::mls::voice::seal_presence(&key, &state)
     }

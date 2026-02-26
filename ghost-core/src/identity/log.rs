@@ -487,15 +487,19 @@ impl LogEntry {
 
         let signature: [u8; 64] = data[body_end..body_end + 64].try_into().unwrap();
         let has_counter = data[body_end + 64];
-        let counter_signature = if has_counter == 1 {
+        let (counter_signature, expected_len) = if has_counter == 1 {
             if data.len() < body_end + 65 + 64 {
                 return Err(err("too short for counter-signature"));
             }
             let cs: [u8; 64] = data[body_end + 65..body_end + 129].try_into().unwrap();
-            Some(cs)
+            (Some(cs), body_end + 129)
         } else {
-            None
+            (None, body_end + 65)
         };
+
+        if data.len() != expected_len {
+            return Err(err(&format!("{} trailing bytes", data.len() - expected_len)));
+        }
 
         Ok(LogEntry {
             seq,

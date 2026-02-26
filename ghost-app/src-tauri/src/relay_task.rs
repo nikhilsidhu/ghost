@@ -11,7 +11,7 @@ use ghost_core::mls::presence::OnlineStatus;
 use ghost_core::mls::voice::PresenceState;
 use ghost_core::relay::{RelayClient, RelayEvent};
 use ghost_core::storage::{Channel, Member, MemberRole};
-use ghost_core::wire::{decode_metadata, ChannelOpPayload, MetadataPayload};
+use ghost_core::wire::{decode_metadata, ChannelOpPayload, MetadataPayload, ProvisionPayload, sync_mailbox_id, sync_open};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 use tokio::sync::{mpsc, Mutex};
@@ -37,6 +37,12 @@ pub async fn run(
     presence: Arc<Mutex<PresenceInfo>>,
     data_dir: PathBuf,
 ) {
+    // Compute sync mailbox ID (key is read dynamically — may be created after pairing)
+    let sync_mb = {
+        let c = client.lock().await;
+        sync_mailbox_id(c.fingerprint())
+    };
+
     // Subscribe to all existing server mailboxes with persisted last_seen_seq
     {
         let c = client.lock().await;
@@ -45,6 +51,11 @@ pub async fn run(
         for (_, mailbox_id) in &mailboxes {
             let seq = c.store().get_last_seen_seq(mailbox_id).unwrap_or(0);
             r.subscribe(*mailbox_id, seq);
+        }
+        // Subscribe to sync mailbox if key exists
+        if c.sync_key().is_some() {
+            let seq = c.store().get_last_seen_seq(&sync_mb).unwrap_or(0);
+            r.subscribe(sync_mb, seq);
         }
     }
 
@@ -81,6 +92,20 @@ pub async fn run(
                 let received_at = blob.received_at;
                 let mailbox_id = blob.mailbox_id;
                 let seq = blob.seq;
+
+                // Handle sync mailbox blobs before server lookup
+                if mailbox_id == sync_mb {
+                    let key = { client.lock().await.sync_key() };
+                    if let Some(key) = key {
+                        handle_sync_blob(
+                            &app, &client, &relay, &key, &blob.payload, &data_dir,
+                        ).await;
+                        let c = client.lock().await;
+                        let _ = c.store().set_last_seen_seq(&sync_mb, seq);
+                    }
+                    continue;
+                }
+
                 let result = {
                     let mut c = client.lock().await;
                     match c.server_id_for_mailbox(&mailbox_id) {
@@ -92,9 +117,10 @@ pub async fn run(
                 match result {
                     Some((server_id, Ok(ReceiveResult::Message(msg)))) if msg.message_type == MessageType::Metadata => {
                         let mut fetch_avatar = None;
+                        let mut own_name_changed = false;
                         match decode_metadata(&msg.content) {
                             Ok(payload) => {
-                                let c = client.lock().await;
+                                let mut c = client.lock().await;
                                 match payload {
                                     MetadataPayload::ChannelOp(ChannelOpPayload::Create { channel_id, name, kind, position }) => {
                                         let _ = c.store().insert_channel(&Channel {
@@ -113,6 +139,10 @@ pub async fn run(
                                     }
                                     MetadataPayload::MemberAnnounce { display_name } => {
                                         let _ = c.store().update_member_name(&server_id, &msg.sender_fp, &display_name);
+                                        if msg.sender_fp == *c.fingerprint() {
+                                            c.set_display_name(display_name);
+                                            own_name_changed = true;
+                                        }
                                     }
                                     MetadataPayload::AvatarUpdate { avatar_hash, avatar_key } => {
                                         let _ = c.store().update_member_avatar(&server_id, &msg.sender_fp, &avatar_hash, &avatar_key);
@@ -132,6 +162,9 @@ pub async fn run(
                         }
                         if let Some((sid, fp, hash)) = fetch_avatar {
                             maybe_fetch_avatar(&client, &relay, &app, &data_dir, &sid, &fp, &hash).await;
+                        }
+                        if own_name_changed {
+                            let _ = app.emit("display-name-sync", ());
                         }
                         let _ = app.emit("sync", hex::encode(server_id));
                     }
@@ -230,6 +263,170 @@ pub async fn run(
                 }
                 let _ = app.emit("relay-connectivity", !connected_mailboxes.is_empty());
             }
+        }
+    }
+}
+
+async fn handle_sync_blob(
+    app: &AppHandle,
+    client: &Arc<Mutex<GhostClient>>,
+    relay: &Arc<Mutex<RelayClient>>,
+    sync_key: &[u8; 32],
+    envelope_blob: &[u8],
+    _data_dir: &std::path::Path,
+) {
+    // Strip envelope header
+    if envelope_blob.len() < ghost_wire::ENVELOPE_HEADER_SIZE {
+        eprintln!("sync: blob too short for envelope");
+        return;
+    }
+    let sealed = &envelope_blob[ghost_wire::ENVELOPE_HEADER_SIZE..];
+
+    // Decrypt
+    let plaintext = match sync_open(sync_key, sealed) {
+        Ok(pt) => pt,
+        Err(e) => {
+            eprintln!("sync: decrypt failed: {e}");
+            return;
+        }
+    };
+
+    if plaintext.is_empty() {
+        eprintln!("sync: empty payload");
+        return;
+    }
+
+    let msg_type = plaintext[0];
+    let body = &plaintext[1..];
+
+    use ghost_core::wire::SyncMessageType;
+    match msg_type {
+        x if x == SyncMessageType::ServerProvisioned as u8 => {
+            // ServerProvisioned — join via external commit
+            let payload = match ProvisionPayload::from_bytes(body) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("sync: bad provision payload: {e}");
+                    return;
+                }
+            };
+
+            // Fetch fresh GroupInfo and join with retry
+            let mut joined = false;
+            for _ in 0..3 {
+                let gi_bytes = {
+                    let r = relay.lock().await;
+                    match r.get_server_info(&payload.mailbox_id).await {
+                        Ok(gi) => gi,
+                        Err(_) => break,
+                    }
+                };
+
+                let result = {
+                    let mut c = client.lock().await;
+                    c.join_from_provision(&payload, &gi_bytes, now_ms())
+                };
+
+                match result {
+                    Ok((commit_bytes, mailbox_id)) => {
+                        // Broadcast external commit via HTTP POST (not WS — we aren't subscribed yet).
+                        // The returned seq lets us subscribe past pre-join history.
+                        let commit_seq = {
+                            let r = relay.lock().await;
+                            match r.post_blob(&mailbox_id, commit_bytes).await {
+                                Ok(seq) => seq,
+                                Err(e) => {
+                                    eprintln!("sync: failed to post external commit: {e}");
+                                    continue;
+                                }
+                            }
+                        };
+
+                        // Upload fresh GroupInfo
+                        {
+                            let c = client.lock().await;
+                            if let Ok(gi) = c.export_server_info(&payload.server_id) {
+                                let r = relay.lock().await;
+                                let _ = r.put_server_info(&mailbox_id, gi).await;
+                            }
+                        }
+
+                        // Subscribe from the commit seq — skips undecryptable pre-join blobs
+                        {
+                            let c = client.lock().await;
+                            let _ = c.store().set_last_seen_seq(&mailbox_id, commit_seq);
+                            drop(c);
+                            let mut r = relay.lock().await;
+                            r.subscribe(mailbox_id, commit_seq);
+                        }
+
+                        // Send member announce
+                        let announce = {
+                            let mut c = client.lock().await;
+                            let name = c.identity().display_name.clone();
+                            c.send_control(
+                                &payload.server_id,
+                                ghost_core::wire::encode_member_announce(&name),
+                            )
+                        };
+                        if let Ok(outbound) = announce {
+                            let r = relay.lock().await;
+                            let _ = r.send(&outbound.mailbox_id, outbound.blob).await;
+                        }
+
+                        joined = true;
+                        break;
+                    }
+                    Err(e) => {
+                        eprintln!("sync: join attempt failed for {}: {e}", hex::encode(&payload.server_id[..8]));
+                        continue;
+                    }
+                }
+            }
+
+            if !joined {
+                eprintln!("sync: failed to join server {} after retries", hex::encode(&payload.server_id[..8]));
+                return;
+            }
+
+            let _ = app.emit("sync", "all");
+        }
+        x if x == SyncMessageType::ServerLeft as u8 => {
+            // ServerLeft — remove local state, unsubscribe
+            if body.len() < 32 {
+                eprintln!("sync: ServerLeft body too short");
+                return;
+            }
+            let server_id: [u8; 32] = body[..32].try_into().unwrap();
+
+            let mailbox_id = {
+                let c = client.lock().await;
+                c.mailbox_id_for_server(&server_id)
+            };
+
+            {
+                let c = client.lock().await;
+                let _ = c.store().delete_server(&server_id);
+            }
+
+            if let Some(mb) = mailbox_id {
+                let mut r = relay.lock().await;
+                r.unsubscribe(&mb);
+            }
+
+            let _ = app.emit("kicked", hex::encode(server_id));
+        }
+        x if x == SyncMessageType::VoiceTakeover as u8 => {
+            // VoiceTakeover — other device joined voice, leave if we're in it
+            if body.len() < 32 {
+                eprintln!("sync: VoiceTakeover body too short");
+                return;
+            }
+            let channel_id: [u8; 32] = body[..32].try_into().unwrap();
+            let _ = app.emit("voice-takeover", hex::encode(channel_id));
+        }
+        _ => {
+            eprintln!("sync: unknown message type {msg_type:#04x}");
         }
     }
 }
@@ -396,7 +593,7 @@ async fn handle_voice_state(
                                 if let Ok(ps) = c.open_presence_blob(&server_id, &channel_id, &blob) {
                                     drop(c);
                                     if let Some(members) = voice_members.get_mut(&channel_id) {
-                                        members.retain(|m| m.fingerprint != ps.fingerprint);
+                                        members.retain(|m| !(m.fingerprint == ps.fingerprint && m.device_vk == ps.device_vk));
                                         if members.is_empty() {
                                             let empty: Vec<PresenceState> = Vec::new();
                                             emit_channel_members(app, &channel_id, &empty);
@@ -422,7 +619,7 @@ async fn handle_voice_state(
                                 drop(c);
                                 mailbox_channels.entry(*mailbox_id).or_default().insert(channel_id);
                                 let members = voice_members.entry(channel_id).or_default();
-                                if let Some(existing) = members.iter_mut().find(|m| m.fingerprint == ps.fingerprint) {
+                                if let Some(existing) = members.iter_mut().find(|m| m.fingerprint == ps.fingerprint && m.device_vk == ps.device_vk) {
                                     existing.muted = ps.muted;
                                     existing.deafened = ps.deafened;
                                 } else {

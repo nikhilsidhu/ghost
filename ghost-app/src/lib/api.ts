@@ -136,3 +136,4 @@ export const joinAsNewDevice = (pairingCode: string) =>
 // Dev testing
 export const createDevSession = () => invoke<Server>("create_dev_session");
 export const readDevSession = () => invoke<DevSession | null>("read_dev_session");
+export const spawnDevInstance = () => invoke<number>("spawn_dev_instance");

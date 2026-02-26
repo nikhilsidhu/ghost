@@ -134,6 +134,7 @@ fn main() {
             commands::cancel_pairing,
             commands::join_as_new_device,
             commands::exit_app,
+            commands::spawn_dev_instance,
         ])
         .run(tauri::generate_context!())
         .expect("error while running ghost");

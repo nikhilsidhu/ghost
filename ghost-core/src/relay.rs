@@ -75,7 +75,11 @@ impl RelayClient {
         let client = Self {
             base_url: base,
             ws_base_url: ws_base,
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .build()
+                .unwrap_or_default(),
             event_tx,
             connections: HashMap::new(),
         };
@@ -130,6 +134,35 @@ impl RelayClient {
             .send(WsOutgoing::Text(text))
             .await
             .map_err(|_| GhostError::Network("ws connection closed".into()))
+    }
+
+    /// Send a blob to a mailbox via HTTP POST (no WebSocket subscription required).
+    /// Returns the seq assigned by the relay.
+    pub async fn post_blob(&self, mailbox_id: &[u8; 32], blob: Vec<u8>) -> Result<u64> {
+        let resp = self
+            .http
+            .post(format!(
+                "{}/box/{}",
+                self.base_url,
+                URL_SAFE_NO_PAD.encode(mailbox_id)
+            ))
+            .body(blob)
+            .send()
+            .await
+            .map_err(|e| GhostError::Network(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(GhostError::Network(format!(
+                "post blob: {}",
+                resp.status()
+            )));
+        }
+        #[derive(serde::Deserialize)]
+        struct PostResp { seq: u64 }
+        let body: PostResp = resp
+            .json()
+            .await
+            .map_err(|e| GhostError::Network(e.to_string()))?;
+        Ok(body.seq)
     }
 
     pub async fn register_invite(&self, token: &str, expires_at: u64) -> Result<()> {

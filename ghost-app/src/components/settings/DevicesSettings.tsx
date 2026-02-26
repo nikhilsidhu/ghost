@@ -9,6 +9,7 @@ import type { Device } from "../../lib/types";
 
 const FLASH_MS = 1200;
 const POLL_INTERVAL = 3000;
+const PAIRING_TIMEOUT = 5 * 60 * 1000; // 5 minutes
 
 function deviceIcon(label: string): Component<{ size: number }> {
   const lower = label.toLowerCase();
@@ -47,10 +48,13 @@ export default function DevicesSettings() {
 
   // Pairing state
   const [pairingCode, setPairingCode] = createSignal<string | null>(null);
+  const [pairingStatus, setPairingStatus] = createSignal<string>("waiting for new device…");
+  const [pairingError, setPairingError] = createSignal<string | null>(null);
   const [showQr, setShowQr] = createSignal(false);
   const [linkCopied, setLinkCopied] = createSignal(false);
   const [pairingStarting, setPairingStarting] = createSignal(false);
   let pollTimer: ReturnType<typeof setInterval> | undefined;
+  let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
 
   const load = async () => {
     setLoading(true);
@@ -70,6 +74,7 @@ export default function DevicesSettings() {
 
   onCleanup(() => {
     if (pollTimer) clearInterval(pollTimer);
+    if (timeoutTimer) clearTimeout(timeoutTimer);
   });
 
   const copyDeviceKey = (key: string) => {
@@ -92,41 +97,62 @@ export default function DevicesSettings() {
     }
   };
 
+  const stopPairing = () => {
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = undefined; }
+    if (timeoutTimer) { clearTimeout(timeoutTimer); timeoutTimer = undefined; }
+  };
+
   const handleStartPairing = async () => {
+    if (pairingCode()) return; // already active
     setPairingStarting(true);
-    setError(null);
+    setPairingError(null);
+    setPairingStatus("waiting for new device…");
     try {
       const code = await startPairing();
       setPairingCode(code);
       setShowQr(false);
+
+      // 5-minute timeout
+      timeoutTimer = setTimeout(() => {
+        stopPairing();
+        setPairingCode(null);
+        setPairingError("pairing session expired. try again.");
+        cancelPairing().catch(() => {});
+      }, PAIRING_TIMEOUT);
+
       pollTimer = setInterval(async () => {
         try {
           const label = await checkPairing();
           if (label) {
-            clearInterval(pollTimer);
-            pollTimer = undefined;
+            stopPairing();
+            setPairingStatus("device linked!");
             setPairingCode(null);
+            setPairingError(null);
             await load();
           }
-        } catch {
-          clearInterval(pollTimer);
-          pollTimer = undefined;
-          setPairingCode(null);
+        } catch (e) {
+          const msg = String(e);
+          // "no active pairing session" means we already completed or cancelled
+          if (msg.includes("no active pairing")) {
+            stopPairing();
+            setPairingCode(null);
+          } else {
+            // transient error — keep polling, show error
+            setPairingError(msg);
+          }
         }
       }, POLL_INTERVAL);
     } catch (e) {
-      setError(String(e));
+      setPairingError(String(e));
     } finally {
       setPairingStarting(false);
     }
   };
 
   const handleCancelPairing = async () => {
-    if (pollTimer) {
-      clearInterval(pollTimer);
-      pollTimer = undefined;
-    }
+    stopPairing();
     setPairingCode(null);
+    setPairingError(null);
     setShowQr(false);
     await cancelPairing().catch(() => {});
   };
@@ -212,53 +238,71 @@ export default function DevicesSettings() {
 
       {/* Pairing section */}
       <SettingGroup label="link new device">
-        <Show when={!pairingCode()} fallback={
-          <div class="py-3">
-            <div class="flex items-center justify-between mb-3">
-              <div class="flex items-center gap-1.5 text-xs text-[var(--neutral-500)]">
-                <Loader size={12} class="animate-spin" />
-                <span>waiting for new device…</span>
-              </div>
-              <div class="flex items-center gap-1.5">
-                <Tooltip label="show qr code" placement="top">
-                  <button
-                    class={cn(
-                      "flex items-center justify-center cursor-pointer transition-colors duration-150",
-                      showQr()
-                        ? "text-[var(--purple-400)]"
-                        : "text-[var(--neutral-500)] hover:text-[var(--neutral-400)]",
-                    )}
-                    onClick={() => setShowQr((v) => !v)}
-                  >
-                    <QrCode size={14} />
-                  </button>
-                </Tooltip>
-                <Tooltip label="copy link" placement="top">
-                  <button
-                    class="flex items-center justify-center text-[var(--neutral-500)] hover:text-[var(--neutral-400)] cursor-pointer transition-colors duration-150"
-                    onClick={copyLink}
-                  >
-                    {linkCopied()
-                      ? <Check size={14} class="text-[var(--emerald-400)]" />
-                      : <Link2 size={14} />}
-                  </button>
-                </Tooltip>
-                <Tooltip label="cancel" placement="top">
-                  <button
-                    class="flex items-center justify-center text-[var(--neutral-500)] hover:text-[var(--neutral-300)] cursor-pointer transition-colors duration-150"
-                    onClick={handleCancelPairing}
-                  >
-                    <X size={14} />
-                  </button>
-                </Tooltip>
-              </div>
-            </div>
-            <Show when={showQr()}>
-              <div class="flex justify-center mb-3">
-                <PairingQr data={pairingCode()!} size={180} />
-              </div>
-            </Show>
+        <Show when={pairingError() && !pairingCode()}>
+          <div class="py-3 flex items-center gap-2">
+            <p class="text-xs text-[var(--red-400)] flex-1">{pairingError()}</p>
+            <button
+              class="text-xs px-2.5 py-1 rounded cursor-pointer text-[var(--neutral-300)] hover:text-[var(--neutral-100)] border border-[var(--neutral-700)] hover:border-[var(--neutral-600)] transition-colors duration-150"
+              onClick={() => { setPairingError(null); handleStartPairing(); }}
+            >
+              retry
+            </button>
           </div>
+        </Show>
+        <Show when={!pairingCode() && !pairingError()} fallback={
+          <Show when={pairingCode()}>
+            <div class="py-3">
+              <div class="flex items-center justify-between mb-3">
+                <div class="flex flex-col gap-1">
+                  <div class="flex items-center gap-1.5 text-xs text-[var(--neutral-500)]">
+                    <Loader size={12} class="animate-spin" />
+                    <span>{pairingStatus()}</span>
+                  </div>
+                  <Show when={pairingError()}>
+                    <p class="text-xs text-[var(--red-400)]">{pairingError()}</p>
+                  </Show>
+                </div>
+                <div class="flex items-center gap-1.5">
+                  <Tooltip label="show qr code" placement="top">
+                    <button
+                      class={cn(
+                        "flex items-center justify-center cursor-pointer transition-colors duration-150",
+                        showQr()
+                          ? "text-[var(--purple-400)]"
+                          : "text-[var(--neutral-500)] hover:text-[var(--neutral-400)]",
+                      )}
+                      onClick={() => setShowQr((v) => !v)}
+                    >
+                      <QrCode size={14} />
+                    </button>
+                  </Tooltip>
+                  <Tooltip label="copy link" placement="top">
+                    <button
+                      class="flex items-center justify-center text-[var(--neutral-500)] hover:text-[var(--neutral-400)] cursor-pointer transition-colors duration-150"
+                      onClick={copyLink}
+                    >
+                      {linkCopied()
+                        ? <Check size={14} class="text-[var(--emerald-400)]" />
+                        : <Link2 size={14} />}
+                    </button>
+                  </Tooltip>
+                  <Tooltip label="cancel" placement="top">
+                    <button
+                      class="flex items-center justify-center text-[var(--neutral-500)] hover:text-[var(--neutral-300)] cursor-pointer transition-colors duration-150"
+                      onClick={handleCancelPairing}
+                    >
+                      <X size={14} />
+                    </button>
+                  </Tooltip>
+                </div>
+              </div>
+              <Show when={showQr()}>
+                <div class="flex justify-center mb-3">
+                  <PairingQr data={pairingCode()!} size={180} />
+                </div>
+              </Show>
+            </div>
+          </Show>
         }>
           <div class="py-3">
             <button

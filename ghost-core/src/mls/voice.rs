@@ -24,13 +24,23 @@ fn derive_export_key(
 }
 
 /// Each sender in a voice channel gets their own encryption key so nonces never collide.
+/// `device_vk` ensures two devices sharing a fingerprint derive different keys.
 pub fn derive_voice_key(
     group: &GhostGroup,
     provider: &GhostProvider,
     channel_id: &[u8; 32],
     sender_fp: &[u8; 32],
+    device_vk: &[u8; 32],
 ) -> Result<[u8; 32]> {
-    derive_export_key(group, provider, VOICE_EXPORT_LABEL, channel_id, sender_fp)
+    let mut context = Vec::with_capacity(96);
+    context.extend_from_slice(channel_id);
+    context.extend_from_slice(sender_fp);
+    context.extend_from_slice(device_vk);
+    let secret = group.export_secret(provider, VOICE_EXPORT_LABEL, &context, 32)?;
+    let key: [u8; 32] = secret
+        .try_into()
+        .map_err(|_| GhostError::Crypto("export key not 32 bytes".into()))?;
+    Ok(key)
 }
 
 /// Encrypt one audio frame before sending it to the voice channel.
@@ -74,25 +84,28 @@ pub struct PresenceState {
     pub fingerprint: [u8; 32],
     pub muted: bool,
     pub deafened: bool,
+    pub device_vk: [u8; 32],
 }
 
 impl PresenceState {
-    pub fn to_bytes(&self) -> [u8; 34] {
-        let mut buf = [0u8; 34];
+    pub fn to_bytes(&self) -> [u8; 66] {
+        let mut buf = [0u8; 66];
         buf[0..32].copy_from_slice(&self.fingerprint);
         buf[32] = self.muted as u8;
         buf[33] = self.deafened as u8;
+        buf[34..66].copy_from_slice(&self.device_vk);
         buf
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        if data.len() < 34 {
+        if data.len() < 66 {
             return Err(GhostError::Crypto("presence too short".into()));
         }
         let fingerprint: [u8; 32] = data[0..32].try_into().unwrap();
         let muted = data[32] != 0;
         let deafened = data[33] != 0;
-        Ok(Self { fingerprint, muted, deafened })
+        let device_vk: [u8; 32] = data[34..66].try_into().unwrap();
+        Ok(Self { fingerprint, muted, deafened, device_vk })
     }
 }
 
@@ -192,8 +205,9 @@ mod tests {
         let group = super::super::group::GhostGroup::create(&provider, &id).unwrap();
 
         let channel_id = [0xFFu8; 32];
-        let key1 = derive_voice_key(&group, &provider, &channel_id, &id.fingerprint).unwrap();
-        let key2 = derive_voice_key(&group, &provider, &channel_id, &id.fingerprint).unwrap();
+        let vk = *id.verifying_key.as_bytes();
+        let key1 = derive_voice_key(&group, &provider, &channel_id, &id.fingerprint, &vk).unwrap();
+        let key2 = derive_voice_key(&group, &provider, &channel_id, &id.fingerprint, &vk).unwrap();
         assert_eq!(key1, key2);
     }
 
@@ -206,8 +220,23 @@ mod tests {
         let channel_id = [0xFFu8; 32];
         let fp_a = [0xAAu8; 32];
         let fp_b = [0xBBu8; 32];
-        let key_a = derive_voice_key(&group, &provider, &channel_id, &fp_a).unwrap();
-        let key_b = derive_voice_key(&group, &provider, &channel_id, &fp_b).unwrap();
+        let vk = [0x00u8; 32];
+        let key_a = derive_voice_key(&group, &provider, &channel_id, &fp_a, &vk).unwrap();
+        let key_b = derive_voice_key(&group, &provider, &channel_id, &fp_b, &vk).unwrap();
+        assert_ne!(key_a, key_b);
+    }
+
+    #[test]
+    fn different_device_vk_different_key() {
+        let provider = GhostProvider::new_in_memory().unwrap();
+        let id = Identity::from_seed([0x01u8; 32]).unwrap();
+        let group = super::super::group::GhostGroup::create(&provider, &id).unwrap();
+
+        let channel_id = [0xFFu8; 32];
+        let vk_a = [0xAAu8; 32];
+        let vk_b = [0xBBu8; 32];
+        let key_a = derive_voice_key(&group, &provider, &channel_id, &id.fingerprint, &vk_a).unwrap();
+        let key_b = derive_voice_key(&group, &provider, &channel_id, &id.fingerprint, &vk_b).unwrap();
         assert_ne!(key_a, key_b);
     }
 
@@ -217,6 +246,7 @@ mod tests {
             fingerprint: [0xAA; 32],
             muted: true,
             deafened: false,
+            device_vk: [0xDD; 32],
         };
         let bytes = state.to_bytes();
         let parsed = PresenceState::from_bytes(&bytes).unwrap();
@@ -230,6 +260,7 @@ mod tests {
             fingerprint: [0xBB; 32],
             muted: false,
             deafened: true,
+            device_vk: [0xDD; 32],
         };
         let blob = seal_presence(&key, &state).unwrap();
         let opened = open_presence(&key, &blob).unwrap();
@@ -244,6 +275,7 @@ mod tests {
             fingerprint: [0xCC; 32],
             muted: false,
             deafened: false,
+            device_vk: [0xDD; 32],
         };
         let blob = seal_presence(&key1, &state).unwrap();
         assert!(open_presence(&key2, &blob).is_err());
@@ -263,6 +295,7 @@ mod tests {
             fingerprint: sender_fp,
             muted: true,
             deafened: false,
+            device_vk: *id.verifying_key.as_bytes(),
         };
         let blob = seal_presence(&key, &state).unwrap();
 
@@ -285,6 +318,7 @@ mod tests {
             fingerprint: id.fingerprint,
             muted: false,
             deafened: false,
+            device_vk: *id.verifying_key.as_bytes(),
         };
         let blob = seal_presence(&key, &state).unwrap();
 
@@ -300,7 +334,8 @@ mod tests {
         let group = super::super::group::GhostGroup::create(&provider, &id).unwrap();
 
         let channel_id = [0xFFu8; 32];
-        let voice = derive_voice_key(&group, &provider, &channel_id, &id.fingerprint).unwrap();
+        let vk = *id.verifying_key.as_bytes();
+        let voice = derive_voice_key(&group, &provider, &channel_id, &id.fingerprint, &vk).unwrap();
         let presence = derive_presence_key(&group, &provider, &channel_id, &id.fingerprint).unwrap();
         assert_ne!(voice, presence);
     }

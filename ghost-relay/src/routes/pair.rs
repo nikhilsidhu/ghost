@@ -6,12 +6,13 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 
 use crate::error::{RelayError, Result};
-use crate::state::{AppState, PairingSession};
+use crate::state::{AppState, PairingSession, ProvisionEntry};
 
 use super::decode_account_fp;
 
 const PAIRING_TTL: Duration = Duration::from_secs(300); // 5 minutes
 const MAX_PAIRING_PAYLOAD: usize = 4096;
+const MAX_PROVISION_PAYLOAD: usize = 256 * 1024; // 256 KB — carries all server metadata
 
 /// POST /pair/{account_fp} — existing device posts pairing offer.
 pub async fn post_offer(
@@ -72,18 +73,13 @@ pub async fn get_response(
 ) -> Result<impl IntoResponse> {
     let account_fp = decode_account_fp(&account_fp_hex)?;
 
-    let mut map = state.pairing.write().await;
+    let map = state.pairing.read().await;
     let session = map.get(&account_fp).ok_or(RelayError::NotFound)?;
     if Instant::now() >= session.expires_at {
-        map.remove(&account_fp);
         return Err(RelayError::NotFound);
     }
     match &session.response {
-        Some(data) => {
-            let data = data.clone();
-            map.remove(&account_fp);
-            Ok((StatusCode::OK, data))
-        }
+        Some(data) => Ok((StatusCode::OK, data.clone())),
         None => Err(RelayError::NotFound),
     }
 }
@@ -103,9 +99,56 @@ pub async fn get_offer(
     Ok((StatusCode::OK, session.offer.clone()))
 }
 
-/// Reap expired pairing sessions. Call from a background task.
+/// PUT /pair/{account_fp}/provision — device A posts encrypted provision blob after pairing.
+pub async fn put_provision(
+    State(state): State<AppState>,
+    Path(account_fp_hex): Path<String>,
+    body: Bytes,
+) -> Result<StatusCode> {
+    let account_fp = decode_account_fp(&account_fp_hex)?;
+
+    if body.is_empty() {
+        return Err(RelayError::BadRequest("empty payload".into()));
+    }
+    if body.len() > MAX_PROVISION_PAYLOAD {
+        return Err(RelayError::PayloadTooLarge);
+    }
+
+    let mut map = state.provision.write().await;
+    map.insert(
+        account_fp,
+        ProvisionEntry {
+            data: body.to_vec(),
+            expires_at: Instant::now() + PAIRING_TTL,
+        },
+    );
+    Ok(StatusCode::CREATED)
+}
+
+/// GET /pair/{account_fp}/provision — device B fetches provision blob.
+pub async fn get_provision(
+    State(state): State<AppState>,
+    Path(account_fp_hex): Path<String>,
+) -> Result<impl IntoResponse> {
+    let account_fp = decode_account_fp(&account_fp_hex)?;
+
+    let map = state.provision.read().await;
+    let entry = map.get(&account_fp).ok_or(RelayError::NotFound)?;
+    if Instant::now() >= entry.expires_at {
+        return Err(RelayError::NotFound);
+    }
+    Ok((StatusCode::OK, entry.data.clone()))
+}
+
+/// Reap expired pairing sessions and provision entries.
 pub async fn reap_expired(state: &AppState) {
-    let mut map = state.pairing.write().await;
     let now = Instant::now();
-    map.retain(|_, session| session.expires_at > now);
+    {
+        let mut map = state.pairing.write().await;
+        map.retain(|_, session| session.expires_at > now);
+    }
+    {
+        let mut map = state.provision.write().await;
+        map.retain(|_, entry| entry.expires_at > now);
+    }
 }

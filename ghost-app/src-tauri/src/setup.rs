@@ -201,8 +201,12 @@ pub fn initialize() -> SetupResult {
     let state = AppState {
         client: Arc::new(Mutex::new(client)),
         relay: Arc::new(Mutex::new(relay)),
-        relay_url,
-        http: reqwest::Client::new(),
+        relay_url: Arc::new(Mutex::new(relay_url)),
+        http: reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap(),
         config_path: cfg_path,
         config: Arc::new(Mutex::new(cfg)),
         voice: VoiceHandle {

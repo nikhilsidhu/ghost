@@ -3,7 +3,7 @@ use rusqlite::Connection;
 use crate::crypto::MessageType;
 use crate::error::{GhostError, Result};
 
-const CURRENT_VERSION: u32 = 3;
+const CURRENT_VERSION: u32 = 4;
 
 pub fn initialize(conn: &Connection) -> Result<()> {
     let version = get_version(conn)?;
@@ -59,6 +59,7 @@ fn drop_all(conn: &Connection) -> Result<()> {
          DROP TABLE IF EXISTS servers;
          DROP TABLE IF EXISTS groups;
          DROP TABLE IF EXISTS relay_state;
+         DROP TABLE IF EXISTS device_config;
          DROP TABLE IF EXISTS schema_version;"
     )
     .map_err(|e| GhostError::Database(format!("drop tables: {e}")))?;
@@ -163,6 +164,11 @@ fn create_tables(conn: &Connection) -> Result<()> {
         CREATE TABLE relay_state (
             mailbox_id    BLOB PRIMARY KEY,
             last_seen_seq INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE TABLE device_config (
+            key   TEXT PRIMARY KEY,
+            value BLOB NOT NULL
         );
         "
     ))

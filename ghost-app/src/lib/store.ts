@@ -5,7 +5,7 @@ import {
   getIdentity, listServers, listChannels, listMembers,
   listPinnedServers, markChannelRead,
   joinVoice, leaveVoice, setVoiceMuted, setVoiceDeafened,
-  createDevSession, readDevSession, joinByInvite, getConfig,
+  getConfig,
   getCachedAvatar,
 } from "./api";
 import { initKeybinds, onPttActiveChange } from "./keybinds";
@@ -250,24 +250,6 @@ const updateIdentity = async () => {
   setIdentity(await getIdentity());
 };
 
-// Auto dev session: instance 1 creates, others join
-const tryDevJoin = async (): Promise<boolean> => {
-  const session = await readDevSession();
-  if (!session) return false;
-  try {
-    const server = await joinByInvite(session.relay_url, session.token);
-    await refreshServers();
-    await selectServer(server.server_id);
-    return true;
-  } catch (e) {
-    console.warn("dev join failed:", e);
-    if (servers().length > 0) {
-      await selectServer(servers()[0].server_id);
-      return true;
-    }
-    return false;
-  }
-};
 
 const initialize = async () => {
   await updateIdentity();
@@ -278,12 +260,22 @@ const initialize = async () => {
 
   listen<string>("sync", (event) => {
     const sid = event.payload;
+    if (sid === "all") {
+      refreshServers();
+      refreshAllChannels();
+      refreshAllMembers();
+      return;
+    }
     if (sid === selectedServerId()) {
       refreshChannels();
       refreshMembers();
     }
     refreshServers();
     refreshAllMembers();
+  });
+
+  listen<string>("display-name-sync", () => {
+    updateIdentity();
   });
 
   listen<Message>("message", (event) => {
@@ -362,6 +354,13 @@ const initialize = async () => {
     });
   });
 
+  listen<string>("voice-takeover", (event) => {
+    const channelId = event.payload;
+    if (voiceChannelId() === channelId) {
+      leaveVoice().catch(() => {});
+    }
+  });
+
   listen<string>("kicked", (event) => {
     const sid = event.payload;
     if (selectedServerId() === sid) {
@@ -438,26 +437,6 @@ const initialize = async () => {
     rebuildPresence();
   });
 
-  // Dev mode: instance 1 creates a dev server, others poll and auto-join
-  if (import.meta.env.DEV) {
-    const inst = import.meta.env.VITE_GHOST_INSTANCE;
-    if (!inst || inst === "1") {
-      try {
-        const server = await createDevSession();
-        await refreshServers();
-        await selectServer(server.server_id);
-      } catch (e) {
-        console.warn("auto dev session failed:", e);
-      }
-    } else {
-      const joined = await tryDevJoin();
-      if (!joined) {
-        const interval = setInterval(async () => {
-          if (await tryDevJoin()) clearInterval(interval);
-        }, 3000);
-      }
-    }
-  }
 };
 
 export {

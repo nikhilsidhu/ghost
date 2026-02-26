@@ -334,6 +334,142 @@ impl InvitePayload {
     }
 }
 
+// --- Sync mailbox: device-to-device communication ---
+
+const SYNC_MAILBOX_TAG: &[u8] = b"ghost-sync-mailbox-v1";
+
+/// Deterministic mailbox ID for device sync, derived from account fingerprint.
+pub fn sync_mailbox_id(account_fp: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(account_fp);
+    hasher.update(SYNC_MAILBOX_TAG);
+    hasher.finalize().into()
+}
+
+/// Sync message types sent between a user's devices.
+#[repr(u8)]
+pub enum SyncMessageType {
+    ServerProvisioned = 0x01,
+    ServerLeft = 0x02,
+    VoiceTakeover = 0x03,
+}
+
+/// Encrypt a sync message with AES-256-GCM. Returns nonce || ciphertext.
+pub fn sync_seal(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>> {
+    use aes_gcm::aead::{Aead, AeadCore, OsRng};
+    use aes_gcm::{Aes256Gcm, KeyInit};
+    let cipher = Aes256Gcm::new(key.into());
+    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+    let ct = cipher
+        .encrypt(&nonce, plaintext)
+        .map_err(|e| GhostError::Format(format!("sync seal: {e}")))?;
+    let mut blob = Vec::with_capacity(12 + ct.len());
+    blob.extend_from_slice(&nonce);
+    blob.extend_from_slice(&ct);
+    Ok(blob)
+}
+
+/// Decrypt a sync message (nonce || ciphertext).
+pub fn sync_open(key: &[u8; 32], blob: &[u8]) -> Result<Vec<u8>> {
+    use aes_gcm::aead::Aead;
+    use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+    if blob.len() < 12 {
+        return Err(GhostError::Format("sync blob too short".into()));
+    }
+    let nonce = Nonce::from_slice(&blob[..12]);
+    let cipher = Aes256Gcm::new(key.into());
+    cipher
+        .decrypt(nonce, &blob[12..])
+        .map_err(|e| GhostError::Format(format!("sync open: {e}")))
+}
+
+/// Wrap a sync ciphertext in a relay-compatible envelope.
+pub fn wrap_sync_envelope(sealed: &[u8]) -> Vec<u8> {
+    let header = ghost_wire::encode_envelope(ghost_wire::EnvelopeType::Application, 0);
+    let mut out = Vec::with_capacity(ghost_wire::ENVELOPE_HEADER_SIZE + sealed.len());
+    out.extend_from_slice(&header);
+    out.extend_from_slice(sealed);
+    out
+}
+
+// --- Provision payload: server metadata for device provisioning ---
+
+pub struct ProvisionPayload {
+    pub server_id: [u8; 32],
+    pub server_name: String,
+    pub kind: ServerKind,
+    pub members: Vec<InviteMember>,
+    pub channels: Vec<InviteChannel>,
+    pub mailbox_id: [u8; 32],
+}
+
+impl ProvisionPayload {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&self.server_id);
+        write_string(&mut buf, &self.server_name);
+        buf.push(self.kind.to_byte());
+
+        buf.extend_from_slice(&(self.members.len() as u16).to_be_bytes());
+        for m in &self.members {
+            buf.extend_from_slice(&m.fingerprint);
+            write_string(&mut buf, &m.display_name);
+            buf.push(m.role.to_byte());
+        }
+
+        buf.extend_from_slice(&(self.channels.len() as u16).to_be_bytes());
+        for c in &self.channels {
+            buf.extend_from_slice(&c.channel_id);
+            write_string(&mut buf, &c.name);
+            buf.push(c.kind.to_byte());
+            buf.extend_from_slice(&c.position.to_be_bytes());
+        }
+
+        buf.extend_from_slice(&self.mailbox_id);
+        buf
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        let mut pos = 0;
+
+        let server_id = read_blob32(data, &mut pos)?;
+        let server_name = read_string(data, &mut pos)?;
+        let kind = ServerKind::from_byte(read_u8(data, &mut pos)?)?;
+
+        let member_count = read_u16(data, &mut pos)? as usize;
+        let mut members = Vec::with_capacity(member_count);
+        for _ in 0..member_count {
+            members.push(InviteMember {
+                fingerprint: read_blob32(data, &mut pos)?,
+                display_name: read_string(data, &mut pos)?,
+                role: MemberRole::from_byte(read_u8(data, &mut pos)?)?,
+            });
+        }
+
+        let channel_count = read_u16(data, &mut pos)? as usize;
+        let mut channels = Vec::with_capacity(channel_count);
+        for _ in 0..channel_count {
+            channels.push(InviteChannel {
+                channel_id: read_blob32(data, &mut pos)?,
+                name: read_string(data, &mut pos)?,
+                kind: ChannelKind::from_byte(read_u8(data, &mut pos)?)?,
+                position: read_i32(data, &mut pos)?,
+            });
+        }
+
+        let mailbox_id = read_blob32(data, &mut pos)?;
+
+        if pos != data.len() {
+            return Err(GhostError::Format(format!(
+                "provision payload: {} trailing bytes",
+                data.len() - pos
+            )));
+        }
+
+        Ok(Self { server_id, server_name, kind, members, channels, mailbox_id })
+    }
+}
+
 // --- Channel operation payloads (carried in Metadata messages) ---
 
 pub enum ChannelOpPayload {

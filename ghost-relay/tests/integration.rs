@@ -969,18 +969,18 @@ async fn pairing_full_flow() {
         .send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
-    // Existing device polls — gets response, session auto-deletes
+    // Existing device polls — gets response (non-destructive read)
     let resp = client
         .get(format!("{}/response", pair_url(&base, &fp)))
         .send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(resp.bytes().await.unwrap().as_ref(), b"encrypted-response");
 
-    // Second poll — session deleted
+    // Second poll — session still alive (TTL-based cleanup, not one-shot)
     let resp = client
         .get(format!("{}/response", pair_url(&base, &fp)))
         .send().await.unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(resp.status(), StatusCode::OK);
 }
 
 #[tokio::test]
@@ -1122,4 +1122,155 @@ async fn recovery_separate_accounts_independent() {
     assert_eq!(resp.bytes().await.unwrap().as_ref(), b"blob-a");
     let resp = client.get(recovery_url(&base, &fp_b)).send().await.unwrap();
     assert_eq!(resp.bytes().await.unwrap().as_ref(), b"blob-b");
+}
+
+// --- Provision tests ---
+
+fn provision_url(base: &str, fp: &[u8; 32]) -> String {
+    format!("{base}/pair/{}/provision", hex::encode(fp))
+}
+
+#[tokio::test]
+async fn provision_put_get_delete() {
+    let base = start_server(test_config()).await;
+    let client = reqwest::Client::new();
+    let fp = [0xD1; 32];
+
+    // PUT provision blob
+    let resp = client
+        .put(provision_url(&base, &fp))
+        .body(b"encrypted-provision-payload".to_vec())
+        .send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // GET returns blob (non-destructive read)
+    let resp = client.get(provision_url(&base, &fp)).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.bytes().await.unwrap().as_ref(), b"encrypted-provision-payload");
+
+    // Second GET still returns blob (TTL-based cleanup, not one-shot)
+    let resp = client.get(provision_url(&base, &fp)).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn provision_overwrite() {
+    let base = start_server(test_config()).await;
+    let client = reqwest::Client::new();
+    let fp = [0xD2; 32];
+
+    client.put(provision_url(&base, &fp)).body(b"v1".to_vec()).send().await.unwrap();
+    client.put(provision_url(&base, &fp)).body(b"v2".to_vec()).send().await.unwrap();
+
+    let resp = client.get(provision_url(&base, &fp)).send().await.unwrap();
+    assert_eq!(resp.bytes().await.unwrap().as_ref(), b"v2");
+}
+
+#[tokio::test]
+async fn provision_empty_payload_rejected() {
+    let base = start_server(test_config()).await;
+    let client = reqwest::Client::new();
+    let fp = [0xD3; 32];
+
+    let resp = client.put(provision_url(&base, &fp)).body(Vec::new()).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn provision_oversize_rejected() {
+    let base = start_server(test_config()).await;
+    let client = reqwest::Client::new();
+    let fp = [0xD4; 32];
+
+    // MAX_PROVISION_PAYLOAD is 256KB
+    let resp = client
+        .put(provision_url(&base, &fp))
+        .body(vec![0u8; 300 * 1024])
+        .send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn provision_get_nonexistent_returns_not_found() {
+    let base = start_server(test_config()).await;
+    let client = reqwest::Client::new();
+    let fp = [0xD5; 32];
+
+    let resp = client.get(provision_url(&base, &fp)).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn provision_separate_accounts_independent() {
+    let base = start_server(test_config()).await;
+    let client = reqwest::Client::new();
+    let fp_a = [0xD6; 32];
+    let fp_b = [0xD7; 32];
+
+    client.put(provision_url(&base, &fp_a)).body(b"prov-a".to_vec()).send().await.unwrap();
+    client.put(provision_url(&base, &fp_b)).body(b"prov-b".to_vec()).send().await.unwrap();
+
+    let resp = client.get(provision_url(&base, &fp_a)).send().await.unwrap();
+    assert_eq!(resp.bytes().await.unwrap().as_ref(), b"prov-a");
+    let resp = client.get(provision_url(&base, &fp_b)).send().await.unwrap();
+    assert_eq!(resp.bytes().await.unwrap().as_ref(), b"prov-b");
+}
+
+// --- Sync mailbox tests ---
+
+#[tokio::test]
+async fn sync_mailbox_post_and_get() {
+    let base = start_server(test_config()).await;
+    let client = reqwest::Client::new();
+
+    // Sync mailbox is just an arbitrary mailbox ID — relay has no special handling
+    let sync_mailbox = [0xE1; 32];
+    let url = mailbox_url(&base, &sync_mailbox);
+
+    // Post an envelope-wrapped blob (simulates a sync message)
+    let payload = test_envelope(b"sync-server-provisioned");
+    let resp = client.post(&url).body(payload).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["seq"], 1);
+
+    // GET retrieves it
+    let blobs: Vec<Value> = client.get(&url).send().await.unwrap().json().await.unwrap();
+    assert_eq!(blobs.len(), 1);
+    assert_eq!(blobs[0]["seq"], 1);
+}
+
+#[tokio::test]
+async fn sync_mailbox_ws_subscribe() {
+    let base = start_server(test_config()).await;
+    let client = reqwest::Client::new();
+    let ws_base = base.replace("http://", "ws://");
+
+    let sync_mailbox = [0xE2; 32];
+    let mailbox_b64 = URL_SAFE_NO_PAD.encode(sync_mailbox);
+    let url = mailbox_url(&base, &sync_mailbox);
+    let ws_url = format!("{ws_base}/ws/{mailbox_b64}");
+
+    // Subscribe via WS
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
+    ws_handshake(&mut ws, 0).await;
+    consume_vs_snap(&mut ws).await;
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Post a sync message via HTTP
+    client.post(&url).body(test_envelope(b"sync-msg")).send().await.unwrap();
+
+    // WS receives the blob
+    let data = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let m = ws.next().await.unwrap().unwrap();
+            if m.is_binary() { break m.into_data(); }
+        }
+    })
+    .await
+    .expect("timed out waiting for sync blob on WS");
+
+    // 16-byte frame header + 10-byte envelope header + "sync-msg"
+    assert_eq!(&data[26..], b"sync-msg");
 }

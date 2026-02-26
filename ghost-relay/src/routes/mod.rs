@@ -35,6 +35,7 @@ pub fn router(state: AppState) -> Router {
         .route("/pair/{account_fp}", post(pair::post_offer).get(pair::get_offer))
         .route("/pair/{account_fp}/respond", post(pair::post_respond))
         .route("/pair/{account_fp}/response", get(pair::get_response))
+        .route("/pair/{account_fp}/provision", put(pair::put_provision).get(pair::get_provision))
         .route("/recovery/{account_fp}", put(recovery::put).get(recovery::get))
         .route("/ws/{mailbox_id}", get(ws::ws_upgrade))
         .route("/voice/{channel_id}", get(voice::ws_upgrade))

@@ -19,6 +19,22 @@ impl GhostStore {
         Ok(())
     }
 
+    pub fn insert_channel_if_not_exists(&self, channel: &Channel) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO channels (channel_id, server_id, name, kind, position) VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    channel.channel_id.as_slice(),
+                    channel.server_id.as_slice(),
+                    channel.name,
+                    channel.kind.as_str(),
+                    channel.position,
+                ],
+            )
+            .map_err(|e| GhostError::Database(format!("insert channel if not exists: {e}")))?;
+        Ok(())
+    }
+
     pub fn get_channel(&self, channel_id: &[u8; 32]) -> Result<Channel> {
         self.conn
             .query_row(

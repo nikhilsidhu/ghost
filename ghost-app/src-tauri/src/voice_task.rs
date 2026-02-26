@@ -239,7 +239,7 @@ async fn process_presence_blob(
         .open_presence_blob(server_id, channel_id, &blob)
         .map_err(|e| format!("presence decrypt: {e}"))?;
     let voice_key = c
-        .derive_voice_key(server_id, channel_id, &ps.fingerprint)
+        .derive_voice_key(server_id, channel_id, &ps.fingerprint, &ps.device_vk)
         .map_err(|e| format!("derive key: {e}"))?;
     Ok((ps, voice_key))
 }
@@ -265,6 +265,7 @@ async fn start_audio(
     server_id: &[u8; 32],
     channel_id: &[u8; 32],
     own_fp: &[u8; 32],
+    own_device_vk: &[u8; 32],
     own_slot_id: u32,
     relay_url: &str,
     port: u16,
@@ -275,7 +276,7 @@ async fn start_audio(
 ) -> Result<AudioSession, String> {
     let own_key = {
         let c = client.lock().await;
-        c.derive_voice_key(server_id, channel_id, own_fp)
+        c.derive_voice_key(server_id, channel_id, own_fp, own_device_vk)
             .map_err(|e| format!("derive own key: {e}"))?
     };
 
@@ -328,6 +329,7 @@ struct PendingJoin {
     channel_id: [u8; 32],
     relay_url: String,
     own_fp: [u8; 32],
+    own_device_vk: [u8; 32],
     input_device: Option<String>,
     output_device: Option<String>,
     ns_mode: u8,
@@ -429,6 +431,10 @@ pub async fn run(
                             Some(b) => b,
                             None => { emit_error(&app, "bad fingerprint"); continue; }
                         };
+                        let own_device_vk = {
+                            let c = client.lock().await;
+                            *c.identity().verifying_key.as_bytes()
+                        };
 
                         let url = match ws_url(&relay_url, &channel_id) {
                             Ok(u) => u,
@@ -489,6 +495,7 @@ pub async fn run(
                             channel_id: channel_id_bytes,
                             relay_url,
                             own_fp,
+                            own_device_vk,
                             input_device,
                             output_device,
                             ns_mode,
@@ -694,8 +701,8 @@ pub async fn run(
                                 }
 
                                 match start_audio(
-                                    &client, &p.server_id, &p.channel_id, &p.own_fp, slot_id,
-                                    &p.relay_url, port, initial_keys, &state,
+                                    &client, &p.server_id, &p.channel_id, &p.own_fp, &p.own_device_vk,
+                                    slot_id, &p.relay_url, port, initial_keys, &state,
                                     p.input_device.clone(), p.output_device.clone(),
                                 ).await {
                                     Ok(session) => {
