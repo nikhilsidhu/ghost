@@ -30,21 +30,23 @@ fn parse_id(hex_str: &str) -> Result<[u8; 32], String> {
 
 /// Post a sync message to all linked devices. No-op if sync key is not set (single device).
 async fn post_sync_message(state: &AppState, msg_type: u8, payload: &[u8]) {
-    use ghost_core::wire::{sync_mailbox_id, sync_seal, wrap_sync_envelope};
+    use ghost_core::wire::{sync_mailbox_id, sync_seal, sync_sign, wrap_sync_envelope};
 
-    let (sync_key, account_fp) = {
+    let (sync_key, account_fp, signing_key) = {
         let c = state.client.lock().await;
         match c.sync_key() {
-            Some(k) => (k, *c.fingerprint()),
+            Some(k) => (k, *c.fingerprint(), c.identity().signing_key.clone()),
             None => return, // no linked devices
         }
     };
 
-    let mut plaintext = Vec::with_capacity(1 + payload.len());
-    plaintext.push(msg_type);
-    plaintext.extend_from_slice(payload);
+    let mut inner = Vec::with_capacity(1 + payload.len());
+    inner.push(msg_type);
+    inner.extend_from_slice(payload);
 
-    let sealed = match sync_seal(&sync_key, &plaintext) {
+    let signed = sync_sign(&signing_key, &inner);
+
+    let sealed = match sync_seal(&sync_key, &signed) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("sync seal: {e}");

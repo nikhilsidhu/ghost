@@ -236,7 +236,7 @@ async fn ws_epoch_mismatch_ack() {
     }).await.expect("timed out");
     assert_eq!(ack, "2");
 
-    // Send at stale epoch 0 — relay is at 1, expect mismatch hint
+    // Send at stale epoch 0 — relay is at 1, expect mismatch hint (app messages still stored)
     ws.send(Message::Binary(envelope(EnvelopeType::Application, 0, b"stale").into())).await.unwrap();
     let ack = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
@@ -245,6 +245,16 @@ async fn ws_epoch_mismatch_ack() {
         }
     }).await.expect("timed out");
     assert_eq!(ack, "3 epoch_mismatch");
+
+    // Send commit at stale epoch 0 — rejected, get error text
+    ws.send(Message::Binary(envelope(EnvelopeType::Commit, 0, b"stale-commit").into())).await.unwrap();
+    let ack = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let m = ws.next().await.unwrap().unwrap();
+            if let Message::Text(t) = m { break t.to_string(); }
+        }
+    }).await.expect("timed out");
+    assert!(ack.starts_with("error:"), "expected error for stale commit, got: {ack}");
 }
 
 #[tokio::test]
@@ -295,11 +305,15 @@ async fn epoch_gating() {
     let blobs: Vec<Value> = client.get(&url).send().await.unwrap().json().await.unwrap();
     assert_eq!(blobs.len(), 4);
 
-    // Stale commit at epoch 0 — relay stays at 1 (MAX prevents backward)
-    let body: Value = client.post(&url)
+    // Stale commit at epoch 0 — rejected with 409
+    let resp = client.post(&url)
         .body(envelope(EnvelopeType::Commit, 0, b"stale-commit"))
-        .send().await.unwrap().json().await.unwrap();
-    assert_eq!(body["epoch_mismatch"], true);
+        .send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+    // Application messages at stale epoch still stored (only commits are rejected)
+    let blobs: Vec<Value> = client.get(&url).send().await.unwrap().json().await.unwrap();
+    assert_eq!(blobs.len(), 4);
 
     // Application at epoch 1 still matches — relay didn't go backward
     let body: Value = client.post(&url)
@@ -307,17 +321,17 @@ async fn epoch_gating() {
         .send().await.unwrap().json().await.unwrap();
     assert!(body.get("epoch_mismatch").is_none());
 
-    // Commit at epoch 5 — relay jumps from 1 to 6
+    // Commit at epoch 1 succeeds — advances relay to 2
     let body: Value = client.post(&url)
-        .body(envelope(EnvelopeType::Commit, 5, b"future-commit"))
-        .send().await.unwrap().json().await.unwrap();
-    assert_eq!(body["epoch_mismatch"], true); // 5 != 1
-
-    // Application at epoch 6 — matches the jumped relay epoch
-    let body: Value = client.post(&url)
-        .body(envelope(EnvelopeType::Application, 6, b"after-jump"))
+        .body(envelope(EnvelopeType::Commit, 1, b"commit2"))
         .send().await.unwrap().json().await.unwrap();
     assert!(body.get("epoch_mismatch").is_none());
+
+    // Commit at epoch 1 now stale — rejected
+    let resp = client.post(&url)
+        .body(envelope(EnvelopeType::Commit, 1, b"stale-commit2"))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
 }
 
 #[tokio::test]

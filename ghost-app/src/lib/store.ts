@@ -264,6 +264,8 @@ const initialize = async () => {
       refreshServers();
       refreshAllChannels();
       refreshAllMembers();
+      refreshChannels();
+      refreshMembers();
       return;
     }
     if (sid === selectedServerId()) {

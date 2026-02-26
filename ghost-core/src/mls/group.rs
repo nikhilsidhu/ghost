@@ -42,6 +42,7 @@ impl GhostGroup {
 
         let config = MlsGroupCreateConfig::builder()
             .use_ratchet_tree_extension(true)
+            .max_past_epochs(1)
             .build();
 
         let mls_group = MlsGroup::new(
@@ -66,6 +67,7 @@ impl GhostGroup {
 
         let config = MlsGroupCreateConfig::builder()
             .use_ratchet_tree_extension(true)
+            .max_past_epochs(1)
             .build();
 
         let mls_group_id = derive_mls_group_id(server_id);
@@ -218,7 +220,9 @@ impl GhostGroup {
             MlsMessageBodyIn::Welcome(w) => w,
             _ => return Err(GhostError::Mls("not a welcome message".into())),
         };
-        let join_config = MlsGroupJoinConfig::default();
+        let join_config = MlsGroupJoinConfig::builder()
+            .max_past_epochs(1)
+            .build();
         let mls_group =
             StagedWelcome::new_from_welcome(provider, &join_config, welcome_msg, None)
                 .map_err(|e| GhostError::Mls(format!("staged welcome: {e}")))?
@@ -286,7 +290,11 @@ impl GhostGroup {
             _ => return Err(GhostError::Mls("expected GroupInfo message".into())),
         };
 
+        let ext_join_config = MlsGroupJoinConfig::builder()
+            .max_past_epochs(1)
+            .build();
         let (mls_group, commit_bundle) = MlsGroup::external_commit_builder()
+            .with_config(ext_join_config)
             .build_group(provider, vgi, credential)
             .map_err(|e| GhostError::Mls(format!("build external commit: {e}")))?
             .load_psks(provider.storage())

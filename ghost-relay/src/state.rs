@@ -71,12 +71,9 @@ impl Inner {
         }
         let (envelope_type, epoch) = ghost_wire::decode_envelope(data)
             .map_err(|e| crate::error::RelayError::BadRequest(format!("envelope: {e}")))?;
-        let relay_epoch = self.storage.get_epoch(mailbox_id)?;
-        let (seq, _) = self.storage.append(mailbox_id, envelope_type as u8, epoch, data)?;
-        if envelope_type == ghost_wire::EnvelopeType::Commit {
-            self.storage.set_epoch(mailbox_id, epoch.saturating_add(1))?;
-        }
-        let epoch_mismatch = epoch != relay_epoch;
+        let (seq, _, epoch_mismatch) =
+            self.storage
+                .append(mailbox_id, envelope_type as u8, epoch, data)?;
         let map = self.mailboxes.read().await;
         if let Some(mailbox) = map.get(mailbox_id) {
             let _ = mailbox.seq_tx.send(seq);

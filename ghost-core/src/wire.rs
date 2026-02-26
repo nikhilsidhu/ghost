@@ -383,6 +383,38 @@ pub fn sync_open(key: &[u8; 32], blob: &[u8]) -> Result<Vec<u8>> {
         .map_err(|e| GhostError::Format(format!("sync open: {e}")))
 }
 
+/// Sign a sync plaintext with the device signing key.
+/// Output: [device_vk:32][ed25519_sig:64][plaintext...]
+pub fn sync_sign(signing_key: &ed25519_dalek::SigningKey, plaintext: &[u8]) -> Vec<u8> {
+    use ed25519_dalek::Signer;
+    let sig = signing_key.sign(plaintext);
+    let vk = signing_key.verifying_key();
+    let mut out = Vec::with_capacity(32 + 64 + plaintext.len());
+    out.extend_from_slice(vk.as_bytes());
+    out.extend_from_slice(&sig.to_bytes());
+    out.extend_from_slice(plaintext);
+    out
+}
+
+/// Verify and extract a signed sync plaintext.
+/// Returns (device_verifying_key, plaintext) on success.
+pub fn sync_verify(signed: &[u8]) -> Result<([u8; 32], Vec<u8>)> {
+    if signed.len() < 96 {
+        return Err(GhostError::Format("signed sync too short".into()));
+    }
+    let vk_bytes: [u8; 32] = signed[..32].try_into().unwrap();
+    let sig_bytes: [u8; 64] = signed[32..96].try_into().unwrap();
+    let payload = &signed[96..];
+
+    let vk = ed25519_dalek::VerifyingKey::from_bytes(&vk_bytes)
+        .map_err(|e| GhostError::Format(format!("bad device key: {e}")))?;
+    let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+    vk.verify_strict(payload, &sig)
+        .map_err(|e| GhostError::Format(format!("sync signature invalid: {e}")))?;
+
+    Ok((vk_bytes, payload.to_vec()))
+}
+
 /// Wrap a sync ciphertext in a relay-compatible envelope.
 pub fn wrap_sync_envelope(sealed: &[u8]) -> Vec<u8> {
     let header = ghost_wire::encode_envelope(ghost_wire::EnvelopeType::Application, 0);
@@ -1061,5 +1093,29 @@ mod tests {
             }
             _ => panic!("expected AvatarUpdate"),
         }
+    }
+
+    #[test]
+    fn sync_sign_verify_roundtrip() {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
+        let payload = b"hello sync";
+        let signed = sync_sign(&sk, payload);
+        let (vk, recovered) = sync_verify(&signed).unwrap();
+        assert_eq!(vk, sk.verifying_key().to_bytes());
+        assert_eq!(recovered, payload);
+    }
+
+    #[test]
+    fn sync_verify_rejects_tampered() {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
+        let mut signed = sync_sign(&sk, b"original");
+        // Tamper with the payload
+        *signed.last_mut().unwrap() ^= 0xFF;
+        assert!(sync_verify(&signed).is_err());
+    }
+
+    #[test]
+    fn sync_verify_rejects_too_short() {
+        assert!(sync_verify(&[0u8; 95]).is_err());
     }
 }

@@ -11,7 +11,7 @@ use ghost_core::mls::presence::OnlineStatus;
 use ghost_core::mls::voice::PresenceState;
 use ghost_core::relay::{RelayClient, RelayEvent};
 use ghost_core::storage::{Channel, Member, MemberRole};
-use ghost_core::wire::{decode_metadata, ChannelOpPayload, MetadataPayload, ProvisionPayload, sync_mailbox_id, sync_open};
+use ghost_core::wire::{decode_metadata, ChannelOpPayload, MetadataPayload, ProvisionPayload, sync_mailbox_id, sync_open, sync_verify};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 use tokio::sync::{mpsc, Mutex};
@@ -283,7 +283,7 @@ async fn handle_sync_blob(
     let sealed = &envelope_blob[ghost_wire::ENVELOPE_HEADER_SIZE..];
 
     // Decrypt
-    let plaintext = match sync_open(sync_key, sealed) {
+    let decrypted = match sync_open(sync_key, sealed) {
         Ok(pt) => pt,
         Err(e) => {
             eprintln!("sync: decrypt failed: {e}");
@@ -291,9 +291,44 @@ async fn handle_sync_blob(
         }
     };
 
-    if plaintext.is_empty() {
+    if decrypted.is_empty() {
         eprintln!("sync: empty payload");
         return;
+    }
+
+    // Verify device signature and check identity log for revocation
+    let (device_vk, plaintext) = match sync_verify(&decrypted) {
+        Ok(v) => v,
+        Err(_) => {
+            // Unsigned legacy message — accept during transition
+            (Default::default(), decrypted)
+        }
+    };
+    if device_vk != [0u8; 32] {
+        let account_fp = {
+            let c = client.lock().await;
+            *c.fingerprint()
+        };
+        let is_active = {
+            let r = relay.lock().await;
+            match r.get_idlog(&account_fp, 0).await {
+                Ok(blobs) => {
+                    use ghost_core::identity::log::{LogEntry, validate_chain};
+                    let entries: Vec<LogEntry> = blobs.iter()
+                        .filter_map(|b| LogEntry::from_bytes(&b.payload).ok())
+                        .collect();
+                    match validate_chain(&entries) {
+                        Ok(log_state) => log_state.is_active_device(&device_vk),
+                        Err(_) => true, // can't validate — don't block
+                    }
+                }
+                Err(_) => true, // network error — don't block
+            }
+        };
+        if !is_active {
+            eprintln!("sync: rejected message from revoked device {}", hex::encode(&device_vk[..8]));
+            return;
+        }
     }
 
     let msg_type = plaintext[0];
@@ -436,62 +471,66 @@ async fn handle_gap(
     relay: &Arc<Mutex<RelayClient>>,
     mailbox_id: &[u8; 32],
 ) {
-    // Fetch GroupInfo from relay, rejoin via external commit
-    let fetch_result = {
-        let r = relay.lock().await;
-        r.get_server_info(mailbox_id).await
-    };
-    let server_info = match fetch_result {
-        Ok(gi) => gi,
-        Err(e) => {
-            if e.to_string().contains("404") {
-                // Relay was restarted — no server_info exists yet.
-                // Our local MLS state is still valid; just reset last_seen
-                // and resubscribe from the start of the (now-empty) log.
-                eprintln!("gap recovery: relay has no server_info, resetting last_seen");
-                let c = client.lock().await;
-                let _ = c.store().set_last_seen_seq(mailbox_id, 0);
-                drop(c);
-                let mut r = relay.lock().await;
-                r.subscribe(*mailbox_id, 0);
-            } else {
-                eprintln!("gap recovery: failed to fetch server_info: {e}");
-            }
-            return;
-        }
-    };
-
-    let (commit_bytes, server_id) = {
-        let mut c = client.lock().await;
-        let sid = match c.server_id_for_mailbox(mailbox_id) {
+    let server_id = {
+        let c = client.lock().await;
+        match c.server_id_for_mailbox(mailbox_id) {
             Some(sid) => sid,
             None => return,
-        };
-        match c.recover_via_external_commit(&sid, &server_info) {
-            Ok((commit, _)) => (commit, sid),
-            Err(e) => {
-                eprintln!("gap recovery: external commit failed: {e}");
-                return;
-            }
         }
     };
 
-    // Broadcast the external commit so other members see us rejoin
-    {
-        let r = relay.lock().await;
-        if let Err(e) = r.send(mailbox_id, commit_bytes).await {
-            eprintln!("gap recovery: failed to send commit: {e}");
-        }
-    }
-
-    // Upload fresh GroupInfo
-    {
-        let c = client.lock().await;
-        if let Ok(gi) = c.export_server_info(&server_id) {
+    for attempt in 0..3 {
+        // Fetch fresh GroupInfo each attempt
+        let fetch_result = {
             let r = relay.lock().await;
-            let _ = r.put_server_info(mailbox_id, gi).await;
+            r.get_server_info(mailbox_id).await
+        };
+        let server_info = match fetch_result {
+            Ok(gi) => gi,
+            Err(e) => {
+                if e.to_string().contains("404") {
+                    eprintln!("gap recovery: relay has no server_info, resetting last_seen");
+                    let c = client.lock().await;
+                    let _ = c.store().set_last_seen_seq(mailbox_id, 0);
+                    drop(c);
+                    let mut r = relay.lock().await;
+                    r.subscribe(*mailbox_id, 0);
+                } else {
+                    eprintln!("gap recovery: failed to fetch server_info: {e}");
+                }
+                return;
+            }
+        };
+
+        let commit_bytes = {
+            let mut c = client.lock().await;
+            match c.recover_via_external_commit(&server_id, &server_info) {
+                Ok((commit, _)) => commit,
+                Err(e) => {
+                    eprintln!("gap recovery: external commit failed (attempt {attempt}): {e}");
+                    continue;
+                }
+            }
+        };
+
+        // Post via HTTP so we get a clear success/rejection signal
+        match relay.lock().await.post_blob(mailbox_id, commit_bytes).await {
+            Ok(_) => {
+                // Upload fresh GroupInfo for other joiners
+                let c = client.lock().await;
+                if let Ok(gi) = c.export_server_info(&server_id) {
+                    let r = relay.lock().await;
+                    let _ = r.put_server_info(mailbox_id, gi).await;
+                }
+                return;
+            }
+            Err(e) => {
+                eprintln!("gap recovery: relay rejected commit (attempt {attempt}): {e}");
+                continue;
+            }
         }
     }
+    eprintln!("gap recovery: failed after 3 attempts for mailbox");
 }
 
 // --- Voice state via mailbox WS ---

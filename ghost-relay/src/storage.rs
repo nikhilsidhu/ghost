@@ -96,16 +96,21 @@ impl Storage {
         Ok(())
     }
 
-    /// Store a blob and return its sequence number.
+    /// Store a blob, enforcing epoch ordering for commits.
+    ///
+    /// Commits whose epoch doesn't match the relay's current epoch are rejected
+    /// with `Conflict` — the sender must re-fetch GroupInfo and retry.
+    /// Application messages are always accepted (epoch mismatch is informational).
     pub fn append(
         &self,
         mailbox_id: &[u8; 32],
         envelope_type: u8,
         epoch: u64,
         payload: &[u8],
-    ) -> Result<(u64, u64), RelayError> {
+    ) -> Result<(u64, u64, bool), RelayError> {
         let conn = self.conn.lock().unwrap();
         let received_at = now_millis();
+        let is_commit = envelope_type == ghost_wire::EnvelopeType::Commit as u8;
 
         let tx = conn
             .unchecked_transaction()
@@ -118,6 +123,20 @@ impl Storage {
             params![mailbox_id.as_slice()],
         )
         .map_err(|e| RelayError::Storage(e.to_string()))?;
+
+        let relay_epoch: u64 = tx
+            .query_row(
+                "SELECT current_epoch FROM mailbox_state WHERE mailbox_id = ?1",
+                params![mailbox_id.as_slice()],
+                |row| row.get::<_, i64>(0).map(|v| v as u64),
+            )
+            .map_err(|e| RelayError::Storage(e.to_string()))?;
+
+        let epoch_mismatch = epoch != relay_epoch;
+
+        if is_commit && epoch_mismatch {
+            return Err(RelayError::Conflict);
+        }
 
         let seq: u64 = tx
             .query_row(
@@ -143,10 +162,19 @@ impl Storage {
         )
         .map_err(|e| RelayError::Storage(e.to_string()))?;
 
+        if is_commit {
+            tx.execute(
+                "UPDATE mailbox_state SET current_epoch = MAX(current_epoch, ?2)
+                 WHERE mailbox_id = ?1",
+                params![mailbox_id.as_slice(), epoch.saturating_add(1) as i64],
+            )
+            .map_err(|e| RelayError::Storage(e.to_string()))?;
+        }
+
         tx.commit()
             .map_err(|e| RelayError::Storage(e.to_string()))?;
 
-        Ok((seq, received_at))
+        Ok((seq, received_at, epoch_mismatch))
     }
 
     /// Read log entries after a given sequence number.
@@ -443,9 +471,9 @@ mod tests {
     fn append_assigns_sequential_seqs() {
         let store = Storage::open_in_memory().unwrap();
         let mb = test_mailbox();
-        let (seq1, _) = store.append(&mb, APP, 0, b"first").unwrap();
-        let (seq2, _) = store.append(&mb, APP, 0, b"second").unwrap();
-        let (seq3, _) = store.append(&mb, COMMIT, 0, b"commit").unwrap();
+        let (seq1, _, _) = store.append(&mb, APP, 0, b"first").unwrap();
+        let (seq2, _, _) = store.append(&mb, APP, 0, b"second").unwrap();
+        let (seq3, _, _) = store.append(&mb, COMMIT, 0, b"commit").unwrap();
         assert_eq!(seq1, 1);
         assert_eq!(seq2, 2);
         assert_eq!(seq3, 3);
@@ -456,9 +484,9 @@ mod tests {
         let store = Storage::open_in_memory().unwrap();
         let mb_a = [0xAA; 32];
         let mb_b = [0xBB; 32];
-        let (a1, _) = store.append(&mb_a, APP, 0, b"a1").unwrap();
-        let (b1, _) = store.append(&mb_b, APP, 0, b"b1").unwrap();
-        let (a2, _) = store.append(&mb_a, APP, 0, b"a2").unwrap();
+        let (a1, _, _) = store.append(&mb_a, APP, 0, b"a1").unwrap();
+        let (b1, _, _) = store.append(&mb_b, APP, 0, b"b1").unwrap();
+        let (a2, _, _) = store.append(&mb_a, APP, 0, b"a2").unwrap();
         assert_eq!(a1, 1);
         assert_eq!(b1, 1);
         assert_eq!(a2, 2);
@@ -512,20 +540,46 @@ mod tests {
 
         assert_eq!(store.get_epoch(&mb).unwrap(), 0);
 
-        // Append creates the mailbox_state row
+        // Commit at epoch 0 advances relay epoch to 1
         store.append(&mb, COMMIT, 0, b"commit").unwrap();
-        assert_eq!(store.get_epoch(&mb).unwrap(), 0);
-
-        // set_epoch advances forward
-        store.set_epoch(&mb, 1).unwrap();
         assert_eq!(store.get_epoch(&mb).unwrap(), 1);
 
-        store.set_epoch(&mb, 3).unwrap();
-        assert_eq!(store.get_epoch(&mb).unwrap(), 3);
+        // Commit at epoch 1 advances to 2
+        store.append(&mb, COMMIT, 1, b"commit2").unwrap();
+        assert_eq!(store.get_epoch(&mb).unwrap(), 2);
 
         // set_epoch never goes backward
         store.set_epoch(&mb, 1).unwrap();
-        assert_eq!(store.get_epoch(&mb).unwrap(), 3);
+        assert_eq!(store.get_epoch(&mb).unwrap(), 2);
+
+        // set_epoch can jump forward
+        store.set_epoch(&mb, 5).unwrap();
+        assert_eq!(store.get_epoch(&mb).unwrap(), 5);
+    }
+
+    #[test]
+    fn commit_at_stale_epoch_rejected() {
+        let store = Storage::open_in_memory().unwrap();
+        let mb = test_mailbox();
+
+        // First commit at epoch 0 succeeds, advances to 1
+        store.append(&mb, COMMIT, 0, b"commit-a").unwrap();
+        assert_eq!(store.get_epoch(&mb).unwrap(), 1);
+
+        // Second commit at epoch 0 is rejected (stale)
+        let err = store.append(&mb, COMMIT, 0, b"commit-b").unwrap_err();
+        assert!(matches!(err, RelayError::Conflict));
+
+        // Application message at stale epoch still accepted
+        let (seq, _, mismatch) = store.append(&mb, APP, 0, b"app-msg").unwrap();
+        assert!(mismatch);
+        assert_eq!(seq, 2); // seq 1 was the first commit
+
+        // Commit at correct epoch succeeds
+        let (seq, _, mismatch) = store.append(&mb, COMMIT, 1, b"commit-c").unwrap();
+        assert!(!mismatch);
+        assert_eq!(seq, 3);
+        assert_eq!(store.get_epoch(&mb).unwrap(), 2);
     }
 
     #[test]

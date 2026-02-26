@@ -108,7 +108,7 @@ impl LogState {
         self.devices.values().filter(|d| d.is_active())
     }
 
-    fn is_active_device(&self, key: &[u8; 32]) -> bool {
+    pub fn is_active_device(&self, key: &[u8; 32]) -> bool {
         self.devices.get(key).map_or(false, |d| d.is_active())
     }
 }
