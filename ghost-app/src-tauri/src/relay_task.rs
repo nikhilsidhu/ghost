@@ -24,6 +24,14 @@ fn parse_hex32(hex: &str) -> std::result::Result<[u8; 32], String> {
     bytes.try_into().map_err(|_| "not 32 bytes".into())
 }
 
+fn get_json_str<'a>(obj: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    obj.get(key)?.as_str()
+}
+
+fn decode_b64_blob(b64: &str) -> Option<Vec<u8>> {
+    B64.decode(b64).ok()
+}
+
 async fn rebroadcast_presence(
     client: &Arc<Mutex<GhostClient>>,
     relay: &Arc<Mutex<RelayClient>>,
@@ -103,7 +111,7 @@ pub async fn run(
                     let key = { client.lock().await.sync_key() };
                     if let Some(key) = key {
                         handle_sync_blob(
-                            &app, &client, &relay, &key, &blob.payload, &data_dir,
+                            &app, &client, &relay, &key, &blob.payload,
                         ).await;
                         let c = client.lock().await;
                         let _ = c.store().set_last_seen_seq(&sync_mb, seq);
@@ -287,7 +295,6 @@ async fn handle_sync_blob(
     relay: &Arc<Mutex<RelayClient>>,
     sync_key: &[u8; 32],
     envelope_blob: &[u8],
-    _data_dir: &std::path::Path,
 ) {
     // Strip envelope header
     if envelope_blob.len() < ghost_wire::ENVELOPE_HEADER_SIZE {
@@ -522,10 +529,8 @@ async fn fetch_and_merge_sync_state(
 
     let (sync_key, account_fp) = {
         let c = client.lock().await;
-        match c.sync_key() {
-            Some(k) => (k, *c.fingerprint()),
-            None => return,
-        }
+        let Some(k) = c.sync_key() else { return };
+        (k, *c.fingerprint())
     };
 
     // GET encrypted snapshot from relay (lock dropped before branching)
@@ -624,10 +629,8 @@ async fn handle_gap(
 ) {
     let server_id = {
         let c = client.lock().await;
-        match c.server_id_for_mailbox(mailbox_id) {
-            Some(sid) => sid,
-            None => return,
-        }
+        let Some(sid) = c.server_id_for_mailbox(mailbox_id) else { return };
+        sid
     };
 
     for attempt in 0..3 {
@@ -729,27 +732,12 @@ async fn handle_voice_state(
                 }
             }
             let c = client.lock().await;
-            let server_id = match c.server_id_for_mailbox(mailbox_id) {
-                Some(sid) => sid,
-                None => return,
-            };
+            let Some(server_id) = c.server_id_for_mailbox(mailbox_id) else { return };
             for entry in arr {
-                let ch_b64 = match entry.get("ch").and_then(|v| v.as_str()) {
-                    Some(s) => s,
-                    None => continue,
-                };
-                let p_b64 = match entry.get("p").and_then(|v| v.as_str()) {
-                    Some(s) => s,
-                    None => continue,
-                };
-                let channel_id = match decode_channel_id(ch_b64) {
-                    Some(id) => id,
-                    None => continue,
-                };
-                let blob = match B64.decode(p_b64) {
-                    Ok(b) => b,
-                    Err(_) => continue,
-                };
+                let Some(ch_b64) = get_json_str(entry, "ch") else { continue };
+                let Some(p_b64) = get_json_str(entry, "p") else { continue };
+                let Some(channel_id) = decode_channel_id(ch_b64) else { continue };
+                let Some(blob) = decode_b64_blob(p_b64) else { continue };
                 if let Ok(ps) = c.open_presence_blob(&server_id, &channel_id, &blob) {
                     voice_members.entry(channel_id).or_default().push(ps);
                     mailbox_channels.entry(*mailbox_id).or_default().insert(channel_id);
@@ -769,60 +757,63 @@ async fn handle_voice_state(
         // Single voice state update
         if let Some(vs_val) = snap.get("vs") {
             if let Ok(vs) = serde_json::from_value::<VsMsg>(vs_val.clone()) {
-                let channel_id = match decode_channel_id(&vs.ch) {
-                    Some(id) => id,
-                    None => return,
-                };
+                let Some(channel_id) = decode_channel_id(&vs.ch) else { return };
+
+                let Some(p_b64) = &vs.p else { return };
+                let Some(blob) = decode_b64_blob(p_b64) else { return };
+                let c = client.lock().await;
+                let Some(server_id) = c.server_id_for_mailbox(mailbox_id) else { return };
+                let Ok(ps) = c.open_presence_blob(&server_id, &channel_id, &blob) else { return };
+                drop(c);
 
                 if vs.leave == Some(true) {
-                    // Leave: decrypt last blob to identify who left
-                    if let Some(p_b64) = &vs.p {
-                        if let Ok(blob) = B64.decode(p_b64) {
-                            let c = client.lock().await;
-                            if let Some(server_id) = c.server_id_for_mailbox(mailbox_id) {
-                                if let Ok(ps) = c.open_presence_blob(&server_id, &channel_id, &blob) {
-                                    drop(c);
-                                    if let Some(members) = voice_members.get_mut(&channel_id) {
-                                        members.retain(|m| !(m.fingerprint == ps.fingerprint && m.device_vk == ps.device_vk));
-                                        if members.is_empty() {
-                                            let empty: Vec<PresenceState> = Vec::new();
-                                            emit_channel_members(app, &channel_id, &empty);
-                                            voice_members.remove(&channel_id);
-                                            // Clean up mailbox_channels tracking
-                                            if let Some(chs) = mailbox_channels.get_mut(mailbox_id) {
-                                                chs.remove(&channel_id);
-                                            }
-                                        } else {
-                                            emit_channel_members(app, &channel_id, members);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                } else if let Some(p_b64) = &vs.p {
-                    // Join or presence update
-                    if let Ok(blob) = B64.decode(p_b64) {
-                        let c = client.lock().await;
-                        if let Some(server_id) = c.server_id_for_mailbox(mailbox_id) {
-                            if let Ok(ps) = c.open_presence_blob(&server_id, &channel_id, &blob) {
-                                drop(c);
-                                mailbox_channels.entry(*mailbox_id).or_default().insert(channel_id);
-                                let members = voice_members.entry(channel_id).or_default();
-                                if let Some(existing) = members.iter_mut().find(|m| m.fingerprint == ps.fingerprint && m.device_vk == ps.device_vk) {
-                                    existing.muted = ps.muted;
-                                    existing.deafened = ps.deafened;
-                                } else {
-                                    members.push(ps);
-                                }
-                                emit_channel_members(app, &channel_id, members);
-                            }
-                        }
-                    }
+                    apply_voice_leave(app, &channel_id, &ps, mailbox_id, voice_members, mailbox_channels);
+                } else {
+                    apply_voice_join(app, &channel_id, ps, mailbox_id, voice_members, mailbox_channels);
                 }
             }
         }
     }
+}
+
+fn apply_voice_leave(
+    app: &AppHandle,
+    channel_id: &[u8; 32],
+    ps: &PresenceState,
+    mailbox_id: &[u8; 32],
+    voice_members: &mut HashMap<[u8; 32], Vec<PresenceState>>,
+    mailbox_channels: &mut HashMap<[u8; 32], HashSet<[u8; 32]>>,
+) {
+    let Some(members) = voice_members.get_mut(channel_id) else { return };
+    members.retain(|m| !(m.fingerprint == ps.fingerprint && m.device_vk == ps.device_vk));
+    if members.is_empty() {
+        emit_channel_members(app, channel_id, &[]);
+        voice_members.remove(channel_id);
+        if let Some(chs) = mailbox_channels.get_mut(mailbox_id) {
+            chs.remove(channel_id);
+        }
+    } else {
+        emit_channel_members(app, channel_id, members);
+    }
+}
+
+fn apply_voice_join(
+    app: &AppHandle,
+    channel_id: &[u8; 32],
+    ps: PresenceState,
+    mailbox_id: &[u8; 32],
+    voice_members: &mut HashMap<[u8; 32], Vec<PresenceState>>,
+    mailbox_channels: &mut HashMap<[u8; 32], HashSet<[u8; 32]>>,
+) {
+    mailbox_channels.entry(*mailbox_id).or_default().insert(*channel_id);
+    let members = voice_members.entry(*channel_id).or_default();
+    if let Some(existing) = members.iter_mut().find(|m| m.fingerprint == ps.fingerprint && m.device_vk == ps.device_vk) {
+        existing.muted = ps.muted;
+        existing.deafened = ps.deafened;
+    } else {
+        members.push(ps);
+    }
+    emit_channel_members(app, channel_id, members);
 }
 
 fn decode_channel_id(b64: &str) -> Option<[u8; 32]> {
@@ -1072,22 +1063,13 @@ async fn handle_online_presence(
     // Snapshot: replace all online members for this server
     if let Some(arr) = snap.get("ps_snap").and_then(|v| v.as_array()) {
         let c = client.lock().await;
-        let server_id = match c.server_id_for_mailbox(mailbox_id) {
-            Some(sid) => sid,
-            None => return,
-        };
+        let Some(server_id) = c.server_id_for_mailbox(mailbox_id) else { return };
         let mut members_list = Vec::new();
         let mut failed = Vec::new();
         let mut avatars_to_fetch: Vec<([u8; 32], [u8; 32])> = Vec::new();
         for entry in arr {
-            let p_b64 = match entry.get("p").and_then(|v| v.as_str()) {
-                Some(s) => s,
-                None => continue,
-            };
-            let blob = match B64.decode(p_b64) {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
+            let Some(p_b64) = get_json_str(entry, "p") else { continue };
+            let Some(blob) = decode_b64_blob(p_b64) else { continue };
             match try_decrypt_presence(&c, &server_id, &blob, &mut members_list) {
                 Some((fp, Some(hash))) => avatars_to_fetch.push((fp, hash)),
                 Some(_) => {}
@@ -1112,20 +1094,11 @@ async fn handle_online_presence(
     // Single update or leave
     if let Some(ps_val) = snap.get("ps") {
         let leave = ps_val.get("leave").and_then(|v| v.as_bool()).unwrap_or(false);
-        let p_b64 = match ps_val.get("p").and_then(|v| v.as_str()) {
-            Some(s) => s,
-            None => return,
-        };
-        let blob = match B64.decode(p_b64) {
-            Ok(b) => b,
-            Err(_) => return,
-        };
+        let Some(p_b64) = get_json_str(ps_val, "p") else { return };
+        let Some(blob) = decode_b64_blob(p_b64) else { return };
 
         let c = client.lock().await;
-        let server_id = match c.server_id_for_mailbox(mailbox_id) {
-            Some(sid) => sid,
-            None => return,
-        };
+        let Some(server_id) = c.server_id_for_mailbox(mailbox_id) else { return };
         if leave {
             // Decrypt just to identify who left
             if let Ok(ps) = c.open_online_presence_blob(&server_id, &blob) {
