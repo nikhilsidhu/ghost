@@ -877,4 +877,223 @@ mod tests {
     fn empty_chain_rejected() {
         assert!(validate_chain(&[]).is_err());
     }
+
+    // ── Counter-signature tampering ────────────────────────────
+
+    #[test]
+    fn counter_sig_tampered_on_genesis_rejected() {
+        let (mk, _) = master_key_and_fp();
+        let dk = random_key();
+        let mut entry = create_genesis(&mk, &dk, "d1");
+        entry.counter_signature.as_mut().unwrap()[0] ^= 0xFF;
+        assert!(validate_chain(&[entry]).is_err());
+    }
+
+    #[test]
+    fn counter_sig_tampered_on_add_device_rejected() {
+        let (state, _mk, dk) = build_genesis();
+        let dk2 = random_key();
+        let mut entry = create_add_device(&state, &dk, &dk2, "device-2");
+        entry.counter_signature.as_mut().unwrap()[0] ^= 0xFF;
+        let mut state = state;
+        assert!(validate_entry(&mut state, &entry).is_err());
+    }
+
+    #[test]
+    fn counter_sig_tampered_on_recovery_rejected() {
+        let (state, mk, _dk) = build_genesis();
+        let recovery_dk = random_key();
+        let mut entry = create_recovery(&state, &mk, &recovery_dk, "recovery");
+        entry.counter_signature.as_mut().unwrap()[0] ^= 0xFF;
+        let mut state = state;
+        assert!(validate_entry(&mut state, &entry).is_err());
+    }
+
+    // ── Before-genesis guards ──────────────────────────────────
+
+    #[test]
+    fn add_device_before_genesis_rejected() {
+        let dk = random_key();
+        let new_dk = random_key();
+        let account_fp = [0xAA; 32];
+        let mut entry = LogEntry {
+            seq: 1,
+            prev_hash: [0u8; 32],
+            account_fp,
+            entry_type: EntryType::AddDevice,
+            timestamp: now_millis(),
+            body: EntryBody::AddDevice {
+                device_verifying_key: new_dk.verifying_key().to_bytes(),
+                device_label: "sneaky".to_string(),
+                authorizer_key: dk.verifying_key().to_bytes(),
+            },
+            signature: [0u8; 64],
+            counter_signature: None,
+        };
+        sign_entry(&dk, &mut entry);
+        counter_sign(&new_dk, &mut entry);
+        let mut state = LogState::empty(account_fp);
+        let err = validate_entry(&mut state, &entry).unwrap_err();
+        assert!(err.to_string().contains("AddDevice before genesis"));
+    }
+
+    #[test]
+    fn revoke_device_before_genesis_rejected() {
+        let dk = random_key();
+        let target = random_key();
+        let account_fp = [0xAA; 32];
+        let mut entry = LogEntry {
+            seq: 1,
+            prev_hash: [0u8; 32],
+            account_fp,
+            entry_type: EntryType::RevokeDevice,
+            timestamp: now_millis(),
+            body: EntryBody::RevokeDevice {
+                device_verifying_key: target.verifying_key().to_bytes(),
+                revoker_key: dk.verifying_key().to_bytes(),
+            },
+            signature: [0u8; 64],
+            counter_signature: None,
+        };
+        sign_entry(&dk, &mut entry);
+        let mut state = LogState::empty(account_fp);
+        let err = validate_entry(&mut state, &entry).unwrap_err();
+        assert!(err.to_string().contains("RevokeDevice before genesis"));
+    }
+
+    #[test]
+    fn recovery_before_genesis_rejected() {
+        let mk = random_key();
+        let new_dk = random_key();
+        let account_fp = [0xAA; 32];
+        let mut entry = LogEntry {
+            seq: 1,
+            prev_hash: [0u8; 32],
+            account_fp,
+            entry_type: EntryType::Recovery,
+            timestamp: now_millis(),
+            body: EntryBody::Recovery {
+                device_verifying_key: new_dk.verifying_key().to_bytes(),
+                device_label: "recovery".to_string(),
+            },
+            signature: [0u8; 64],
+            counter_signature: None,
+        };
+        sign_entry(&mk, &mut entry);
+        counter_sign(&new_dk, &mut entry);
+        let mut state = LogState::empty(account_fp);
+        let err = validate_entry(&mut state, &entry).unwrap_err();
+        assert!(err.to_string().contains("Recovery before genesis"));
+    }
+
+    // ── Second genesis in chain ────────────────────────────────
+
+    #[test]
+    fn second_genesis_rejected() {
+        let (mk, _) = master_key_and_fp();
+        let dk = random_key();
+        let genesis = create_genesis(&mk, &dk, "d1");
+        let state = validate_chain(&[genesis.clone()]).unwrap();
+
+        // Construct a second genesis at seq=2
+        let dk2 = random_key();
+        let mut entry = LogEntry {
+            seq: 2,
+            prev_hash: state.head_hash,
+            account_fp: state.account_fp,
+            entry_type: EntryType::Genesis,
+            timestamp: now_millis(),
+            body: EntryBody::Genesis {
+                master_verifying_key: mk.verifying_key().to_bytes(),
+                device_verifying_key: dk2.verifying_key().to_bytes(),
+                device_label: "second-genesis".to_string(),
+            },
+            signature: [0u8; 64],
+            counter_signature: None,
+        };
+        sign_entry(&mk, &mut entry);
+        counter_sign(&dk2, &mut entry);
+
+        let err = validate_chain(&[genesis, entry]).unwrap_err();
+        assert!(err.to_string().contains("genesis must be seq 1"));
+    }
+
+    // ── Authorizer/signer mismatch ─────────────────────────────
+
+    #[test]
+    fn add_device_authorizer_signer_mismatch() {
+        let (state, _mk, dk) = build_genesis();
+        let attacker = random_key();
+        let new_dk = random_key();
+
+        // Body claims authorizer is the legitimate device, but attacker signs
+        let mut entry = LogEntry {
+            seq: state.head_seq + 1,
+            prev_hash: state.head_hash,
+            account_fp: state.account_fp,
+            entry_type: EntryType::AddDevice,
+            timestamp: now_millis(),
+            body: EntryBody::AddDevice {
+                device_verifying_key: new_dk.verifying_key().to_bytes(),
+                device_label: "evil".to_string(),
+                authorizer_key: dk.verifying_key().to_bytes(),
+            },
+            signature: [0u8; 64],
+            counter_signature: None,
+        };
+        sign_entry(&attacker, &mut entry);
+        counter_sign(&new_dk, &mut entry);
+
+        let mut state = state;
+        assert!(validate_entry(&mut state, &entry).is_err());
+    }
+
+    // ── Re-add revoked device ──────────────────────────────────
+
+    #[test]
+    fn readd_revoked_device_rejected() {
+        let (state, _mk, dk) = build_genesis();
+        let dk2 = random_key();
+        let add2 = create_add_device(&state, &dk, &dk2, "device-2");
+        let mut state = state;
+        validate_entry(&mut state, &add2).unwrap();
+
+        let revoke2 = create_revoke_device(&state, &dk, &dk2.verifying_key().to_bytes());
+        validate_entry(&mut state, &revoke2).unwrap();
+        assert!(!state.is_active_device(&dk2.verifying_key().to_bytes()));
+
+        // Try to re-add the same device key
+        let readd = create_add_device(&state, &dk, &dk2, "device-2-again");
+        let err = validate_entry(&mut state, &readd).unwrap_err();
+        assert!(err.to_string().contains("duplicate device key"));
+    }
+
+    // ── account_fp mismatch on non-genesis entry ───────────────
+
+    #[test]
+    fn account_fp_mismatch_on_add_device_rejected() {
+        let (state, _mk, dk) = build_genesis();
+        let new_dk = random_key();
+
+        let mut entry = LogEntry {
+            seq: state.head_seq + 1,
+            prev_hash: state.head_hash,
+            account_fp: [0xFF; 32], // wrong fingerprint
+            entry_type: EntryType::AddDevice,
+            timestamp: now_millis(),
+            body: EntryBody::AddDevice {
+                device_verifying_key: new_dk.verifying_key().to_bytes(),
+                device_label: "wrong-fp".to_string(),
+                authorizer_key: dk.verifying_key().to_bytes(),
+            },
+            signature: [0u8; 64],
+            counter_signature: None,
+        };
+        sign_entry(&dk, &mut entry);
+        counter_sign(&new_dk, &mut entry);
+
+        let mut state = state;
+        let err = validate_entry(&mut state, &entry).unwrap_err();
+        assert!(err.to_string().contains("account_fp mismatch"));
+    }
 }

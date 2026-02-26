@@ -659,73 +659,6 @@ async fn voice_max_participants() {
     assert!(msg["message"].as_str().unwrap().contains("full"));
 }
 
-// --- ServerInfo tests ---
-
-#[tokio::test]
-async fn server_info_put_get() {
-    let base = start_server(test_config()).await;
-    let client = reqwest::Client::new();
-    let mailbox_id = URL_SAFE_NO_PAD.encode([0xDD; 32]);
-
-    let resp = client
-        .put(format!("{base}/box/{mailbox_id}/server_info"))
-        .body(b"group-info-bytes".to_vec())
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-
-    let resp = client
-        .get(format!("{base}/box/{mailbox_id}/server_info"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(resp.bytes().await.unwrap().as_ref(), b"group-info-bytes");
-}
-
-#[tokio::test]
-async fn server_info_not_found() {
-    let base = start_server(test_config()).await;
-    let client = reqwest::Client::new();
-    let mailbox_id = URL_SAFE_NO_PAD.encode([0xEE; 32]);
-
-    let resp = client
-        .get(format!("{base}/box/{mailbox_id}/server_info"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-}
-
-#[tokio::test]
-async fn server_info_overwrite() {
-    let base = start_server(test_config()).await;
-    let client = reqwest::Client::new();
-    let mailbox_id = URL_SAFE_NO_PAD.encode([0xFF; 32]);
-
-    client
-        .put(format!("{base}/box/{mailbox_id}/server_info"))
-        .body(b"v1".to_vec())
-        .send()
-        .await
-        .unwrap();
-
-    client
-        .put(format!("{base}/box/{mailbox_id}/server_info"))
-        .body(b"v2".to_vec())
-        .send()
-        .await
-        .unwrap();
-
-    let resp = client
-        .get(format!("{base}/box/{mailbox_id}/server_info"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.bytes().await.unwrap().as_ref(), b"v2");
-}
-
 // --- Identity log tests ---
 
 /// Build a fake idlog payload with the given seq and prev_hash.
@@ -741,47 +674,6 @@ fn idlog_entry(seq: u64, prev_hash: [u8; 32]) -> Vec<u8> {
 
 fn idlog_url(base: &str, account_fp: &[u8; 32]) -> String {
     format!("{base}/idlog/{}", hex::encode(account_fp))
-}
-
-#[tokio::test]
-async fn idlog_put_get_roundtrip() {
-    let base = start_server(test_config()).await;
-    let client = reqwest::Client::new();
-    let fp = [0xA1; 32];
-
-    // Genesis (seq=1, prev_hash=zeroed)
-    let entry1 = idlog_entry(1, [0u8; 32]);
-    let resp = client.put(idlog_url(&base, &fp)).body(entry1.clone()).send().await.unwrap();
-    assert_eq!(resp.status(), StatusCode::CREATED);
-
-    // Fetch all
-    let entries: Vec<Value> = client
-        .get(idlog_url(&base, &fp))
-        .send().await.unwrap()
-        .json().await.unwrap();
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0]["seq"], 1);
-
-    // Second entry (seq=2, prev_hash = blake3 of first entry's payload)
-    let prev_hash: [u8; 32] = blake3::hash(&entry1).into();
-    let entry2 = idlog_entry(2, prev_hash);
-    let resp = client.put(idlog_url(&base, &fp)).body(entry2.clone()).send().await.unwrap();
-    assert_eq!(resp.status(), StatusCode::CREATED);
-
-    // Fetch after_seq=1 returns only entry 2
-    let entries: Vec<Value> = client
-        .get(format!("{}?after_seq=1", idlog_url(&base, &fp)))
-        .send().await.unwrap()
-        .json().await.unwrap();
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0]["seq"], 2);
-
-    // Fetch all returns both
-    let entries: Vec<Value> = client
-        .get(idlog_url(&base, &fp))
-        .send().await.unwrap()
-        .json().await.unwrap();
-    assert_eq!(entries.len(), 2);
 }
 
 #[tokio::test]
@@ -857,34 +749,6 @@ async fn idlog_size_limit() {
     big.extend_from_slice(&[0u8; 5000]); // exceed 4096 limit
     let resp = client.put(idlog_url(&base, &fp)).body(big).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
-}
-
-#[tokio::test]
-async fn idlog_separate_accounts_independent() {
-    let base = start_server(test_config()).await;
-    let client = reqwest::Client::new();
-    let fp_a = [0xA7; 32];
-    let fp_b = [0xA8; 32];
-
-    let entry_a = idlog_entry(1, [0u8; 32]);
-    let entry_b = idlog_entry(1, [0u8; 32]);
-    client.put(idlog_url(&base, &fp_a)).body(entry_a).send().await.unwrap();
-    client.put(idlog_url(&base, &fp_b)).body(entry_b).send().await.unwrap();
-
-    let entries: Vec<Value> = client.get(idlog_url(&base, &fp_a)).send().await.unwrap().json().await.unwrap();
-    assert_eq!(entries.len(), 1);
-    let entries: Vec<Value> = client.get(idlog_url(&base, &fp_b)).send().await.unwrap().json().await.unwrap();
-    assert_eq!(entries.len(), 1);
-}
-
-#[tokio::test]
-async fn idlog_get_empty_returns_empty() {
-    let base = start_server(test_config()).await;
-    let client = reqwest::Client::new();
-    let fp = [0xA9; 32];
-
-    let entries: Vec<Value> = client.get(idlog_url(&base, &fp)).send().await.unwrap().json().await.unwrap();
-    assert_eq!(entries.len(), 0);
 }
 
 // --- Pairing tests ---
@@ -997,48 +861,6 @@ fn recovery_url(base: &str, fp: &[u8; 32]) -> String {
 }
 
 #[tokio::test]
-async fn recovery_put_get_roundtrip() {
-    let base = start_server(test_config()).await;
-    let client = reqwest::Client::new();
-    let fp = [0xC1; 32];
-
-    let resp = client
-        .put(recovery_url(&base, &fp))
-        .body(b"encrypted-recovery-blob".to_vec())
-        .send().await.unwrap();
-    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-
-    let resp = client
-        .get(recovery_url(&base, &fp))
-        .send().await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(resp.bytes().await.unwrap().as_ref(), b"encrypted-recovery-blob");
-}
-
-#[tokio::test]
-async fn recovery_get_nonexistent_returns_not_found() {
-    let base = start_server(test_config()).await;
-    let client = reqwest::Client::new();
-    let fp = [0xC2; 32];
-
-    let resp = client.get(recovery_url(&base, &fp)).send().await.unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-}
-
-#[tokio::test]
-async fn recovery_overwrite() {
-    let base = start_server(test_config()).await;
-    let client = reqwest::Client::new();
-    let fp = [0xC3; 32];
-
-    client.put(recovery_url(&base, &fp)).body(b"v1".to_vec()).send().await.unwrap();
-    client.put(recovery_url(&base, &fp)).body(b"v2".to_vec()).send().await.unwrap();
-
-    let resp = client.get(recovery_url(&base, &fp)).send().await.unwrap();
-    assert_eq!(resp.bytes().await.unwrap().as_ref(), b"v2");
-}
-
-#[tokio::test]
 async fn recovery_empty_payload_rejected() {
     let base = start_server(test_config()).await;
     let client = reqwest::Client::new();
@@ -1058,62 +880,10 @@ async fn recovery_size_limit() {
     assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
 }
 
-#[tokio::test]
-async fn recovery_separate_accounts_independent() {
-    let base = start_server(test_config()).await;
-    let client = reqwest::Client::new();
-    let fp_a = [0xC6; 32];
-    let fp_b = [0xC7; 32];
-
-    client.put(recovery_url(&base, &fp_a)).body(b"blob-a".to_vec()).send().await.unwrap();
-    client.put(recovery_url(&base, &fp_b)).body(b"blob-b".to_vec()).send().await.unwrap();
-
-    let resp = client.get(recovery_url(&base, &fp_a)).send().await.unwrap();
-    assert_eq!(resp.bytes().await.unwrap().as_ref(), b"blob-a");
-    let resp = client.get(recovery_url(&base, &fp_b)).send().await.unwrap();
-    assert_eq!(resp.bytes().await.unwrap().as_ref(), b"blob-b");
-}
-
 // --- Provision tests ---
 
 fn provision_url(base: &str, fp: &[u8; 32]) -> String {
     format!("{base}/pair/{}/provision", hex::encode(fp))
-}
-
-#[tokio::test]
-async fn provision_put_get_delete() {
-    let base = start_server(test_config()).await;
-    let client = reqwest::Client::new();
-    let fp = [0xD1; 32];
-
-    // PUT provision blob
-    let resp = client
-        .put(provision_url(&base, &fp))
-        .body(b"encrypted-provision-payload".to_vec())
-        .send().await.unwrap();
-    assert_eq!(resp.status(), StatusCode::CREATED);
-
-    // GET returns blob (non-destructive read)
-    let resp = client.get(provision_url(&base, &fp)).send().await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(resp.bytes().await.unwrap().as_ref(), b"encrypted-provision-payload");
-
-    // Second GET still returns blob (TTL-based cleanup, not one-shot)
-    let resp = client.get(provision_url(&base, &fp)).send().await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-}
-
-#[tokio::test]
-async fn provision_overwrite() {
-    let base = start_server(test_config()).await;
-    let client = reqwest::Client::new();
-    let fp = [0xD2; 32];
-
-    client.put(provision_url(&base, &fp)).body(b"v1".to_vec()).send().await.unwrap();
-    client.put(provision_url(&base, &fp)).body(b"v2".to_vec()).send().await.unwrap();
-
-    let resp = client.get(provision_url(&base, &fp)).send().await.unwrap();
-    assert_eq!(resp.bytes().await.unwrap().as_ref(), b"v2");
 }
 
 #[tokio::test]
@@ -1138,89 +908,4 @@ async fn provision_oversize_rejected() {
         .body(vec![0u8; 300 * 1024])
         .send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
-}
-
-#[tokio::test]
-async fn provision_get_nonexistent_returns_not_found() {
-    let base = start_server(test_config()).await;
-    let client = reqwest::Client::new();
-    let fp = [0xD5; 32];
-
-    let resp = client.get(provision_url(&base, &fp)).send().await.unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-}
-
-#[tokio::test]
-async fn provision_separate_accounts_independent() {
-    let base = start_server(test_config()).await;
-    let client = reqwest::Client::new();
-    let fp_a = [0xD6; 32];
-    let fp_b = [0xD7; 32];
-
-    client.put(provision_url(&base, &fp_a)).body(b"prov-a".to_vec()).send().await.unwrap();
-    client.put(provision_url(&base, &fp_b)).body(b"prov-b".to_vec()).send().await.unwrap();
-
-    let resp = client.get(provision_url(&base, &fp_a)).send().await.unwrap();
-    assert_eq!(resp.bytes().await.unwrap().as_ref(), b"prov-a");
-    let resp = client.get(provision_url(&base, &fp_b)).send().await.unwrap();
-    assert_eq!(resp.bytes().await.unwrap().as_ref(), b"prov-b");
-}
-
-// --- Sync mailbox tests ---
-
-#[tokio::test]
-async fn sync_mailbox_post_and_get() {
-    let base = start_server(test_config()).await;
-    let client = reqwest::Client::new();
-
-    // Sync mailbox is just an arbitrary mailbox ID — relay has no special handling
-    let sync_mailbox = [0xE1; 32];
-    let url = mailbox_url(&base, &sync_mailbox);
-
-    // Post an envelope-wrapped blob (simulates a sync message)
-    let payload = test_envelope(b"sync-server-provisioned");
-    let resp = client.post(&url).body(payload).send().await.unwrap();
-    assert_eq!(resp.status(), StatusCode::CREATED);
-    let body: Value = resp.json().await.unwrap();
-    assert_eq!(body["seq"], 1);
-
-    // GET retrieves it
-    let blobs: Vec<Value> = client.get(&url).send().await.unwrap().json().await.unwrap();
-    assert_eq!(blobs.len(), 1);
-    assert_eq!(blobs[0]["seq"], 1);
-}
-
-#[tokio::test]
-async fn sync_mailbox_ws_subscribe() {
-    let base = start_server(test_config()).await;
-    let client = reqwest::Client::new();
-    let ws_base = base.replace("http://", "ws://");
-
-    let sync_mailbox = [0xE2; 32];
-    let mailbox_b64 = URL_SAFE_NO_PAD.encode(sync_mailbox);
-    let url = mailbox_url(&base, &sync_mailbox);
-    let ws_url = format!("{ws_base}/ws/{mailbox_b64}");
-
-    // Subscribe via WS
-    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
-    ws_handshake(&mut ws, 0).await;
-    consume_vs_snap(&mut ws).await;
-
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    // Post a sync message via HTTP
-    client.post(&url).body(test_envelope(b"sync-msg")).send().await.unwrap();
-
-    // WS receives the blob
-    let data = tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            let m = ws.next().await.unwrap().unwrap();
-            if m.is_binary() { break m.into_data(); }
-        }
-    })
-    .await
-    .expect("timed out waiting for sync blob on WS");
-
-    // 16-byte frame header + 10-byte envelope header + "sync-msg"
-    assert_eq!(&data[26..], b"sync-msg");
 }

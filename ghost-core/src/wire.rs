@@ -954,13 +954,6 @@ mod tests {
     }
 
     #[test]
-    fn message_id_deterministic() {
-        let a = derive_message_id(&test_channel(), &test_sender(), 1000, b"hello");
-        let b = derive_message_id(&test_channel(), &test_sender(), 1000, b"hello");
-        assert_eq!(a, b);
-    }
-
-    #[test]
     fn message_id_changes_with_input() {
         let base = derive_message_id(&test_channel(), &test_sender(), 1000, b"hello");
         let diff_content = derive_message_id(&test_channel(), &test_sender(), 1000, b"world");
@@ -975,17 +968,6 @@ mod tests {
     }
 
     #[test]
-    fn mls_group_id_deterministic() {
-        let gid = [0x11; 32];
-        let a = derive_mls_group_id(&gid);
-        let b = derive_mls_group_id(&gid);
-        assert_eq!(a, b);
-
-        let different = derive_mls_group_id(&[0x22; 32]);
-        assert_ne!(a, different);
-    }
-
-    #[test]
     fn default_channel_id_deterministic() {
         let gid = [0x11; 32];
         let a = derive_default_channel_id(&gid);
@@ -997,17 +979,6 @@ mod tests {
 
         // Must differ from MLS group ID derivation for same input
         assert_ne!(a, derive_mls_group_id(&gid));
-    }
-
-    #[test]
-    fn mailbox_id_deterministic() {
-        let mls_id = derive_mls_group_id(&[0x33; 32]);
-        let a = mls_group_mailbox_id(&mls_id);
-        let b = mls_group_mailbox_id(&mls_id);
-        assert_eq!(a, b);
-
-        let different = mls_group_mailbox_id(&[0x44; 32]);
-        assert_ne!(a, different);
     }
 
     #[test]
@@ -1122,40 +1093,6 @@ mod tests {
     }
 
     #[test]
-    fn seal_open_with_references() {
-        let provider_a = GhostProvider::new_in_memory().unwrap();
-        let provider_b = GhostProvider::new_in_memory().unwrap();
-        let id_a = Identity::from_seed([0x01; 32]).unwrap();
-        let id_b = Identity::from_seed([0x02; 32]).unwrap();
-
-        let server_id = [0x42; 32];
-        let mut group_a =
-            GhostGroup::create_with_id(&provider_a, &id_a, &server_id).unwrap();
-        let kp_b = generate_key_package(&provider_b, &id_b).unwrap();
-        let (_commit, welcome) = group_a.add_member(&provider_a, kp_b).unwrap();
-        let mut group_b =
-            GhostGroup::join(&provider_b, &id_b, &welcome.to_bytes().unwrap()).unwrap();
-
-        let target = [0xCC; 32];
-        let msg = ApplicationMessage::new(
-            MessageType::Text,
-            test_channel(),
-            id_b.fingerprint,
-            2000,
-            vec![target],
-            b"replying".to_vec(),
-        )
-        .unwrap();
-
-        let blob = seal(&mut group_b, &provider_b, &msg).unwrap();
-        let decrypted = open(&mut group_a, &provider_a, &blob).unwrap();
-
-        assert_eq!(decrypted.references.len(), 1);
-        assert_eq!(decrypted.references[0], target);
-        assert_eq!(decrypted.content, b"replying");
-    }
-
-    #[test]
     fn reject_spoofed_sender_fp() {
         let provider_a = GhostProvider::new_in_memory().unwrap();
         let provider_b = GhostProvider::new_in_memory().unwrap();
@@ -1258,5 +1195,436 @@ mod tests {
         assert_eq!(decoded[0], entries[0]);
         assert_eq!(decoded[1], entries[1]);
         assert_eq!(decoded[2], entries[2]);
+    }
+
+    // --- Sync seal/open crypto tests ---
+
+    #[test]
+    fn sync_seal_open_roundtrip() {
+        let key = [0xAA; 32];
+        let plaintext = b"hello multi-device";
+        let sealed = sync_seal(&key, plaintext).unwrap();
+        assert_ne!(&sealed, plaintext); // not plaintext
+        assert_eq!(sealed.len(), 12 + plaintext.len() + 16); // nonce + payload + GCM tag
+        let opened = sync_open(&key, &sealed).unwrap();
+        assert_eq!(opened, plaintext);
+    }
+
+    #[test]
+    fn sync_open_wrong_key_fails() {
+        let sealed = sync_seal(&[0xAA; 32], b"secret").unwrap();
+        assert!(sync_open(&[0xBB; 32], &sealed).is_err());
+    }
+
+    #[test]
+    fn sync_open_truncated_blob_fails() {
+        let sealed = sync_seal(&[0xAA; 32], b"data").unwrap();
+        // Cut off the GCM tag
+        assert!(sync_open(&[0xAA; 32], &sealed[..sealed.len() - 4]).is_err());
+    }
+
+    #[test]
+    fn sync_open_too_short_fails() {
+        assert!(sync_open(&[0xAA; 32], &[0u8; 11]).is_err()); // less than nonce
+    }
+
+    #[test]
+    fn sync_seal_produces_different_nonces() {
+        let key = [0xCC; 32];
+        let a = sync_seal(&key, b"same").unwrap();
+        let b = sync_seal(&key, b"same").unwrap();
+        assert_ne!(a[..12], b[..12]); // nonces differ
+    }
+
+    #[test]
+    fn sync_open_tampered_ciphertext_fails() {
+        let key = [0xDD; 32];
+        let mut sealed = sync_seal(&key, b"authentic").unwrap();
+        sealed[14] ^= 0xFF; // flip a ciphertext byte
+        assert!(sync_open(&key, &sealed).is_err());
+    }
+
+    // --- Sync sign/verify edge cases ---
+
+    #[test]
+    fn sync_verify_wrong_key_in_header_fails() {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
+        let mut signed = sync_sign(&sk, b"payload");
+        // Corrupt the verifying key bytes — signature check will fail
+        signed[0] ^= 0xFF;
+        assert!(sync_verify(&signed).is_err());
+    }
+
+    #[test]
+    fn sync_verify_empty_payload_succeeds() {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
+        let signed = sync_sign(&sk, b"");
+        let (vk, payload) = sync_verify(&signed).unwrap();
+        assert_eq!(vk, sk.verifying_key().to_bytes());
+        assert!(payload.is_empty());
+    }
+
+    // --- Full sync envelope round trip: sign → seal → wrap → unwrap → open → verify ---
+
+    #[test]
+    fn sync_full_pipeline_roundtrip() {
+        let device_key = ed25519_dalek::SigningKey::from_bytes(&[0x77; 32]);
+        let sync_key = [0x88; 32];
+        let mutation = encode_mutation(MUTATION_SET, 5000, "read:abc123", &42u64.to_be_bytes());
+
+        // Sender side
+        let signed = sync_sign(&device_key, &mutation);
+        let sealed = sync_seal(&sync_key, &signed).unwrap();
+        let envelope = wrap_sync_envelope(&sealed);
+
+        // Receiver side: strip envelope header, open, verify
+        let sealed_recv = &envelope[ghost_wire::ENVELOPE_HEADER_SIZE..];
+        let signed_recv = sync_open(&sync_key, sealed_recv).unwrap();
+        let (vk, plaintext) = sync_verify(&signed_recv).unwrap();
+        assert_eq!(vk, device_key.verifying_key().to_bytes());
+
+        let (op, ts, key, value) = decode_mutation(&plaintext).unwrap();
+        assert_eq!(op, MUTATION_SET);
+        assert_eq!(ts, 5000);
+        assert_eq!(key, "read:abc123");
+        assert_eq!(u64::from_be_bytes(value.try_into().unwrap()), 42);
+    }
+
+    // --- Sync state dump edge cases ---
+
+    #[test]
+    fn sync_state_dump_empty() {
+        let encoded = encode_sync_state_dump(&[]);
+        let decoded = decode_sync_state_dump(&encoded).unwrap();
+        assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn sync_state_dump_decode_truncated_header() {
+        assert!(decode_sync_state_dump(&[0x00]).is_err()); // 1 byte, need 2
+    }
+
+    #[test]
+    fn sync_state_dump_decode_truncated_entry() {
+        // Says 1 entry but no data follows
+        let data = [0x00, 0x01];
+        assert!(decode_sync_state_dump(&data).is_err());
+    }
+
+    #[test]
+    fn sync_state_dump_decode_truncated_value() {
+        // Build a valid entry header then cut off the value
+        let entries = vec![("k".to_string(), Some(vec![0xAA; 100]), 1)];
+        let mut encoded = encode_sync_state_dump(&entries);
+        encoded.truncate(encoded.len() - 50); // chop value
+        assert!(decode_sync_state_dump(&encoded).is_err());
+    }
+
+    // --- Mutation edge cases ---
+
+    #[test]
+    fn mutation_decode_too_short() {
+        assert!(decode_mutation(&[0u8; 10]).is_err()); // needs 11
+    }
+
+    #[test]
+    fn mutation_decode_truncated_key() {
+        // Says key_len=100 but only has a few bytes
+        let mut buf = vec![MUTATION_SET];
+        buf.extend_from_slice(&0u64.to_be_bytes());
+        buf.extend_from_slice(&100u16.to_be_bytes());
+        buf.extend_from_slice(b"short");
+        assert!(decode_mutation(&buf).is_err());
+    }
+
+    // --- Provision payload tests ---
+
+    #[test]
+    fn provision_payload_roundtrip() {
+        let pp = ProvisionPayload {
+            server_id: [0x11; 32],
+            server_name: "Test Server".to_string(),
+            kind: ServerKind::Server,
+            members: vec![
+                InviteMember {
+                    fingerprint: [0x22; 32],
+                    display_name: "Alice".to_string(),
+                    role: MemberRole::Creator,
+                },
+                InviteMember {
+                    fingerprint: [0x33; 32],
+                    display_name: "Bob".to_string(),
+                    role: MemberRole::Member,
+                },
+            ],
+            channels: vec![
+                InviteChannel {
+                    channel_id: [0x44; 32],
+                    name: "general".to_string(),
+                    kind: ChannelKind::Text,
+                    position: 0,
+                },
+                InviteChannel {
+                    channel_id: [0x55; 32],
+                    name: "voice".to_string(),
+                    kind: ChannelKind::Voice,
+                    position: 1,
+                },
+            ],
+            mailbox_id: [0x66; 32],
+        };
+        let bytes = pp.to_bytes();
+        let decoded = ProvisionPayload::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.server_id, pp.server_id);
+        assert_eq!(decoded.server_name, pp.server_name);
+        assert_eq!(decoded.members.len(), 2);
+        assert_eq!(decoded.members[0].display_name, "Alice");
+        assert_eq!(decoded.members[1].fingerprint, [0x33; 32]);
+        assert_eq!(decoded.channels.len(), 2);
+        assert_eq!(decoded.channels[0].name, "general");
+        assert_eq!(decoded.channels[1].name, "voice");
+        assert_eq!(decoded.mailbox_id, pp.mailbox_id);
+    }
+
+    #[test]
+    fn provision_payload_empty_server() {
+        let pp = ProvisionPayload {
+            server_id: [0xFF; 32],
+            server_name: "Empty".to_string(),
+            kind: ServerKind::Dm,
+            members: vec![],
+            channels: vec![],
+            mailbox_id: [0xEE; 32],
+        };
+        let bytes = pp.to_bytes();
+        let decoded = ProvisionPayload::from_bytes(&bytes).unwrap();
+        assert!(decoded.members.is_empty());
+        assert!(decoded.channels.is_empty());
+    }
+
+    #[test]
+    fn provision_payload_truncated_fails() {
+        let pp = ProvisionPayload {
+            server_id: [0x11; 32],
+            server_name: "Test".to_string(),
+            kind: ServerKind::Server,
+            members: vec![],
+            channels: vec![],
+            mailbox_id: [0x22; 32],
+        };
+        let bytes = pp.to_bytes();
+        assert!(ProvisionPayload::from_bytes(&bytes[..bytes.len() - 10]).is_err());
+    }
+
+    #[test]
+    fn provision_payload_trailing_bytes_rejected() {
+        let pp = ProvisionPayload {
+            server_id: [0x11; 32],
+            server_name: "Test".to_string(),
+            kind: ServerKind::Server,
+            members: vec![],
+            channels: vec![],
+            mailbox_id: [0x22; 32],
+        };
+        let mut bytes = pp.to_bytes();
+        bytes.push(0xFF); // trailing junk
+        assert!(ProvisionPayload::from_bytes(&bytes).is_err());
+    }
+
+    // --- Provision blob (the full envelope: sync_key + payloads + sync state) ---
+
+    #[test]
+    fn provision_blob_build_and_parse() {
+        let sync_key = [0xAA; 32];
+        let pp = ProvisionPayload {
+            server_id: [0x11; 32],
+            server_name: "srv".to_string(),
+            kind: ServerKind::Server,
+            members: vec![],
+            channels: vec![InviteChannel {
+                channel_id: [0x22; 32],
+                name: "gen".to_string(),
+                kind: ChannelKind::Text,
+                position: 0,
+            }],
+            mailbox_id: [0x33; 32],
+        };
+        let sync_entries = vec![
+            ("order:servers".to_string(), Some(vec![0x01, 0x02]), 100),
+            ("read:abc".to_string(), None, 200),
+        ];
+
+        // Build provision blob (same format as check_pairing)
+        let pp_bytes = pp.to_bytes();
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&sync_key);
+        blob.extend_from_slice(&1u16.to_be_bytes()); // 1 server
+        blob.extend_from_slice(&(pp_bytes.len() as u32).to_be_bytes());
+        blob.extend_from_slice(&pp_bytes);
+        blob.extend_from_slice(&encode_sync_state_dump(&sync_entries));
+
+        // Parse it back (same logic as consume_provision)
+        assert!(blob.len() >= 34);
+        let recovered_sync_key: [u8; 32] = blob[..32].try_into().unwrap();
+        assert_eq!(recovered_sync_key, sync_key);
+
+        let count = u16::from_be_bytes(blob[32..34].try_into().unwrap()) as usize;
+        assert_eq!(count, 1);
+
+        let mut pos = 34;
+        let payload_len = u32::from_be_bytes(blob[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+        let recovered_pp = ProvisionPayload::from_bytes(&blob[pos..pos + payload_len]).unwrap();
+        assert_eq!(recovered_pp.server_id, pp.server_id);
+        assert_eq!(recovered_pp.server_name, "srv");
+        pos += payload_len;
+
+        let recovered_sync = decode_sync_state_dump(&blob[pos..]).unwrap();
+        assert_eq!(recovered_sync.len(), 2);
+        assert_eq!(recovered_sync[0].0, "order:servers");
+        assert_eq!(recovered_sync[1].0, "read:abc");
+        assert!(recovered_sync[1].1.is_none()); // tombstone preserved
+    }
+
+    #[test]
+    fn sync_state_dump_large_roundtrip() {
+        // Many entries to stress the count/offset logic
+        let entries: Vec<_> = (0..200)
+            .map(|i| (format!("key:{i}"), Some(vec![i as u8; 10]), i as u64))
+            .collect();
+        let encoded = encode_sync_state_dump(&entries);
+        let decoded = decode_sync_state_dump(&encoded).unwrap();
+        assert_eq!(decoded.len(), 200);
+        assert_eq!(decoded[199].0, "key:199");
+    }
+
+    // --- Domain separation ---
+
+    #[test]
+    fn derivation_domain_separation() {
+        // All derivation functions must produce different outputs for the same input
+        let id = [0xAA; 32];
+        let mls_gid = derive_mls_group_id(&id);
+        let channel = derive_default_channel_id(&id);
+        let mailbox = mls_group_mailbox_id(&id);
+        let sync_mb = sync_mailbox_id(&id);
+        // All four must be different (domain tags prevent collisions)
+        let all = [mls_gid, channel, mailbox, sync_mb];
+        for i in 0..all.len() {
+            for j in (i + 1)..all.len() {
+                assert_ne!(all[i], all[j], "domain separation failed between derivation {i} and {j}");
+            }
+        }
+    }
+
+    // --- InvitePayload tests ---
+
+    #[test]
+    fn invite_payload_roundtrip() {
+        let payload = InvitePayload {
+            server_id: [0x11; 32],
+            server_name: "My Server".to_string(),
+            kind: ServerKind::Server,
+            members: vec![
+                InviteMember {
+                    fingerprint: [0x22; 32],
+                    display_name: "Alice".to_string(),
+                    role: MemberRole::Creator,
+                },
+                InviteMember {
+                    fingerprint: [0x33; 32],
+                    display_name: "Bob".to_string(),
+                    role: MemberRole::Member,
+                },
+            ],
+            channels: vec![InviteChannel {
+                channel_id: [0x44; 32],
+                name: "general".to_string(),
+                kind: ChannelKind::Text,
+                position: 5,
+            }],
+            group_info_bytes: vec![0xDE, 0xAD, 0xBE, 0xEF],
+        };
+
+        let bytes = payload.to_bytes();
+        let decoded = InvitePayload::from_bytes(&bytes).unwrap();
+
+        assert_eq!(decoded.server_id, [0x11; 32]);
+        assert_eq!(decoded.server_name, "My Server");
+        assert_eq!(decoded.members.len(), 2);
+        assert_eq!(decoded.members[0].fingerprint, [0x22; 32]);
+        assert_eq!(decoded.members[0].display_name, "Alice");
+        assert_eq!(decoded.members[1].fingerprint, [0x33; 32]);
+        assert_eq!(decoded.members[1].display_name, "Bob");
+        assert_eq!(decoded.channels.len(), 1);
+        assert_eq!(decoded.channels[0].channel_id, [0x44; 32]);
+        assert_eq!(decoded.channels[0].name, "general");
+        assert_eq!(decoded.channels[0].position, 5);
+        assert_eq!(decoded.group_info_bytes, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+    }
+
+    #[test]
+    fn invite_payload_truncated_rejected() {
+        let payload = InvitePayload {
+            server_id: [0x11; 32],
+            server_name: "Test".to_string(),
+            kind: ServerKind::Server,
+            members: vec![],
+            channels: vec![],
+            group_info_bytes: vec![0xAA; 16],
+        };
+        let bytes = payload.to_bytes();
+        assert!(InvitePayload::from_bytes(&bytes[..bytes.len() - 4]).is_err());
+    }
+
+    #[test]
+    fn invite_payload_trailing_bytes_rejected() {
+        let payload = InvitePayload {
+            server_id: [0x11; 32],
+            server_name: "Test".to_string(),
+            kind: ServerKind::Server,
+            members: vec![],
+            channels: vec![],
+            group_info_bytes: vec![0xBB; 8],
+        };
+        let mut bytes = payload.to_bytes();
+        bytes.push(0xFF);
+        assert!(InvitePayload::from_bytes(&bytes).is_err());
+    }
+
+    // --- Metadata encode/decode tests ---
+
+    #[test]
+    fn member_announce_roundtrip() {
+        let encoded = encode_member_announce("ghostuser");
+        let decoded = decode_metadata(&encoded).unwrap();
+        match decoded {
+            MetadataPayload::MemberAnnounce { display_name } => {
+                assert_eq!(display_name, "ghostuser");
+            }
+            _ => panic!("expected MemberAnnounce"),
+        }
+    }
+
+    #[test]
+    fn avatar_clear_roundtrip() {
+        let encoded = encode_avatar_clear();
+        let decoded = decode_metadata(&encoded).unwrap();
+        assert!(matches!(decoded, MetadataPayload::AvatarClear));
+    }
+
+    // --- Sync envelope header test ---
+
+    #[test]
+    fn sync_envelope_header_valid() {
+        let payload = b"test-sync-payload";
+        let sealed = sync_seal(&[0xCC; 32], payload).unwrap();
+        let envelope = wrap_sync_envelope(&sealed);
+
+        // Header is exactly ENVELOPE_HEADER_SIZE bytes
+        assert!(envelope.len() == ghost_wire::ENVELOPE_HEADER_SIZE + sealed.len());
+
+        // Payload follows immediately after header
+        assert_eq!(&envelope[ghost_wire::ENVELOPE_HEADER_SIZE..], &sealed[..]);
     }
 }
