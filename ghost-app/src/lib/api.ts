@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Identity, Server, Channel, Member, Message, Invite, Config, AudioDevices, DevSession, KeybindConfig, Device } from "./types";
+import type { Identity, Server, Channel, Member, Message, Invite, Config, AudioDevices, KeybindConfig, Device } from "./types";
 
 export const getIdentity = () => invoke<Identity>("get_identity");
 
@@ -131,6 +131,4 @@ export const cancelPairing = () => invoke<void>("cancel_pairing");
 export const joinAsNewDevice = (pairingCode: string) =>
   invoke<string>("join_as_new_device", { pairingCode });
 // Dev testing
-export const createDevSession = () => invoke<Server>("create_dev_session");
-export const readDevSession = () => invoke<DevSession | null>("read_dev_session");
 export const spawnDevInstance = () => invoke<number>("spawn_dev_instance");

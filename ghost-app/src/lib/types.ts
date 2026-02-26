@@ -97,11 +97,6 @@ export interface VoiceQuality {
   ping_ms: number | null;
 }
 
-export interface DevSession {
-  relay_url: string;
-  token: string;
-}
-
 export interface KeybindConfig {
   push_to_talk: string | null;
 }
