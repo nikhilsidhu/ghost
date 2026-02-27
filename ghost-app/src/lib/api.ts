@@ -130,5 +130,16 @@ export const cancelPairing = () => invoke<void>("cancel_pairing");
 // Device linking (new device side)
 export const joinAsNewDevice = (pairingCode: string) =>
   invoke<string>("join_as_new_device", { pairingCode });
+// Recovery
+export const setRecoveryPassphrase = (passphrase: string) =>
+  invoke<string>("set_recovery_passphrase", { passphrase });
+export const skipRecoverySetup = () => invoke<void>("skip_recovery_setup");
+export const getRecoveryCode = () => invoke<string>("get_recovery_code");
+export const changeRecoveryPassphrase = (currentPassphrase: string, newPassphrase: string) =>
+  invoke<void>("change_recovery_passphrase", { currentPassphrase, newPassphrase });
+export const hasRecoveryBlob = () => invoke<boolean>("has_recovery_blob");
+export const recoverAccount = (recoveryCode: string, passphrase: string) =>
+  invoke<string>("recover_account", { recoveryCode, passphrase });
+
 // Dev testing
 export const spawnDevInstance = () => invoke<number>("spawn_dev_instance");

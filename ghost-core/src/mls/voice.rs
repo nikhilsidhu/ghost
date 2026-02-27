@@ -171,6 +171,15 @@ pub fn try_open_presence(
 mod tests {
     use super::*;
     use crate::identity::Identity;
+    use crate::mls::membership::MemberBinding;
+
+    fn test_binding(id: &Identity) -> MemberBinding {
+        MemberBinding {
+            account_fp: id.fingerprint,
+            idlog_seq: 1,
+            device_key: id.verifying_key.to_bytes(),
+        }
+    }
 
     #[test]
     fn voice_frame_roundtrip() {
@@ -202,7 +211,7 @@ mod tests {
     fn derive_voice_key_deterministic() {
         let provider = GhostProvider::new_in_memory().unwrap();
         let id = Identity::from_seed([0x01u8; 32]).unwrap();
-        let group = super::super::group::GhostGroup::create(&provider, &id).unwrap();
+        let group = super::super::group::GhostGroup::create(&provider, &id, test_binding(&id)).unwrap();
 
         let channel_id = [0xFFu8; 32];
         let vk = *id.verifying_key.as_bytes();
@@ -215,7 +224,7 @@ mod tests {
     fn different_sender_different_key() {
         let provider = GhostProvider::new_in_memory().unwrap();
         let id = Identity::from_seed([0x01u8; 32]).unwrap();
-        let group = super::super::group::GhostGroup::create(&provider, &id).unwrap();
+        let group = super::super::group::GhostGroup::create(&provider, &id, test_binding(&id)).unwrap();
 
         let channel_id = [0xFFu8; 32];
         let fp_a = [0xAAu8; 32];
@@ -230,7 +239,7 @@ mod tests {
     fn different_device_vk_different_key() {
         let provider = GhostProvider::new_in_memory().unwrap();
         let id = Identity::from_seed([0x01u8; 32]).unwrap();
-        let group = super::super::group::GhostGroup::create(&provider, &id).unwrap();
+        let group = super::super::group::GhostGroup::create(&provider, &id, test_binding(&id)).unwrap();
 
         let channel_id = [0xFFu8; 32];
         let vk_a = [0xAAu8; 32];
@@ -285,7 +294,7 @@ mod tests {
     fn presence_trial_decryption() {
         let provider = GhostProvider::new_in_memory().unwrap();
         let id = Identity::from_seed([0x01u8; 32]).unwrap();
-        let group = super::super::group::GhostGroup::create(&provider, &id).unwrap();
+        let group = super::super::group::GhostGroup::create(&provider, &id, test_binding(&id)).unwrap();
 
         let channel_id = [0xFFu8; 32];
         let sender_fp = id.fingerprint;
@@ -310,7 +319,7 @@ mod tests {
     fn presence_trial_decryption_fails_no_match() {
         let provider = GhostProvider::new_in_memory().unwrap();
         let id = Identity::from_seed([0x01u8; 32]).unwrap();
-        let group = super::super::group::GhostGroup::create(&provider, &id).unwrap();
+        let group = super::super::group::GhostGroup::create(&provider, &id, test_binding(&id)).unwrap();
 
         let channel_id = [0xFFu8; 32];
         let key = derive_presence_key(&group, &provider, &channel_id, &id.fingerprint).unwrap();
@@ -331,7 +340,7 @@ mod tests {
     fn presence_key_differs_from_voice_key() {
         let provider = GhostProvider::new_in_memory().unwrap();
         let id = Identity::from_seed([0x01u8; 32]).unwrap();
-        let group = super::super::group::GhostGroup::create(&provider, &id).unwrap();
+        let group = super::super::group::GhostGroup::create(&provider, &id, test_binding(&id)).unwrap();
 
         let channel_id = [0xFFu8; 32];
         let vk = *id.verifying_key.as_bytes();

@@ -14,6 +14,7 @@ use crate::error::{GhostError, Result};
 
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
+const RELAY_ERROR_PREFIX: &str = "error: ";
 
 pub struct IdLogBlob {
     pub seq: u64,
@@ -41,6 +42,7 @@ pub struct Ack {
 pub enum RelayEvent {
     Blob(IncomingBlob),
     Ack(Ack),
+    Error { mailbox_id: [u8; 32], message: String },
     Gap { mailbox_id: [u8; 32] },
     VoiceState { mailbox_id: [u8; 32], json: String },
     Presence { mailbox_id: [u8; 32], json: String },
@@ -719,6 +721,11 @@ async fn ws_task(
                                 let _ = event_tx.send(RelayEvent::Presence {
                                     mailbox_id,
                                     json: s.to_string(),
+                                }).await;
+                            } else if let Some(err_msg) = s.strip_prefix(RELAY_ERROR_PREFIX) {
+                                let _ = event_tx.send(RelayEvent::Error {
+                                    mailbox_id,
+                                    message: err_msg.to_string(),
                                 }).await;
                             } else if let Some(ack) = parse_ack(s) {
                                 let _ = event_tx.send(RelayEvent::Ack(ack)).await;

@@ -1,7 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
@@ -18,11 +17,6 @@ use tokio::sync::{mpsc, Mutex};
 
 use crate::dto::MessageDto;
 use crate::presence::{self, PresenceInfo};
-
-fn parse_hex32(hex: &str) -> std::result::Result<[u8; 32], String> {
-    let bytes = hex::decode(hex).map_err(|e| e.to_string())?;
-    bytes.try_into().map_err(|_| "not 32 bytes".into())
-}
 
 fn get_json_str<'a>(obj: &'a serde_json::Value, key: &str) -> Option<&'a str> {
     obj.get(key)?.as_str()
@@ -49,6 +43,9 @@ pub async fn run(
     mut events: mpsc::Receiver<RelayEvent>,
     presence: Arc<Mutex<PresenceInfo>>,
     data_dir: PathBuf,
+    config: Arc<Mutex<crate::config::GhostConfig>>,
+    config_path: PathBuf,
+    voice_cmd_tx: mpsc::Sender<crate::voice_task::VoiceCommand>,
 ) {
     // Compute sync mailbox ID (key is read dynamically — may be created after pairing)
     let sync_mb = {
@@ -112,6 +109,7 @@ pub async fn run(
                     if let Some(key) = key {
                         handle_sync_blob(
                             &app, &client, &relay, &key, &blob.payload,
+                            &config, &config_path, &presence, &voice_cmd_tx,
                         ).await;
                         let c = client.lock().await;
                         let _ = c.store().set_last_seen_seq(&sync_mb, seq);
@@ -220,9 +218,14 @@ pub async fn run(
                         let _ = app.emit("sync", hex::encode(server_id));
                     }
                     Some((server_id, Ok(ReceiveResult::Kicked))) => {
+                        use ghost_core::wire::{SyncMessageType, SYNC_KEY_SERVER_PREFIX};
                         let c = client.lock().await;
                         let _ = c.store().set_last_seen_seq(&mailbox_id, seq);
+                        let key = format!("{}{}", SYNC_KEY_SERVER_PREFIX, hex::encode(server_id));
+                        let _ = c.sync_remove(&key, now_ms());
                         drop(c);
+                        crate::sync_utils::post_sync_message(&client, &relay, SyncMessageType::ServerLeft as u8, &server_id).await;
+                        crate::sync_utils::push_sync_snapshot(&client, &relay).await;
                         let _ = app.emit("kicked", hex::encode(server_id));
                     }
                     Some((server_id, Ok(ReceiveResult::MembersRemoved(removed)))) => {
@@ -254,6 +257,9 @@ pub async fn run(
                 }
             }
             RelayEvent::Ack(_) => {}
+            RelayEvent::Error { mailbox_id, message } => {
+                eprintln!("relay: ws error on {}: {}", hex::encode(&mailbox_id[..8]), message);
+            }
             RelayEvent::Gap { mailbox_id } => {
                 handle_gap(&client, &relay, &mailbox_id).await;
             }
@@ -276,8 +282,12 @@ pub async fn run(
                         let app2 = app.clone();
                         let client2 = client.clone();
                         let relay2 = relay.clone();
+                        let cfg2 = config.clone();
+                        let cfgp2 = config_path.clone();
+                        let pres2 = presence.clone();
+                        let vcmd2 = voice_cmd_tx.clone();
                         tokio::spawn(async move {
-                            fetch_and_merge_sync_state(&app2, &client2, &relay2).await;
+                            fetch_and_merge_sync_state(&app2, &client2, &relay2, &cfg2, &cfgp2, &pres2, &vcmd2).await;
                         });
                     }
                 } else {
@@ -295,6 +305,10 @@ async fn handle_sync_blob(
     relay: &Arc<Mutex<RelayClient>>,
     sync_key: &[u8; 32],
     envelope_blob: &[u8],
+    config: &Arc<Mutex<crate::config::GhostConfig>>,
+    config_path: &PathBuf,
+    presence: &Arc<Mutex<PresenceInfo>>,
+    voice_cmd_tx: &mpsc::Sender<crate::voice_task::VoiceCommand>,
 ) {
     // Strip envelope header
     if envelope_blob.len() < ghost_wire::ENVELOPE_HEADER_SIZE {
@@ -382,19 +396,22 @@ async fn handle_sync_blob(
                 };
 
                 match result {
-                    Ok((commit_bytes, mailbox_id)) => {
-                        // Broadcast external commit via HTTP POST (not WS — we aren't subscribed yet).
-                        // The returned seq lets us subscribe past pre-join history.
-                        let commit_seq = {
+                    Ok((commits, mailbox_id)) => {
+                        // Broadcast external commit + membership update via HTTP POST
+                        let mut commit_seq = 0u64;
+                        let mut post_failed = false;
+                        for commit_bytes in commits {
                             let r = relay.lock().await;
                             match r.post_blob(&mailbox_id, commit_bytes).await {
-                                Ok(seq) => seq,
+                                Ok(seq) => commit_seq = seq,
                                 Err(e) => {
-                                    eprintln!("sync: failed to post external commit: {e}");
-                                    continue;
+                                    eprintln!("sync: failed to post commit: {e}");
+                                    post_failed = true;
+                                    break;
                                 }
                             }
-                        };
+                        }
+                        if post_failed { continue; }
 
                         // Upload fresh GroupInfo
                         {
@@ -428,6 +445,16 @@ async fn handle_sync_blob(
                             let _ = r.send(&outbound.mailbox_id, outbound.blob).await;
                         }
 
+                        // Write server entry to sync_state
+                        {
+                            use ghost_core::wire::SYNC_KEY_SERVER_PREFIX;
+                            let c = client.lock().await;
+                            if let Ok(meta) = c.export_server_meta(&payload.server_id) {
+                                let key = format!("{}{}", SYNC_KEY_SERVER_PREFIX, hex::encode(payload.server_id));
+                                let _ = c.sync_set(&key, &meta.to_bytes(), now_ms());
+                            }
+                        }
+
                         joined = true;
                         break;
                     }
@@ -459,8 +486,11 @@ async fn handle_sync_blob(
             };
 
             {
+                use ghost_core::wire::SYNC_KEY_SERVER_PREFIX;
                 let c = client.lock().await;
                 let _ = c.store().delete_server(&server_id);
+                let key = format!("{}{}", SYNC_KEY_SERVER_PREFIX, hex::encode(server_id));
+                let _ = c.sync_remove(&key, now_ms());
             }
 
             if let Some(mb) = mailbox_id {
@@ -468,6 +498,8 @@ async fn handle_sync_blob(
                 r.unsubscribe(&mb);
             }
 
+            // No sync broadcast — this IS the broadcast from the other device
+            crate::sync_utils::push_sync_snapshot(&client, &relay).await;
             let _ = app.emit("kicked", hex::encode(server_id));
         }
         x if x == SyncMessageType::VoiceTakeover as u8 => {
@@ -499,19 +531,15 @@ async fn handle_sync_blob(
             };
             if !applied { return; }
 
-            // Apply side effects to data tables
-            if key == ghost_core::wire::SYNC_KEY_SERVER_ORDER {
-                let _ = app.emit("sync-server-order", "");
-            } else if let Some(id_hex) = key.strip_prefix(ghost_core::wire::SYNC_KEY_READ_PREFIX) {
-                if op == MUTATION_SET && value.len() == 8 {
-                    let read_ts = u64::from_be_bytes(value[..8].try_into().unwrap());
-                    if let Ok(cid) = parse_hex32(id_hex) {
-                        let c = client.lock().await;
-                        let _ = c.store().mark_channel_read(&cid, read_ts);
-                    }
-                }
-                let _ = app.emit("sync-read-state", "");
-            }
+            let entry = if op == MUTATION_SET {
+                vec![(key, Some(value), ts)]
+            } else {
+                vec![(key, None, ts)]
+            };
+            let settings = crate::sync_utils::parse_sync_entries(&entry);
+            crate::sync_utils::apply_sync_side_effects(
+                &settings, app, client, relay, config, config_path, presence, voice_cmd_tx,
+            ).await;
         }
         _ => {
             eprintln!("sync: unknown message type {msg_type:#04x}");
@@ -524,8 +552,12 @@ async fn fetch_and_merge_sync_state(
     app: &AppHandle,
     client: &Arc<Mutex<GhostClient>>,
     relay: &Arc<Mutex<RelayClient>>,
+    config: &Arc<Mutex<crate::config::GhostConfig>>,
+    config_path: &PathBuf,
+    presence: &Arc<Mutex<PresenceInfo>>,
+    voice_cmd_tx: &mpsc::Sender<crate::voice_task::VoiceCommand>,
 ) {
-    use ghost_core::wire::{decode_sync_state_dump, encode_sync_state_dump, sync_open, sync_seal, SYNC_KEY_SERVER_ORDER, SYNC_KEY_READ_PREFIX};
+    use ghost_core::wire::{decode_sync_state_dump, encode_sync_state_dump, sync_open, sync_seal};
 
     let (sync_key, account_fp) = {
         let c = client.lock().await;
@@ -578,37 +610,17 @@ async fn fetch_and_merge_sync_state(
         }
     };
 
-    // Import via LWW and apply side effects
-    let mut order_changed = false;
-    let mut read_changed = false;
-
+    // Import via LWW
     {
         let c = client.lock().await;
         c.sync_import(&entries).unwrap_or_default();
-
-        for (key, value, _ts) in &entries {
-            if key == SYNC_KEY_SERVER_ORDER {
-                order_changed = true;
-            } else if let Some(id_hex) = key.strip_prefix(SYNC_KEY_READ_PREFIX) {
-                if let Some(val) = value {
-                    if val.len() == 8 {
-                        let read_ts = u64::from_be_bytes(val[..8].try_into().unwrap());
-                        if let Ok(cid) = parse_hex32(id_hex) {
-                            let _ = c.store().mark_channel_read(&cid, read_ts);
-                        }
-                    }
-                }
-                read_changed = true;
-            }
-        }
     }
 
-    if order_changed {
-        let _ = app.emit("sync-server-order", "");
-    }
-    if read_changed {
-        let _ = app.emit("sync-read-state", "");
-    }
+    // Apply all side effects (read marks, config, voice, presence, events)
+    let settings = crate::sync_utils::parse_sync_entries(&entries);
+    crate::sync_utils::apply_sync_side_effects(
+        &settings, app, client, relay, config, config_path, presence, voice_cmd_tx,
+    ).await;
 
     // PUT our merged state back
     let merged_blob = {
@@ -633,58 +645,22 @@ async fn handle_gap(
         sid
     };
 
-    for attempt in 0..3 {
-        // Fetch fresh GroupInfo each attempt
-        let fetch_result = {
-            let r = relay.lock().await;
-            r.get_server_info(mailbox_id).await
-        };
-        let server_info = match fetch_result {
-            Ok(gi) => gi,
-            Err(e) => {
-                if e.to_string().contains("404") {
-                    eprintln!("gap recovery: relay has no server_info, resetting last_seen");
-                    let c = client.lock().await;
-                    let _ = c.store().set_last_seen_seq(mailbox_id, 0);
-                    drop(c);
-                    let mut r = relay.lock().await;
-                    r.subscribe(*mailbox_id, 0);
-                } else {
-                    eprintln!("gap recovery: failed to fetch server_info: {e}");
-                }
-                return;
-            }
-        };
-
-        let commit_bytes = {
-            let mut c = client.lock().await;
-            match c.recover_via_external_commit(&server_id, &server_info) {
-                Ok((commit, _)) => commit,
-                Err(e) => {
-                    eprintln!("gap recovery: external commit failed (attempt {attempt}): {e}");
-                    continue;
-                }
-            }
-        };
-
-        // Post via HTTP so we get a clear success/rejection signal
-        match relay.lock().await.post_blob(mailbox_id, commit_bytes).await {
-            Ok(_) => {
-                // Upload fresh GroupInfo for other joiners
+    match crate::commands::recover_epoch(client, relay, &server_id, mailbox_id, "gap recovery").await {
+        Ok(true) => {}
+        Ok(false) => eprintln!("gap recovery: failed after attempts"),
+        Err(e) => {
+            if e.contains("404") {
+                eprintln!("gap recovery: relay has no server_info, resetting last_seen");
                 let c = client.lock().await;
-                if let Ok(gi) = c.export_server_info(&server_id) {
-                    let r = relay.lock().await;
-                    let _ = r.put_server_info(mailbox_id, gi).await;
-                }
-                return;
-            }
-            Err(e) => {
-                eprintln!("gap recovery: relay rejected commit (attempt {attempt}): {e}");
-                continue;
+                let _ = c.store().set_last_seen_seq(mailbox_id, 0);
+                drop(c);
+                let mut r = relay.lock().await;
+                r.subscribe(*mailbox_id, 0);
+            } else {
+                eprintln!("{e}");
             }
         }
     }
-    eprintln!("gap recovery: failed after 3 attempts for mailbox");
 }
 
 // --- Voice state via mailbox WS ---
@@ -859,12 +835,7 @@ struct OnlinePresenceMemberDto {
     avatar_hash: Option<String>,
 }
 
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
+fn now_ms() -> u64 { crate::state::now_millis() }
 
 /// Strip expired status messages from received presence (handles crashed senders).
 fn filter_expired_status(ps: &mut ghost_core::mls::presence::OnlinePresence) {

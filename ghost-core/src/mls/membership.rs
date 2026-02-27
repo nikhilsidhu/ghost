@@ -1,5 +1,8 @@
 use std::collections::HashMap;
 
+use openmls::prelude::*;
+
+use crate::crypto::constants::GHOST_MEMBERSHIP_EXTENSION_TYPE;
 use crate::error::{GhostError, Result};
 use crate::identity::log::LogState;
 
@@ -9,6 +12,16 @@ pub struct MemberBinding {
     pub account_fp: [u8; 32],
     pub idlog_seq: u64,
     pub device_key: [u8; 32],
+}
+
+impl MemberBinding {
+    pub fn from_identity(identity: &crate::identity::Identity) -> Self {
+        Self {
+            account_fp: identity.fingerprint,
+            idlog_seq: identity.idlog_seq,
+            device_key: identity.verifying_key.to_bytes(),
+        }
+    }
 }
 
 /// Maps account fingerprints to authorized device keys within an MLS group.
@@ -82,6 +95,33 @@ impl GroupMembership {
             bindings.push(MemberBinding { account_fp, idlog_seq, device_key });
         }
         Ok(Self { bindings })
+    }
+
+    /// Wrap as an MLS group context extension.
+    pub fn to_extension(&self) -> Extension {
+        Extension::Unknown(GHOST_MEMBERSHIP_EXTENSION_TYPE, UnknownExtension(self.encode()))
+    }
+
+    /// Build Extensions<GroupContext> containing this membership + required capabilities.
+    pub fn to_group_context_extensions(&self) -> Result<Extensions<GroupContext>> {
+        let required = Extension::RequiredCapabilities(
+            RequiredCapabilitiesExtension::new(
+                &[ExtensionType::Unknown(GHOST_MEMBERSHIP_EXTENSION_TYPE)],
+                &[],
+                &[],
+            ),
+        );
+        Extensions::from_vec(vec![required, self.to_extension()])
+            .map_err(|e| GhostError::Mls(format!("build membership extension: {e}")))
+    }
+
+    /// Read GroupMembership from MLS group context extensions.
+    /// Returns empty if not present (backward compat with groups created before the extension existed).
+    pub fn from_group(group: &openmls::group::MlsGroup) -> Result<Self> {
+        match group.extensions().unknown(GHOST_MEMBERSHIP_EXTENSION_TYPE) {
+            Some(ext) => Self::decode(&ext.0),
+            None => Ok(Self::new()),
+        }
     }
 
     /// Validate all bindings against a cache of identity log states.

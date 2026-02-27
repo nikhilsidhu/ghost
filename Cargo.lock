@@ -1861,6 +1861,7 @@ dependencies = [
  "toml 0.8.23",
  "url",
  "user-idle",
+ "zeroize",
 ]
 
 [[package]]
@@ -1894,7 +1895,6 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tokio-tungstenite 0.26.2",
- "x25519-dalek",
  "zeroize",
 ]
 

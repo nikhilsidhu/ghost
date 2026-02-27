@@ -1,39 +1,25 @@
-use std::time::Duration;
+mod common;
 
-use tokio::net::TcpListener;
+use std::time::Duration;
 
 use ghost_core::client::{GhostClient, ReceiveResult};
 use ghost_core::identity::Identity;
+use ghost_core::mls::membership::MemberBinding;
 use ghost_core::relay::{IncomingBlob, RelayClient, RelayEvent};
 use ghost_core::storage::ServerKind;
 use ghost_core::wire::{derive_default_channel_id, derive_mls_group_id, mls_group_mailbox_id};
-use ghost_relay::config::Config;
-use ghost_relay::storage::Storage;
-use ghost_relay::{routes, state};
 use openmls::key_packages::KeyPackageIn;
 use openmls::prelude::tls_codec::{Deserialize as TlsDeserialize, Serialize as TlsSerialize};
 use openmls::prelude::ProtocolVersion;
 use openmls_rust_crypto::RustCrypto;
 
-async fn start_relay() -> String {
-    let config = Config {
-        port: 0,
-        max_blob_size: 10 * 1024 * 1024,
-        voice_port: 0,
-        max_voice_participants: 25,
-    };
-    let storage = Storage::open_in_memory().unwrap();
-    let st = state::new_state(config, storage);
-    let app = routes::router(st);
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    format!("http://127.0.0.1:{port}")
+fn binding_for(client: &GhostClient) -> MemberBinding {
+    MemberBinding::from_identity(client.identity())
 }
 
 #[tokio::test]
 async fn encrypted_message_through_relay() {
-    let relay_url = start_relay().await;
+    let relay_url = common::start_relay().await;
 
     let mut sender = GhostClient::open_in_memory(Identity::from_seed([0x01; 32]).unwrap(), [0x01; 32]).unwrap();
     let mut receiver = GhostClient::open_in_memory(Identity::from_seed([0x02; 32]).unwrap(), [0x02; 32]).unwrap();
@@ -44,7 +30,7 @@ async fn encrypted_message_through_relay() {
     let recv_fp = *receiver.fingerprint();
     let recv_name = receiver.identity().display_name.clone();
     let (_, welcome_bytes) = sender
-        .invite_member(&server_id, kp, recv_fp, &recv_name, 1000)
+        .invite_member(&server_id, kp, recv_fp, &recv_name, 1000, binding_for(&receiver))
         .unwrap();
     receiver
         .join_server(&server_id, &welcome_bytes, "test", ServerKind::Server, 1000)
@@ -78,7 +64,7 @@ async fn encrypted_message_through_relay() {
         loop {
             match events.recv().await {
                 Some(RelayEvent::Blob(blob)) => break blob,
-                Some(RelayEvent::Ack(_) | RelayEvent::Gap { .. } | RelayEvent::VoiceState { .. } | RelayEvent::Presence { .. } | RelayEvent::ConnectionState { .. }) => continue,
+                Some(RelayEvent::Ack(_) | RelayEvent::Error { .. } | RelayEvent::Gap { .. } | RelayEvent::VoiceState { .. } | RelayEvent::Presence { .. } | RelayEvent::ConnectionState { .. }) => continue,
                 None => panic!("event channel closed"),
             }
         }
@@ -96,7 +82,7 @@ async fn encrypted_message_through_relay() {
 
 #[tokio::test]
 async fn invite_roundtrip_via_relay() {
-    let relay_url = start_relay().await;
+    let relay_url = common::start_relay().await;
     let (inviter, _) = RelayClient::new(&relay_url);
     let (joiner, _) = RelayClient::new(&relay_url);
 
@@ -160,7 +146,7 @@ fn setup_two_clients(sender_seed: [u8; 32], receiver_seed: [u8; 32]) -> TwoClien
     let recv_fp = *receiver.fingerprint();
     let recv_name = receiver.identity().display_name.clone();
     let (_, welcome_bytes) = sender
-        .invite_member(&server_id, kp, recv_fp, &recv_name, 1000)
+        .invite_member(&server_id, kp, recv_fp, &recv_name, 1000, binding_for(&receiver))
         .unwrap();
     receiver
         .join_server(&server_id, &welcome_bytes, "test", ServerKind::Server, 1000)
@@ -181,7 +167,7 @@ fn setup_two_clients(sender_seed: [u8; 32], receiver_seed: [u8; 32]) -> TwoClien
 
 #[tokio::test]
 async fn multiple_messages_in_order() {
-    let relay_url = start_relay().await;
+    let relay_url = common::start_relay().await;
     let mut s = setup_two_clients([0x10; 32], [0x11; 32]);
 
     let (mut send_relay, _) = RelayClient::new(&relay_url);
@@ -224,7 +210,7 @@ async fn multiple_messages_in_order() {
 
 #[tokio::test]
 async fn bidirectional_messaging() {
-    let relay_url = start_relay().await;
+    let relay_url = common::start_relay().await;
     let mut s = setup_two_clients([0x20; 32], [0x21; 32]);
 
     // Both sides share one relay connection each, both subscribe
@@ -279,7 +265,7 @@ async fn bidirectional_messaging() {
 
 #[tokio::test]
 async fn self_message_not_echoed_as_new() {
-    let relay_url = start_relay().await;
+    let relay_url = common::start_relay().await;
     let mut s = setup_two_clients([0x30; 32], [0x31; 32]);
 
     // The relay skips echoing a blob back on the same WS connection that sent it.
@@ -321,7 +307,7 @@ async fn self_message_not_echoed_as_new() {
 
 #[tokio::test]
 async fn invite_with_real_key_package() {
-    let relay_url = start_relay().await;
+    let relay_url = common::start_relay().await;
 
     let mut inviter =
         GhostClient::open_in_memory(Identity::from_seed([0x40; 32]).unwrap(), [0x40; 32]).unwrap();
@@ -363,7 +349,7 @@ async fn invite_with_real_key_package() {
     let joiner_fp = *joiner.fingerprint();
     let joiner_name = joiner.identity().display_name.clone();
     let (_, welcome_bytes) = inviter
-        .invite_member(&server_id, validated_kp, joiner_fp, &joiner_name, 2000)
+        .invite_member(&server_id, validated_kp, joiner_fp, &joiner_name, 2000, binding_for(&joiner))
         .unwrap();
 
     // Send welcome bytes back through the relay

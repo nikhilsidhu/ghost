@@ -12,6 +12,7 @@ mod presence;
 mod relay_task;
 mod setup;
 mod state;
+mod sync_utils;
 mod udp_transport;
 mod voice_task;
 
@@ -34,6 +35,7 @@ fn main() {
     let idle_voice_tx = app_state.voice.cmd_tx.clone();
     let idle_config = app_state.config.clone();
     let idle_config_path = app_state.config_path.clone();
+    let relay_task_handle = app_state.relay_task_handle.clone();
     let data_dir = app_state.config_path.parent().unwrap().to_path_buf();
 
     tauri::Builder::default()
@@ -52,14 +54,22 @@ fn main() {
             }
 
             let handle = app.handle().clone();
-            tauri::async_runtime::spawn(relay_task::run(
+            let relay_config = idle_config.clone();
+            let relay_config_path = idle_config_path.clone();
+            let relay_voice_tx = idle_voice_tx.clone();
+            let relay_task_handle = relay_task_handle.clone();
+            let jh = tauri::async_runtime::spawn(relay_task::run(
                 handle.clone(),
                 client,
                 relay,
                 inbox_rx,
                 presence,
                 data_dir,
+                relay_config,
+                relay_config_path,
+                relay_voice_tx,
             ));
+            *relay_task_handle.blocking_lock() = Some(jh);
             tauri::async_runtime::spawn(voice_task::run(
                 handle.clone(),
                 voice_client,
@@ -129,6 +139,12 @@ fn main() {
             commands::check_pairing,
             commands::cancel_pairing,
             commands::join_as_new_device,
+            commands::set_recovery_passphrase,
+            commands::skip_recovery_setup,
+            commands::get_recovery_code,
+            commands::change_recovery_passphrase,
+            commands::has_recovery_blob,
+            commands::recover_account,
             commands::exit_app,
             commands::spawn_dev_instance,
         ])

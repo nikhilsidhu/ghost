@@ -174,6 +174,7 @@ pub struct InviteMember {
     pub role: MemberRole,
 }
 
+#[derive(Debug, Clone)]
 pub struct InviteChannel {
     pub channel_id: [u8; 32],
     pub name: String,
@@ -422,6 +423,13 @@ pub const MUTATION_SET: u8 = 0x01;
 pub const MUTATION_REMOVE: u8 = 0x02;
 pub const SYNC_KEY_SERVER_ORDER: &str = "order:servers";
 pub const SYNC_KEY_READ_PREFIX: &str = "read:";
+pub const SYNC_KEY_DISPLAY_NAME: &str = "profile:display_name";
+pub const SYNC_KEY_NOISE_SUPPRESSION: &str = "pref:noise_suppression";
+pub const SYNC_KEY_AGC: &str = "pref:agc";
+pub const SYNC_KEY_INPUT_MODE: &str = "pref:input_mode";
+pub const SYNC_KEY_STATUS: &str = "status:current";
+pub const SYNC_KEY_STATUS_MESSAGE: &str = "status:message";
+pub const SYNC_KEY_SERVER_PREFIX: &str = "server:";
 
 /// Encode a mutation: [op:1][ts:8 BE][key_len:2 BE][key bytes][value bytes]
 pub fn encode_mutation(op: u8, ts: u64, key: &str, value: &[u8]) -> Vec<u8> {
@@ -605,6 +613,58 @@ impl ProvisionPayload {
         }
 
         Ok(Self { server_id, server_name, kind, members, channels, mailbox_id })
+    }
+}
+
+// --- Sync server metadata: lightweight group entry for sync_state (no members) ---
+
+#[derive(Debug)]
+pub struct SyncServerMeta {
+    pub server_name: String,
+    pub kind: ServerKind,
+    pub mailbox_id: [u8; 32],
+    pub channels: Vec<InviteChannel>,
+}
+
+impl SyncServerMeta {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        write_string(&mut buf, &self.server_name);
+        buf.push(self.kind.to_byte());
+        buf.extend_from_slice(&self.mailbox_id);
+        buf.extend_from_slice(&(self.channels.len() as u16).to_be_bytes());
+        for c in &self.channels {
+            buf.extend_from_slice(&c.channel_id);
+            write_string(&mut buf, &c.name);
+            buf.push(c.kind.to_byte());
+            buf.extend_from_slice(&c.position.to_be_bytes());
+        }
+        buf
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        let mut pos = 0;
+        let server_name = read_string(data, &mut pos)?;
+        let kind = ServerKind::from_byte(read_u8(data, &mut pos)?)?;
+        let mailbox_id = read_blob32(data, &mut pos)?;
+        let channel_count = read_u16(data, &mut pos)? as usize;
+        let mut channels = Vec::with_capacity(channel_count);
+        for _ in 0..channel_count {
+            channels.push(InviteChannel {
+                channel_id: read_blob32(data, &mut pos)?,
+                name: read_string(data, &mut pos)?,
+                kind: ChannelKind::from_byte(read_u8(data, &mut pos)?)?,
+                position: read_i32(data, &mut pos)?,
+            });
+        }
+        if pos != data.len() {
+            return Err(GhostError::Format(format!(
+                "sync server meta: {} trailing bytes",
+                data.len() - pos
+            )));
+        }
+
+        Ok(Self { server_name, kind, mailbox_id, channels })
     }
 }
 
@@ -846,6 +906,15 @@ mod tests {
     use super::*;
     use crate::identity::Identity;
     use crate::mls::credential::generate_key_package;
+    use crate::mls::membership::MemberBinding;
+
+    fn test_binding(id: &Identity, seq: u64) -> MemberBinding {
+        MemberBinding {
+            account_fp: id.fingerprint,
+            idlog_seq: seq,
+            device_key: id.verifying_key.to_bytes(),
+        }
+    }
 
     const MESSAGE_ID_OFFSET: usize = 1 + 1 + 32 + 32 + 8;
 
@@ -1051,7 +1120,7 @@ mod tests {
         let provider = GhostProvider::new_in_memory().unwrap();
         let id = Identity::from_seed([0x01; 32]).unwrap();
         let server_id = [0x42; 32];
-        let group = GhostGroup::create_with_id(&provider, &id, &server_id).unwrap();
+        let group = GhostGroup::create_with_id(&provider, &id, &server_id, test_binding(&id, 1)).unwrap();
 
         let expected = derive_mls_group_id(&server_id);
         assert_eq!(group.group_id(), expected);
@@ -1066,9 +1135,9 @@ mod tests {
 
         let server_id = [0x42; 32];
         let mut group_a =
-            GhostGroup::create_with_id(&provider_a, &id_a, &server_id).unwrap();
+            GhostGroup::create_with_id(&provider_a, &id_a, &server_id, test_binding(&id_a, 1)).unwrap();
         let kp_b = generate_key_package(&provider_b, &id_b).unwrap();
-        let (_commit, welcome) = group_a.add_member(&provider_a, kp_b).unwrap();
+        let (_commit, welcome) = group_a.add_member(&provider_a, kp_b, test_binding(&id_b, 1)).unwrap();
         let mut group_b =
             GhostGroup::join(&provider_b, &id_b, &welcome.to_bytes().unwrap()).unwrap();
 
@@ -1101,9 +1170,9 @@ mod tests {
 
         let server_id = [0x42; 32];
         let mut group_a =
-            GhostGroup::create_with_id(&provider_a, &id_a, &server_id).unwrap();
+            GhostGroup::create_with_id(&provider_a, &id_a, &server_id, test_binding(&id_a, 1)).unwrap();
         let kp_b = generate_key_package(&provider_b, &id_b).unwrap();
-        let (_commit, welcome) = group_a.add_member(&provider_a, kp_b).unwrap();
+        let (_commit, welcome) = group_a.add_member(&provider_a, kp_b, test_binding(&id_b, 1)).unwrap();
         let mut group_b =
             GhostGroup::join(&provider_b, &id_b, &welcome.to_bytes().unwrap()).unwrap();
 
@@ -1626,5 +1695,66 @@ mod tests {
 
         // Payload follows immediately after header
         assert_eq!(&envelope[ghost_wire::ENVELOPE_HEADER_SIZE..], &sealed[..]);
+    }
+
+    #[test]
+    fn roundtrip_sync_server_meta() {
+        let meta = SyncServerMeta {
+            server_name: "test server".into(),
+            kind: ServerKind::Server,
+            mailbox_id: [0xAA; 32],
+            channels: vec![
+                InviteChannel {
+                    channel_id: [0xBB; 32],
+                    name: "general".into(),
+                    kind: ChannelKind::Text,
+                    position: 0,
+                },
+                InviteChannel {
+                    channel_id: [0xCC; 32],
+                    name: "voice".into(),
+                    kind: ChannelKind::Voice,
+                    position: 1,
+                },
+            ],
+        };
+        let bytes = meta.to_bytes();
+        let decoded = SyncServerMeta::from_bytes(&bytes).unwrap();
+
+        assert_eq!(decoded.server_name, "test server");
+        assert_eq!(decoded.kind, ServerKind::Server);
+        assert_eq!(decoded.mailbox_id, [0xAA; 32]);
+        assert_eq!(decoded.channels.len(), 2);
+        assert_eq!(decoded.channels[0].name, "general");
+        assert_eq!(decoded.channels[1].name, "voice");
+        assert_eq!(decoded.channels[1].kind, ChannelKind::Voice);
+        assert_eq!(decoded.channels[1].position, 1);
+    }
+
+    #[test]
+    fn sync_server_meta_trailing_bytes_rejected() {
+        let meta = SyncServerMeta {
+            server_name: "x".into(),
+            kind: ServerKind::Dm,
+            mailbox_id: [0x11; 32],
+            channels: vec![],
+        };
+        let mut bytes = meta.to_bytes();
+        bytes.push(0xFF);
+        assert!(SyncServerMeta::from_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn sync_server_meta_empty_channels() {
+        let meta = SyncServerMeta {
+            server_name: "empty".into(),
+            kind: ServerKind::Dm,
+            mailbox_id: [0x22; 32],
+            channels: vec![],
+        };
+        let bytes = meta.to_bytes();
+        let decoded = SyncServerMeta::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.server_name, "empty");
+        assert!(decoded.channels.is_empty());
     }
 }

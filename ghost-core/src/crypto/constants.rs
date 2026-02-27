@@ -15,9 +15,6 @@ pub const ONLINE_PRESENCE_EXPORT_LABEL: &str = "ghost-online-presence";
 /// Label used when deriving Ed25519 signing keys from identity seeds.
 pub const ED25519_DERIVE_LABEL: &[u8] = b"ghost-ed25519";
 
-/// Label used when deriving X25519 keys from identity seeds.
-pub const X25519_DERIVE_LABEL: &[u8] = b"ghost-x25519";
-
 /// How many bytes of a fingerprint to use for short display names (produces 2x hex chars).
 pub const FINGERPRINT_SHORT_BYTES: usize = 8;
 

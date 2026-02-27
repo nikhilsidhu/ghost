@@ -34,6 +34,25 @@ pub(crate) fn genesis_pending_path() -> PathBuf {
     ghost_dir().join("genesis.pending")
 }
 
+/// Remove all local database and pending-state files.
+pub(crate) fn wipe_local_databases() {
+    fn try_remove(path: &std::path::Path) {
+        if let Err(e) = std::fs::remove_file(path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                eprintln!("wipe: failed to remove {}: {e}", path.display());
+            }
+        }
+    }
+    let db = db_path();
+    let mls_db = db.with_extension("mls.db");
+    for path in [&db, &mls_db] {
+        try_remove(path);
+        try_remove(&std::path::PathBuf::from(format!("{}-wal", path.display())));
+        try_remove(&std::path::PathBuf::from(format!("{}-shm", path.display())));
+    }
+    try_remove(&genesis_pending_path());
+}
+
 pub(crate) fn device_label() -> &'static str {
     match std::env::consts::OS {
         "macos" => "macOS",
@@ -47,47 +66,47 @@ pub(crate) fn device_label() -> &'static str {
 
 /// In debug builds, store device credentials in a file to avoid keychain popups on every recompile.
 #[cfg(debug_assertions)]
-fn load_or_create_device() -> (Identity, [u8; 32], [u8; 32]) {
+fn load_or_create_device() -> (Identity, [u8; 32], [u8; 32], Option<[u8; 32]>) {
+    use ghost_core::identity::keyring_store::DEVICE_BLOB_SIZE;
+
     let path = device_file();
     if let Ok(bytes) = fs::read(&path) {
-        if bytes.len() != ghost_core::identity::keyring_store::DEVICE_BLOB_SIZE {
-            panic!("corrupt device.key");
-        }
+        assert_eq!(bytes.len(), DEVICE_BLOB_SIZE, "corrupt device.key");
+        let idlog_seq = u64::from_be_bytes(bytes[128..136].try_into().unwrap());
         let fingerprint: [u8; 32] = bytes[0..32].try_into().unwrap();
         let sk_bytes: [u8; 32] = bytes[32..64].try_into().unwrap();
         let db_key: [u8; 32] = bytes[64..96].try_into().unwrap();
         let mls_db_key: [u8; 32] = bytes[96..128].try_into().unwrap();
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&sk_bytes);
-        let identity = Identity::from_device(fingerprint, signing_key);
-        (identity, db_key, mls_db_key)
+        let identity = Identity::from_device(fingerprint, signing_key, idlog_seq);
+        (identity, db_key, mls_db_key, None)
     } else {
         let creation = Identity::create_account(device_label())
             .expect("failed to create account");
-        // Copy out what we need before AccountCreation drops (zeroizes seed)
         let fingerprint = creation.identity.fingerprint;
         let sk_bytes = creation.identity.signing_key.to_bytes();
         let db_key = creation.db_key;
         let mls_db_key = creation.mls_db_key;
+        let seed = creation.seed;
         let genesis_bytes = creation.genesis_entry.to_bytes();
-        // Write genesis first — if we crash after device.key but before this,
-        // the device exists but can never push its identity log to relays
         fs::write(genesis_pending_path(), &genesis_bytes)
             .expect("failed to write genesis.pending");
-        let mut blob = Vec::with_capacity(ghost_core::identity::keyring_store::DEVICE_BLOB_SIZE);
+        let mut blob = Vec::with_capacity(DEVICE_BLOB_SIZE);
         blob.extend_from_slice(&fingerprint);
         blob.extend_from_slice(&sk_bytes);
         blob.extend_from_slice(&db_key);
         blob.extend_from_slice(&mls_db_key);
+        blob.extend_from_slice(&1u64.to_be_bytes());
         fs::write(&path, &blob).expect("failed to write device.key");
         drop(creation);
-        let identity = Identity::from_device(fingerprint, ed25519_dalek::SigningKey::from_bytes(&sk_bytes));
-        (identity, db_key, mls_db_key)
+        let identity = Identity::from_device(fingerprint, ed25519_dalek::SigningKey::from_bytes(&sk_bytes), 1);
+        (identity, db_key, mls_db_key, Some(seed))
     }
 }
 
 /// Release builds use the OS keyring.
 #[cfg(not(debug_assertions))]
-fn load_or_create_device() -> (Identity, [u8; 32], [u8; 32]) {
+fn load_or_create_device() -> (Identity, [u8; 32], [u8; 32], Option<[u8; 32]>) {
     use ghost_core::identity::keyring_store::{self, StoredDevice};
 
     let fp_file = ghost_dir().join("identity.txt");
@@ -95,8 +114,8 @@ fn load_or_create_device() -> (Identity, [u8; 32], [u8; 32]) {
         Ok(fp_short) => {
             let device = keyring_store::retrieve(fp_short.trim())
                 .expect("device in keyring not found — delete ~/.ghost/identity.txt to reset");
-            let identity = Identity::from_device(device.fingerprint, device.signing_key);
-            (identity, device.db_key, device.mls_db_key)
+            let identity = Identity::from_device(device.fingerprint, device.signing_key, device.idlog_seq);
+            (identity, device.db_key, device.mls_db_key, None)
         }
         Err(_) => {
             let creation = Identity::create_account(device_label())
@@ -106,6 +125,7 @@ fn load_or_create_device() -> (Identity, [u8; 32], [u8; 32]) {
             let sk_bytes = creation.identity.signing_key.to_bytes();
             let db_key = creation.db_key;
             let mls_db_key = creation.mls_db_key;
+            let seed = creation.seed;
             let fp_short = creation.identity.fingerprint_short();
             let genesis_bytes = creation.genesis_entry.to_bytes();
             let stored = StoredDevice {
@@ -113,9 +133,8 @@ fn load_or_create_device() -> (Identity, [u8; 32], [u8; 32]) {
                 signing_key: ed25519_dalek::SigningKey::from_bytes(&sk_bytes),
                 db_key,
                 mls_db_key,
+                idlog_seq: 1,
             };
-            // Write genesis first — if we crash after keyring but before this,
-            // the device exists but can never push its identity log to relays
             fs::write(genesis_pending_path(), &genesis_bytes)
                 .expect("failed to write genesis.pending");
             keyring_store::store(&fp_short, &stored)
@@ -123,8 +142,8 @@ fn load_or_create_device() -> (Identity, [u8; 32], [u8; 32]) {
             fs::write(&fp_file, &fp_short)
                 .expect("failed to write identity.txt");
             drop(creation);
-            let identity = Identity::from_device(fingerprint, ed25519_dalek::SigningKey::from_bytes(&sk_bytes));
-            (identity, db_key, mls_db_key)
+            let identity = Identity::from_device(fingerprint, ed25519_dalek::SigningKey::from_bytes(&sk_bytes), 1);
+            (identity, db_key, mls_db_key, Some(seed))
         }
     }
 }
@@ -143,10 +162,17 @@ pub fn initialize() -> SetupResult {
     let cfg_path = config::config_path(&dir);
     let mut cfg = GhostConfig::load(&cfg_path);
 
-    let (identity, db_key, mls_db_key) = load_or_create_device();
+    let (identity, db_key, mls_db_key, recovery_seed) = load_or_create_device();
 
     let mut client = GhostClient::open(identity, db_key, mls_db_key, &db_path())
         .expect("failed to open database");
+
+    // New account: generate sync_key immediately
+    if recovery_seed.is_some() && client.sync_key().is_none() {
+        let mut k = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut k);
+        client.set_sync_key(k).expect("failed to set sync_key");
+    }
 
     if let Some(name) = &cfg.display_name {
         client.set_display_name(name.clone());
@@ -214,6 +240,8 @@ pub fn initialize() -> SetupResult {
         },
         presence: Arc::new(Mutex::new(initial_presence)),
         pairing_secret: Arc::new(Mutex::new(None)),
+        recovery_seed: Arc::new(Mutex::new(recovery_seed.map(zeroize::Zeroizing::new))),
+        relay_task_handle: Arc::new(Mutex::new(None)),
     };
 
     SetupResult {

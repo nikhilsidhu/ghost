@@ -4,8 +4,8 @@ use keyring::Entry;
 use crate::error::{GhostError, Result};
 
 const SERVICE: &str = "ghost";
-/// fingerprint(32) + signing_key(32) + db_key(32) + mls_db_key(32)
-pub const DEVICE_BLOB_SIZE: usize = 128;
+/// fingerprint(32) + signing_key(32) + db_key(32) + mls_db_key(32) + idlog_seq(8) = 136 bytes.
+pub const DEVICE_BLOB_SIZE: usize = 136;
 
 fn entry(fingerprint_short: &str) -> Result<Entry> {
     Ok(Entry::new(SERVICE, fingerprint_short)?)
@@ -17,6 +17,7 @@ pub struct StoredDevice {
     pub signing_key: SigningKey,
     pub db_key: [u8; 32],
     pub mls_db_key: [u8; 32],
+    pub idlog_seq: u64,
 }
 
 /// Store device credentials in OS keyring.
@@ -26,6 +27,7 @@ pub fn store(fingerprint_short: &str, device: &StoredDevice) -> Result<()> {
     blob.extend_from_slice(&device.signing_key.to_bytes());
     blob.extend_from_slice(&device.db_key);
     blob.extend_from_slice(&device.mls_db_key);
+    blob.extend_from_slice(&device.idlog_seq.to_be_bytes());
     let e = entry(fingerprint_short)?;
     e.set_password(&hex::encode(&blob))?;
     Ok(())
@@ -38,17 +40,23 @@ pub fn retrieve(fingerprint_short: &str) -> Result<StoredDevice> {
     let blob = hex::decode(&hex_blob)
         .map_err(|e| GhostError::InvalidKey(format!("bad hex in keyring: {e}")))?;
     if blob.len() != DEVICE_BLOB_SIZE {
-        return Err(GhostError::InvalidKey(format!("expected {} bytes, got {}", DEVICE_BLOB_SIZE, blob.len())));
+        return Err(GhostError::InvalidKey(format!(
+            "expected {} bytes, got {}",
+            DEVICE_BLOB_SIZE,
+            blob.len()
+        )));
     }
+    let idlog_seq = u64::from_be_bytes(blob[128..136].try_into().unwrap());
     let fingerprint: [u8; 32] = blob[0..32].try_into().unwrap();
     let sk_bytes: [u8; 32] = blob[32..64].try_into().unwrap();
     let db_key: [u8; 32] = blob[64..96].try_into().unwrap();
-    let mls_db_key: [u8; 32] = blob[96..DEVICE_BLOB_SIZE].try_into().unwrap();
+    let mls_db_key: [u8; 32] = blob[96..128].try_into().unwrap();
     Ok(StoredDevice {
         fingerprint,
         signing_key: SigningKey::from_bytes(&sk_bytes),
         db_key,
         mls_db_key,
+        idlog_seq,
     })
 }
 
@@ -70,6 +78,7 @@ mod tests {
             signing_key: SigningKey::generate(&mut OsRng),
             db_key: [0xAAu8; 32],
             mls_db_key: [0xBBu8; 32],
+            idlog_seq: 1,
         }
     }
 
@@ -85,6 +94,7 @@ mod tests {
         assert_eq!(device.signing_key.to_bytes(), restored.signing_key.to_bytes());
         assert_eq!(device.db_key, restored.db_key);
         assert_eq!(device.mls_db_key, restored.mls_db_key);
+        assert_eq!(device.idlog_seq, restored.idlog_seq);
 
         delete(&fp_short).unwrap();
     }

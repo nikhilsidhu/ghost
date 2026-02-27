@@ -1,8 +1,8 @@
 import { createSignal, createMemo, For, Show, onMount, onCleanup, type Component } from "solid-js";
-import { getDevices, revokeDevice, startPairing, checkPairing, cancelPairing } from "../../lib/api";
+import { getDevices, revokeDevice, startPairing, checkPairing, cancelPairing, getRecoveryCode, hasRecoveryBlob, changeRecoveryPassphrase } from "../../lib/api";
 import { SettingGroup } from "./controls";
 import { cn } from "../../lib/cn";
-import { KeySquare, Check, Monitor, Smartphone, Plus, X, Loader, QrCode, Link2 } from "lucide-solid";
+import { KeySquare, Check, Monitor, Smartphone, Plus, X, Loader, QrCode, Link2, Copy, ShieldAlert } from "lucide-solid";
 import { Tooltip } from "../ui/tooltip";
 import { encode } from "uqr";
 import type { Device } from "../../lib/types";
@@ -46,6 +46,18 @@ export default function DevicesSettings() {
   const [revoking, setRevoking] = createSignal<string | null>(null);
   const [copiedKey, setCopiedKey] = createSignal<string | null>(null);
 
+  // Recovery state
+  const [hasRecovery, setHasRecovery] = createSignal<boolean | null>(null);
+  const [recCode, setRecCode] = createSignal<string | null>(null);
+  const [recCodeCopied, setRecCodeCopied] = createSignal(false);
+  const [changingPassphrase, setChangingPassphrase] = createSignal(false);
+  const [currentPp, setCurrentPp] = createSignal("");
+  const [newPp, setNewPp] = createSignal("");
+  const [confirmPp, setConfirmPp] = createSignal("");
+  const [changeError, setChangeError] = createSignal<string | null>(null);
+  const [changeLoading, setChangeLoading] = createSignal(false);
+  const [changeSuccess, setChangeSuccess] = createSignal(false);
+
   // Pairing state
   const [pairingCode, setPairingCode] = createSignal<string | null>(null);
   const [pairingStatus, setPairingStatus] = createSignal<string>("waiting for new device…");
@@ -70,7 +82,12 @@ export default function DevicesSettings() {
     }
   };
 
-  onMount(load);
+  onMount(() => {
+    load();
+    // Load recovery status
+    hasRecoveryBlob().then(setHasRecovery).catch(() => setHasRecovery(false));
+    getRecoveryCode().then(setRecCode).catch((e) => console.error("getRecoveryCode:", e));
+  });
 
   onCleanup(() => {
     if (pollTimer) clearInterval(pollTimer);
@@ -78,19 +95,25 @@ export default function DevicesSettings() {
   });
 
   const copyDeviceKey = (key: string) => {
-    navigator.clipboard.writeText(key);
+    navigator.clipboard.writeText(key).catch(() => {});
     setCopiedKey(key);
     setTimeout(() => setCopiedKey(null), FLASH_MS);
   };
 
+  const [revokeLoading, setRevokeLoading] = createSignal(false);
+
   const handleRevoke = async (key: string) => {
     if (revoking() === key) {
+      if (revokeLoading()) return;
+      setRevokeLoading(true);
       try {
         await revokeDevice(key);
         setRevoking(null);
         await load();
       } catch (e) {
         setError(String(e));
+      } finally {
+        setRevokeLoading(false);
       }
     } else {
       setRevoking(key);
@@ -157,10 +180,48 @@ export default function DevicesSettings() {
     await cancelPairing().catch(() => {});
   };
 
+  const copyRecoveryCode = () => {
+    const code = recCode();
+    if (!code) return;
+    navigator.clipboard.writeText(code).catch(() => {});
+    setRecCodeCopied(true);
+    setTimeout(() => setRecCodeCopied(false), FLASH_MS);
+  };
+
+  const newPpLongEnough = () => newPp().length >= 12;
+  const newPpMatch = () => confirmPp().length === 0 || newPp() === confirmPp();
+  const changePpReady = () => currentPp().length > 0 && newPpLongEnough() && confirmPp().length > 0 && newPpMatch();
+
+  const handleChangePassphrase = async () => {
+    if (!changePpReady()) return;
+    setChangeLoading(true);
+    setChangeError(null);
+    try {
+      await changeRecoveryPassphrase(currentPp(), newPp());
+      setChangingPassphrase(false);
+      setCurrentPp("");
+      setNewPp("");
+      setConfirmPp("");
+      setChangeSuccess(true);
+      setTimeout(() => setChangeSuccess(false), FLASH_MS);
+    } catch (e: any) {
+      const msg = String(e).toLowerCase();
+      if (msg.includes("decrypt") || msg.includes("aead") || msg.includes("passphrase")) {
+        setChangeError("wrong current passphrase");
+      } else {
+        setChangeError(String(e));
+      }
+    } finally {
+      setChangeLoading(false);
+    }
+  };
+
+  const inputClass = "w-full h-8 rounded px-3 text-xs bg-[var(--neutral-800)] text-[var(--neutral-100)] placeholder:text-[var(--neutral-600)] border border-[var(--neutral-700)] focus:border-[var(--purple-500)] outline-none";
+
   const copyLink = () => {
     const code = pairingCode();
     if (!code) return;
-    navigator.clipboard.writeText(code);
+    navigator.clipboard.writeText(code).catch(() => {});
     setLinkCopied(true);
     setTimeout(() => setLinkCopied(false), FLASH_MS);
   };
@@ -317,6 +378,114 @@ export default function DevicesSettings() {
               <Plus size={12} />
               {pairingStarting() ? "starting…" : "link new device"}
             </button>
+          </div>
+        </Show>
+      </SettingGroup>
+
+      {/* Recovery section */}
+      <SettingGroup label="account recovery">
+        <Show when={hasRecovery() === null}>
+          <div class="py-3 text-xs text-[var(--neutral-500)]">checking recovery status…</div>
+        </Show>
+        <Show when={hasRecovery() === false}>
+          <div class="py-3 flex items-center gap-2">
+            <ShieldAlert size={14} class="text-[var(--red-400)] flex-shrink-0" />
+            <p class="text-xs text-[var(--red-400)]">recovery not configured — account cannot be recovered if all devices are lost</p>
+          </div>
+        </Show>
+        <Show when={hasRecovery() === true}>
+          <div class="py-3 flex flex-col gap-3">
+            <Show when={recCode()}>
+              <div>
+                <label class="text-xs text-[var(--neutral-400)] mb-1 block">recovery code</label>
+                <div class="flex items-center gap-2 p-2 rounded bg-[var(--neutral-800)] border border-[var(--neutral-700)]">
+                  <span class="text-xs text-[var(--neutral-200)] font-mono break-all flex-1">{recCode()}</span>
+                  <button
+                    class="flex-shrink-0 text-[var(--neutral-500)] hover:text-[var(--neutral-400)] cursor-pointer"
+                    onClick={copyRecoveryCode}
+                  >
+                    {recCodeCopied() ? <Check size={14} class="text-[var(--emerald-400)]" /> : <Copy size={14} />}
+                  </button>
+                </div>
+              </div>
+            </Show>
+
+            <Show when={!changingPassphrase()}>
+              <div class="flex items-center gap-2">
+                <button
+                  class={cn(
+                    "flex items-center gap-1.5 text-xs px-3 py-1.5 rounded cursor-pointer transition-colors duration-150 w-fit",
+                    "text-[var(--neutral-300)] hover:text-[var(--neutral-100)]",
+                    "border border-[var(--neutral-700)] hover:border-[var(--neutral-600)]",
+                  )}
+                  onClick={() => setChangingPassphrase(true)}
+                >
+                  change passphrase
+                </button>
+                <Show when={changeSuccess()}>
+                  <span class="text-xs text-emerald-400 flex items-center gap-1">
+                    <Check size={12} /> passphrase updated
+                  </span>
+                </Show>
+              </div>
+            </Show>
+
+            <Show when={changingPassphrase()}>
+              <div class="flex flex-col gap-2">
+                <input
+                  class={inputClass}
+                  type="password"
+                  placeholder="current passphrase"
+                  value={currentPp()}
+                  onInput={(e) => setCurrentPp(e.currentTarget.value)}
+                />
+                <div>
+                  <input
+                    class={inputClass}
+                    type="password"
+                    placeholder="new passphrase (at least 12 characters)"
+                    value={newPp()}
+                    onInput={(e) => setNewPp(e.currentTarget.value)}
+                  />
+                  <Show when={newPp().length > 0}>
+                    <p class={`text-[10px] mt-0.5 ${newPpLongEnough() ? "text-[var(--emerald-400)]" : "text-[var(--neutral-600)]"}`}>
+                      {newPp().length} / 12 characters
+                    </p>
+                  </Show>
+                </div>
+                <div>
+                  <input
+                    class={inputClass}
+                    type="password"
+                    placeholder="confirm new passphrase"
+                    value={confirmPp()}
+                    onInput={(e) => setConfirmPp(e.currentTarget.value)}
+                    onKeyDown={(e) => { if (e.key === "Enter") handleChangePassphrase(); }}
+                  />
+                  <Show when={confirmPp().length > 0 && !newPpMatch()}>
+                    <p class="text-[10px] mt-0.5 text-[var(--red-400)]">passphrases don't match</p>
+                  </Show>
+                </div>
+                <Show when={changeError()}>
+                  <p class="text-xs text-[var(--red-400)]">{changeError()}</p>
+                </Show>
+                <div class="flex gap-2">
+                  <button
+                    class="text-xs px-3 py-1.5 rounded cursor-pointer bg-[var(--purple-600)] text-white hover:bg-[var(--purple-500)] disabled:opacity-50 disabled:cursor-default"
+                    onClick={handleChangePassphrase}
+                    disabled={!changePpReady() || changeLoading()}
+                  >
+                    {changeLoading() ? "saving…" : "save"}
+                  </button>
+                  <button
+                    class="text-xs px-3 py-1.5 rounded cursor-pointer text-[var(--neutral-400)] hover:text-[var(--neutral-200)] border border-[var(--neutral-700)]"
+                    onClick={() => { setChangingPassphrase(false); setChangeError(null); setCurrentPp(""); setNewPp(""); setConfirmPp(""); }}
+                  >
+                    cancel
+                  </button>
+                </div>
+              </div>
+            </Show>
           </div>
         </Show>
       </SettingGroup>

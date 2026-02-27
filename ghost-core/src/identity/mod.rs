@@ -40,6 +40,8 @@ pub struct Identity {
     pub verifying_key: VerifyingKey,
     pub fingerprint: [u8; 32],
     pub display_name: String,
+    /// Sequence number in the identity log that authorized this device key.
+    pub idlog_seq: u64,
 }
 
 impl Identity {
@@ -62,17 +64,18 @@ impl Identity {
         let fp_hex = hex::encode(&fingerprint[..FINGERPRINT_SHORT_BYTES]);
         let display_name = format!("ghost-{fp_hex}");
 
-        Ok(Self { signing_key, verifying_key, fingerprint, display_name })
+        // 0 = seed-derived identity, not registered in any identity log
+        Ok(Self { signing_key, verifying_key, fingerprint, display_name, idlog_seq: 0 })
     }
 
     /// Restore a device identity from stored components.
     /// `fingerprint` is the account-level fingerprint (Blake3 of master verifying key).
     /// `signing_key` is this device's random Ed25519 key.
-    pub fn from_device(fingerprint: [u8; 32], signing_key: SigningKey) -> Self {
+    pub fn from_device(fingerprint: [u8; 32], signing_key: SigningKey, idlog_seq: u64) -> Self {
         let verifying_key = signing_key.verifying_key();
         let fp_hex = hex::encode(&fingerprint[..FINGERPRINT_SHORT_BYTES]);
         let display_name = format!("ghost-{fp_hex}");
-        Self { signing_key, verifying_key, fingerprint, display_name }
+        Self { signing_key, verifying_key, fingerprint, display_name, idlog_seq }
     }
 
     /// Create a new account: derive master key from random seed, generate device key,
@@ -102,6 +105,7 @@ impl Identity {
             verifying_key: device_vk,
             fingerprint,
             display_name: format!("ghost-{fp_hex}"),
+            idlog_seq: 1,
         };
 
         Ok(AccountCreation { identity, genesis_entry: genesis, seed, db_key, mls_db_key })
@@ -158,7 +162,7 @@ mod tests {
     fn from_device_uses_provided_fingerprint() {
         let key = SigningKey::generate(&mut OsRng);
         let fp = [0xBBu8; 32];
-        let id = Identity::from_device(fp, key);
+        let id = Identity::from_device(fp, key, 0);
         assert_eq!(id.fingerprint, fp);
     }
 }

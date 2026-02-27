@@ -18,6 +18,15 @@ pub enum NoiseSuppressionMode {
     Nnnoiseless = 1,
 }
 
+impl NoiseSuppressionMode {
+    pub fn from_config(s: &str) -> Self {
+        match s {
+            "off" => Self::Off,
+            _ => Self::Nnnoiseless,
+        }
+    }
+}
+
 impl From<u8> for NoiseSuppressionMode {
     fn from(v: u8) -> Self {
         match v {
@@ -32,6 +41,15 @@ impl From<u8> for NoiseSuppressionMode {
 pub enum AgcMode {
     Off = 0,
     Auto = 1,
+}
+
+impl AgcMode {
+    pub fn from_config(s: &str) -> Self {
+        match s {
+            "off" => Self::Off,
+            _ => Self::Auto,
+        }
+    }
 }
 
 impl From<u8> for AgcMode {

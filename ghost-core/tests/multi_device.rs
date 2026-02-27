@@ -1,12 +1,13 @@
+mod common;
+
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
-use tokio::net::TcpListener;
 
 use ghost_core::client::GhostClient;
 use ghost_core::crypto::keys::derive_ed25519_seed;
-use ghost_core::identity::export::{export_seed, import_seed};
+use ghost_core::identity::export::{export_recovery_blob, import_recovery_blob};
 use ghost_core::identity::log::{
     create_add_device, create_genesis, create_recovery, create_revoke_device, validate_chain,
     LogEntry,
@@ -17,25 +18,6 @@ use ghost_core::wire::{
     decode_mutation, encode_mutation, encode_sync_state_dump, sync_mailbox_id, sync_open,
     sync_seal, sync_sign, sync_verify, wrap_sync_envelope, MUTATION_SET, SYNC_KEY_SERVER_ORDER,
 };
-use ghost_relay::config::Config;
-use ghost_relay::storage::Storage;
-use ghost_relay::{routes, state};
-
-async fn start_relay() -> String {
-    let config = Config {
-        port: 0,
-        max_blob_size: 10 * 1024 * 1024,
-        voice_port: 0,
-        max_voice_participants: 25,
-    };
-    let storage = Storage::open_in_memory().unwrap();
-    let st = state::new_state(config, storage);
-    let app = routes::router(st);
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    format!("http://127.0.0.1:{port}")
-}
 
 /// Create account using the real Identity::create_account flow.
 /// Returns (master_key, device_key, genesis, account_fp, seed).
@@ -73,7 +55,7 @@ fn make_ghost_client(label: &str) -> (GhostClient, [u8; 32], SigningKey) {
     let fp = acct.identity.fingerprint;
     let sk = acct.identity.signing_key.clone();
     let db_key = acct.db_key;
-    let identity = Identity::from_device(fp, sk.clone());
+    let identity = Identity::from_device(fp, sk.clone(), 1);
     drop(acct);
     (GhostClient::open_in_memory(identity, db_key).unwrap(), fp, sk)
 }
@@ -99,7 +81,7 @@ async fn push_and_validate(
 
 #[tokio::test]
 async fn idlog_genesis_add_revoke_full_lifecycle() {
-    let relay_url = start_relay().await;
+    let relay_url = common::start_relay().await;
     let (relay, _) = RelayClient::new(&relay_url);
     let (_master, device1, genesis, fp, _seed) = make_account("desktop");
     let device2 = SigningKey::generate(&mut OsRng);
@@ -313,7 +295,7 @@ fn sync_key_set_and_retrieve() {
 
 #[tokio::test]
 async fn pairing_offer_response_encrypted_roundtrip() {
-    let relay_url = start_relay().await;
+    let relay_url = common::start_relay().await;
     let (relay_a, _) = RelayClient::new(&relay_url);
     let (relay_b, _) = RelayClient::new(&relay_url);
     let (_master, _device1, _genesis, fp, _seed) = make_account("desktop");
@@ -363,7 +345,7 @@ async fn pairing_offer_response_encrypted_roundtrip() {
 
 #[tokio::test]
 async fn full_pairing_then_sync_exchange() {
-    let relay_url = start_relay().await;
+    let relay_url = common::start_relay().await;
     let http = reqwest::Client::new();
 
     // 1. Device A creates account
@@ -377,7 +359,7 @@ async fn full_pairing_then_sync_exchange() {
 
     // 2. Device A creates GhostClient and generates a sync key
     let client_a = GhostClient::open_in_memory(
-        Identity::from_device(fp, device_a.clone()),
+        Identity::from_device(fp, device_a.clone(), 1),
         [0x01; 32],
     )
     .unwrap();
@@ -473,7 +455,7 @@ async fn full_pairing_then_sync_exchange() {
 
     // Device B creates GhostClient, stores the sync key
     let client_b = GhostClient::open_in_memory(
-        Identity::from_device(fp, device_b.clone()),
+        Identity::from_device(fp, device_b.clone(), 2),
         [0x02; 32],
     )
     .unwrap();
@@ -513,7 +495,7 @@ async fn full_pairing_then_sync_exchange() {
 
 #[tokio::test]
 async fn recovery_full_flow() {
-    let relay_url = start_relay().await;
+    let relay_url = common::start_relay().await;
     let (relay, _) = RelayClient::new(&relay_url);
 
     // 1. Create account with 2 devices
@@ -531,8 +513,8 @@ async fn recovery_full_flow() {
     // Both devices had a sync key
     let old_sync_key = [0xAA; 32];
 
-    // 2. Export seed encrypted with passphrase, store on relay
-    let recovery_blob = export_seed(&seed, "my-recovery-passphrase").unwrap();
+    // 2. Export seed + sync_key encrypted with passphrase, store on relay
+    let recovery_blob = export_recovery_blob(&seed, &old_sync_key, "my-recovery-passphrase").unwrap();
     relay
         .put_recovery_blob(&fp, recovery_blob.clone())
         .await
@@ -543,8 +525,10 @@ async fn recovery_full_flow() {
     assert_eq!(fetched, recovery_blob);
 
     // 4. Decrypt → derive master key
-    let recovered_seed = import_seed(&fetched, "my-recovery-passphrase").unwrap();
-    assert_eq!(recovered_seed, seed);
+    let recovered = import_recovery_blob(&fetched, "my-recovery-passphrase").unwrap();
+    assert_eq!(recovered.seed, seed);
+    assert_eq!(recovered.sync_key.unwrap(), old_sync_key);
+    let recovered_seed = recovered.seed;
     let recovered_ed = derive_ed25519_seed(&recovered_seed).unwrap();
     let recovered_master = SigningKey::from_bytes(&recovered_ed);
     assert_eq!(
@@ -582,7 +566,7 @@ async fn recovery_full_flow() {
     assert!(!final_state.is_active_device(&device2.verifying_key().to_bytes()));
 
     // 7. Recovery device creates a new GhostClient with fresh sync key
-    let recovery_identity = Identity::from_device(fp, recovery_device.clone());
+    let recovery_identity = Identity::from_device(fp, recovery_device.clone(), 3);
     let recovery_client =
         GhostClient::open_in_memory(recovery_identity, [0x99; 32]).unwrap();
     assert!(recovery_client.sync_key().is_none()); // fresh — no sync key yet

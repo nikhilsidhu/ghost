@@ -1,6 +1,5 @@
 use hkdf::Hkdf;
 use sha2::Sha256;
-use x25519_dalek::StaticSecret;
 
 use crate::error::{GhostError, Result};
 
@@ -16,12 +15,6 @@ pub fn derive_key(ikm: &[u8], info: &[u8]) -> Result<[u8; 32]> {
 /// Seed -> Ed25519 signing key bytes via HKDF
 pub fn derive_ed25519_seed(seed: &[u8; 32]) -> Result<[u8; 32]> {
     derive_key(seed, super::ED25519_DERIVE_LABEL)
-}
-
-/// Seed -> X25519 static secret via HKDF
-pub fn derive_x25519_secret(seed: &[u8; 32]) -> Result<StaticSecret> {
-    let bytes = derive_key(seed, super::X25519_DERIVE_LABEL)?;
-    Ok(StaticSecret::from(bytes))
 }
 
 #[cfg(test)]
