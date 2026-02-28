@@ -167,11 +167,16 @@ pub fn initialize() -> SetupResult {
     let mut client = GhostClient::open(identity, db_key, mls_db_key, &db_path())
         .expect("failed to open database");
 
-    // New account: generate sync_key immediately
-    if recovery_seed.is_some() && client.sync_key().is_none() {
-        let mut k = [0u8; 32];
-        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut k);
-        client.set_sync_key(k).expect("failed to set sync_key");
+    // New account: create sync MLS group + generate snapshot key
+    if recovery_seed.is_some() {
+        if !client.has_sync_group() {
+            client.create_sync_group().expect("failed to create sync group");
+        }
+        if client.sync_key().is_none() {
+            let mut k = [0u8; 32];
+            rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut k);
+            client.set_sync_key(k).expect("failed to set sync_key");
+        }
     }
 
     if let Some(name) = &cfg.display_name {

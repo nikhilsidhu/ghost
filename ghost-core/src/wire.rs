@@ -335,15 +335,15 @@ impl InvitePayload {
     }
 }
 
-// --- Sync mailbox: device-to-device communication ---
+// --- Sync MLS group ---
 
-const SYNC_MAILBOX_TAG: &[u8] = b"ghost-sync-mailbox-v1";
+const SYNC_GROUP_TAG: &[u8] = b"ghost-sync-group-v1";
 
-/// Deterministic mailbox ID for device sync, derived from account fingerprint.
-pub fn sync_mailbox_id(account_fp: &[u8; 32]) -> [u8; 32] {
+/// Deterministic server_id for the sync MLS group, derived from account fingerprint.
+pub fn sync_server_id(account_fp: &[u8; 32]) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(account_fp);
-    hasher.update(SYNC_MAILBOX_TAG);
+    hasher.update(SYNC_GROUP_TAG);
     hasher.finalize().into()
 }
 
@@ -354,6 +354,17 @@ pub enum SyncMessageType {
     ServerLeft = 0x02,
     VoiceTakeover = 0x03,
     MutationSync = 0x04,
+}
+
+/// Result of processing an inbound sync MLS message.
+#[derive(Debug)]
+pub enum SyncReceiveResult {
+    /// Decrypted application message: [msg_type:1][payload...]
+    Application(Vec<u8>),
+    /// A commit was processed (device added/removed, epoch advanced).
+    CommitProcessed,
+    /// Our own message echoed back by the relay.
+    SelfMessage,
 }
 
 /// Encrypt a sync message with AES-256-GCM. Returns nonce || ciphertext.
@@ -383,38 +394,6 @@ pub fn sync_open(key: &[u8; 32], blob: &[u8]) -> Result<Vec<u8>> {
     cipher
         .decrypt(nonce, &blob[12..])
         .map_err(|e| GhostError::Format(format!("sync open: {e}")))
-}
-
-/// Sign a sync plaintext with the device signing key.
-/// Output: [device_vk:32][ed25519_sig:64][plaintext...]
-pub fn sync_sign(signing_key: &ed25519_dalek::SigningKey, plaintext: &[u8]) -> Vec<u8> {
-    use ed25519_dalek::Signer;
-    let sig = signing_key.sign(plaintext);
-    let vk = signing_key.verifying_key();
-    let mut out = Vec::with_capacity(32 + 64 + plaintext.len());
-    out.extend_from_slice(vk.as_bytes());
-    out.extend_from_slice(&sig.to_bytes());
-    out.extend_from_slice(plaintext);
-    out
-}
-
-/// Verify and extract a signed sync plaintext.
-/// Returns (device_verifying_key, plaintext) on success.
-pub fn sync_verify(signed: &[u8]) -> Result<([u8; 32], Vec<u8>)> {
-    if signed.len() < 96 {
-        return Err(GhostError::Format("signed sync too short".into()));
-    }
-    let vk_bytes: [u8; 32] = signed[..32].try_into().unwrap();
-    let sig_bytes: [u8; 64] = signed[32..96].try_into().unwrap();
-    let payload = &signed[96..];
-
-    let vk = ed25519_dalek::VerifyingKey::from_bytes(&vk_bytes)
-        .map_err(|e| GhostError::Format(format!("bad device key: {e}")))?;
-    let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-    vk.verify_strict(payload, &sig)
-        .map_err(|e| GhostError::Format(format!("sync signature invalid: {e}")))?;
-
-    Ok((vk_bytes, payload.to_vec()))
 }
 
 // --- Mutation sync wire format ---
@@ -527,15 +506,6 @@ pub fn decode_sync_state_dump(data: &[u8]) -> Result<Vec<(String, Option<Vec<u8>
         }
     }
     Ok(entries)
-}
-
-/// Wrap a sync ciphertext in a relay-compatible envelope.
-pub fn wrap_sync_envelope(sealed: &[u8]) -> Vec<u8> {
-    let header = ghost_wire::encode_envelope(ghost_wire::EnvelopeType::Application, 0);
-    let mut out = Vec::with_capacity(ghost_wire::ENVELOPE_HEADER_SIZE + sealed.len());
-    out.extend_from_slice(&header);
-    out.extend_from_slice(sealed);
-    out
 }
 
 // --- Provision payload: server metadata for device provisioning ---
@@ -1208,30 +1178,6 @@ mod tests {
     }
 
     #[test]
-    fn sync_sign_verify_roundtrip() {
-        let sk = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
-        let payload = b"hello sync";
-        let signed = sync_sign(&sk, payload);
-        let (vk, recovered) = sync_verify(&signed).unwrap();
-        assert_eq!(vk, sk.verifying_key().to_bytes());
-        assert_eq!(recovered, payload);
-    }
-
-    #[test]
-    fn sync_verify_rejects_tampered() {
-        let sk = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
-        let mut signed = sync_sign(&sk, b"original");
-        // Tamper with the payload
-        *signed.last_mut().unwrap() ^= 0xFF;
-        assert!(sync_verify(&signed).is_err());
-    }
-
-    #[test]
-    fn sync_verify_rejects_too_short() {
-        assert!(sync_verify(&[0u8; 95]).is_err());
-    }
-
-    #[test]
     fn mutation_encode_decode_set() {
         let encoded = encode_mutation(MUTATION_SET, 12345, "order:servers", &[0x01, 0x02]);
         let (op, ts, key, value) = decode_mutation(&encoded).unwrap();
@@ -1311,52 +1257,6 @@ mod tests {
         let mut sealed = sync_seal(&key, b"authentic").unwrap();
         sealed[14] ^= 0xFF; // flip a ciphertext byte
         assert!(sync_open(&key, &sealed).is_err());
-    }
-
-    // --- Sync sign/verify edge cases ---
-
-    #[test]
-    fn sync_verify_wrong_key_in_header_fails() {
-        let sk = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
-        let mut signed = sync_sign(&sk, b"payload");
-        // Corrupt the verifying key bytes — signature check will fail
-        signed[0] ^= 0xFF;
-        assert!(sync_verify(&signed).is_err());
-    }
-
-    #[test]
-    fn sync_verify_empty_payload_succeeds() {
-        let sk = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
-        let signed = sync_sign(&sk, b"");
-        let (vk, payload) = sync_verify(&signed).unwrap();
-        assert_eq!(vk, sk.verifying_key().to_bytes());
-        assert!(payload.is_empty());
-    }
-
-    // --- Full sync envelope round trip: sign → seal → wrap → unwrap → open → verify ---
-
-    #[test]
-    fn sync_full_pipeline_roundtrip() {
-        let device_key = ed25519_dalek::SigningKey::from_bytes(&[0x77; 32]);
-        let sync_key = [0x88; 32];
-        let mutation = encode_mutation(MUTATION_SET, 5000, "read:abc123", &42u64.to_be_bytes());
-
-        // Sender side
-        let signed = sync_sign(&device_key, &mutation);
-        let sealed = sync_seal(&sync_key, &signed).unwrap();
-        let envelope = wrap_sync_envelope(&sealed);
-
-        // Receiver side: strip envelope header, open, verify
-        let sealed_recv = &envelope[ghost_wire::ENVELOPE_HEADER_SIZE..];
-        let signed_recv = sync_open(&sync_key, sealed_recv).unwrap();
-        let (vk, plaintext) = sync_verify(&signed_recv).unwrap();
-        assert_eq!(vk, device_key.verifying_key().to_bytes());
-
-        let (op, ts, key, value) = decode_mutation(&plaintext).unwrap();
-        assert_eq!(op, MUTATION_SET);
-        assert_eq!(ts, 5000);
-        assert_eq!(key, "read:abc123");
-        assert_eq!(u64::from_be_bytes(value.try_into().unwrap()), 42);
     }
 
     // --- Sync state dump edge cases ---
@@ -1576,9 +1476,9 @@ mod tests {
         let mls_gid = derive_mls_group_id(&id);
         let channel = derive_default_channel_id(&id);
         let mailbox = mls_group_mailbox_id(&id);
-        let sync_mb = sync_mailbox_id(&id);
+        let sync_sid = sync_server_id(&id);
         // All four must be different (domain tags prevent collisions)
-        let all = [mls_gid, channel, mailbox, sync_mb];
+        let all = [mls_gid, channel, mailbox, sync_sid];
         for i in 0..all.len() {
             for j in (i + 1)..all.len() {
                 assert_ne!(all[i], all[j], "domain separation failed between derivation {i} and {j}");
@@ -1680,21 +1580,6 @@ mod tests {
         let encoded = encode_avatar_clear();
         let decoded = decode_metadata(&encoded).unwrap();
         assert!(matches!(decoded, MetadataPayload::AvatarClear));
-    }
-
-    // --- Sync envelope header test ---
-
-    #[test]
-    fn sync_envelope_header_valid() {
-        let payload = b"test-sync-payload";
-        let sealed = sync_seal(&[0xCC; 32], payload).unwrap();
-        let envelope = wrap_sync_envelope(&sealed);
-
-        // Header is exactly ENVELOPE_HEADER_SIZE bytes
-        assert!(envelope.len() == ghost_wire::ENVELOPE_HEADER_SIZE + sealed.len());
-
-        // Payload follows immediately after header
-        assert_eq!(&envelope[ghost_wire::ENVELOPE_HEADER_SIZE..], &sealed[..]);
     }
 
     #[test]

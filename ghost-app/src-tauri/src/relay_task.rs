@@ -10,7 +10,7 @@ use ghost_core::mls::presence::OnlineStatus;
 use ghost_core::mls::voice::PresenceState;
 use ghost_core::relay::{RelayClient, RelayEvent};
 use ghost_core::storage::{Channel, Member, MemberRole};
-use ghost_core::wire::{decode_metadata, ChannelOpPayload, MetadataPayload, ProvisionPayload, SyncMessageType, sync_mailbox_id, sync_open, sync_verify};
+use ghost_core::wire::{decode_metadata, ChannelOpPayload, MetadataPayload, ProvisionPayload, SyncMessageType, SyncReceiveResult};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 use tokio::sync::{mpsc, Mutex};
@@ -47,14 +47,9 @@ pub async fn run(
     config_path: PathBuf,
     voice_cmd_tx: mpsc::Sender<crate::voice_task::VoiceCommand>,
 ) {
-    // Compute sync mailbox ID (key is read dynamically — may be created after pairing)
-    let sync_mb = {
-        let c = client.lock().await;
-        sync_mailbox_id(c.fingerprint())
-    };
-
     // Subscribe to all existing server mailboxes with persisted last_seen_seq
-    {
+    // and the sync MLS group mailbox if it exists
+    let sync_mb = {
         let c = client.lock().await;
         let mailboxes = c.server_mailboxes();
         let mut r = relay.lock().await;
@@ -62,12 +57,14 @@ pub async fn run(
             let seq = c.store().get_last_seen_seq(mailbox_id).unwrap_or(0);
             r.subscribe(*mailbox_id, seq);
         }
-        // Subscribe to sync mailbox if key exists
-        if c.sync_key().is_some() {
-            let seq = c.store().get_last_seen_seq(&sync_mb).unwrap_or(0);
-            r.subscribe(sync_mb, seq);
+        if let Some(mb) = c.sync_mailbox_id() {
+            let seq = c.store().get_last_seen_seq(&mb).unwrap_or(0);
+            r.subscribe(mb, seq);
+            Some(mb)
+        } else {
+            None
         }
-    }
+    };
 
     // Push pending genesis entry to relay (first launch only)
     {
@@ -104,17 +101,27 @@ pub async fn run(
                 let seq = blob.seq;
 
                 // Handle sync mailbox blobs before server lookup
-                if mailbox_id == sync_mb {
-                    let key = { client.lock().await.sync_key() };
-                    if let Some(key) = key {
-                        handle_sync_blob(
-                            &app, &client, &relay, &key, &blob.payload,
-                            &config, &config_path, &presence, &voice_cmd_tx,
-                        ).await;
+                if let Some(ref smb) = sync_mb {
+                    if &mailbox_id == smb {
+                        let result = {
+                            let mut c = client.lock().await;
+                            c.receive_sync(&blob.payload)
+                        };
+                        match result {
+                            Ok(SyncReceiveResult::Application(plaintext)) => {
+                                handle_sync_application(
+                                    &app, &client, &relay, &plaintext,
+                                    &config, &config_path, &presence, &voice_cmd_tx,
+                                ).await;
+                            }
+                            Ok(SyncReceiveResult::CommitProcessed) => {}
+                            Ok(SyncReceiveResult::SelfMessage) => {}
+                            Err(e) => eprintln!("sync: process failed: {e}"),
+                        }
                         let c = client.lock().await;
-                        let _ = c.store().set_last_seen_seq(&sync_mb, seq);
+                        let _ = c.store().set_last_seen_seq(smb, seq);
+                        continue;
                     }
-                    continue;
                 }
 
                 let result = {
@@ -277,8 +284,8 @@ pub async fn run(
                 if connected {
                     connected_mailboxes.insert(mailbox_id);
                     rebroadcast_presence(&client, &relay, &mailbox_id, &presence).await;
-                    // On sync mailbox connect: GET snapshot, import, PUT merged state (background)
-                    if mailbox_id == sync_mb {
+                    // On sync mailbox connect: fetch durable snapshot for catchup
+                    if sync_mb.as_ref() == Some(&mailbox_id) {
                         let app2 = app.clone();
                         let client2 = client.clone();
                         let relay2 = relay.clone();
@@ -299,71 +306,18 @@ pub async fn run(
     }
 }
 
-async fn handle_sync_blob(
+/// Handle a decrypted sync application message (plaintext from MLS group).
+async fn handle_sync_application(
     app: &AppHandle,
     client: &Arc<Mutex<GhostClient>>,
     relay: &Arc<Mutex<RelayClient>>,
-    sync_key: &[u8; 32],
-    envelope_blob: &[u8],
+    plaintext: &[u8],
     config: &Arc<Mutex<crate::config::GhostConfig>>,
     config_path: &PathBuf,
     presence: &Arc<Mutex<PresenceInfo>>,
     voice_cmd_tx: &mpsc::Sender<crate::voice_task::VoiceCommand>,
 ) {
-    // Strip envelope header
-    if envelope_blob.len() < ghost_wire::ENVELOPE_HEADER_SIZE {
-        eprintln!("sync: blob too short for envelope");
-        return;
-    }
-    let sealed = &envelope_blob[ghost_wire::ENVELOPE_HEADER_SIZE..];
-
-    let decrypted = match sync_open(sync_key, sealed) {
-        Ok(pt) => pt,
-        Err(e) => {
-            eprintln!("sync: decrypt failed, skipping: {e}");
-            return;
-        }
-    };
-
-    if decrypted.is_empty() {
-        eprintln!("sync: empty payload");
-        return;
-    }
-
-    // Verify device signature and check identity log for revocation
-    let (device_vk, plaintext) = match sync_verify(&decrypted) {
-        Ok(v) => v,
-        Err(_) => {
-            // Unsigned legacy message — accept during transition
-            (Default::default(), decrypted)
-        }
-    };
-    if device_vk != [0u8; 32] {
-        let account_fp = {
-            let c = client.lock().await;
-            *c.fingerprint()
-        };
-        let is_active = {
-            let r = relay.lock().await;
-            match r.get_idlog(&account_fp, 0).await {
-                Ok(blobs) => {
-                    use ghost_core::identity::log::{LogEntry, validate_chain};
-                    let entries: Vec<LogEntry> = blobs.iter()
-                        .filter_map(|b| LogEntry::from_bytes(&b.payload).ok())
-                        .collect();
-                    match validate_chain(&entries) {
-                        Ok(log_state) => log_state.is_active_device(&device_vk),
-                        Err(_) => true, // can't validate — don't block
-                    }
-                }
-                Err(_) => true, // network error — don't block
-            }
-        };
-        if !is_active {
-            eprintln!("sync: rejected message from revoked device {}", hex::encode(&device_vk[..8]));
-            return;
-        }
-    }
+    if plaintext.is_empty() { return; }
 
     let msg_type = plaintext[0];
     let body = &plaintext[1..];
@@ -547,7 +501,7 @@ async fn handle_sync_blob(
     }
 }
 
-/// On sync mailbox connect: GET relay snapshot, LWW-import, apply side effects, PUT merged state back.
+/// On sync mailbox connect: GET durable snapshot, LWW-import, apply side effects, PUT merged state.
 async fn fetch_and_merge_sync_state(
     app: &AppHandle,
     client: &Arc<Mutex<GhostClient>>,
@@ -565,7 +519,6 @@ async fn fetch_and_merge_sync_state(
         (k, *c.fingerprint())
     };
 
-    // GET encrypted snapshot from relay (lock dropped before branching)
     let get_result = {
         let r = relay.lock().await;
         r.get_sync_state(&account_fp).await
@@ -592,7 +545,6 @@ async fn fetch_and_merge_sync_state(
         }
     };
 
-    // Decrypt
     let dump_bytes = match sync_open(&sync_key, &sealed) {
         Ok(pt) => pt,
         Err(e) => {
@@ -601,7 +553,6 @@ async fn fetch_and_merge_sync_state(
         }
     };
 
-    // Decode
     let entries = match decode_sync_state_dump(&dump_bytes) {
         Ok(e) => e,
         Err(e) => {
@@ -610,13 +561,11 @@ async fn fetch_and_merge_sync_state(
         }
     };
 
-    // Import via LWW
     {
         let c = client.lock().await;
         c.sync_import(&entries).unwrap_or_default();
     }
 
-    // Apply all side effects (read marks, config, voice, presence, events)
     let settings = crate::sync_utils::parse_sync_entries(&entries);
     crate::sync_utils::apply_sync_side_effects(
         &settings, app, client, relay, config, config_path, presence, voice_cmd_tx,

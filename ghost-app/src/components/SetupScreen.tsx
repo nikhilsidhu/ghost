@@ -140,11 +140,12 @@ export function SetupScreen(props: Props) {
   onCleanup(() => statusUnlisten?.());
 
   const validatePairingCode = (code: string): string | null => {
+    const hexRegex = /^[0-9a-f]{64}$/i;
     const parts = code.split("#");
     if (parts.length !== 3) return "invalid format — should be relay_url#fingerprint#secret";
     if (!parts[0].startsWith("http")) return "invalid relay url in pairing code";
-    if (parts[1].length !== 64) return "invalid fingerprint in pairing code";
-    if (parts[2].length !== 64) return "invalid secret in pairing code";
+    if (!hexRegex.test(parts[1])) return "invalid fingerprint in pairing code";
+    if (!hexRegex.test(parts[2])) return "invalid secret in pairing code";
     return null;
   };
 

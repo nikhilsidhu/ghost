@@ -14,9 +14,9 @@ use crate::storage::{
     Channel, ChannelKind, GhostStore, Server, ServerKind, Member, MemberRole, StoredMessage,
 };
 use crate::wire::{
-    derive_default_channel_id, mls_group_mailbox_id, open, open_any, seal, ApplicationMessage,
-    InboundMessage, InviteChannel, InviteMember, InvitePayload, Outbound, ProvisionPayload,
-    SyncServerMeta,
+    derive_default_channel_id, mls_group_mailbox_id, open, open_any, seal, sync_server_id,
+    ApplicationMessage, InboundMessage, InviteChannel, InviteMember, InvitePayload, Outbound,
+    ProvisionPayload, SyncReceiveResult, SyncServerMeta,
 };
 
 /// Open an encrypted SQLite connection for MLS state, separate from the app DB.
@@ -53,6 +53,8 @@ pub struct GhostClient {
     servers: HashMap<[u8; 32], GhostGroup>,
     /// mailbox_id → server_id for O(1) reverse lookup
     mailbox_map: HashMap<[u8; 32], [u8; 32]>,
+    /// MLS self-group for cross-device sync (separate from server groups)
+    sync_group: Option<GhostGroup>,
 }
 
 impl GhostClient {
@@ -79,12 +81,18 @@ impl GhostClient {
             .map(|(sid, g)| (mls_group_mailbox_id(g.group_id()), *sid))
             .collect();
 
+        let sid = sync_server_id(&identity.fingerprint);
+        let sync_group = GhostGroup::load(&provider, &identity, &sid)
+            .ok()
+            .flatten();
+
         Ok(Self {
             identity,
             provider,
             store,
             servers,
             mailbox_map,
+            sync_group,
         })
     }
 
@@ -97,6 +105,7 @@ impl GhostClient {
             store,
             servers: HashMap::new(),
             mailbox_map: HashMap::new(),
+            sync_group: None,
         })
     }
 
@@ -112,7 +121,12 @@ impl GhostClient {
         &self.store
     }
 
+    /// Update own display name in identity and all server member records.
     pub fn set_display_name(&mut self, name: String) {
+        let fp = self.identity.fingerprint;
+        for server_id in self.servers.keys() {
+            let _ = self.store.update_member_name(server_id, &fp, &name);
+        }
         self.identity.display_name = name;
     }
 
@@ -146,6 +160,99 @@ impl GhostClient {
 
     pub fn sync_import(&self, entries: &[(String, Option<Vec<u8>>, u64)]) -> Result<()> {
         self.store.sync_import(entries)
+    }
+
+    // --- Sync MLS group ---
+
+    pub fn create_sync_group(&mut self) -> Result<()> {
+        let sid = sync_server_id(&self.identity.fingerprint);
+        let binding = crate::mls::membership::MemberBinding::from_identity(&self.identity);
+        let group = GhostGroup::create_with_id(&self.provider, &self.identity, &sid, binding)?;
+        self.sync_group = Some(group);
+        Ok(())
+    }
+
+    pub fn has_sync_group(&self) -> bool {
+        self.sync_group.is_some()
+    }
+
+    pub fn sync_mailbox_id(&self) -> Option<[u8; 32]> {
+        self.sync_group.as_ref().map(|g| mls_group_mailbox_id(g.group_id()))
+    }
+
+    /// Encrypt a sync plaintext and wrap in relay envelope.
+    pub fn send_sync(&mut self, plaintext: &[u8]) -> Result<Outbound> {
+        let group = self.sync_group.as_mut()
+            .ok_or_else(|| GhostError::Format("no sync group".into()))?;
+        let mls_out = group.encrypt(&self.provider, plaintext)?;
+        let mls_bytes = mls_out
+            .to_bytes()
+            .map_err(|e| GhostError::Mls(format!("serialize: {e}")))?;
+        let header = ghost_wire::encode_envelope(ghost_wire::EnvelopeType::Application, group.epoch());
+        let mut blob = Vec::with_capacity(ghost_wire::ENVELOPE_HEADER_SIZE + mls_bytes.len());
+        blob.extend_from_slice(&header);
+        blob.extend_from_slice(&mls_bytes);
+        let mailbox_id = mls_group_mailbox_id(group.group_id());
+        Ok(Outbound { mailbox_id, blob })
+    }
+
+    /// Decrypt an inbound sync blob (envelope-wrapped MLS ciphertext).
+    pub fn receive_sync(&mut self, blob: &[u8]) -> Result<SyncReceiveResult> {
+        let group = self.sync_group.as_mut()
+            .ok_or_else(|| GhostError::Format("no sync group".into()))?;
+        ghost_wire::decode_envelope(blob)
+            .map_err(|e| GhostError::Format(format!("envelope: {e}")))?;
+        let mls_bytes = ghost_wire::envelope_payload(blob);
+        match group.process_message_bytes(&self.provider, mls_bytes) {
+            Err(GhostError::SelfMessage) => Ok(SyncReceiveResult::SelfMessage),
+            Err(e) => Err(e),
+            Ok(processed) => match processed.into_content() {
+                openmls::prelude::ProcessedMessageContent::ApplicationMessage(app) => {
+                    Ok(SyncReceiveResult::Application(app.into_bytes()))
+                }
+                openmls::prelude::ProcessedMessageContent::StagedCommitMessage(staged) => {
+                    group.merge_staged_commit(&self.provider, *staged)?;
+                    Ok(SyncReceiveResult::CommitProcessed)
+                }
+                _ => Ok(SyncReceiveResult::CommitProcessed),
+            },
+        }
+    }
+
+    /// Export GroupInfo for pairing (so the new device can join via external commit).
+    pub fn sync_group_info(&self) -> Result<Vec<u8>> {
+        let group = self.sync_group.as_ref()
+            .ok_or_else(|| GhostError::Format("no sync group".into()))?;
+        group.export_group_info(&self.provider)
+    }
+
+    /// Join the sync group via external commit + membership update.
+    /// Returns (commit blobs to post, sync mailbox ID).
+    pub fn join_sync_group(&mut self, group_info_bytes: &[u8]) -> Result<(Vec<Vec<u8>>, [u8; 32])> {
+        let (mut group, commit_bytes) = GhostGroup::join_by_external_commit(
+            &self.provider,
+            &self.identity,
+            group_info_bytes,
+        )?;
+        let membership_commit = self.update_membership_after_join(&mut group)?;
+        let mailbox_id = mls_group_mailbox_id(group.group_id());
+        self.sync_group = Some(group);
+        Ok((vec![commit_bytes, membership_commit], mailbox_id))
+    }
+
+    /// Remove a device from the sync group by its verifying key.
+    pub fn remove_device_from_sync_group(&mut self, device_vk: &[u8; 32]) -> Result<Vec<u8>> {
+        let group = self.sync_group.as_mut()
+            .ok_or_else(|| GhostError::Format("no sync group".into()))?;
+        let leaf_indices: Vec<openmls::prelude::LeafNodeIndex> = group
+            .members()
+            .filter(|m| m.signature_key.as_slice() == device_vk.as_slice())
+            .map(|m| m.index)
+            .collect();
+        if leaf_indices.is_empty() {
+            return Err(GhostError::Mls("device not in sync group".into()));
+        }
+        group.remove_members(&self.provider, &leaf_indices, &[*device_vk])
     }
 
     /// Export server metadata for provisioning a sibling device (no role check).
@@ -208,76 +315,79 @@ impl GhostClient {
         })
     }
 
-    /// Join a server from a provision payload + fresh GroupInfo (handles duplicates).
-    /// Returns (commits_to_broadcast, mailbox_id). Multiple commits: external join + membership update.
-    pub fn join_from_provision(
+    /// Core join logic: external commit → membership update → persist metadata → register.
+    /// `idempotent`: true uses `_if_not_exists` inserts (provision/sync), false uses strict inserts (invite).
+    fn join_server_common(
         &mut self,
-        payload: &ProvisionPayload,
+        server_id: [u8; 32],
+        server_name: String,
+        kind: ServerKind,
         group_info_bytes: &[u8],
+        members: &[InviteMember],
+        channels: &[InviteChannel],
         timestamp: u64,
+        idempotent: bool,
     ) -> Result<(Vec<Vec<u8>>, [u8; 32])> {
         let (mut ghost_group, commit_bytes) = GhostGroup::join_by_external_commit(
             &self.provider,
             &self.identity,
             group_info_bytes,
         )?;
-
-        // Add own binding to membership extension via follow-up commit
         let membership_commit = self.update_membership_after_join(&mut ghost_group)?;
 
-        let creator_fp = payload
-            .members
+        let creator_fp = members
             .iter()
             .find(|m| m.role == MemberRole::Creator)
             .map(|m| m.fingerprint)
             .unwrap_or([0u8; 32]);
 
-        self.store.insert_server_if_not_exists(&Server {
-            server_id: payload.server_id,
-            name: payload.server_name.clone(),
-            kind: payload.kind,
-            creator_fp,
-            created_at: timestamp,
-        })?;
+        let server = Server { server_id, name: server_name, kind, creator_fp, created_at: timestamp };
+        if idempotent { self.store.insert_server_if_not_exists(&server)?; }
+        else { self.store.insert_server(&server)?; }
 
-        for ch in &payload.channels {
-            self.store.insert_channel_if_not_exists(&Channel {
-                channel_id: ch.channel_id,
-                server_id: payload.server_id,
-                name: ch.name.clone(),
-                kind: ch.kind,
-                position: ch.position,
-            })?;
+        for ch in channels {
+            let channel = Channel {
+                channel_id: ch.channel_id, server_id, name: ch.name.clone(),
+                kind: ch.kind, position: ch.position,
+            };
+            if idempotent { self.store.insert_channel_if_not_exists(&channel)?; }
+            else { self.store.insert_channel(&channel)?; }
         }
 
-        for m in &payload.members {
-            self.store.insert_member_if_not_exists(&Member {
-                server_id: payload.server_id,
-                fingerprint: m.fingerprint,
-                display_name: m.display_name.clone(),
-                role: m.role,
-                joined_at: timestamp,
-                avatar_hash: None,
-                avatar_key: None,
-            })?;
+        for m in members {
+            let member = Member {
+                server_id, fingerprint: m.fingerprint, display_name: m.display_name.clone(),
+                role: m.role, joined_at: timestamp, avatar_hash: None, avatar_key: None,
+            };
+            if idempotent { self.store.insert_member_if_not_exists(&member)?; }
+            else { self.store.insert_member(&member)?; }
         }
 
-        // Insert self as member
-        self.store.insert_member_if_not_exists(&Member {
-            server_id: payload.server_id,
-            fingerprint: self.identity.fingerprint,
+        let self_member = Member {
+            server_id, fingerprint: self.identity.fingerprint,
             display_name: self.identity.display_name.clone(),
-            role: MemberRole::Member,
-            joined_at: timestamp,
-            avatar_hash: None,
-            avatar_key: None,
-        })?;
+            role: MemberRole::Member, joined_at: timestamp, avatar_hash: None, avatar_key: None,
+        };
+        if idempotent { self.store.insert_member_if_not_exists(&self_member)?; }
+        else { self.store.insert_member(&self_member)?; }
 
         let mailbox_id = mls_group_mailbox_id(ghost_group.group_id());
-        self.servers.insert(payload.server_id, ghost_group);
-        self.mailbox_map.insert(mailbox_id, payload.server_id);
-
+        self.servers.insert(server_id, ghost_group);
+        self.mailbox_map.insert(mailbox_id, server_id);
         Ok((vec![commit_bytes, membership_commit], mailbox_id))
+    }
+
+    /// Join a server from a provision payload + fresh GroupInfo (handles duplicates).
+    pub fn join_from_provision(
+        &mut self,
+        payload: &ProvisionPayload,
+        group_info_bytes: &[u8],
+        timestamp: u64,
+    ) -> Result<(Vec<Vec<u8>>, [u8; 32])> {
+        self.join_server_common(
+            payload.server_id, payload.server_name.clone(), payload.kind,
+            group_info_bytes, &payload.members, &payload.channels, timestamp, true,
+        )
     }
 
     /// After joining via external commit, add own binding to the group's membership extension.
@@ -597,67 +707,11 @@ impl GhostClient {
         timestamp: u64,
     ) -> Result<([u8; 32], Vec<Vec<u8>>, [u8; 32])> {
         let payload = InvitePayload::from_bytes(payload_bytes)?;
-
-        let (mut ghost_group, commit_bytes) = GhostGroup::join_by_external_commit(
-            &self.provider,
-            &self.identity,
-            &payload.group_info_bytes,
+        let (commits, mailbox_id) = self.join_server_common(
+            payload.server_id, payload.server_name, payload.kind,
+            &payload.group_info_bytes, &payload.members, &payload.channels, timestamp, false,
         )?;
-
-        let membership_commit = self.update_membership_after_join(&mut ghost_group)?;
-
-        let creator_fp = payload
-            .members
-            .iter()
-            .find(|m| m.role == MemberRole::Creator)
-            .map(|m| m.fingerprint)
-            .unwrap_or([0u8; 32]);
-
-        self.store.insert_server(&Server {
-            server_id: payload.server_id,
-            name: payload.server_name,
-            kind: payload.kind,
-            creator_fp,
-            created_at: timestamp,
-        })?;
-
-        for ch in &payload.channels {
-            self.store.insert_channel(&Channel {
-                channel_id: ch.channel_id,
-                server_id: payload.server_id,
-                name: ch.name.clone(),
-                kind: ch.kind,
-                position: ch.position,
-            })?;
-        }
-
-        for m in &payload.members {
-            self.store.insert_member(&Member {
-                server_id: payload.server_id,
-                fingerprint: m.fingerprint,
-                display_name: m.display_name.clone(),
-                role: m.role.clone(),
-                joined_at: timestamp,
-                avatar_hash: None,
-                avatar_key: None,
-            })?;
-        }
-
-        self.store.insert_member(&Member {
-            server_id: payload.server_id,
-            fingerprint: self.identity.fingerprint,
-            display_name: self.identity.display_name.clone(),
-            role: MemberRole::Member,
-            joined_at: timestamp,
-            avatar_hash: None,
-            avatar_key: None,
-        })?;
-
-        let mailbox_id = mls_group_mailbox_id(ghost_group.group_id());
-        self.servers.insert(payload.server_id, ghost_group);
-        self.mailbox_map.insert(mailbox_id, payload.server_id);
-
-        Ok((payload.server_id, vec![commit_bytes, membership_commit], mailbox_id))
+        Ok((payload.server_id, commits, mailbox_id))
     }
 
     /// Re-export an invite payload with fresh GroupInfo (after joining via external commit).
@@ -966,26 +1020,38 @@ impl GhostClient {
                 Ok(ReceiveResult::Message(msg))
             }
             InboundMessage::Commit { removed } => {
+                let group = self.servers.get(server_id).ok_or_else(|| {
+                    GhostError::ServerNotLoaded(hex::encode(&server_id[..8]))
+                })?;
+
+                // Check if we were fully kicked (all our leaves removed)
                 if removed.contains(&self.identity.fingerprint) {
-                    // With multi-device, removing one leaf isn't a kick if other leaves remain
-                    let own_fp = self.identity.fingerprint;
-                    let group = self.servers.get(server_id).ok_or_else(|| {
-                        GhostError::ServerNotLoaded(hex::encode(&server_id[..8]))
-                    })?;
                     let still_in = group.members().any(|m| {
                         openmls::prelude::BasicCredential::try_from(m.credential)
                             .ok()
-                            .map(|bc| bc.identity() == own_fp.as_slice())
+                            .map(|bc| bc.identity() == self.identity.fingerprint.as_slice())
                             .unwrap_or(false)
                     });
                     if !still_in {
                         return Ok(ReceiveResult::Kicked);
                     }
                 }
-                if removed.is_empty() {
+
+                // Only report members as truly removed if they have no leaves remaining.
+                // A device revocation removes one leaf but the account stays if other devices remain.
+                let truly_removed: Vec<[u8; 32]> = removed.into_iter().filter(|fp| {
+                    !group.members().any(|m| {
+                        openmls::prelude::BasicCredential::try_from(m.credential)
+                            .ok()
+                            .map(|bc| bc.identity() == fp.as_slice())
+                            .unwrap_or(false)
+                    })
+                }).collect();
+
+                if truly_removed.is_empty() {
                     Ok(ReceiveResult::CommitProcessed)
                 } else {
-                    Ok(ReceiveResult::MembersRemoved(removed))
+                    Ok(ReceiveResult::MembersRemoved(truly_removed))
                 }
             }
         }

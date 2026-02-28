@@ -12,43 +12,32 @@ use ghost_core::wire::{
 use tauri::{AppHandle, Emitter};
 use tokio::sync::{mpsc, Mutex};
 
-/// Send a sync message to all linked devices via the sync mailbox.
+/// Send a sync message to all linked devices via the sync MLS group.
 pub async fn post_sync_message(
     client: &Arc<Mutex<GhostClient>>,
     relay: &Arc<Mutex<RelayClient>>,
     msg_type: u8,
     payload: &[u8],
 ) {
-    use ghost_core::wire::{sync_mailbox_id, sync_seal, sync_sign, wrap_sync_envelope};
-
-    let (sync_key, account_fp, signing_key) = {
-        let c = client.lock().await;
-        match c.sync_key() {
-            Some(k) => (k, *c.fingerprint(), c.identity().signing_key.clone()),
-            None => return,
+    let outbound = {
+        let mut c = client.lock().await;
+        if !c.has_sync_group() { return; }
+        let mut inner = Vec::with_capacity(1 + payload.len());
+        inner.push(msg_type);
+        inner.extend_from_slice(payload);
+        match c.send_sync(&inner) {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("sync send: {e}");
+                return;
+            }
         }
     };
-
-    let mut inner = Vec::with_capacity(1 + payload.len());
-    inner.push(msg_type);
-    inner.extend_from_slice(payload);
-
-    let signed = sync_sign(&signing_key, &inner);
-    let sealed = match sync_seal(&sync_key, &signed) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("sync seal: {e}");
-            return;
-        }
-    };
-
-    let envelope = wrap_sync_envelope(&sealed);
-    let mailbox_id = sync_mailbox_id(&account_fp);
     let r = relay.lock().await;
-    let _ = r.send(&mailbox_id, envelope).await;
+    let _ = r.send(&outbound.mailbox_id, outbound.blob).await;
 }
 
-/// Dump local sync state, encrypt, and PUT to relay as a snapshot.
+/// Dump local sync state, encrypt with sync_key, and PUT to relay as a durable snapshot.
 pub async fn push_sync_snapshot(
     client: &Arc<Mutex<GhostClient>>,
     relay: &Arc<Mutex<RelayClient>>,
@@ -279,7 +268,7 @@ pub async fn apply_sync_side_effects(
         let _ = app.emit("sync-read-state", "");
     }
     if settings.display_name.is_some() {
-        let _ = app.emit("sync-display-name", "");
+        let _ = app.emit("display-name-sync", "");
     }
     if settings.noise_suppression.is_some() {
         let _ = app.emit("sync-pref", "noise_suppression");

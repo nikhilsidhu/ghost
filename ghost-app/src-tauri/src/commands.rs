@@ -99,10 +99,10 @@ async fn spawn_relay_task(
 ) {
     {
         let client = state.client.lock().await;
-        if client.sync_key().is_some() {
-            let sync_mb = ghost_core::wire::sync_mailbox_id(client.fingerprint());
+        if let Some(sync_mb) = client.sync_mailbox_id() {
+            let seq = client.store().get_last_seen_seq(&sync_mb).unwrap_or(0);
             let mut relay = state.relay.lock().await;
-            relay.subscribe(sync_mb, 0);
+            relay.subscribe(sync_mb, seq);
         }
     }
     let data_dir = state.config_path.parent().unwrap().to_path_buf();
@@ -709,6 +709,7 @@ pub async fn get_config(state: State<'_, AppState>) -> Result<ConfigDto, String>
 #[tauri::command]
 pub async fn set_display_name(
     name: String,
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     use ghost_core::wire::SYNC_KEY_DISPLAY_NAME;
@@ -737,6 +738,7 @@ pub async fn set_display_name(
     drop(relay);
 
     sync_set_and_push(&state, SYNC_KEY_DISPLAY_NAME, name.as_bytes()).await;
+    let _ = app.emit("display-name-sync", ());
     Ok(())
 }
 
@@ -1313,6 +1315,42 @@ pub async fn revoke_device(
         relay.put_idlog_entry(&account_fp, payload).await.map_err(|e| e.to_string())?;
     }
 
+    // Remove from sync MLS group (forward secrecy — revoked device can't decrypt future sync)
+    // Generate commit once (merge_pending_commit advances local epoch), then retry POST.
+    let sync_removal = {
+        let mut client = state.client.lock().await;
+        if client.has_sync_group() {
+            let mb = client.sync_mailbox_id();
+            match client.remove_device_from_sync_group(&target_key) {
+                Ok(blob) => mb.map(|m| (m, blob)),
+                Err(e) => {
+                    eprintln!("revoke: failed to remove from sync group: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    };
+    if let Some((sync_mb, commit_blob)) = sync_removal {
+        let mut posted = false;
+        for attempt in 0..3 {
+            let post_result = {
+                let relay = state.relay.lock().await;
+                relay.post_blob(&sync_mb, commit_blob.clone()).await
+            };
+            match post_result {
+                Ok(_) => { posted = true; break; }
+                Err(e) => {
+                    eprintln!("revoke: sync group POST failed (attempt {}): {e}", attempt + 1);
+                }
+            }
+        }
+        if !posted {
+            eprintln!("revoke: sync group removal commit lost — revoked device retains forward secrecy until next epoch advance");
+        }
+    }
+
     // Remove leaves via HTTP so we detect epoch conflicts
     let outbound = {
         let mut client = state.client.lock().await;
@@ -1503,14 +1541,20 @@ async fn consume_provision(
 ) -> Result<(), String> {
     use ghost_core::wire::ProvisionPayload;
 
-    if plaintext.len() < 34 {
+    // Parse: [sync_key:32][gi_len:u32][group_info][count:u16][len:u32 + payload]...[sync_dump]
+    if plaintext.len() < 38 {
         return Err("provision blob too short".into());
     }
 
     let sync_key: [u8; 32] = plaintext[..32].try_into().unwrap();
-    let count = u16::from_be_bytes(plaintext[32..34].try_into().unwrap()) as usize;
+    let gi_len = u32::from_be_bytes(plaintext[32..36].try_into().unwrap()) as usize;
+    if plaintext.len() < 36 + gi_len + 2 {
+        return Err("provision blob truncated (group info)".into());
+    }
+    let gi_bytes = &plaintext[36..36 + gi_len];
+    let count = u16::from_be_bytes(plaintext[36 + gi_len..38 + gi_len].try_into().unwrap()) as usize;
 
-    let mut pos = 34;
+    let mut pos = 38 + gi_len;
     let mut payloads = Vec::with_capacity(count);
     for _ in 0..count {
         if pos + 4 > plaintext.len() {
@@ -1525,9 +1569,30 @@ async fn consume_provision(
         pos += len;
     }
 
+    // Store sync_key (used for durable snapshot encryption)
     {
         let client = state.client.lock().await;
         client.set_sync_key(sync_key).map_err(|e| e.to_string())?;
+    }
+
+    // Join sync MLS group via external commit
+    let (sync_commits, sync_mb) = {
+        let mut client = state.client.lock().await;
+        client.join_sync_group(gi_bytes).map_err(|e| format!("join sync group: {e}"))?
+    };
+    for commit in sync_commits {
+        let relay = state.relay.lock().await;
+        if let Err(e) = relay.post_blob(&sync_mb, commit).await {
+            eprintln!("provision: failed to post sync group commit: {e}");
+        }
+    }
+
+    // Subscribe to sync MLS mailbox
+    {
+        let client = state.client.lock().await;
+        let seq = client.store().get_last_seen_seq(&sync_mb).unwrap_or(0);
+        let mut relay = state.relay.lock().await;
+        relay.subscribe(sync_mb, seq);
     }
 
     let now = now_millis();
@@ -1539,7 +1604,7 @@ async fn consume_provision(
         }
     }
 
-    // Import sync state if present (new provision format)
+    // Import sync state if present
     if pos < plaintext.len() {
         if let Ok(sync_entries) = ghost_core::wire::decode_sync_state_dump(&plaintext[pos..]) {
             let settings = crate::sync_utils::parse_sync_entries(&sync_entries);
@@ -1663,6 +1728,9 @@ pub async fn check_pairing(state: State<'_, AppState>) -> Result<Option<String>,
         let sync_key = client.sync_key()
             .ok_or_else(|| "sync_key not set — account may not be initialized".to_string())?;
 
+        let gi_bytes = client.sync_group_info()
+            .map_err(|e| format!("sync group info: {e}"))?;
+
         // Export each server's metadata
         let server_mailboxes = client.server_mailboxes();
         let mut payloads: Vec<Vec<u8>> = Vec::new();
@@ -1672,9 +1740,11 @@ pub async fn check_pairing(state: State<'_, AppState>) -> Result<Option<String>,
             }
         }
 
-        // Serialize: [sync_key:32][count:u16][len:u32 + payload_bytes]...[sync_state_dump]
+        // Serialize: [sync_key:32][gi_len:u32][group_info][count:u16][len:u32 + payload]...[sync_dump]
         let mut provision_pt = Vec::new();
         provision_pt.extend_from_slice(&sync_key);
+        provision_pt.extend_from_slice(&(gi_bytes.len() as u32).to_be_bytes());
+        provision_pt.extend_from_slice(&gi_bytes);
         provision_pt.extend_from_slice(&(payloads.len() as u16).to_be_bytes());
         for p in &payloads {
             provision_pt.extend_from_slice(&(p.len() as u32).to_be_bytes());
@@ -1714,11 +1784,10 @@ pub async fn check_pairing(state: State<'_, AppState>) -> Result<Option<String>,
         relay.put_idlog_entry(&account_fp, payload).await.map_err(|e| e.to_string())?;
     }
 
-    // Subscribe to sync mailbox now that sync_key exists
+    // Subscribe to sync MLS mailbox if not already subscribed
     {
         let client = state.client.lock().await;
-        if client.sync_key().is_some() {
-            let sync_mb = ghost_core::wire::sync_mailbox_id(client.fingerprint());
+        if let Some(sync_mb) = client.sync_mailbox_id() {
             let seq = client.store().get_last_seen_seq(&sync_mb).unwrap_or(0);
             let mut relay = state.relay.lock().await;
             relay.subscribe(sync_mb, seq);
@@ -2296,10 +2365,11 @@ pub async fn recover_account(
         ed25519_dalek::SigningKey::from_bytes(&new_device_key.to_bytes()),
         recovery_seq,
     );
-    let new_client = ghost_core::client::GhostClient::open(
+    let mut new_client = ghost_core::client::GhostClient::open(
         new_identity, db_key, mls_db_key, &crate::setup::db_path(),
     ).map_err(|e| format!("open new client: {e}"))?;
     new_client.set_sync_key(sync_key).map_err(|e| e.to_string())?;
+    new_client.create_sync_group().map_err(|e| format!("create sync group: {e}"))?;
     *state.client.lock().await = new_client;
 
     // 11. Replace relay + save URL in config

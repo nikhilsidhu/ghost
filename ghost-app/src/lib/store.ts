@@ -259,8 +259,6 @@ const initialize = async () => {
       refreshServers();
       refreshAllChannels();
       refreshAllMembers();
-      refreshChannels();
-      refreshMembers();
       return;
     }
     if (sid === selectedServerId()) {
@@ -273,6 +271,8 @@ const initialize = async () => {
 
   listen<string>("display-name-sync", () => {
     updateIdentity();
+    refreshMembers();
+    refreshAllMembers();
   });
 
   listen("sync-read-state", () => {
