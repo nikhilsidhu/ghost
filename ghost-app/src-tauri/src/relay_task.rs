@@ -350,22 +350,17 @@ async fn handle_sync_application(
                 };
 
                 match result {
-                    Ok((commits, mailbox_id)) => {
-                        // Broadcast external commit + membership update via HTTP POST
-                        let mut commit_seq = 0u64;
-                        let mut post_failed = false;
-                        for commit_bytes in commits {
+                    Ok((commit, mailbox_id)) => {
+                        let commit_seq = {
                             let r = relay.lock().await;
-                            match r.post_blob(&mailbox_id, commit_bytes).await {
-                                Ok(seq) => commit_seq = seq,
+                            match r.post_blob(&mailbox_id, commit).await {
+                                Ok(seq) => seq,
                                 Err(e) => {
                                     eprintln!("sync: failed to post commit: {e}");
-                                    post_failed = true;
-                                    break;
+                                    continue;
                                 }
                             }
-                        }
-                        if post_failed { continue; }
+                        };
 
                         // Upload fresh GroupInfo
                         {

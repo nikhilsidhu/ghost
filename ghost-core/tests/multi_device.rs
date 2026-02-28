@@ -367,15 +367,13 @@ fn sync_group_add_device_via_external_commit() {
     let identity_b = Identity::from_device(fp_a, acct_b.identity.signing_key.clone(), 2);
     drop(acct_b);
     let mut client_b = GhostClient::open_in_memory(identity_b, [0x02; 32]).unwrap();
-    let (commits, mailbox_b) = client_b.join_sync_group(&gi).unwrap();
+    let (commit, mailbox_b) = client_b.join_sync_group(&gi).unwrap();
     assert_eq!(mailbox_b, client_a.sync_mailbox_id().unwrap());
 
-    // Device A processes the commits (already envelope-wrapped by join_sync_group)
-    for commit in &commits {
-        match client_a.receive_sync(commit).unwrap() {
-            SyncReceiveResult::CommitProcessed => {}
-            other => panic!("expected CommitProcessed, got {:?}", other),
-        }
+    // Device A processes the commit
+    match client_a.receive_sync(&commit).unwrap() {
+        SyncReceiveResult::CommitProcessed => {}
+        other => panic!("expected CommitProcessed, got {:?}", other),
     }
 
     // Both devices are now in the same group
@@ -393,10 +391,8 @@ fn sync_mutation_encrypted_decrypted() {
     let identity_b = Identity::from_device(fp_a, acct_b.identity.signing_key.clone(), 2);
     drop(acct_b);
     let mut client_b = GhostClient::open_in_memory(identity_b, [0x02; 32]).unwrap();
-    let (commits, _) = client_b.join_sync_group(&gi).unwrap();
-    for commit in &commits {
-        client_a.receive_sync(commit).unwrap();
-    }
+    let (commit, _) = client_b.join_sync_group(&gi).unwrap();
+    client_a.receive_sync(&commit).unwrap();
 
     // Device A sends a mutation
     let mutation = encode_mutation(MUTATION_SET, 9000, "read:ch1", &77u64.to_be_bytes());
@@ -431,10 +427,8 @@ fn sync_revocation_prevents_decryption() {
     let identity_b = Identity::from_device(fp_a, acct_b.identity.signing_key.clone(), 2);
     drop(acct_b);
     let mut client_b = GhostClient::open_in_memory(identity_b, [0x02; 32]).unwrap();
-    let (commits, _) = client_b.join_sync_group(&gi).unwrap();
-    for commit in &commits {
-        client_a.receive_sync(commit).unwrap();
-    }
+    let (commit, _) = client_b.join_sync_group(&gi).unwrap();
+    client_a.receive_sync(&commit).unwrap();
 
     // Device A removes Device B from sync group
     let removal_commit = client_a.remove_device_from_sync_group(&b_vk).unwrap();
@@ -597,15 +591,13 @@ async fn full_pairing_then_sync_exchange() {
     client_b.set_sync_key(recovered_sync_key).unwrap();
     assert_eq!(client_b.sync_key().unwrap(), sync_key);
 
-    let (commits, sync_mb) = client_b.join_sync_group(recovered_gi).unwrap();
+    let (commit, sync_mb) = client_b.join_sync_group(recovered_gi).unwrap();
     assert_eq!(sync_mb, client_a.sync_mailbox_id().unwrap());
 
-    // Device A processes the join commits (already envelope-wrapped)
-    for commit in &commits {
-        match client_a.receive_sync(commit).unwrap() {
-            SyncReceiveResult::CommitProcessed => {}
-            other => panic!("expected CommitProcessed, got {:?}", other),
-        }
+    // Device A processes the join commit
+    match client_a.receive_sync(&commit).unwrap() {
+        SyncReceiveResult::CommitProcessed => {}
+        other => panic!("expected CommitProcessed, got {:?}", other),
     }
 
     // 7. Both subscribe to sync mailbox, A sends mutation via MLS, B receives

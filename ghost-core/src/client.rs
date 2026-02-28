@@ -166,8 +166,7 @@ impl GhostClient {
 
     pub fn create_sync_group(&mut self) -> Result<()> {
         let sid = sync_server_id(&self.identity.fingerprint);
-        let binding = crate::mls::membership::MemberBinding::from_identity(&self.identity);
-        let group = GhostGroup::create_with_id(&self.provider, &self.identity, &sid, binding)?;
+        let group = GhostGroup::create_with_id(&self.provider, &self.identity, &sid)?;
         self.sync_group = Some(group);
         Ok(())
     }
@@ -226,18 +225,17 @@ impl GhostClient {
         group.export_group_info(&self.provider)
     }
 
-    /// Join the sync group via external commit + membership update.
-    /// Returns (commit blobs to post, sync mailbox ID).
-    pub fn join_sync_group(&mut self, group_info_bytes: &[u8]) -> Result<(Vec<Vec<u8>>, [u8; 32])> {
-        let (mut group, commit_bytes) = GhostGroup::join_by_external_commit(
+    /// Join the sync group via external commit.
+    /// Returns (commit blob to post, sync mailbox ID).
+    pub fn join_sync_group(&mut self, group_info_bytes: &[u8]) -> Result<(Vec<u8>, [u8; 32])> {
+        let (group, commit_bytes) = GhostGroup::join_by_external_commit(
             &self.provider,
             &self.identity,
             group_info_bytes,
         )?;
-        let membership_commit = self.update_membership_after_join(&mut group)?;
         let mailbox_id = mls_group_mailbox_id(group.group_id());
         self.sync_group = Some(group);
-        Ok((vec![commit_bytes, membership_commit], mailbox_id))
+        Ok((commit_bytes, mailbox_id))
     }
 
     /// Remove a device from the sync group by its verifying key.
@@ -252,7 +250,7 @@ impl GhostClient {
         if leaf_indices.is_empty() {
             return Err(GhostError::Mls("device not in sync group".into()));
         }
-        group.remove_members(&self.provider, &leaf_indices, &[*device_vk])
+        group.remove_members(&self.provider, &leaf_indices)
     }
 
     /// Export server metadata for provisioning a sibling device (no role check).
@@ -315,7 +313,7 @@ impl GhostClient {
         })
     }
 
-    /// Core join logic: external commit → membership update → persist metadata → register.
+    /// Core join logic: external commit → persist metadata → register.
     /// `idempotent`: true uses `_if_not_exists` inserts (provision/sync), false uses strict inserts (invite).
     fn join_server_common(
         &mut self,
@@ -327,13 +325,12 @@ impl GhostClient {
         channels: &[InviteChannel],
         timestamp: u64,
         idempotent: bool,
-    ) -> Result<(Vec<Vec<u8>>, [u8; 32])> {
-        let (mut ghost_group, commit_bytes) = GhostGroup::join_by_external_commit(
+    ) -> Result<(Vec<u8>, [u8; 32])> {
+        let (ghost_group, commit_bytes) = GhostGroup::join_by_external_commit(
             &self.provider,
             &self.identity,
             group_info_bytes,
         )?;
-        let membership_commit = self.update_membership_after_join(&mut ghost_group)?;
 
         let creator_fp = members
             .iter()
@@ -374,7 +371,7 @@ impl GhostClient {
         let mailbox_id = mls_group_mailbox_id(ghost_group.group_id());
         self.servers.insert(server_id, ghost_group);
         self.mailbox_map.insert(mailbox_id, server_id);
-        Ok((vec![commit_bytes, membership_commit], mailbox_id))
+        Ok((commit_bytes, mailbox_id))
     }
 
     /// Join a server from a provision payload + fresh GroupInfo (handles duplicates).
@@ -383,19 +380,11 @@ impl GhostClient {
         payload: &ProvisionPayload,
         group_info_bytes: &[u8],
         timestamp: u64,
-    ) -> Result<(Vec<Vec<u8>>, [u8; 32])> {
+    ) -> Result<(Vec<u8>, [u8; 32])> {
         self.join_server_common(
             payload.server_id, payload.server_name.clone(), payload.kind,
             group_info_bytes, &payload.members, &payload.channels, timestamp, true,
         )
-    }
-
-    /// After joining via external commit, add own binding to the group's membership extension.
-    fn update_membership_after_join(&self, group: &mut GhostGroup) -> Result<Vec<u8>> {
-        use crate::mls::membership::MemberBinding;
-        let mut membership = group.read_membership()?;
-        membership.add(MemberBinding::from_identity(&self.identity));
-        group.update_membership(&self.provider, membership)
     }
 
     pub fn generate_key_package(&self) -> Result<KeyPackage> {
@@ -406,9 +395,8 @@ impl GhostClient {
         let mut server_id = [0u8; 32];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut server_id);
 
-        let own_binding = crate::mls::membership::MemberBinding::from_identity(&self.identity);
         let ghost_group =
-            GhostGroup::create_with_id(&self.provider, &self.identity, &server_id, own_binding)?;
+            GhostGroup::create_with_id(&self.provider, &self.identity, &server_id)?;
 
         self.store.insert_server(&Server {
             server_id,
@@ -564,13 +552,12 @@ impl GhostClient {
         invitee_fp: [u8; 32],
         invitee_name: &str,
         timestamp: u64,
-        invitee_binding: crate::mls::membership::MemberBinding,
     ) -> Result<(Outbound, Vec<u8>)> {
         let group = self.servers.get_mut(server_id).ok_or_else(|| {
             GhostError::ServerNotLoaded(hex::encode(&server_id[..8]))
         })?;
 
-        let (commit_blob, welcome) = group.add_member(&self.provider, key_package, invitee_binding)?;
+        let (commit_blob, welcome) = group.add_member(&self.provider, key_package)?;
         let welcome_bytes = welcome
             .to_bytes()
             .map_err(|e| GhostError::Mls(format!("serialize welcome: {e}")))?;
@@ -700,18 +687,18 @@ impl GhostClient {
     }
 
     /// Join a server via an invite payload (external commit).
-    /// Returns (server_id, commits_to_broadcast, mailbox_id).
+    /// Returns (server_id, commit_to_broadcast, mailbox_id).
     pub fn join_by_invite(
         &mut self,
         payload_bytes: &[u8],
         timestamp: u64,
-    ) -> Result<([u8; 32], Vec<Vec<u8>>, [u8; 32])> {
+    ) -> Result<([u8; 32], Vec<u8>, [u8; 32])> {
         let payload = InvitePayload::from_bytes(payload_bytes)?;
-        let (commits, mailbox_id) = self.join_server_common(
+        let (commit, mailbox_id) = self.join_server_common(
             payload.server_id, payload.server_name, payload.kind,
             &payload.group_info_bytes, &payload.members, &payload.channels, timestamp, false,
         )?;
-        Ok((payload.server_id, commits, mailbox_id))
+        Ok((payload.server_id, commit, mailbox_id))
     }
 
     /// Re-export an invite payload with fresh GroupInfo (after joining via external commit).
@@ -739,29 +726,26 @@ impl GhostClient {
 
     /// Rejoin a server via external commit after falling too far behind.
     /// Deletes old MLS state and creates a fresh session from GroupInfo.
-    /// Returns (commits_to_broadcast, mailbox_id). Multiple commits: external join + membership update.
     pub fn recover_via_external_commit(
         &mut self,
         server_id: &[u8; 32],
         group_info_bytes: &[u8],
-    ) -> Result<(Vec<Vec<u8>>, [u8; 32])> {
+    ) -> Result<(Vec<u8>, [u8; 32])> {
         if let Some(old_group) = self.servers.remove(server_id) {
             let _ = old_group.delete(&self.provider);
         }
 
-        let (mut ghost_group, commit_bytes) = GhostGroup::join_by_external_commit(
+        let (ghost_group, commit_bytes) = GhostGroup::join_by_external_commit(
             &self.provider,
             &self.identity,
             group_info_bytes,
         )?;
 
-        let membership_commit = self.update_membership_after_join(&mut ghost_group)?;
-
         let mailbox_id = mls_group_mailbox_id(ghost_group.group_id());
         self.servers.insert(*server_id, ghost_group);
         self.mailbox_map.insert(mailbox_id, *server_id);
 
-        Ok((vec![commit_bytes, membership_commit], mailbox_id))
+        Ok((commit_bytes, mailbox_id))
     }
 
     /// Creator-only: remove a member from the MLS group and broadcast the commit.
@@ -786,7 +770,7 @@ impl GhostClient {
         })?;
 
         // Collect ALL leaves matching target — a user may have multiple devices
-        let matching: Vec<_> = group
+        let leaf_indices: Vec<_> = group
             .members()
             .filter(|m| {
                 openmls::prelude::BasicCredential::try_from(m.credential.clone())
@@ -794,20 +778,14 @@ impl GhostClient {
                     .map(|bc| bc.identity() == target_fp.as_slice())
                     .unwrap_or(false)
             })
-            .filter_map(|m| {
-                let dk: [u8; 32] = m.signature_key.as_slice().try_into().ok()?;
-                Some((m.index, dk))
-            })
+            .map(|m| m.index)
             .collect();
 
-        if matching.is_empty() {
+        if leaf_indices.is_empty() {
             return Err(GhostError::Mls("member not found in MLS group".into()));
         }
 
-        let leaf_indices: Vec<_> = matching.iter().map(|(idx, _)| *idx).collect();
-        let device_keys: Vec<_> = matching.iter().map(|(_, dk)| *dk).collect();
-
-        let commit_blob = group.remove_members(&self.provider, &leaf_indices, &device_keys)?;
+        let commit_blob = group.remove_members(&self.provider, &leaf_indices)?;
         let mailbox_id = mls_group_mailbox_id(group.group_id());
 
         self.store.remove_member(server_id, target_fp)?;
@@ -833,7 +811,7 @@ impl GhostClient {
             if leaf_indices.is_empty() {
                 continue;
             }
-            match group.remove_members(&self.provider, &leaf_indices, &[*device_vk]) {
+            match group.remove_members(&self.provider, &leaf_indices) {
                 Ok(commit_blob) => {
                     let mailbox_id = mls_group_mailbox_id(group.group_id());
                     outbound.push(Outbound { mailbox_id, blob: commit_blob });
@@ -1067,10 +1045,6 @@ mod tests {
         GhostClient::open_in_memory(identity, seed).unwrap()
     }
 
-    fn binding_for(client: &GhostClient) -> crate::mls::membership::MemberBinding {
-        crate::mls::membership::MemberBinding::from_identity(client.identity())
-    }
-
     /// Returns (creator, joiner, server_id) with both clients in a shared MLS group.
     fn setup_two_clients() -> (GhostClient, GhostClient, [u8; 32]) {
         let mut c1 = test_client([0x01; 32]);
@@ -1082,7 +1056,7 @@ mod tests {
         let fp = *c2.fingerprint();
         let name = c2.identity().display_name.clone();
         let (_outbound, welcome_bytes) =
-            c1.invite_member(&server_id, kp, fp, &name, 1000, binding_for(&c2)).unwrap();
+            c1.invite_member(&server_id, kp, fp, &name, 1000).unwrap();
 
         c2.join_server(&server_id, &welcome_bytes, "test", ServerKind::Server, 1000).unwrap();
 
@@ -1184,7 +1158,7 @@ mod tests {
         let fp = *c2.fingerprint();
         let name = c2.identity().display_name.clone();
         let (_outbound, welcome) =
-            c1.invite_member(&server_id, kp, fp, &name, 1000, binding_for(&c2)).unwrap();
+            c1.invite_member(&server_id, kp, fp, &name, 1000).unwrap();
 
         // c2 joins
         c2.join_server(&server_id, &welcome, "full-flow", ServerKind::Server, 1000).unwrap();
@@ -1234,10 +1208,9 @@ mod tests {
 
         let (_token, payload_bytes) = c1.create_invite(&server_id).unwrap();
 
-        let (joined_server_id, commits, _mailbox_id) =
+        let (joined_server_id, commit, _mailbox_id) =
             c2.join_by_invite(&payload_bytes, 2000).unwrap();
         assert_eq!(joined_server_id, server_id);
-        assert_eq!(commits.len(), 2); // external commit + membership update
 
         // c2 should have the server, channel, and members in their store
         let server = c2.store().get_server(&server_id).unwrap();
@@ -1248,11 +1221,9 @@ mod tests {
         let members = c2.store().list_members(&server_id).unwrap();
         assert_eq!(members.len(), 2); // c1 + c2
 
-        // c1 processes both commits (external join + membership update)
-        for commit_bytes in &commits {
-            let result = c1.receive_any(&server_id, commit_bytes, Some(2000)).unwrap();
-            assert!(matches!(result, ReceiveResult::CommitProcessed));
-        }
+        // c1 processes the external commit
+        let result = c1.receive_any(&server_id, &commit, Some(2000)).unwrap();
+        assert!(matches!(result, ReceiveResult::CommitProcessed));
 
         // After merging, c1's MLS group should include c2
         let mls_fps = c1.mls_member_fingerprints(&server_id).unwrap();

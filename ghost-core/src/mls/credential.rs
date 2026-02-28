@@ -32,7 +32,6 @@ pub fn generate_key_package(
     let credential = credential_from_identity(identity);
 
     let bundle = KeyPackage::builder()
-        .leaf_node_capabilities(super::group::leaf_node_capabilities())
         .build(MLS_CIPHERSUITE, provider, &signer, credential)
         .map_err(|e| GhostError::Mls(format!("key package: {e}")))?;
     Ok(bundle.key_package().clone())

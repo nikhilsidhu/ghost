@@ -4,7 +4,6 @@ use std::time::Duration;
 
 use ghost_core::client::{GhostClient, ReceiveResult};
 use ghost_core::identity::Identity;
-use ghost_core::mls::membership::MemberBinding;
 use ghost_core::relay::{IncomingBlob, RelayClient, RelayEvent};
 use ghost_core::storage::ServerKind;
 use ghost_core::wire::{derive_default_channel_id, derive_mls_group_id, mls_group_mailbox_id};
@@ -12,10 +11,6 @@ use openmls::key_packages::KeyPackageIn;
 use openmls::prelude::tls_codec::{Deserialize as TlsDeserialize, Serialize as TlsSerialize};
 use openmls::prelude::ProtocolVersion;
 use openmls_rust_crypto::RustCrypto;
-
-fn binding_for(client: &GhostClient) -> MemberBinding {
-    MemberBinding::from_identity(client.identity())
-}
 
 #[tokio::test]
 async fn encrypted_message_through_relay() {
@@ -30,7 +25,7 @@ async fn encrypted_message_through_relay() {
     let recv_fp = *receiver.fingerprint();
     let recv_name = receiver.identity().display_name.clone();
     let (_, welcome_bytes) = sender
-        .invite_member(&server_id, kp, recv_fp, &recv_name, 1000, binding_for(&receiver))
+        .invite_member(&server_id, kp, recv_fp, &recv_name, 1000)
         .unwrap();
     receiver
         .join_server(&server_id, &welcome_bytes, "test", ServerKind::Server, 1000)
@@ -146,7 +141,7 @@ fn setup_two_clients(sender_seed: [u8; 32], receiver_seed: [u8; 32]) -> TwoClien
     let recv_fp = *receiver.fingerprint();
     let recv_name = receiver.identity().display_name.clone();
     let (_, welcome_bytes) = sender
-        .invite_member(&server_id, kp, recv_fp, &recv_name, 1000, binding_for(&receiver))
+        .invite_member(&server_id, kp, recv_fp, &recv_name, 1000)
         .unwrap();
     receiver
         .join_server(&server_id, &welcome_bytes, "test", ServerKind::Server, 1000)
@@ -349,7 +344,7 @@ async fn invite_with_real_key_package() {
     let joiner_fp = *joiner.fingerprint();
     let joiner_name = joiner.identity().display_name.clone();
     let (_, welcome_bytes) = inviter
-        .invite_member(&server_id, validated_kp, joiner_fp, &joiner_name, 2000, binding_for(&joiner))
+        .invite_member(&server_id, validated_kp, joiner_fp, &joiner_name, 2000)
         .unwrap();
 
     // Send welcome bytes back through the relay

@@ -142,27 +142,23 @@ pub(crate) async fn recover_epoch(
                 Err(e) => return Err(format!("{label}: fetch GroupInfo: {e}")),
             }
         };
-        let commits = {
+        let commit = {
             let mut c = client.lock().await;
             match c.recover_via_external_commit(server_id, &server_info) {
-                Ok((commits, _)) => commits,
+                Ok((commit, _)) => commit,
                 Err(e) => {
                     eprintln!("{label}: external commit failed (attempt {attempt}): {e}");
                     continue;
                 }
             }
         };
-        let mut all_ok = true;
-        for commit_bytes in commits {
-            match relay.lock().await.post_blob(mailbox_id, commit_bytes).await {
-                Ok(_) => {}
-                Err(e) => {
-                    eprintln!("{label}: relay rejected commit (attempt {attempt}): {e}");
-                    all_ok = false;
-                    break;
-                }
+        let all_ok = match relay.lock().await.post_blob(mailbox_id, commit).await {
+            Ok(_) => true,
+            Err(e) => {
+                eprintln!("{label}: relay rejected commit (attempt {attempt}): {e}");
+                false
             }
-        }
+        };
         if all_ok {
             let c = client.lock().await;
             if let Ok(gi) = c.export_server_info(server_id) {
@@ -590,32 +586,29 @@ pub async fn join_by_invite(
         .await
         .map_err(|e| format!("read invite body: {e}"))?;
 
-    let (server_id, commits, mailbox_id) = {
+    let (server_id, commit, mailbox_id) = {
         let mut client = state.client.lock().await;
         client
             .join_by_invite(&payload_bytes, now_millis())
             .map_err(|e| e.to_string())?
     };
 
-    // Broadcast the external commit + membership update so existing members see us
+    // Broadcast the external commit so existing members see us
     let mailbox_b64 =
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mailbox_id);
     #[derive(serde::Deserialize)]
     struct PostBlobResp { seq: u64 }
-    let mut commit_seq = 0u64;
-    for commit_bytes in commits {
-        let resp = state
-            .http
-            .post(format!("{}/box/{}", relay_url, mailbox_b64))
-            .body(commit_bytes)
-            .send()
-            .await
-            .map_err(|e| format!("broadcast commit: {e}"))?
-            .error_for_status()
-            .map_err(|e| format!("broadcast commit: {e}"))?;
-        commit_seq = resp.json::<PostBlobResp>().await
-            .map(|r| r.seq).unwrap_or(commit_seq);
-    }
+    let resp = state
+        .http
+        .post(format!("{}/box/{}", relay_url, mailbox_b64))
+        .body(commit)
+        .send()
+        .await
+        .map_err(|e| format!("broadcast commit: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("broadcast commit: {e}"))?;
+    let commit_seq = resp.json::<PostBlobResp>().await
+        .map(|r| r.seq).unwrap_or(0);
 
     // Refresh the invite payload with fresh GroupInfo for the next joiner
     let updated_payload = {
@@ -1453,35 +1446,29 @@ async fn rejoin_server(
         };
 
         match result {
-            Ok((commits, mailbox_id)) => {
-                let mut commit_seq = 0u64;
-                let mut post_failed = false;
-                for commit_bytes in commits {
-                    let resp = state.http
-                        .post(format!("{}/box/{}", relay_url, mailbox_b64))
-                        .body(commit_bytes)
-                        .send()
-                        .await;
-                    match resp {
-                        Ok(r) if r.status().is_success() => {
-                            commit_seq = r.json::<serde_json::Value>().await
-                                .ok()
-                                .and_then(|v| v["seq"].as_u64())
-                                .unwrap_or(commit_seq);
-                        }
-                        Ok(r) => {
-                            eprintln!("{label}: relay rejected commit (status {})", r.status());
-                            post_failed = true;
-                            break;
-                        }
-                        Err(e) => {
-                            eprintln!("{label}: failed to post commit: {e}");
-                            post_failed = true;
-                            break;
-                        }
+            Ok((commit, mailbox_id)) => {
+                let commit_seq;
+                let resp = state.http
+                    .post(format!("{}/box/{}", relay_url, mailbox_b64))
+                    .body(commit)
+                    .send()
+                    .await;
+                match resp {
+                    Ok(r) if r.status().is_success() => {
+                        commit_seq = r.json::<serde_json::Value>().await
+                            .ok()
+                            .and_then(|v| v["seq"].as_u64())
+                            .unwrap_or(0);
+                    }
+                    Ok(r) => {
+                        eprintln!("{label}: relay rejected commit (status {})", r.status());
+                        continue;
+                    }
+                    Err(e) => {
+                        eprintln!("{label}: failed to post commit: {e}");
+                        continue;
                     }
                 }
-                if post_failed { continue; }
 
                 {
                     let client = state.client.lock().await;
@@ -1576,13 +1563,13 @@ async fn consume_provision(
     }
 
     // Join sync MLS group via external commit
-    let (sync_commits, sync_mb) = {
+    let (sync_commit, sync_mb) = {
         let mut client = state.client.lock().await;
         client.join_sync_group(gi_bytes).map_err(|e| format!("join sync group: {e}"))?
     };
-    for commit in sync_commits {
+    {
         let relay = state.relay.lock().await;
-        if let Err(e) = relay.post_blob(&sync_mb, commit).await {
+        if let Err(e) = relay.post_blob(&sync_mb, sync_commit).await {
             eprintln!("provision: failed to post sync group commit: {e}");
         }
     }

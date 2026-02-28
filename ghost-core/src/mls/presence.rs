@@ -190,15 +190,6 @@ pub fn try_open_online_presence(
 mod tests {
     use super::*;
     use crate::identity::Identity;
-    use crate::mls::membership::MemberBinding;
-
-    fn test_binding(id: &Identity) -> MemberBinding {
-        MemberBinding {
-            account_fp: id.fingerprint,
-            idlog_seq: 1,
-            device_key: id.verifying_key.to_bytes(),
-        }
-    }
 
     #[test]
     fn online_presence_roundtrip_minimal() {
@@ -261,7 +252,7 @@ mod tests {
     fn trial_decryption() {
         let provider = GhostProvider::new_in_memory().unwrap();
         let id = Identity::from_seed([0x01u8; 32]).unwrap();
-        let group = super::super::group::GhostGroup::create(&provider, &id, test_binding(&id)).unwrap();
+        let group = super::super::group::GhostGroup::create(&provider, &id).unwrap();
 
         let key = derive_online_presence_key(&group, &provider, &id.fingerprint).unwrap();
         let state = OnlinePresence {
@@ -284,7 +275,7 @@ mod tests {
     fn key_differs_from_voice_presence_key() {
         let provider = GhostProvider::new_in_memory().unwrap();
         let id = Identity::from_seed([0x01u8; 32]).unwrap();
-        let group = super::super::group::GhostGroup::create(&provider, &id, test_binding(&id)).unwrap();
+        let group = super::super::group::GhostGroup::create(&provider, &id).unwrap();
 
         let channel_id = [0xFF; 32];
         let voice = super::super::voice::derive_presence_key(
