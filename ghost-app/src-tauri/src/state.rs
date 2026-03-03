@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use ghost_core::client::GhostClient;
 use ghost_core::relay::RelayClient;
@@ -9,6 +9,14 @@ use zeroize::Zeroizing;
 use crate::config::GhostConfig;
 use crate::presence::PresenceInfo;
 use crate::voice_task::VoiceHandle;
+
+/// Device credentials for request signing. Stored separately from GhostClient
+/// so sign_request can read without contending on the heavy client mutex.
+pub struct AuthMaterial {
+    pub account_fp: [u8; 32],
+    pub device_vk: [u8; 32],
+    pub signing_key: ed25519_dalek::SigningKey,
+}
 
 pub struct AppState {
     pub client: Arc<Mutex<GhostClient>>,
@@ -24,6 +32,8 @@ pub struct AppState {
     pub recovery_seed: Arc<Mutex<Option<Zeroizing<[u8; 32]>>>>,
     /// Handle for the running relay task — used to abort it before hot-swap.
     pub relay_task_handle: Arc<Mutex<Option<tauri::async_runtime::JoinHandle<()>>>>,
+    /// Device auth material for request signing — avoids locking client on every HTTP request.
+    pub auth: Arc<RwLock<AuthMaterial>>,
 }
 
 pub fn now_millis() -> u64 {

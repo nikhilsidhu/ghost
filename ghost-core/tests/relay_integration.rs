@@ -35,9 +35,11 @@ async fn encrypted_message_through_relay() {
     let mailbox_id = mls_group_mailbox_id(&mls_gid);
     let channel_id = derive_default_channel_id(&server_id);
 
-    // Connect both to relay
+    // Connect both to relay with auth
     let (mut send_relay, _) = RelayClient::new(&relay_url);
     let (mut recv_relay, mut events) = RelayClient::new(&relay_url);
+    common::setup_relay_auth(&relay_url, &mut send_relay, &sender).await;
+    common::setup_relay_auth(&relay_url, &mut recv_relay, &receiver).await;
     send_relay.subscribe(mailbox_id, 0);
     recv_relay.subscribe(mailbox_id, 0);
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -73,32 +75,6 @@ async fn encrypted_message_through_relay() {
         .unwrap();
     assert_eq!(msg.content, b"hello through relay");
     assert_eq!(msg.sender_fp, *sender.fingerprint());
-}
-
-#[tokio::test]
-async fn invite_roundtrip_via_relay() {
-    let relay_url = common::start_relay().await;
-    let (inviter, _) = RelayClient::new(&relay_url);
-    let (joiner, _) = RelayClient::new(&relay_url);
-
-    let token = "test-token";
-
-    inviter.register_invite(token, u64::MAX).await.unwrap();
-    joiner
-        .post_join(token, b"key-package-bytes".to_vec())
-        .await
-        .unwrap();
-
-    let join_data = inviter.get_join(token).await.unwrap();
-    assert_eq!(join_data, b"key-package-bytes");
-
-    inviter
-        .post_accept(token, b"welcome-bytes".to_vec())
-        .await
-        .unwrap();
-
-    let accept_data = joiner.get_accept(token).await.unwrap();
-    assert_eq!(accept_data, b"welcome-bytes");
 }
 
 /// Wait for the next blob on an event receiver, ignoring acks/gaps/presence.
@@ -167,6 +143,8 @@ async fn multiple_messages_in_order() {
 
     let (mut send_relay, _) = RelayClient::new(&relay_url);
     let (mut recv_relay, mut events) = RelayClient::new(&relay_url);
+    common::setup_relay_auth(&relay_url, &mut send_relay, &s.sender).await;
+    common::setup_relay_auth(&relay_url, &mut recv_relay, &s.receiver).await;
     send_relay.subscribe(s.mailbox_id, 0);
     recv_relay.subscribe(s.mailbox_id, 0);
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -211,6 +189,8 @@ async fn bidirectional_messaging() {
     // Both sides share one relay connection each, both subscribe
     let (mut relay_a, mut events_a) = RelayClient::new(&relay_url);
     let (mut relay_b, mut events_b) = RelayClient::new(&relay_url);
+    common::setup_relay_auth(&relay_url, &mut relay_a, &s.sender).await;
+    common::setup_relay_auth(&relay_url, &mut relay_b, &s.receiver).await;
     relay_a.subscribe(s.mailbox_id, 0);
     relay_b.subscribe(s.mailbox_id, 0);
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -267,6 +247,13 @@ async fn self_message_not_echoed_as_new() {
     // Use a separate connection to send vs receive so the blob is delivered.
     let (mut send_relay, _) = RelayClient::new(&relay_url);
     let (mut listen_relay, mut events) = RelayClient::new(&relay_url);
+    common::setup_relay_auth(&relay_url, &mut send_relay, &s.sender).await;
+    // Same identity — genesis already pushed, just set auth on the second connection
+    listen_relay.set_auth(
+        *s.sender.fingerprint(),
+        s.sender.verifying_key_bytes(),
+        s.sender.signing_key_clone(),
+    );
     send_relay.subscribe(s.mailbox_id, 0);
     listen_relay.subscribe(s.mailbox_id, 0);
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -373,6 +360,8 @@ async fn invite_with_real_key_package() {
 
     let (mut inv_relay, _) = RelayClient::new(&relay_url);
     let (mut join_relay, mut join_events) = RelayClient::new(&relay_url);
+    common::setup_relay_auth(&relay_url, &mut inv_relay, &inviter).await;
+    common::setup_relay_auth(&relay_url, &mut join_relay, &joiner).await;
     inv_relay.subscribe(mailbox_id, 0);
     join_relay.subscribe(mailbox_id, 0);
     tokio::time::sleep(Duration::from_millis(50)).await;

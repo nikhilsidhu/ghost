@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use ghost_wire::{WS_FRAME_HEADER_SIZE, WS_SIGNAL_EPOCH_MISMATCH, WS_SIGNAL_GAP};
 
+use crate::auth::DeviceAuth;
 use crate::constants::{MAX_PRESENCE_BLOB_SIZE, WS_MAX_FANOUT_BATCH, WS_PING_INTERVAL_SECS};
 use crate::mailbox::Mailbox;
 use crate::state::{AppState, OpEntry, VpEntry};
@@ -41,6 +42,7 @@ struct PsInner {
 }
 
 pub async fn ws_upgrade(
+    auth: DeviceAuth,
     State(state): State<AppState>,
     Path(mailbox_id): Path<String>,
     ws: WebSocketUpgrade,
@@ -49,10 +51,10 @@ pub async fn ws_upgrade(
         Ok(id) => id,
         Err(e) => return e.into_response(),
     };
-    ws.on_upgrade(move |socket| ws_connection(socket, id, state))
+    ws.on_upgrade(move |socket| ws_connection(socket, id, state, auth))
 }
 
-async fn ws_connection(socket: WebSocket, mailbox_id: [u8; 32], state: AppState) {
+async fn ws_connection(socket: WebSocket, mailbox_id: [u8; 32], state: AppState, auth: DeviceAuth) {
     let (mut sink, mut stream) = socket.split();
     let conn_id = state.next_conn_id.fetch_add(1, Relaxed);
 
@@ -158,6 +160,7 @@ async fn ws_connection(socket: WebSocket, mailbox_id: [u8; 32], state: AppState)
     let ping_interval_dur = Duration::from_secs(WS_PING_INTERVAL_SECS);
     let mut ping_interval = tokio::time::interval(ping_interval_dur);
     let mut own_seqs: Vec<u64> = Vec::new();
+    let mut revoke_rx = state.revocation_tx.subscribe();
 
     loop {
         tokio::select! {
@@ -230,6 +233,26 @@ async fn ws_connection(socket: WebSocket, mailbox_id: [u8; 32], state: AppState)
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     _ => {}
+                }
+            }
+            revoke_event = revoke_rx.recv() => {
+                let revoked = match revoke_event {
+                    Ok((afp, dvk)) => afp == auth.account_fp && dvk == auth.device_vk,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        // Missed events — check storage to see if we've been revoked
+                        !state.storage.is_active_device(&auth.account_fp, &auth.device_vk)
+                            .unwrap_or(false)
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                };
+                if revoked {
+                    let _ = sink.send(Message::Close(Some(
+                        axum::extract::ws::CloseFrame {
+                            code: ghost_wire::WS_CLOSE_DEVICE_REVOKED,
+                            reason: "device revoked".into(),
+                        },
+                    ))).await;
+                    break;
                 }
             }
             _ = ping_interval.tick() => {

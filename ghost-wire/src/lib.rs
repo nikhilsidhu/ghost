@@ -1,3 +1,6 @@
+pub mod auth;
+pub mod idlog;
+
 /// Envelope framing for blobs transiting the relay.
 ///
 /// Every blob sent to the relay is prefixed with a 10-byte plaintext header
@@ -21,6 +24,9 @@ pub const WS_FRAME_HEADER_SIZE: usize = WS_SEQ_SIZE + WS_TIMESTAMP_SIZE;
 // WS text signals
 pub const WS_SIGNAL_GAP: &str = "gap";
 pub const WS_SIGNAL_EPOCH_MISMATCH: &str = "epoch_mismatch";
+
+// WS close codes (4000-4999 = application-defined)
+pub const WS_CLOSE_DEVICE_REVOKED: u16 = 4001;
 
 // Voice packet: [header_len:2][channel_id:32][slot_id:4][flags:1][seq:4][payload_len:2][payload...]
 // Relay reads first 38 bytes (header_len + channel_id + slot_id) for routing.

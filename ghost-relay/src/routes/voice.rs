@@ -9,6 +9,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 
+use crate::auth::DeviceAuth;
 use crate::constants::{MAX_PRESENCE_BLOB_SIZE, PRESENCE_RATE_LIMIT, SPEAKING_RATE_LIMIT};
 use crate::state::AppState;
 use crate::util::decode_mailbox_id;
@@ -45,6 +46,7 @@ struct PeerEntry {
 }
 
 pub async fn ws_upgrade(
+    auth: DeviceAuth,
     State(state): State<AppState>,
     Path(channel_id): Path<String>,
     ws: WebSocketUpgrade,
@@ -53,10 +55,10 @@ pub async fn ws_upgrade(
         Ok(id) => id,
         Err(e) => return e.into_response(),
     };
-    ws.on_upgrade(move |socket| voice_connection(socket, id, state))
+    ws.on_upgrade(move |socket| voice_connection(socket, id, state, auth))
 }
 
-async fn voice_connection(socket: WebSocket, channel_id: [u8; 32], state: AppState) {
+async fn voice_connection(socket: WebSocket, channel_id: [u8; 32], state: AppState, auth: DeviceAuth) {
     let (mut sink, mut stream) = socket.split();
     let mut ping_interval = tokio::time::interval(PING_INTERVAL);
     let mut last_pong = Instant::now();
@@ -65,6 +67,8 @@ async fn voice_connection(socket: WebSocket, channel_id: [u8; 32], state: AppSta
 
     // Track which peer slots this connection knows about
     let mut known_slots: HashSet<u32> = HashSet::new();
+
+    let mut revoke_rx = state.revocation_tx.subscribe();
 
     // Rate limiting state
     let mut last_presence_time = Instant::now();
@@ -347,6 +351,25 @@ async fn voice_connection(socket: WebSocket, channel_id: [u8; 32], state: AppSta
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            revoke_event = revoke_rx.recv() => {
+                let revoked = match revoke_event {
+                    Ok((afp, dvk)) => afp == auth.account_fp && dvk == auth.device_vk,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        !state.storage.is_active_device(&auth.account_fp, &auth.device_vk)
+                            .unwrap_or(false)
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                };
+                if revoked {
+                    let _ = sink.send(Message::Close(Some(
+                        axum::extract::ws::CloseFrame {
+                            code: ghost_wire::WS_CLOSE_DEVICE_REVOKED,
+                            reason: "device revoked".into(),
+                        },
+                    ))).await;
+                    break;
                 }
             }
             _ = ping_interval.tick() => {

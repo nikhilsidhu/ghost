@@ -24,6 +24,17 @@ fn parse_id(hex_str: &str) -> Result<[u8; 32], String> {
     bytes.try_into().map_err(|_| "invalid 32-byte id".into())
 }
 
+/// Sign an HTTP request with the device's cached auth credentials.
+fn sign_request(state: &AppState, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    let auth = state.auth.read().unwrap();
+    let h = ghost_wire::auth::sign_request_headers(&auth.account_fp, &auth.device_vk, &auth.signing_key);
+    drop(auth);
+    req.header("X-Ghost-Account", &h.account)
+        .header("X-Ghost-Device", &h.device)
+        .header("X-Ghost-Timestamp", &h.timestamp)
+        .header("X-Ghost-Signature", &h.signature)
+}
+
 /// Post a sync message to all linked devices. No-op if sync key is not set (single device).
 async fn post_sync_message(state: &AppState, msg_type: u8, payload: &[u8]) {
     crate::sync_utils::post_sync_message(&state.client, &state.relay, msg_type, payload).await;
@@ -85,7 +96,11 @@ async fn replace_relay(
     if let Some(handle) = state.relay_task_handle.lock().await.take() {
         handle.abort();
     }
-    let (new_relay, inbox_rx) = ghost_core::relay::RelayClient::new(relay_url);
+    let (mut new_relay, inbox_rx) = ghost_core::relay::RelayClient::new(relay_url);
+    {
+        let auth = state.auth.read().unwrap();
+        new_relay.set_auth(auth.account_fp, auth.device_vk, auth.signing_key.clone());
+    }
     *state.relay.lock().await = new_relay;
     *state.relay_url.lock().await = relay_url.to_string();
     inbox_rx
@@ -204,12 +219,21 @@ async fn create_server_impl(name: &str, kind: ServerKind, state: &AppState) -> R
     };
 
     if let Some(mid) = mailbox_id {
-        {
+        let upload_ok = {
             let client = state.client.lock().await;
-            if let Ok(gi) = client.export_server_info(&server_id) {
-                let relay = state.relay.lock().await;
-                let _ = relay.put_server_info(&mid, gi).await;
+            match client.export_server_info(&server_id) {
+                Ok(gi) => {
+                    let relay = state.relay.lock().await;
+                    relay.put_server_info(&mid, gi).await.map_err(|e| e.to_string())
+                }
+                Err(e) => Err(e.to_string()),
             }
+        };
+        if let Err(e) = upload_ok {
+            // Roll back local state — server can't exist without relay presence
+            let client = state.client.lock().await;
+            let _ = client.store().delete_server(&server_id);
+            return Err(e);
         }
         let mut relay = state.relay.lock().await;
         relay.subscribe(mid, 0);
@@ -1425,8 +1449,8 @@ async fn rejoin_server(
     );
 
     for _ in 0..MAX_REJOIN_ATTEMPTS {
-        let gi_resp = state.http
-            .get(format!("{}/box/{}/server_info", relay_url, mailbox_b64))
+        let gi_resp = sign_request(state, state.http
+            .get(format!("{}/box/{}/server_info", relay_url, mailbox_b64)))
             .send()
             .await;
         let gi_bytes = match gi_resp {
@@ -1448,9 +1472,9 @@ async fn rejoin_server(
         match result {
             Ok((commit, mailbox_id)) => {
                 let commit_seq;
-                let resp = state.http
+                let resp = sign_request(state, state.http
                     .post(format!("{}/box/{}", relay_url, mailbox_b64))
-                    .body(commit)
+                    .body(commit))
                     .send()
                     .await;
                 match resp {
@@ -1483,9 +1507,10 @@ async fn rejoin_server(
                 {
                     let client = state.client.lock().await;
                     if let Ok(gi) = client.export_server_info(&payload.server_id) {
-                        let _ = state.http
+                        drop(client);
+                        let _ = sign_request(state, state.http
                             .put(format!("{}/box/{}/server_info", relay_url, mailbox_b64))
-                            .body(gi)
+                            .body(gi))
                             .send()
                             .await;
                     }
@@ -1500,9 +1525,9 @@ async fn rejoin_server(
                     )
                 };
                 if let Ok(outbound) = announce_result {
-                    let _ = state.http
+                    let _ = sign_request(state, state.http
                         .post(format!("{}/box/{}", relay_url, mailbox_b64))
-                        .body(outbound.blob)
+                        .body(outbound.blob))
                         .send()
                         .await;
                 }
@@ -1697,10 +1722,26 @@ pub async fn check_pairing(state: State<'_, AppState>) -> Result<Option<String>,
     let new_device_key = ed25519_dalek::SigningKey::from_bytes(&new_sk_bytes);
 
     // Fetch current identity log to get state
-    let blobs = {
+    let mut blobs = {
         let relay = state.relay.lock().await;
         relay.get_idlog(&account_fp, 0).await.map_err(|e| e.to_string())?
     };
+
+    // If relay has no identity log, try re-pushing genesis (relay may have been restarted)
+    if blobs.is_empty() {
+        let genesis_path = state.config_path.parent()
+            .unwrap_or(&state.config_path)
+            .join("genesis.pending");
+        if let Ok(payload) = std::fs::read(&genesis_path) {
+            let relay = state.relay.lock().await;
+            relay.put_idlog_entry(&account_fp, payload).await
+                .map_err(|e| format!("re-push genesis: {e}"))?;
+            blobs = relay.get_idlog(&account_fp, 0).await.map_err(|e| e.to_string())?;
+        } else {
+            return Err("identity log empty on relay and no local genesis available".into());
+        }
+    }
+
     let entries: Vec<LogEntry> = blobs
         .iter()
         .map(|b| LogEntry::from_bytes(&b.payload).map_err(|e| e.to_string()))
@@ -1748,10 +1789,9 @@ pub async fn check_pairing(state: State<'_, AppState>) -> Result<Option<String>,
     // PUT provision to relay first
     let relay_url = state.relay_url.lock().await.clone();
     let fp_hex = hex::encode(account_fp);
-    state
-        .http
+    sign_request(&state, state.http
         .put(format!("{}/pair/{}/provision", relay_url, fp_hex))
-        .body(provision_blob)
+        .body(provision_blob))
         .send()
         .await
         .map_err(|e| format!("put provision: {e}"))?
@@ -1953,6 +1993,12 @@ pub async fn join_as_new_device(
                     ).map_err(|e| format!("open new client: {e}"))?;
                     if !display_name.is_empty() {
                         new_client.set_display_name(display_name.to_string());
+                    }
+                    {
+                        let mut auth = state.auth.write().unwrap();
+                        auth.account_fp = *new_client.fingerprint();
+                        auth.device_vk = new_client.verifying_key_bytes();
+                        auth.signing_key = new_client.signing_key_clone();
                     }
                     *state.client.lock().await = new_client;
 
@@ -2221,9 +2267,9 @@ async fn revoke_old_device_leaves(
                 &base64::engine::general_purpose::URL_SAFE_NO_PAD,
                 &out.mailbox_id,
             );
-            let post_result = state.http
+            let post_result = sign_request(state, state.http
                 .post(format!("{}/box/{}", relay_url, mailbox_b64))
-                .body(out.blob)
+                .body(out.blob))
                 .send()
                 .await;
             match post_result {
@@ -2232,9 +2278,9 @@ async fn revoke_old_device_leaves(
                     if let Some(sid) = client.server_id_for_mailbox(&out.mailbox_id) {
                         if let Ok(gi) = client.export_server_info(&sid) {
                             drop(client);
-                            let _ = state.http
+                            let _ = sign_request(state, state.http
                                 .put(format!("{}/box/{}/server_info", relay_url, mailbox_b64))
-                                .body(gi)
+                                .body(gi))
                                 .send()
                                 .await;
                         }
@@ -2357,6 +2403,12 @@ pub async fn recover_account(
     ).map_err(|e| format!("open new client: {e}"))?;
     new_client.set_sync_key(sync_key).map_err(|e| e.to_string())?;
     new_client.create_sync_group().map_err(|e| format!("create sync group: {e}"))?;
+    {
+        let mut auth = state.auth.write().unwrap();
+        auth.account_fp = *new_client.fingerprint();
+        auth.device_vk = new_client.verifying_key_bytes();
+        auth.signing_key = new_client.signing_key_clone();
+    }
     *state.client.lock().await = new_client;
 
     // 11. Replace relay + save URL in config
@@ -2373,8 +2425,8 @@ pub async fn recover_account(
 
     if recovered.sync_key.is_some() {
         let entries = async {
-            let resp = state.http
-                .get(format!("{}/sync_state/{}", relay_url, fp_hex))
+            let resp = sign_request(&state, state.http
+                .get(format!("{}/sync_state/{}", relay_url, fp_hex)))
                 .send().await.map_err(|e| format!("fetch: {e}"))?;
             if !resp.status().is_success() {
                 return Err(format!("HTTP {}", resp.status()));

@@ -1,4 +1,6 @@
+use ghost_wire::idlog;
 use rusqlite::{params, Connection, OptionalExtension};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -82,6 +84,15 @@ impl Storage {
                  payload BLOB NOT NULL,
                  received_at INTEGER NOT NULL,
                  PRIMARY KEY (account_fp, seq)
+             ) WITHOUT ROWID;
+
+             CREATE TABLE IF NOT EXISTS device_keys (
+                 account_fp BLOB NOT NULL,
+                 device_vk BLOB NOT NULL,
+                 active INTEGER NOT NULL DEFAULT 1,
+                 added_seq INTEGER NOT NULL,
+                 revoked_seq INTEGER,
+                 PRIMARY KEY (account_fp, device_vk)
              ) WITHOUT ROWID;
 
              CREATE TABLE IF NOT EXISTS recovery_blob (
@@ -322,68 +333,243 @@ impl Storage {
         Ok(())
     }
 
-    /// Append an identity log entry, enforcing sequential ordering and prev_hash chain.
+    /// Append an identity log entry with full cryptographic validation.
+    /// Returns the list of device keys revoked by this entry (empty for
+    /// Genesis/AddDevice, one key for RevokeDevice, all previously-active
+    /// keys for Recovery).
     pub fn append_idlog_entry(
         &self,
         account_fp: &[u8; 32],
-        seq: u64,
-        prev_hash: &[u8; 32],
         payload: &[u8],
-    ) -> Result<(), RelayError> {
-        let conn = self.conn.lock().unwrap();
+    ) -> Result<Vec<[u8; 32]>, RelayError> {
+        let entry = idlog::LogEntry::from_bytes(payload)
+            .map_err(|e| RelayError::BadRequest(format!("invalid entry: {e}")))?;
 
-        // Check current head
-        let head_seq: Option<i64> = conn
-            .query_row(
-                "SELECT seq FROM identity_log
-                 WHERE account_fp = ?1
-                 ORDER BY seq DESC LIMIT 1",
-                params![account_fp.as_slice()],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|e| RelayError::Storage(e.to_string()))?;
-
-        match head_seq {
-            Some(head_seq) => {
-                if seq != (head_seq as u64) + 1 {
-                    return Err(RelayError::Conflict);
-                }
-                // Verify prev_hash matches hash of previous entry's payload
-                let prev_payload: Vec<u8> = conn
-                    .query_row(
-                        "SELECT payload FROM identity_log
-                         WHERE account_fp = ?1 AND seq = ?2",
-                        params![account_fp.as_slice(), head_seq],
-                        |row| row.get(0),
-                    )
-                    .map_err(|e| RelayError::Storage(e.to_string()))?;
-                let expected_hash: [u8; 32] = blake3::hash(&prev_payload).into();
-                if prev_hash != &expected_hash {
-                    return Err(RelayError::BadRequest("prev_hash mismatch".into()));
-                }
-            }
-            None => {
-                if seq != 1 {
-                    return Err(RelayError::BadRequest("first entry must be seq 1".into()));
-                }
-            }
+        if entry.account_fp != *account_fp {
+            return Err(RelayError::BadRequest("account_fp mismatch with URL".into()));
         }
 
-        conn.execute(
+        let conn = self.conn.lock().unwrap();
+
+        // Build log state from point-reads instead of replaying the full chain
+        let mut state = Self::build_log_state(&conn, account_fp)?;
+
+        // Validate the new entry (signatures, authority, seq, prev_hash)
+        idlog::validate_entry(&mut state, &entry)
+            .map_err(|e| RelayError::BadRequest(format!("validation failed: {e}")))?;
+
+        // Collect device keys that will be revoked by this entry
+        let revoked = Self::collect_revoked_keys(&conn, account_fp, &entry)?;
+
+        // Store entry + update device_keys atomically
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| RelayError::Storage(e.to_string()))?;
+
+        tx.execute(
             "INSERT INTO identity_log (account_fp, seq, prev_hash, payload, received_at)
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 account_fp.as_slice(),
-                seq as i64,
-                prev_hash.as_slice(),
+                entry.seq as i64,
+                entry.prev_hash.as_slice(),
                 payload,
                 now_millis() as i64,
             ],
         )
         .map_err(|e| RelayError::Storage(e.to_string()))?;
 
+        // Update device_keys table based on entry type
+        Self::update_device_keys(&tx, account_fp, &entry)?;
+
+        tx.commit().map_err(|e| RelayError::Storage(e.to_string()))?;
+        Ok(revoked)
+    }
+
+    /// Reconstruct LogState from point-reads: last entry (head_seq, head_hash),
+    /// genesis (master_vk), and device_keys table (devices).
+    fn build_log_state(
+        conn: &Connection,
+        account_fp: &[u8; 32],
+    ) -> Result<idlog::LogState, RelayError> {
+        let map_err = |e: rusqlite::Error| RelayError::Storage(e.to_string());
+
+        // Read last entry for head_seq and head_hash
+        let last: Option<(i64, Vec<u8>)> = conn
+            .query_row(
+                "SELECT seq, payload FROM identity_log
+                 WHERE account_fp = ?1 ORDER BY seq DESC LIMIT 1",
+                params![account_fp.as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(map_err)?;
+
+        let (head_seq, head_hash) = match &last {
+            Some((seq, payload)) => {
+                let hash: [u8; 32] = blake3::hash(payload).into();
+                (*seq as u64, hash)
+            }
+            None => return Ok(idlog::LogState::empty(*account_fp)),
+        };
+
+        // Read genesis entry for master_vk
+        let genesis_payload: Vec<u8> = conn
+            .query_row(
+                "SELECT payload FROM identity_log
+                 WHERE account_fp = ?1 AND seq = 1",
+                params![account_fp.as_slice()],
+                |row| row.get(0),
+            )
+            .map_err(map_err)?;
+
+        let genesis = idlog::LogEntry::from_bytes(&genesis_payload)
+            .map_err(|e| RelayError::Storage(format!("corrupt genesis: {e}")))?;
+        let master_vk = match &genesis.body {
+            idlog::EntryBody::Genesis { master_verifying_key, .. } => *master_verifying_key,
+            _ => return Err(RelayError::Storage("seq 1 is not genesis".into())),
+        };
+
+        // Read device state from device_keys table
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT device_vk, added_seq, revoked_seq
+                 FROM device_keys WHERE account_fp = ?1",
+            )
+            .map_err(map_err)?;
+
+        let rows: Vec<(Vec<u8>, i64, Option<i64>)> = stmt
+            .query_map(params![account_fp.as_slice()], |row| {
+                let vk_bytes: Vec<u8> = row.get(0)?;
+                let added_seq: i64 = row.get(1)?;
+                let revoked_seq: Option<i64> = row.get(2)?;
+                Ok((vk_bytes, added_seq, revoked_seq))
+            })
+            .map_err(map_err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_err)?;
+
+        let mut devices = HashMap::new();
+        for (vk_bytes, added_seq, revoked_seq) in rows {
+            let vk: [u8; 32] = vk_bytes.try_into().map_err(|_| {
+                RelayError::Storage("corrupt device_vk in device_keys table".into())
+            })?;
+            devices.insert(vk, idlog::DeviceInfo {
+                verifying_key: vk,
+                label: String::new(),
+                added_at_seq: added_seq as u64,
+                revoked_at_seq: revoked_seq.map(|s| s as u64),
+            });
+        }
+
+        Ok(idlog::LogState {
+            account_fp: *account_fp,
+            master_verifying_key: Some(master_vk),
+            devices,
+            head_seq,
+            head_hash,
+        })
+    }
+
+    /// Return device keys that this entry will revoke.
+    fn collect_revoked_keys(
+        conn: &Connection,
+        account_fp: &[u8; 32],
+        entry: &idlog::LogEntry,
+    ) -> Result<Vec<[u8; 32]>, RelayError> {
+        match &entry.body {
+            idlog::EntryBody::RevokeDevice { device_verifying_key, .. } => {
+                Ok(vec![*device_verifying_key])
+            }
+            idlog::EntryBody::Recovery { .. } => {
+                let map_err = |e: rusqlite::Error| RelayError::Storage(e.to_string());
+                let mut stmt = conn
+                    .prepare_cached(
+                        "SELECT device_vk FROM device_keys
+                         WHERE account_fp = ?1 AND active = 1",
+                    )
+                    .map_err(map_err)?;
+                let rows: Vec<Vec<u8>> = stmt
+                    .query_map(params![account_fp.as_slice()], |row| row.get(0))
+                    .map_err(map_err)?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(map_err)?;
+                let mut keys = Vec::with_capacity(rows.len());
+                for vk in rows {
+                    let arr: [u8; 32] = vk.try_into().map_err(|_| {
+                        RelayError::Storage("corrupt device_vk in device_keys table".into())
+                    })?;
+                    keys.push(arr);
+                }
+                Ok(keys)
+            }
+            _ => Ok(vec![]),
+        }
+    }
+
+    fn update_device_keys(
+        conn: &Connection,
+        account_fp: &[u8; 32],
+        entry: &idlog::LogEntry,
+    ) -> Result<(), RelayError> {
+        let map_err = |e: rusqlite::Error| RelayError::Storage(e.to_string());
+        match &entry.body {
+            idlog::EntryBody::Genesis { device_verifying_key, .. } => {
+                conn.execute(
+                    "INSERT INTO device_keys (account_fp, device_vk, active, added_seq)
+                     VALUES (?1, ?2, 1, ?3)",
+                    params![account_fp.as_slice(), device_verifying_key.as_slice(), entry.seq as i64],
+                ).map_err(map_err)?;
+            }
+            idlog::EntryBody::AddDevice { device_verifying_key, .. } => {
+                conn.execute(
+                    "INSERT INTO device_keys (account_fp, device_vk, active, added_seq)
+                     VALUES (?1, ?2, 1, ?3)",
+                    params![account_fp.as_slice(), device_verifying_key.as_slice(), entry.seq as i64],
+                ).map_err(map_err)?;
+            }
+            idlog::EntryBody::RevokeDevice { device_verifying_key, .. } => {
+                conn.execute(
+                    "UPDATE device_keys SET active = 0, revoked_seq = ?3
+                     WHERE account_fp = ?1 AND device_vk = ?2",
+                    params![account_fp.as_slice(), device_verifying_key.as_slice(), entry.seq as i64],
+                ).map_err(map_err)?;
+            }
+            idlog::EntryBody::Recovery { device_verifying_key, .. } => {
+                // Revoke all active devices
+                conn.execute(
+                    "UPDATE device_keys SET active = 0, revoked_seq = ?2
+                     WHERE account_fp = ?1 AND active = 1",
+                    params![account_fp.as_slice(), entry.seq as i64],
+                ).map_err(map_err)?;
+                // Add the new recovery device (may re-use a previously revoked key)
+                conn.execute(
+                    "INSERT OR REPLACE INTO device_keys (account_fp, device_vk, active, added_seq)
+                     VALUES (?1, ?2, 1, ?3)",
+                    params![account_fp.as_slice(), device_verifying_key.as_slice(), entry.seq as i64],
+                ).map_err(map_err)?;
+            }
+        }
         Ok(())
+    }
+
+    /// Check if a device key is currently active for an account.
+    pub fn is_active_device(
+        &self,
+        account_fp: &[u8; 32],
+        device_vk: &[u8; 32],
+    ) -> Result<bool, RelayError> {
+        let conn = self.conn.lock().unwrap();
+        let active: Option<i64> = conn
+            .query_row(
+                "SELECT active FROM device_keys
+                 WHERE account_fp = ?1 AND device_vk = ?2",
+                params![account_fp.as_slice(), device_vk.as_slice()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| RelayError::Storage(e.to_string()))?;
+        Ok(active == Some(1))
     }
 
     /// Get identity log entries for an account, optionally after a given seq.
@@ -651,30 +837,105 @@ mod tests {
         assert_eq!(store.get_avatar(&mb, &fp_b).unwrap().unwrap(), b"bob");
     }
 
-    fn test_account() -> [u8; 32] {
-        [0xCC; 32]
+    fn test_account() -> ([u8; 32], ed25519_dalek::SigningKey, ed25519_dalek::SigningKey) {
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+        let mk = SigningKey::generate(&mut OsRng);
+        let dk = SigningKey::generate(&mut OsRng);
+        let fp: [u8; 32] = blake3::hash(mk.verifying_key().as_bytes()).into();
+        (fp, mk, dk)
     }
 
-    // Build a fake idlog payload with the right header: [seq:8][prev_hash:32][body...]
-    fn make_idlog_payload(seq: u64, prev_hash: &[u8; 32]) -> Vec<u8> {
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&seq.to_be_bytes());
-        buf.extend_from_slice(prev_hash);
-        buf.extend_from_slice(b"test-body");
-        buf
+    fn make_genesis(mk: &ed25519_dalek::SigningKey, dk: &ed25519_dalek::SigningKey) -> Vec<u8> {
+        use ed25519_dalek::Signer;
+        let master_vk = mk.verifying_key();
+        let device_vk = dk.verifying_key();
+        let fp: [u8; 32] = blake3::hash(master_vk.as_bytes()).into();
+        let mut entry = ghost_wire::idlog::LogEntry {
+            seq: 1,
+            prev_hash: [0u8; 32],
+            account_fp: fp,
+            entry_type: ghost_wire::idlog::EntryType::Genesis,
+            timestamp: 1000,
+            body: ghost_wire::idlog::EntryBody::Genesis {
+                master_verifying_key: master_vk.to_bytes(),
+                device_verifying_key: device_vk.to_bytes(),
+                device_label: "test".to_string(),
+            },
+            signature: [0u8; 64],
+            counter_signature: None,
+        };
+        let msg = ghost_wire::idlog::sign_message(&entry);
+        entry.signature = mk.sign(&msg).to_bytes();
+        entry.counter_signature = Some(dk.sign(&msg).to_bytes());
+        entry.to_bytes()
+    }
+
+    fn make_add_device(
+        state: &ghost_wire::idlog::LogState,
+        auth: &ed25519_dalek::SigningKey,
+        new: &ed25519_dalek::SigningKey,
+    ) -> Vec<u8> {
+        use ed25519_dalek::Signer;
+        let mut entry = ghost_wire::idlog::LogEntry {
+            seq: state.head_seq + 1,
+            prev_hash: state.head_hash,
+            account_fp: state.account_fp,
+            entry_type: ghost_wire::idlog::EntryType::AddDevice,
+            timestamp: 2000,
+            body: ghost_wire::idlog::EntryBody::AddDevice {
+                device_verifying_key: new.verifying_key().to_bytes(),
+                device_label: "device-2".to_string(),
+                authorizer_key: auth.verifying_key().to_bytes(),
+            },
+            signature: [0u8; 64],
+            counter_signature: None,
+        };
+        let msg = ghost_wire::idlog::sign_message(&entry);
+        entry.signature = auth.sign(&msg).to_bytes();
+        entry.counter_signature = Some(new.sign(&msg).to_bytes());
+        entry.to_bytes()
+    }
+
+    fn make_revoke_device(
+        state: &ghost_wire::idlog::LogState,
+        revoker: &ed25519_dalek::SigningKey,
+        target_vk: &[u8; 32],
+    ) -> Vec<u8> {
+        use ed25519_dalek::Signer;
+        let mut entry = ghost_wire::idlog::LogEntry {
+            seq: state.head_seq + 1,
+            prev_hash: state.head_hash,
+            account_fp: state.account_fp,
+            entry_type: ghost_wire::idlog::EntryType::RevokeDevice,
+            timestamp: 3000,
+            body: ghost_wire::idlog::EntryBody::RevokeDevice {
+                device_verifying_key: *target_vk,
+                revoker_key: revoker.verifying_key().to_bytes(),
+            },
+            signature: [0u8; 64],
+            counter_signature: None,
+        };
+        let msg = ghost_wire::idlog::sign_message(&entry);
+        entry.signature = revoker.sign(&msg).to_bytes();
+        entry.to_bytes()
     }
 
     #[test]
     fn idlog_append_and_fetch() {
         let store = Storage::open_in_memory().unwrap();
-        let fp = test_account();
+        let (fp, mk, dk) = test_account();
 
-        let payload1 = make_idlog_payload(1, &[0u8; 32]);
-        store.append_idlog_entry(&fp, 1, &[0u8; 32], &payload1).unwrap();
+        let genesis = make_genesis(&mk, &dk);
+        store.append_idlog_entry(&fp, &genesis).unwrap();
 
-        let hash1: [u8; 32] = blake3::hash(&payload1).into();
-        let payload2 = make_idlog_payload(2, &hash1);
-        store.append_idlog_entry(&fp, 2, &hash1, &payload2).unwrap();
+        // Parse genesis to get state for building next entry
+        let parsed = ghost_wire::idlog::LogEntry::from_bytes(&genesis).unwrap();
+        let state = ghost_wire::idlog::validate_chain(&[parsed]).unwrap();
+
+        let dk2 = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let add = make_add_device(&state, &dk, &dk2);
+        store.append_idlog_entry(&fp, &add).unwrap();
 
         let all = store.get_idlog(&fp, 0).unwrap();
         assert_eq!(all.len(), 2);
@@ -687,52 +948,46 @@ mod tests {
     }
 
     #[test]
-    fn idlog_rejects_bad_seq() {
+    fn idlog_rejects_bad_signature() {
         let store = Storage::open_in_memory().unwrap();
-        let fp = test_account();
+        let (fp, mk, dk) = test_account();
 
-        // First entry must be seq 1
-        let payload = make_idlog_payload(2, &[0u8; 32]);
-        let err = store.append_idlog_entry(&fp, 2, &[0u8; 32], &payload).unwrap_err();
+        let mut genesis = make_genesis(&mk, &dk);
+        // Tamper with the signature (last 64 bytes before counter-sig flag)
+        let parsed = ghost_wire::idlog::LogEntry::from_bytes(&genesis).unwrap();
+        let body_len = {
+            let mut buf = Vec::new();
+            ghost_wire::idlog::encode_body(&mut buf, &parsed.body);
+            buf.len()
+        };
+        let sig_offset = 85 + body_len;
+        genesis[sig_offset] ^= 0xFF;
+
+        let err = store.append_idlog_entry(&fp, &genesis).unwrap_err();
         assert!(matches!(err, RelayError::BadRequest(_)));
-
-        // Append seq 1
-        let payload1 = make_idlog_payload(1, &[0u8; 32]);
-        store.append_idlog_entry(&fp, 1, &[0u8; 32], &payload1).unwrap();
-
-        // Skip to seq 3
-        let hash1: [u8; 32] = blake3::hash(&payload1).into();
-        let payload3 = make_idlog_payload(3, &hash1);
-        let err = store.append_idlog_entry(&fp, 3, &hash1, &payload3).unwrap_err();
-        assert!(matches!(err, RelayError::Conflict));
     }
 
     #[test]
-    fn idlog_rejects_bad_prev_hash() {
+    fn idlog_rejects_bad_seq() {
         let store = Storage::open_in_memory().unwrap();
-        let fp = test_account();
+        let (fp, mk, dk) = test_account();
 
-        let payload1 = make_idlog_payload(1, &[0u8; 32]);
-        store.append_idlog_entry(&fp, 1, &[0u8; 32], &payload1).unwrap();
+        let genesis = make_genesis(&mk, &dk);
+        store.append_idlog_entry(&fp, &genesis).unwrap();
 
-        // Wrong prev_hash for seq 2
-        let bad_hash = [0xFF; 32];
-        let payload2 = make_idlog_payload(2, &bad_hash);
-        let err = store.append_idlog_entry(&fp, 2, &bad_hash, &payload2).unwrap_err();
+        // Try to append genesis again (seq 1 when head is already 1)
+        let err = store.append_idlog_entry(&fp, &genesis).unwrap_err();
         assert!(matches!(err, RelayError::BadRequest(_)));
     }
 
     #[test]
     fn idlog_separate_accounts_independent() {
         let store = Storage::open_in_memory().unwrap();
-        let fp_a = [0xAA; 32];
-        let fp_b = [0xBB; 32];
+        let (fp_a, mk_a, dk_a) = test_account();
+        let (fp_b, mk_b, dk_b) = test_account();
 
-        let p1a = make_idlog_payload(1, &[0u8; 32]);
-        store.append_idlog_entry(&fp_a, 1, &[0u8; 32], &p1a).unwrap();
-
-        let p1b = make_idlog_payload(1, &[0u8; 32]);
-        store.append_idlog_entry(&fp_b, 1, &[0u8; 32], &p1b).unwrap();
+        store.append_idlog_entry(&fp_a, &make_genesis(&mk_a, &dk_a)).unwrap();
+        store.append_idlog_entry(&fp_b, &make_genesis(&mk_b, &dk_b)).unwrap();
 
         assert_eq!(store.get_idlog(&fp_a, 0).unwrap().len(), 1);
         assert_eq!(store.get_idlog(&fp_b, 0).unwrap().len(), 1);
@@ -741,8 +996,61 @@ mod tests {
     #[test]
     fn idlog_empty_returns_empty() {
         let store = Storage::open_in_memory().unwrap();
-        let fp = test_account();
-        assert!(store.get_idlog(&fp, 0).unwrap().is_empty());
+        assert!(store.get_idlog(&[0xCC; 32], 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn idlog_device_keys_tracked() {
+        let store = Storage::open_in_memory().unwrap();
+        let (fp, mk, dk) = test_account();
+
+        // No devices before genesis
+        assert!(!store.is_active_device(&fp, &dk.verifying_key().to_bytes()).unwrap());
+
+        let genesis = make_genesis(&mk, &dk);
+        store.append_idlog_entry(&fp, &genesis).unwrap();
+
+        // Device active after genesis
+        assert!(store.is_active_device(&fp, &dk.verifying_key().to_bytes()).unwrap());
+
+        // Add second device
+        let parsed = ghost_wire::idlog::LogEntry::from_bytes(&genesis).unwrap();
+        let state = ghost_wire::idlog::validate_chain(&[parsed]).unwrap();
+        let dk2 = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let add = make_add_device(&state, &dk, &dk2);
+        store.append_idlog_entry(&fp, &add).unwrap();
+        assert!(store.is_active_device(&fp, &dk2.verifying_key().to_bytes()).unwrap());
+
+        // Revoke second device
+        let all = store.get_idlog(&fp, 0).unwrap();
+        let entries: Vec<_> = all.iter()
+            .map(|r| ghost_wire::idlog::LogEntry::from_bytes(&r.payload).unwrap())
+            .collect();
+        let state2 = ghost_wire::idlog::validate_chain(&entries).unwrap();
+        let revoke = make_revoke_device(&state2, &dk, &dk2.verifying_key().to_bytes());
+        store.append_idlog_entry(&fp, &revoke).unwrap();
+
+        assert!(!store.is_active_device(&fp, &dk2.verifying_key().to_bytes()).unwrap());
+        assert!(store.is_active_device(&fp, &dk.verifying_key().to_bytes()).unwrap());
+    }
+
+    #[test]
+    fn idlog_rejects_unauthorized_signer() {
+        let store = Storage::open_in_memory().unwrap();
+        let (fp, mk, dk) = test_account();
+
+        let genesis = make_genesis(&mk, &dk);
+        store.append_idlog_entry(&fp, &genesis).unwrap();
+
+        let parsed = ghost_wire::idlog::LogEntry::from_bytes(&genesis).unwrap();
+        let state = ghost_wire::idlog::validate_chain(&[parsed]).unwrap();
+
+        // Rogue key tries to add a device
+        let rogue = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let dk2 = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let bad_add = make_add_device(&state, &rogue, &dk2);
+        let err = store.append_idlog_entry(&fp, &bad_add).unwrap_err();
+        assert!(matches!(err, RelayError::BadRequest(_)));
     }
 
 }

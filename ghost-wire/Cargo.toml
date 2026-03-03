@@ -6,3 +6,9 @@ license = "AGPL-3.0"
 
 [dependencies]
 thiserror = "1"
+ed25519-dalek = "2"
+blake3 = "1"
+hex = "0.4"
+
+[dev-dependencies]
+rand = "0.8"

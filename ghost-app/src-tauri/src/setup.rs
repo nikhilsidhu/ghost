@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use ghost_core::client::GhostClient;
 use ghost_core::identity::Identity;
@@ -12,7 +12,7 @@ use ghost_core::mls::presence::OnlineStatus;
 use crate::config::{self, GhostConfig};
 use crate::constants::VOICE_CMD_CHANNEL_SIZE;
 use crate::presence::PresenceInfo;
-use crate::state::AppState;
+use crate::state::{AppState, AuthMaterial};
 use crate::voice_task::{VoiceCommand, VoiceHandle, VoiceStateEvent};
 
 pub(crate) fn ghost_dir() -> PathBuf {
@@ -192,7 +192,12 @@ pub fn initialize() -> SetupResult {
         .or_else(|| std::env::var("GHOST_RELAY_URL").ok())
         .unwrap_or_else(|| "http://localhost:7700".into());
 
-    let (relay, inbox_rx) = RelayClient::new(&relay_url);
+    let (mut relay, inbox_rx) = RelayClient::new(&relay_url);
+    relay.set_auth(
+        *client.fingerprint(),
+        client.verifying_key_bytes(),
+        client.signing_key_clone(),
+    );
 
     let (voice_cmd_tx, voice_cmd_rx) = mpsc::channel(VOICE_CMD_CHANNEL_SIZE);
     let (voice_state_tx, _voice_state_rx) = watch::channel(VoiceStateEvent::default());
@@ -229,6 +234,12 @@ pub fn initialize() -> SetupResult {
         avatar_hash,
     };
 
+    let auth = AuthMaterial {
+        account_fp: *client.fingerprint(),
+        device_vk: client.verifying_key_bytes(),
+        signing_key: client.signing_key_clone(),
+    };
+
     let state = AppState {
         client: Arc::new(Mutex::new(client)),
         relay: Arc::new(Mutex::new(relay)),
@@ -247,6 +258,7 @@ pub fn initialize() -> SetupResult {
         pairing_secret: Arc::new(Mutex::new(None)),
         recovery_seed: Arc::new(Mutex::new(recovery_seed.map(zeroize::Zeroizing::new))),
         relay_task_handle: Arc::new(Mutex::new(None)),
+        auth: Arc::new(RwLock::new(auth)),
     };
 
     SetupResult {

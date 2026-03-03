@@ -66,7 +66,9 @@ pub async fn run(
         }
     };
 
-    // Push pending genesis entry to relay (first launch only)
+    // Push genesis entry to relay if relay doesn't have it yet.
+    // genesis.pending is kept on disk permanently so it can be re-pushed
+    // after relay DB wipes (dev restarts, migrations, server moves).
     {
         let genesis_path = data_dir.join("genesis.pending");
         if let Ok(payload) = std::fs::read(&genesis_path) {
@@ -75,9 +77,13 @@ pub async fn run(
                 *c.fingerprint()
             };
             let r = relay.lock().await;
-            match r.put_idlog_entry(&account_fp, payload).await {
-                Ok(()) => { let _ = std::fs::remove_file(&genesis_path); }
-                Err(e) => eprintln!("failed to push genesis entry: {e}"),
+            let needs_push = r.get_idlog(&account_fp, 0).await
+                .map(|entries| entries.is_empty())
+                .unwrap_or(true);
+            if needs_push {
+                if let Err(e) = r.put_idlog_entry(&account_fp, payload).await {
+                    eprintln!("failed to push genesis entry: {e}");
+                }
             }
         }
     }

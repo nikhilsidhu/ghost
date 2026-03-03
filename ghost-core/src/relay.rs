@@ -1,8 +1,10 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use ed25519_dalek::SigningKey;
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -59,12 +61,27 @@ struct WsHandle {
     task: JoinHandle<()>,
 }
 
+/// Auth context for request signing. Shared with WS tasks via Arc.
+#[derive(Clone)]
+pub struct AuthContext {
+    pub account_fp: [u8; 32],
+    pub device_vk: [u8; 32],
+    signing_key: SigningKey,
+}
+
+impl AuthContext {
+    fn sign_now(&self) -> ghost_wire::auth::AuthHeaders {
+        ghost_wire::auth::sign_request_headers(&self.account_fp, &self.device_vk, &self.signing_key)
+    }
+}
+
 pub struct RelayClient {
     base_url: String,
     ws_base_url: String,
     http: reqwest::Client,
     event_tx: mpsc::Sender<RelayEvent>,
     connections: HashMap<[u8; 32], WsHandle>,
+    auth: Option<Arc<AuthContext>>,
 }
 
 impl RelayClient {
@@ -84,8 +101,28 @@ impl RelayClient {
                 .unwrap_or_default(),
             event_tx,
             connections: HashMap::new(),
+            auth: None,
         };
         (client, event_rx)
+    }
+
+    /// Set auth credentials for request signing. Called once after identity is loaded.
+    pub fn set_auth(&mut self, account_fp: [u8; 32], device_vk: [u8; 32], signing_key: SigningKey) {
+        self.auth = Some(Arc::new(AuthContext { account_fp, device_vk, signing_key }));
+    }
+
+    /// Apply auth headers to a request builder if auth is configured.
+    fn authenticated(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.auth {
+            Some(auth) => {
+                let h = auth.sign_now();
+                req.header("X-Ghost-Account", &h.account)
+                    .header("X-Ghost-Device", &h.device)
+                    .header("X-Ghost-Timestamp", &h.timestamp)
+                    .header("X-Ghost-Signature", &h.signature)
+            }
+            None => req,
+        }
     }
 
     /// Subscribe to a mailbox. The connection is established in the background
@@ -103,7 +140,8 @@ impl RelayClient {
 
         let (outbox_tx, outbox_rx) = mpsc::channel(64);
         let event_tx = self.event_tx.clone();
-        let task = tokio::spawn(ws_task(url, mailbox_id, last_seen_seq, event_tx, outbox_rx));
+        let auth = self.auth.clone();
+        let task = tokio::spawn(ws_task(url, mailbox_id, last_seen_seq, event_tx, outbox_rx, auth));
         self.connections
             .insert(mailbox_id, WsHandle { outbox: outbox_tx, task });
     }
@@ -141,14 +179,15 @@ impl RelayClient {
     /// Send a blob to a mailbox via HTTP POST (no WebSocket subscription required).
     /// Returns the seq assigned by the relay.
     pub async fn post_blob(&self, mailbox_id: &[u8; 32], blob: Vec<u8>) -> Result<u64> {
-        let resp = self
+        let req = self
             .http
             .post(format!(
                 "{}/box/{}",
                 self.base_url,
                 URL_SAFE_NO_PAD.encode(mailbox_id)
             ))
-            .body(blob)
+            .body(blob);
+        let resp = self.authenticated(req)
             .send()
             .await
             .map_err(|e| GhostError::Network(e.to_string()))?;
@@ -263,14 +302,15 @@ impl RelayClient {
     }
 
     pub async fn put_server_info(&self, mailbox_id: &[u8; 32], data: Vec<u8>) -> Result<()> {
-        let resp = self
+        let req = self
             .http
             .put(format!(
                 "{}/box/{}/server_info",
                 self.base_url,
                 URL_SAFE_NO_PAD.encode(mailbox_id)
             ))
-            .body(data)
+            .body(data);
+        let resp = self.authenticated(req)
             .send()
             .await
             .map_err(|e| GhostError::Network(e.to_string()))?;
@@ -284,13 +324,14 @@ impl RelayClient {
     }
 
     pub async fn get_server_info(&self, mailbox_id: &[u8; 32]) -> Result<Vec<u8>> {
-        let resp = self
+        let req = self
             .http
             .get(format!(
                 "{}/box/{}/server_info",
                 self.base_url,
                 URL_SAFE_NO_PAD.encode(mailbox_id)
-            ))
+            ));
+        let resp = self.authenticated(req)
             .send()
             .await
             .map_err(|e| GhostError::Network(e.to_string()))?;
@@ -312,7 +353,7 @@ impl RelayClient {
         fingerprint: &[u8; 32],
         data: Vec<u8>,
     ) -> Result<()> {
-        let resp = self
+        let req = self
             .http
             .put(format!(
                 "{}/box/{}/avatar/{}",
@@ -320,7 +361,8 @@ impl RelayClient {
                 URL_SAFE_NO_PAD.encode(mailbox_id),
                 hex::encode(fingerprint),
             ))
-            .body(data)
+            .body(data);
+        let resp = self.authenticated(req)
             .send()
             .await
             .map_err(|e| GhostError::Network(e.to_string()))?;
@@ -335,14 +377,15 @@ impl RelayClient {
         mailbox_id: &[u8; 32],
         fingerprint: &[u8; 32],
     ) -> Result<Option<Vec<u8>>> {
-        let resp = self
+        let req = self
             .http
             .get(format!(
                 "{}/box/{}/avatar/{}",
                 self.base_url,
                 URL_SAFE_NO_PAD.encode(mailbox_id),
                 hex::encode(fingerprint),
-            ))
+            ));
+        let resp = self.authenticated(req)
             .send()
             .await
             .map_err(|e| GhostError::Network(e.to_string()))?;
@@ -363,14 +406,15 @@ impl RelayClient {
         mailbox_id: &[u8; 32],
         fingerprint: &[u8; 32],
     ) -> Result<()> {
-        let resp = self
+        let req = self
             .http
             .delete(format!(
                 "{}/box/{}/avatar/{}",
                 self.base_url,
                 URL_SAFE_NO_PAD.encode(mailbox_id),
                 hex::encode(fingerprint),
-            ))
+            ));
+        let resp = self.authenticated(req)
             .send()
             .await
             .map_err(|e| GhostError::Network(e.to_string()))?;
@@ -523,14 +567,15 @@ impl RelayClient {
         account_fp: &[u8; 32],
         data: Vec<u8>,
     ) -> Result<()> {
-        let resp = self
+        let req = self
             .http
             .put(format!(
                 "{}/recovery/{}",
                 self.base_url,
                 hex::encode(account_fp),
             ))
-            .body(data)
+            .body(data);
+        let resp = self.authenticated(req)
             .send()
             .await
             .map_err(|e| GhostError::Network(e.to_string()))?;
@@ -546,14 +591,15 @@ impl RelayClient {
         account_fp: &[u8; 32],
         data: Vec<u8>,
     ) -> Result<()> {
-        let resp = self
+        let req = self
             .http
             .put(format!(
                 "{}/sync_state/{}",
                 self.base_url,
                 hex::encode(account_fp),
             ))
-            .body(data)
+            .body(data);
+        let resp = self.authenticated(req)
             .send()
             .await
             .map_err(|e| GhostError::Network(e.to_string()))?;
@@ -568,13 +614,14 @@ impl RelayClient {
         &self,
         account_fp: &[u8; 32],
     ) -> Result<Option<Vec<u8>>> {
-        let resp = self
+        let req = self
             .http
             .get(format!(
                 "{}/sync_state/{}",
                 self.base_url,
                 hex::encode(account_fp),
-            ))
+            ));
+        let resp = self.authenticated(req)
             .send()
             .await
             .map_err(|e| GhostError::Network(e.to_string()))?;
@@ -633,6 +680,7 @@ async fn ws_task(
     initial_last_seen: u64,
     event_tx: mpsc::Sender<RelayEvent>,
     mut outbox_rx: mpsc::Receiver<WsOutgoing>,
+    auth: Option<Arc<AuthContext>>,
 ) {
     let mut last_seen = initial_last_seen;
     let mut backoff = INITIAL_BACKOFF;
@@ -645,9 +693,30 @@ async fn ws_task(
         }
         first_attempt = false;
 
-        let ws = match tokio_tungstenite::connect_async(&url).await {
-            Ok((ws, _)) => ws,
-            Err(_) => continue,
+        let ws = if let Some(ref auth) = auth {
+            let h = auth.sign_now();
+            let req = tokio_tungstenite::tungstenite::http::Request::builder()
+                .uri(&url)
+                .header("Host", url_host(&url))
+                .header("Connection", "Upgrade")
+                .header("Upgrade", "websocket")
+                .header("Sec-WebSocket-Version", "13")
+                .header("Sec-WebSocket-Key", tokio_tungstenite::tungstenite::handshake::client::generate_key())
+                .header("X-Ghost-Account", &h.account)
+                .header("X-Ghost-Device", &h.device)
+                .header("X-Ghost-Timestamp", &h.timestamp)
+                .header("X-Ghost-Signature", &h.signature)
+                .body(())
+                .unwrap();
+            match tokio_tungstenite::connect_async(req).await {
+                Ok((ws, _)) => ws,
+                Err(_) => continue,
+            }
+        } else {
+            match tokio_tungstenite::connect_async(&url).await {
+                Ok((ws, _)) => ws,
+                Err(_) => continue,
+            }
         };
 
         let (mut sink, mut stream) = ws.split();
@@ -731,7 +800,7 @@ async fn ws_task(
                                 let _ = event_tx.send(RelayEvent::Ack(ack)).await;
                             }
                         }
-                        Some(Ok(Message::Close(_))) | None => break, // reconnect
+                        Some(Ok(Message::Close(_))) | None => break,
                         _ => {}
                     }
                 }
@@ -747,4 +816,17 @@ fn parse_ack(text: &str) -> Option<Ack> {
     let seq: u64 = parts.next()?.parse().ok()?;
     let epoch_mismatch = parts.next() == Some(WS_SIGNAL_EPOCH_MISMATCH);
     Some(Ack { seq, epoch_mismatch })
+}
+
+/// Extract host[:port] from a ws:// or wss:// URL for the Host header.
+fn url_host(url: &str) -> String {
+    let without_scheme = url
+        .strip_prefix("ws://")
+        .or_else(|| url.strip_prefix("wss://"))
+        .unwrap_or(url);
+    without_scheme
+        .split('/')
+        .next()
+        .unwrap_or(without_scheme)
+        .to_string()
 }

@@ -3,6 +3,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 
+use crate::auth::DeviceAuth;
 use crate::constants::MAX_AVATAR_SIZE;
 use crate::error::{RelayError, Result};
 use crate::state::AppState;
@@ -17,6 +18,7 @@ fn decode_fingerprint(hex: &str) -> Result<[u8; 32]> {
 }
 
 pub async fn put(
+    _auth: DeviceAuth,
     State(state): State<AppState>,
     Path((mailbox_id, fingerprint)): Path<(String, String)>,
     body: Bytes,
@@ -31,6 +33,7 @@ pub async fn put(
 }
 
 pub async fn get(
+    _auth: DeviceAuth,
     State(state): State<AppState>,
     Path((mailbox_id, fingerprint)): Path<(String, String)>,
 ) -> Result<impl IntoResponse> {
@@ -43,6 +46,7 @@ pub async fn get(
 }
 
 pub async fn delete(
+    _auth: DeviceAuth,
     State(state): State<AppState>,
     Path((mailbox_id, fingerprint)): Path<(String, String)>,
 ) -> Result<StatusCode> {

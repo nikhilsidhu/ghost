@@ -45,4 +45,14 @@ pub enum GhostError {
     Io(#[from] std::io::Error),
 }
 
+impl From<ghost_wire::idlog::IdlogError> for GhostError {
+    fn from(e: ghost_wire::idlog::IdlogError) -> Self {
+        match e {
+            ghost_wire::idlog::IdlogError::Format(msg) => GhostError::Format(msg),
+            ghost_wire::idlog::IdlogError::InvalidKey(msg) => GhostError::InvalidKey(msg),
+            ghost_wire::idlog::IdlogError::AuthenticationFailed => GhostError::AuthenticationFailed,
+        }
+    }
+}
+
 pub type Result<T> = std::result::Result<T, GhostError>;

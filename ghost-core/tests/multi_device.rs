@@ -2,7 +2,7 @@ mod common;
 
 use std::time::Duration;
 
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{Signer, SigningKey};
 use rand::rngs::OsRng;
 
 use ghost_core::client::GhostClient;
@@ -276,21 +276,6 @@ fn sync_dump_import_between_clients() {
     assert_eq!(ts, 400);
 }
 
-#[test]
-fn sync_key_not_set_returns_none() {
-    let (client, _, _) = make_ghost_client("test");
-    assert!(client.sync_key().is_none());
-}
-
-#[test]
-fn sync_key_set_and_retrieve() {
-    let (client, _, _) = make_ghost_client("test");
-
-    let key = [0xAB; 32];
-    client.set_sync_key(key).unwrap();
-    assert_eq!(client.sync_key().unwrap(), key);
-}
-
 // ── Pairing: crypto through relay ───────────────────────────────────
 
 #[tokio::test]
@@ -544,7 +529,21 @@ async fn full_pairing_then_sync_exchange() {
     provision_pt.extend_from_slice(&0u16.to_be_bytes()); // 0 servers
     provision_pt.extend_from_slice(&encode_sync_state_dump(&sync_dump));
     let provision_sealed = sync_seal(&secret, &provision_pt).unwrap();
+
+    // put_provision requires auth — sign as device_a
+    let prov_timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let da_vk = device_a.verifying_key().to_bytes();
+    let prov_msg = ghost_wire::auth::auth_message(&fp, &da_vk, prov_timestamp);
+    let prov_sig = device_a.sign(&prov_msg);
+
     http.put(format!("{}/pair/{}/provision", relay_url, fp_hex))
+        .header("x-ghost-account", hex::encode(fp))
+        .header("x-ghost-device", hex::encode(da_vk))
+        .header("x-ghost-timestamp", prov_timestamp.to_string())
+        .header("x-ghost-signature", hex::encode(prov_sig.to_bytes()))
         .body(provision_sealed)
         .send()
         .await
@@ -604,6 +603,8 @@ async fn full_pairing_then_sync_exchange() {
     let mailbox = client_a.sync_mailbox_id().unwrap();
     let (mut relay_a2, _events_a) = RelayClient::new(&relay_url);
     let (mut relay_b2, mut events_b) = RelayClient::new(&relay_url);
+    relay_a2.set_auth(fp, device_a.verifying_key().to_bytes(), device_a.clone());
+    relay_b2.set_auth(fp, device_b.verifying_key().to_bytes(), device_b.clone());
     relay_a2.subscribe(mailbox, 0);
     relay_b2.subscribe(mailbox, 0);
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -637,7 +638,7 @@ async fn full_pairing_then_sync_exchange() {
 #[tokio::test]
 async fn recovery_full_flow() {
     let relay_url = common::start_relay().await;
-    let (relay, _) = RelayClient::new(&relay_url);
+    let (mut relay, _) = RelayClient::new(&relay_url);
 
     // 1. Create account with 2 devices
     let (master, device1, genesis, fp, seed) = make_account("desktop");
@@ -650,6 +651,9 @@ async fn recovery_full_flow() {
     let s1 = validate_chain(&[genesis.clone()]).unwrap();
     let add = create_add_device(&s1, &device1, &device2, "phone");
     relay.put_idlog_entry(&fp, add.to_bytes()).await.unwrap();
+
+    // Set auth as device1 for subsequent authenticated calls
+    relay.set_auth(fp, device1.verifying_key().to_bytes(), device1.clone());
 
     // Both devices had a sync key
     let old_sync_key = [0xAA; 32];

@@ -15,6 +15,9 @@ pub enum RelayError {
     #[error("payload too large")]
     PayloadTooLarge,
 
+    #[error("unauthorized: {0}")]
+    Unauthorized(String),
+
     #[error("conflict")]
     Conflict,
 
@@ -28,6 +31,7 @@ impl IntoResponse for RelayError {
             Self::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
             Self::NotFound => (StatusCode::NOT_FOUND, "not found".into()),
             Self::Gone(msg) => (StatusCode::GONE, msg.clone()),
+            Self::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg.clone()),
             Self::PayloadTooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "payload too large".into()),
             Self::Conflict => (StatusCode::CONFLICT, "conflict".into()),
             Self::Storage(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),

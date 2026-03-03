@@ -11,17 +11,6 @@ use super::decode_account_fp;
 
 const MAX_IDLOG_ENTRY_SIZE: usize = 4096;
 
-/// Extract seq and prev_hash from the wire-format payload header.
-/// Wire format starts with: [seq:8][prev_hash:32][...]
-fn parse_entry_header(payload: &[u8]) -> Result<(u64, [u8; 32])> {
-    if payload.len() < 40 {
-        return Err(RelayError::BadRequest("payload too short".into()));
-    }
-    let seq = u64::from_be_bytes(payload[..8].try_into().unwrap());
-    let prev_hash: [u8; 32] = payload[8..40].try_into().unwrap();
-    Ok((seq, prev_hash))
-}
-
 /// PUT /idlog/{account_fp_hex} — append a new identity log entry.
 pub async fn put(
     State(state): State<AppState>,
@@ -37,8 +26,10 @@ pub async fn put(
         return Err(RelayError::PayloadTooLarge);
     }
 
-    let (seq, prev_hash) = parse_entry_header(&body)?;
-    state.storage.append_idlog_entry(&account_fp, seq, &prev_hash, &body)?;
+    let revoked = state.storage.append_idlog_entry(&account_fp, &body)?;
+    for device_vk in revoked {
+        let _ = state.revocation_tx.send((account_fp, device_vk));
+    }
     Ok(StatusCode::CREATED)
 }
 

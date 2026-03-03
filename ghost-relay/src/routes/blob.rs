@@ -5,6 +5,7 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+use crate::auth::DeviceAuth;
 use crate::constants::{DEFAULT_READ_LIMIT, MAX_LONG_POLL_MS};
 use crate::error::Result;
 use crate::mailbox::Mailbox;
@@ -46,6 +47,7 @@ pub(crate) struct BlobQuery {
 }
 
 pub async fn post_blob(
+    _auth: DeviceAuth,
     State(state): State<AppState>,
     Path(mailbox_id): Path<String>,
     body: Bytes,
@@ -56,6 +58,7 @@ pub async fn post_blob(
 }
 
 pub async fn get_blobs(
+    _auth: DeviceAuth,
     State(state): State<AppState>,
     Path(mailbox_id): Path<String>,
     Query(query): Query<BlobQuery>,

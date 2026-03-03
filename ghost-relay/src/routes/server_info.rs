@@ -3,11 +3,13 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 
+use crate::auth::DeviceAuth;
 use crate::error::Result;
 use crate::state::AppState;
 use crate::util::decode_mailbox_id;
 
 pub async fn put(
+    _auth: DeviceAuth,
     State(state): State<AppState>,
     Path(mailbox_id): Path<String>,
     body: Bytes,
@@ -18,6 +20,7 @@ pub async fn put(
 }
 
 pub async fn get(
+    _auth: DeviceAuth,
     State(state): State<AppState>,
     Path(mailbox_id): Path<String>,
 ) -> Result<impl IntoResponse> {

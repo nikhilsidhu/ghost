@@ -117,6 +117,14 @@ impl GhostClient {
         &self.identity.fingerprint
     }
 
+    pub fn verifying_key_bytes(&self) -> [u8; 32] {
+        self.identity.verifying_key.to_bytes()
+    }
+
+    pub fn signing_key_clone(&self) -> ed25519_dalek::SigningKey {
+        self.identity.signing_key.clone()
+    }
+
     pub fn store(&self) -> &GhostStore {
         &self.store
     }
@@ -811,12 +819,9 @@ impl GhostClient {
             if leaf_indices.is_empty() {
                 continue;
             }
-            match group.remove_members(&self.provider, &leaf_indices) {
-                Ok(commit_blob) => {
-                    let mailbox_id = mls_group_mailbox_id(group.group_id());
-                    outbound.push(Outbound { mailbox_id, blob: commit_blob });
-                }
-                Err(e) => eprintln!("revoke: remove from {}: {e}", hex::encode(&sid[..8])),
+            if let Ok(commit_blob) = group.remove_members(&self.provider, &leaf_indices) {
+                let mailbox_id = mls_group_mailbox_id(group.group_id());
+                outbound.push(Outbound { mailbox_id, blob: commit_blob });
             }
         }
         outbound

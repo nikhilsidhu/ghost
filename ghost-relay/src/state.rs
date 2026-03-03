@@ -62,6 +62,9 @@ pub struct Inner {
     pub pairing: RwLock<HashMap<[u8; 32], PairingSession>>,
     pub provision: RwLock<HashMap<[u8; 32], ProvisionEntry>>,
     pub next_conn_id: AtomicU64,
+    /// Broadcast (account_fp, device_vk) when a device is revoked, so WS
+    /// connections belonging to that device can close immediately.
+    pub revocation_tx: broadcast::Sender<([u8; 32], [u8; 32])>,
 }
 
 impl Inner {
@@ -86,6 +89,7 @@ pub type AppState = Arc<Inner>;
 
 pub fn new_state(config: Config, storage: Storage) -> AppState {
     let (voice_udp_port, voice_udp_port_rx) = watch::channel(0);
+    let (revocation_tx, _) = broadcast::channel(16);
     Arc::new(Inner {
         mailboxes: RwLock::new(HashMap::new()),
         invites: RwLock::new(HashMap::new()),
@@ -101,5 +105,6 @@ pub fn new_state(config: Config, storage: Storage) -> AppState {
         pairing: RwLock::new(HashMap::new()),
         provision: RwLock::new(HashMap::new()),
         next_conn_id: AtomicU64::new(1),
+        revocation_tx,
     })
 }
