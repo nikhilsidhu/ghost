@@ -111,6 +111,28 @@ impl RelayClient {
         self.auth = Some(Arc::new(AuthContext { account_fp, device_vk, signing_key }));
     }
 
+    /// Fetch the relay's Ed25519 verifying key (hex-encoded, 32 bytes).
+    pub async fn get_relay_key(&self) -> Result<[u8; 32]> {
+        let resp = self
+            .http
+            .get(format!("{}/relay_key", self.base_url))
+            .send()
+            .await
+            .map_err(|e| GhostError::Network(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(GhostError::Network(format!("get relay_key: {}", resp.status())));
+        }
+        let hex_str = resp
+            .text()
+            .await
+            .map_err(|e| GhostError::Network(e.to_string()))?;
+        let bytes = hex::decode(hex_str.trim())
+            .map_err(|e| GhostError::Network(format!("relay_key hex: {e}")))?;
+        bytes
+            .try_into()
+            .map_err(|_| GhostError::Network("relay_key must be 32 bytes".into()))
+    }
+
     /// Apply auth headers to a request builder if auth is configured.
     fn authenticated(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         match &self.auth {

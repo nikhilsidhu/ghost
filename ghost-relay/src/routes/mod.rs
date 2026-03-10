@@ -3,6 +3,7 @@ mod blob;
 mod idlog;
 pub(crate) mod pair;
 mod recovery;
+mod relay_key;
 mod server_info;
 mod sync_state;
 mod health;
@@ -29,6 +30,7 @@ pub fn router(state: AppState) -> Router {
     let max_body = state.config.max_blob_size;
     Router::new()
         .route("/health", get(health::health))
+        .route("/relay_key", get(relay_key::get))
         .route("/box/{mailbox_id}", post(blob::post_blob).get(blob::get_blobs))
         .route("/box/{mailbox_id}/server_info", put(server_info::put).get(server_info::get))
         .route("/box/{mailbox_id}/avatar/{fingerprint}", put(avatar::put).get(avatar::get).delete(avatar::delete))

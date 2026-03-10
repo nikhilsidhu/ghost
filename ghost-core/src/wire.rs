@@ -453,6 +453,7 @@ pub fn encode_sync_state_dump(entries: &[(String, Option<Vec<u8>>, u64)]) -> Vec
         buf.extend_from_slice(&ts.to_be_bytes());
         match value {
             Some(v) => {
+                assert!(v.len() < 0xFFFF, "sync value too large (0xFFFF reserved for tombstone)");
                 buf.extend_from_slice(&(v.len() as u16).to_be_bytes());
                 buf.extend_from_slice(v);
             }
@@ -1081,7 +1082,7 @@ mod tests {
         let provider = GhostProvider::new_in_memory().unwrap();
         let id = Identity::from_seed([0x01; 32]).unwrap();
         let server_id = [0x42; 32];
-        let group = GhostGroup::create_with_id(&provider, &id, &server_id).unwrap();
+        let group = GhostGroup::create_with_id(&provider, &id, &server_id, None).unwrap();
 
         let expected = derive_mls_group_id(&server_id);
         assert_eq!(group.group_id(), expected);
@@ -1096,7 +1097,7 @@ mod tests {
 
         let server_id = [0x42; 32];
         let mut group_a =
-            GhostGroup::create_with_id(&provider_a, &id_a, &server_id).unwrap();
+            GhostGroup::create_with_id(&provider_a, &id_a, &server_id, None).unwrap();
         let kp_b = generate_key_package(&provider_b, &id_b).unwrap();
         let (_commit, welcome) = group_a.add_member(&provider_a, kp_b).unwrap();
         let mut group_b =
@@ -1131,7 +1132,7 @@ mod tests {
 
         let server_id = [0x42; 32];
         let mut group_a =
-            GhostGroup::create_with_id(&provider_a, &id_a, &server_id).unwrap();
+            GhostGroup::create_with_id(&provider_a, &id_a, &server_id, None).unwrap();
         let kp_b = generate_key_package(&provider_b, &id_b).unwrap();
         let (_commit, welcome) = group_a.add_member(&provider_a, kp_b).unwrap();
         let mut group_b =

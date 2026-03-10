@@ -29,6 +29,25 @@ fn outbound_to_inbound(msg: &MlsMessageOut) -> std::result::Result<MlsMessageIn,
         .map_err(|e| GhostError::Mls(format!("deserialize: {e}")))
 }
 
+/// Validate pending proposals when building commits.
+/// Accepts member proposals (relay already validated) and relay external proposals
+/// (remove + group context extensions). Rejects unexpected sender types.
+fn validate_pending_proposal(proposal: &QueuedProposal) -> bool {
+    match proposal.sender() {
+        Sender::Member(_) => true,
+        Sender::External(_) => matches!(
+            proposal.proposal(),
+            Proposal::Remove(_) | Proposal::GroupContextExtensions(_)
+        ),
+        // External commit: ExternalInit is required, Remove/PSK are allowed
+        Sender::NewMemberCommit => matches!(
+            proposal.proposal(),
+            Proposal::ExternalInit(_) | Proposal::Remove(_) | Proposal::PreSharedKey(_)
+        ),
+        _ => false,
+    }
+}
+
 /// An encrypted MLS group — used for both multi-member groups and 2-person DMs.
 pub struct GhostGroup {
     mls_group: MlsGroup,
@@ -36,18 +55,36 @@ pub struct GhostGroup {
 }
 
 impl GhostGroup {
+    /// Build an MlsGroupCreateConfig, optionally adding ExternalSendersExtension.
+    fn build_create_config(relay_vk: Option<&[u8; 32]>) -> Result<MlsGroupCreateConfig> {
+        let mut builder = MlsGroupCreateConfig::builder()
+            .use_ratchet_tree_extension(true)
+            .max_past_epochs(1)
+            .wire_format_policy(MIXED_PLAINTEXT_WIRE_FORMAT_POLICY);
+
+        if let Some(vk) = relay_vk {
+            let external_sender = ExternalSender::new(
+                SignaturePublicKey::from(vk.to_vec()),
+                Credential::new(CredentialType::Basic, b"ghost-relay".to_vec()),
+            );
+            let ext = Extension::ExternalSenders(vec![external_sender]);
+            let extensions = Extensions::single(ext)
+                .map_err(|e| GhostError::Mls(format!("external senders extension: {e}")))?;
+            builder = builder.with_group_context_extensions(extensions);
+        }
+
+        Ok(builder.build())
+    }
+
     /// Start a new group where this identity is the first (and only) member.
     pub fn create(
         provider: &GhostProvider,
         identity: &Identity,
+        relay_vk: Option<&[u8; 32]>,
     ) -> Result<Self> {
         let signer = signer_from_identity(identity);
         let credential = credential_from_identity(identity);
-
-        let config = MlsGroupCreateConfig::builder()
-            .use_ratchet_tree_extension(true)
-            .max_past_epochs(1)
-            .build();
+        let config = Self::build_create_config(relay_vk)?;
 
         let mls_group = MlsGroup::new(
             provider,
@@ -65,14 +102,11 @@ impl GhostGroup {
         provider: &GhostProvider,
         identity: &Identity,
         server_id: &[u8; 32],
+        relay_vk: Option<&[u8; 32]>,
     ) -> Result<Self> {
         let signer = signer_from_identity(identity);
         let credential = credential_from_identity(identity);
-
-        let config = MlsGroupCreateConfig::builder()
-            .use_ratchet_tree_extension(true)
-            .max_past_epochs(1)
-            .build();
+        let config = Self::build_create_config(relay_vk)?;
 
         let mls_group_id = derive_mls_group_id(server_id);
         let mls_group = MlsGroup::new_with_group_id(
@@ -118,7 +152,7 @@ impl GhostGroup {
             .propose_adds([key_package])
             .load_psks(provider.storage())
             .map_err(|e| GhostError::Mls(format!("load psks: {e}")))?
-            .build(provider.rand(), provider.crypto(), &self.signer, |_| true)
+            .build(provider.rand(), provider.crypto(), &self.signer, validate_pending_proposal)
             .map_err(|e| GhostError::Mls(format!("build add commit: {e}")))?
             .stage_commit(provider)
             .map_err(|e| GhostError::Mls(format!("stage add commit: {e}")))?;
@@ -149,7 +183,7 @@ impl GhostGroup {
             .propose_removals(members.iter().copied())
             .load_psks(provider.storage())
             .map_err(|e| GhostError::Mls(format!("load psks: {e}")))?
-            .build(provider.rand(), provider.crypto(), &self.signer, |_| true)
+            .build(provider.rand(), provider.crypto(), &self.signer, validate_pending_proposal)
             .map_err(|e| GhostError::Mls(format!("build remove commit: {e}")))?
             .stage_commit(provider)
             .map_err(|e| GhostError::Mls(format!("stage remove commit: {e}")))?;
@@ -238,6 +272,8 @@ impl GhostGroup {
         };
         let join_config = MlsGroupJoinConfig::builder()
             .max_past_epochs(1)
+            .wire_format_policy(MIXED_PLAINTEXT_WIRE_FORMAT_POLICY)
+            .use_ratchet_tree_extension(true)
             .build();
         let mls_group =
             StagedWelcome::new_from_welcome(provider, &join_config, welcome_msg, None)
@@ -289,6 +325,55 @@ impl GhostGroup {
             .map_err(|e| GhostError::Mls(format!("serialize group info: {e}")))
     }
 
+    /// Check if this group already has ExternalSendersExtension.
+    pub fn has_external_senders(&self) -> bool {
+        self.mls_group.extensions().external_senders().is_some()
+    }
+
+    /// Add ExternalSendersExtension for the relay key to a group that was
+    /// created before relay MLS enforcement. Returns envelope-wrapped commit.
+    pub fn add_external_sender_extension(
+        &mut self,
+        provider: &GhostProvider,
+        relay_vk: &[u8; 32],
+    ) -> Result<Vec<u8>> {
+        let external_sender = ExternalSender::new(
+            SignaturePublicKey::from(relay_vk.to_vec()),
+            Credential::new(CredentialType::Basic, b"ghost-relay".to_vec()),
+        );
+
+        // Build new extensions: keep existing ones, add ExternalSenders
+        let mut ext_vec: Vec<Extension> = Vec::new();
+        for e in self.mls_group.extensions().iter() {
+            ext_vec.push(e.clone());
+        }
+        ext_vec.push(Extension::ExternalSenders(vec![external_sender]));
+
+        let extensions = Extensions::from_vec(ext_vec)
+            .map_err(|e| GhostError::Mls(format!("build extensions: {e}")))?;
+
+        let epoch = self.epoch();
+        let bundle = self.mls_group.commit_builder()
+            .propose_group_context_extensions(extensions)
+            .map_err(|e| GhostError::Mls(format!("propose extensions: {e}")))?
+            .load_psks(provider.storage())
+            .map_err(|e| GhostError::Mls(format!("load psks: {e}")))?
+            .build(provider.rand(), provider.crypto(), &self.signer, validate_pending_proposal)
+            .map_err(|e| GhostError::Mls(format!("build extension commit: {e}")))?
+            .stage_commit(provider)
+            .map_err(|e| GhostError::Mls(format!("stage extension commit: {e}")))?;
+
+        let commit_bytes = bundle.into_commit()
+            .to_bytes()
+            .map_err(|e| GhostError::Mls(format!("serialize extension commit: {e}")))?;
+
+        self.mls_group
+            .merge_pending_commit(provider)
+            .map_err(|e| GhostError::Mls(format!("merge extension commit: {e}")))?;
+
+        Ok(wrap_commit(&commit_bytes, epoch))
+    }
+
     /// Join an existing group using exported GroupInfo (external commit).
     /// Returns the new group and the serialized commit to broadcast to existing members.
     pub fn join_by_external_commit(
@@ -308,6 +393,8 @@ impl GhostGroup {
 
         let ext_join_config = MlsGroupJoinConfig::builder()
             .max_past_epochs(1)
+            .wire_format_policy(MIXED_PLAINTEXT_WIRE_FORMAT_POLICY)
+            .use_ratchet_tree_extension(true)
             .build();
         let (mls_group, commit_bundle) = MlsGroup::external_commit_builder()
             .with_config(ext_join_config)
@@ -315,7 +402,7 @@ impl GhostGroup {
             .map_err(|e| GhostError::Mls(format!("build external commit: {e}")))?
             .load_psks(provider.storage())
             .map_err(|e| GhostError::Mls(format!("load psks: {e}")))?
-            .build(provider.rand(), provider.crypto(), &signer, |_| true)
+            .build(provider.rand(), provider.crypto(), &signer, validate_pending_proposal)
             .map_err(|e| GhostError::Mls(format!("build commit: {e}")))?
             .finalize(provider)
             .map_err(|e| GhostError::Mls(format!("finalize external commit: {e}")))?;
@@ -337,11 +424,22 @@ mod tests {
     use crate::mls::credential::generate_key_package;
 
     #[test]
-    fn create_group() {
+    fn create_group_has_single_member() {
         let provider = GhostProvider::new_in_memory().unwrap();
         let id = Identity::from_seed([0x01u8; 32]).unwrap();
-        let group = GhostGroup::create(&provider, &id).unwrap();
+        let group = GhostGroup::create(&provider, &id, None).unwrap();
         assert!(!group.group_id().is_empty());
+        assert_eq!(group.members().count(), 1);
+        assert!(!group.has_external_senders());
+    }
+
+    #[test]
+    fn create_with_relay_vk_enables_external_senders() {
+        let provider = GhostProvider::new_in_memory().unwrap();
+        let id = Identity::from_seed([0x01u8; 32]).unwrap();
+        let relay_vk = [0xFFu8; 32];
+        let group = GhostGroup::create(&provider, &id, Some(&relay_vk)).unwrap();
+        assert!(group.has_external_senders());
     }
 
     #[test]
@@ -352,7 +450,7 @@ mod tests {
         let id_a = Identity::from_seed([0x01u8; 32]).unwrap();
         let id_b = Identity::from_seed([0x02u8; 32]).unwrap();
 
-        let mut group_a = GhostGroup::create(&provider_a, &id_a).unwrap();
+        let mut group_a = GhostGroup::create(&provider_a, &id_a, None).unwrap();
         let kp_b = generate_key_package(&provider_b, &id_b).unwrap();
 
         let (_commit, welcome) = group_a
@@ -373,7 +471,7 @@ mod tests {
         let id_a = Identity::from_seed([0x01u8; 32]).unwrap();
         let id_b = Identity::from_seed([0x02u8; 32]).unwrap();
 
-        let mut group_a = GhostGroup::create(&provider_a, &id_a).unwrap();
+        let mut group_a = GhostGroup::create(&provider_a, &id_a, None).unwrap();
         let kp_b = generate_key_package(&provider_b, &id_b).unwrap();
         let (_commit, welcome) = group_a
             .add_member(&provider_a, kp_b)
@@ -394,15 +492,20 @@ mod tests {
     }
 
     #[test]
-    fn export_secret_returns_32_bytes() {
+    fn export_secret_differs_by_label_and_is_deterministic() {
         let provider = GhostProvider::new_in_memory().unwrap();
         let id = Identity::from_seed([0x01u8; 32]).unwrap();
-        let group = GhostGroup::create(&provider, &id).unwrap();
+        let group = GhostGroup::create(&provider, &id, None).unwrap();
 
-        let secret = group
-            .export_secret(&provider, "ghost-voice", b"test-context", 32)
-            .unwrap();
-        assert_eq!(secret.len(), 32);
+        let s1 = group.export_secret(&provider, "label-a", b"ctx", 32).unwrap();
+        let s2 = group.export_secret(&provider, "label-b", b"ctx", 32).unwrap();
+        let s3 = group.export_secret(&provider, "label-a", b"other-ctx", 32).unwrap();
+        assert_ne!(s1, s2, "different labels must produce different secrets");
+        assert_ne!(s1, s3, "different contexts must produce different secrets");
+
+        // Same inputs must be deterministic
+        let s1_again = group.export_secret(&provider, "label-a", b"ctx", 32).unwrap();
+        assert_eq!(s1, s1_again);
     }
 
     #[test]
@@ -413,7 +516,7 @@ mod tests {
         let id_a = Identity::from_seed([0x01u8; 32]).unwrap();
         let id_b = Identity::from_seed([0x02u8; 32]).unwrap();
 
-        let group_a = GhostGroup::create(&provider_a, &id_a).unwrap();
+        let group_a = GhostGroup::create(&provider_a, &id_a, None).unwrap();
         let group_info_bytes = group_a.export_group_info(&provider_a).unwrap();
 
         let (group_b, commit_bytes) =
@@ -430,7 +533,7 @@ mod tests {
         let server_id = [0x42u8; 32];
 
         let original = GhostGroup::create_with_id(
-            &provider, &id, &server_id,
+            &provider, &id, &server_id, None,
         ).unwrap();
         let original_mls_id = original.group_id().to_vec();
 
@@ -448,7 +551,7 @@ mod tests {
         let id_a = Identity::from_seed([0x01u8; 32]).unwrap();
         let id_b = Identity::from_seed([0x02u8; 32]).unwrap();
 
-        let mut group_a = GhostGroup::create(&provider_a, &id_a).unwrap();
+        let mut group_a = GhostGroup::create(&provider_a, &id_a, None).unwrap();
 
         let kp_b = generate_key_package(&provider_b, &id_b).unwrap();
         let (_commit, _welcome) = group_a
@@ -469,5 +572,57 @@ mod tests {
         // Only creator's leaf should remain
         let member_count = group_a.members().count();
         assert_eq!(member_count, 1);
+    }
+
+    #[test]
+    fn add_external_sender_extension_to_existing_group() {
+        let provider = GhostProvider::new_in_memory().unwrap();
+        let id = Identity::from_seed([0x01u8; 32]).unwrap();
+        let mut group = GhostGroup::create(&provider, &id, None).unwrap();
+        assert!(!group.has_external_senders());
+
+        let relay_vk = [0xFFu8; 32];
+        let commit = group.add_external_sender_extension(&provider, &relay_vk).unwrap();
+        assert!(!commit.is_empty());
+        assert!(group.has_external_senders());
+    }
+
+    #[test]
+    fn delete_then_load_returns_none() {
+        let provider = GhostProvider::new_in_memory().unwrap();
+        let id = Identity::from_seed([0x01u8; 32]).unwrap();
+        let server_id = [0x42u8; 32];
+
+        let group = GhostGroup::create_with_id(&provider, &id, &server_id, None).unwrap();
+        assert!(GhostGroup::load(&provider, &id, &server_id).unwrap().is_some());
+        group.delete(&provider).unwrap();
+        assert!(GhostGroup::load(&provider, &id, &server_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn load_nonexistent_returns_none() {
+        let provider = GhostProvider::new_in_memory().unwrap();
+        let id = Identity::from_seed([0x01u8; 32]).unwrap();
+        assert!(GhostGroup::load(&provider, &id, &[0x99u8; 32]).unwrap().is_none());
+    }
+
+    #[test]
+    fn wrap_commit_produces_valid_envelope() {
+        let mls_bytes = b"fake-commit-payload";
+        let epoch = 42u64;
+        let wrapped = wrap_commit(mls_bytes, epoch);
+
+        let (envelope_type, decoded_epoch) = ghost_wire::decode_envelope(&wrapped).unwrap();
+        assert_eq!(envelope_type, ghost_wire::EnvelopeType::Commit);
+        assert_eq!(decoded_epoch, epoch);
+        assert_eq!(ghost_wire::envelope_payload(&wrapped), mls_bytes);
+    }
+
+    #[test]
+    fn process_message_bytes_rejects_garbage() {
+        let provider = GhostProvider::new_in_memory().unwrap();
+        let id = Identity::from_seed([0x01u8; 32]).unwrap();
+        let mut group = GhostGroup::create(&provider, &id, None).unwrap();
+        assert!(group.process_message_bytes(&provider, b"not-valid-mls").is_err());
     }
 }

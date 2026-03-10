@@ -105,10 +105,40 @@ impl Storage {
                  account_fp BLOB NOT NULL PRIMARY KEY,
                  data BLOB NOT NULL,
                  updated_at INTEGER NOT NULL
+             );
+
+             CREATE TABLE IF NOT EXISTS mls_public_group (
+                 group_id BLOB NOT NULL,
+                 component TEXT NOT NULL,
+                 data BLOB NOT NULL,
+                 PRIMARY KEY (group_id, component)
+             ) WITHOUT ROWID;
+
+             CREATE TABLE IF NOT EXISTS mls_proposals (
+                 group_id BLOB NOT NULL,
+                 proposal_ref BLOB NOT NULL,
+                 data BLOB NOT NULL,
+                 PRIMARY KEY (group_id, proposal_ref)
+             ) WITHOUT ROWID;
+
+             CREATE TABLE IF NOT EXISTS mailbox_members (
+                 mailbox_id BLOB NOT NULL,
+                 account_fp BLOB NOT NULL,
+                 PRIMARY KEY (mailbox_id, account_fp)
+             ) WITHOUT ROWID;
+
+             CREATE TABLE IF NOT EXISTS relay_keypair (
+                 id INTEGER PRIMARY KEY CHECK (id = 1),
+                 signing_key BLOB NOT NULL,
+                 verifying_key BLOB NOT NULL
              );",
         )
         .map_err(|e| RelayError::Storage(e.to_string()))?;
         Ok(())
+    }
+
+    pub fn conn(&self) -> &Mutex<Connection> {
+        &self.conn
     }
 
     /// Store a blob, enforcing epoch ordering for commits.
@@ -655,6 +685,126 @@ impl Storage {
         .map_err(|e| RelayError::Storage(e.to_string()))
     }
 
+    /// Return distinct serialized group_ids from the mls_public_group table.
+    pub fn stored_mls_group_ids(&self) -> Result<Vec<Vec<u8>>, RelayError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare_cached("SELECT DISTINCT group_id FROM mls_public_group")
+            .map_err(|e| RelayError::Storage(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, Vec<u8>>(0))
+            .map_err(|e| RelayError::Storage(e.to_string()))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| RelayError::Storage(e.to_string()))
+    }
+
+    /// Replace the member set for a mailbox with the given account fingerprints.
+    pub fn update_mailbox_members(
+        &self,
+        mailbox_id: &[u8; 32],
+        members: &[[u8; 32]],
+    ) -> Result<(), RelayError> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| RelayError::Storage(e.to_string()))?;
+        tx.execute(
+            "DELETE FROM mailbox_members WHERE mailbox_id = ?1",
+            params![mailbox_id.as_slice()],
+        )
+        .map_err(|e| RelayError::Storage(e.to_string()))?;
+        for fp in members {
+            tx.execute(
+                "INSERT OR IGNORE INTO mailbox_members (mailbox_id, account_fp) VALUES (?1, ?2)",
+                params![mailbox_id.as_slice(), fp.as_slice()],
+            )
+            .map_err(|e| RelayError::Storage(e.to_string()))?;
+        }
+        tx.commit().map_err(|e| RelayError::Storage(e.to_string()))
+    }
+
+    pub fn is_mailbox_member(
+        &self,
+        mailbox_id: &[u8; 32],
+        account_fp: &[u8; 32],
+    ) -> Result<bool, RelayError> {
+        let conn = self.conn.lock().unwrap();
+        let exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM mailbox_members WHERE mailbox_id = ?1 AND account_fp = ?2)",
+                params![mailbox_id.as_slice(), account_fp.as_slice()],
+                |row| row.get(0),
+            )
+            .map_err(|e| RelayError::Storage(e.to_string()))?;
+        Ok(exists)
+    }
+
+    /// Returns true if any membership rows exist for this mailbox (i.e., the relay has ACL data).
+    pub fn has_mailbox_members(&self, mailbox_id: &[u8; 32]) -> Result<bool, RelayError> {
+        let conn = self.conn.lock().unwrap();
+        let exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM mailbox_members WHERE mailbox_id = ?1)",
+                params![mailbox_id.as_slice()],
+                |row| row.get(0),
+            )
+            .map_err(|e| RelayError::Storage(e.to_string()))?;
+        Ok(exists)
+    }
+
+    /// Load or generate the relay Ed25519 keypair.
+    pub fn get_or_create_relay_keypair(&self) -> Result<([u8; 32], [u8; 64]), RelayError> {
+        let conn = self.conn.lock().unwrap();
+        let existing: Option<(Vec<u8>, Vec<u8>)> = conn
+            .query_row(
+                "SELECT signing_key, verifying_key FROM relay_keypair WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| RelayError::Storage(e.to_string()))?;
+
+        if let Some((sk, vk)) = existing {
+            let vk: [u8; 32] = vk.try_into().map_err(|_| RelayError::Storage("corrupt relay vk".into()))?;
+            let sk: [u8; 64] = sk.try_into().map_err(|_| RelayError::Storage("corrupt relay sk".into()))?;
+            return Ok((vk, sk));
+        }
+
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+        let sk = SigningKey::generate(&mut OsRng);
+        let vk = sk.verifying_key();
+        let sk_bytes = sk.to_keypair_bytes();
+        let vk_bytes = vk.to_bytes();
+
+        conn.execute(
+            "INSERT INTO relay_keypair (id, signing_key, verifying_key) VALUES (1, ?1, ?2)",
+            params![sk_bytes.as_slice(), vk_bytes.as_slice()],
+        )
+        .map_err(|e| RelayError::Storage(e.to_string()))?;
+
+        Ok((vk_bytes, sk_bytes))
+    }
+
+    /// Get all mailbox IDs where an account is a member.
+    pub fn mailboxes_for_account(&self, account_fp: &[u8; 32]) -> Result<Vec<[u8; 32]>, RelayError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare_cached("SELECT mailbox_id FROM mailbox_members WHERE account_fp = ?1")
+            .map_err(|e| RelayError::Storage(e.to_string()))?;
+        let rows: Vec<Vec<u8>> = stmt
+            .query_map(params![account_fp.as_slice()], |row| row.get(0))
+            .map_err(|e| RelayError::Storage(e.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| RelayError::Storage(e.to_string()))?;
+        let mut result = Vec::with_capacity(rows.len());
+        for r in rows {
+            let arr: [u8; 32] = r.try_into().map_err(|_| RelayError::Storage("corrupt mailbox_id".into()))?;
+            result.push(arr);
+        }
+        Ok(result)
+    }
+
 }
 
 #[cfg(test)]
@@ -1053,4 +1203,70 @@ mod tests {
         assert!(matches!(err, RelayError::BadRequest(_)));
     }
 
+    // -- Mailbox members tests --
+
+    #[test]
+    fn mailbox_members_set_check_replace() {
+        let store = Storage::open_in_memory().unwrap();
+        let mb = [0xAA; 32];
+        let fp_a = [0x01; 32];
+        let fp_b = [0x02; 32];
+        let fp_c = [0x03; 32];
+
+        // No members initially
+        assert!(!store.has_mailbox_members(&mb).unwrap());
+        assert!(!store.is_mailbox_member(&mb, &fp_a).unwrap());
+
+        // Set members [A, B]
+        store.update_mailbox_members(&mb, &[fp_a, fp_b]).unwrap();
+        assert!(store.has_mailbox_members(&mb).unwrap());
+        assert!(store.is_mailbox_member(&mb, &fp_a).unwrap());
+        assert!(store.is_mailbox_member(&mb, &fp_b).unwrap());
+        assert!(!store.is_mailbox_member(&mb, &fp_c).unwrap());
+
+        // Replace with [B, C] — A should be gone
+        store.update_mailbox_members(&mb, &[fp_b, fp_c]).unwrap();
+        assert!(!store.is_mailbox_member(&mb, &fp_a).unwrap());
+        assert!(store.is_mailbox_member(&mb, &fp_b).unwrap());
+        assert!(store.is_mailbox_member(&mb, &fp_c).unwrap());
+    }
+
+    #[test]
+    fn mailboxes_for_account_cross_mailbox() {
+        let store = Storage::open_in_memory().unwrap();
+        let mb1 = [0xAA; 32];
+        let mb2 = [0xBB; 32];
+        let fp = [0x01; 32];
+
+        store.update_mailbox_members(&mb1, &[fp]).unwrap();
+        store.update_mailbox_members(&mb2, &[fp]).unwrap();
+
+        let mailboxes = store.mailboxes_for_account(&fp).unwrap();
+        assert_eq!(mailboxes.len(), 2);
+        assert!(mailboxes.contains(&mb1));
+        assert!(mailboxes.contains(&mb2));
+    }
+
+    // -- Relay keypair tests --
+
+    #[test]
+    fn relay_keypair_idempotent() {
+        let store = Storage::open_in_memory().unwrap();
+        let (vk1, sk1) = store.get_or_create_relay_keypair().unwrap();
+        let (vk2, sk2) = store.get_or_create_relay_keypair().unwrap();
+        assert_eq!(vk1, vk2);
+        assert_eq!(sk1, sk2);
+    }
+
+    #[test]
+    fn relay_keypair_signs_verifies() {
+        let store = Storage::open_in_memory().unwrap();
+        let (vk_bytes, sk_bytes) = store.get_or_create_relay_keypair().unwrap();
+
+        let sk = ed25519_dalek::SigningKey::from_keypair_bytes(&sk_bytes).unwrap();
+        let vk = ed25519_dalek::VerifyingKey::from_bytes(&vk_bytes).unwrap();
+        use ed25519_dalek::Signer;
+        let sig = sk.sign(b"test");
+        vk.verify_strict(b"test", &sig).unwrap();
+    }
 }

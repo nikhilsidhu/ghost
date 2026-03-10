@@ -18,6 +18,9 @@ pub enum RelayError {
     #[error("unauthorized: {0}")]
     Unauthorized(String),
 
+    #[error("forbidden: {0}")]
+    Forbidden(String),
+
     #[error("conflict")]
     Conflict,
 
@@ -32,6 +35,7 @@ impl IntoResponse for RelayError {
             Self::NotFound => (StatusCode::NOT_FOUND, "not found".into()),
             Self::Gone(msg) => (StatusCode::GONE, msg.clone()),
             Self::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg.clone()),
+            Self::Forbidden(msg) => (StatusCode::FORBIDDEN, msg.clone()),
             Self::PayloadTooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "payload too large".into()),
             Self::Conflict => (StatusCode::CONFLICT, "conflict".into()),
             Self::Storage(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),

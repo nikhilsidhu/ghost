@@ -1034,6 +1034,55 @@ mod tests {
         assert!(err.to_string().contains("duplicate device key"));
     }
 
+    // ── Revoke edge cases ────────────────────────────────────────
+
+    #[test]
+    fn revoke_nonexistent_device_rejected() {
+        let (state, _mk, dk) = build_genesis();
+        let phantom = random_key();
+        let entry = create_revoke_device(&state, &dk, &phantom.verifying_key().to_bytes());
+        let mut state = state;
+        let err = validate_entry(&mut state, &entry).unwrap_err();
+        assert!(err.to_string().contains("device not active"));
+    }
+
+    #[test]
+    fn double_revoke_rejected() {
+        let (state, _mk, dk) = build_genesis();
+        let dk2 = random_key();
+        let add2 = create_add_device(&state, &dk, &dk2, "device-2");
+        let mut state = state;
+        validate_entry(&mut state, &add2).unwrap();
+
+        let revoke = create_revoke_device(&state, &dk, &dk2.verifying_key().to_bytes());
+        validate_entry(&mut state, &revoke).unwrap();
+
+        let revoke_again = create_revoke_device(&state, &dk, &dk2.verifying_key().to_bytes());
+        let err = validate_entry(&mut state, &revoke_again).unwrap_err();
+        assert!(err.to_string().contains("device not active"));
+    }
+
+    // ── Missing counter-signatures ──────────────────────────────
+
+    #[test]
+    fn missing_counter_sig_on_genesis_rejected() {
+        let (mk, _) = master_key_and_fp();
+        let dk = random_key();
+        let mut entry = create_genesis(&mk, &dk, "d1");
+        entry.counter_signature = None;
+        assert!(validate_chain(&[entry]).is_err());
+    }
+
+    #[test]
+    fn missing_counter_sig_on_add_device_rejected() {
+        let (state, _mk, dk) = build_genesis();
+        let dk2 = random_key();
+        let mut entry = create_add_device(&state, &dk, &dk2, "device-2");
+        entry.counter_signature = None;
+        let mut state = state;
+        assert!(validate_entry(&mut state, &entry).is_err());
+    }
+
     // ── account_fp mismatch on non-genesis entry ───────────────
 
     #[test]

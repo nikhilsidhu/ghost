@@ -165,15 +165,9 @@ mod tests {
     }
 
     #[test]
-    fn epoch_zero() {
-        let header = encode_envelope(EnvelopeType::Commit, 0);
+    fn epoch_byte_order_preserved() {
+        let header = encode_envelope(EnvelopeType::Commit, 0x0102030405060708);
         let (_, epoch) = decode_envelope(&header).unwrap();
-        assert_eq!(epoch, 0);
-    }
-
-    #[test]
-    fn header_is_exactly_10_bytes() {
-        let header = encode_envelope(EnvelopeType::Application, 999);
-        assert_eq!(header.len(), 10);
+        assert_eq!(epoch, 0x0102030405060708);
     }
 }

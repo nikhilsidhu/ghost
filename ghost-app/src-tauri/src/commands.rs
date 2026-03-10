@@ -622,10 +622,9 @@ pub async fn join_by_invite(
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mailbox_id);
     #[derive(serde::Deserialize)]
     struct PostBlobResp { seq: u64 }
-    let resp = state
-        .http
+    let resp = sign_request(&state, state.http
         .post(format!("{}/box/{}", relay_url, mailbox_b64))
-        .body(commit)
+        .body(commit))
         .send()
         .await
         .map_err(|e| format!("broadcast commit: {e}"))?
@@ -2473,8 +2472,13 @@ pub async fn recover_account(
     // 13. Rejoin groups from sync_state
     rejoin_servers_from_sync(&state, relay_url, &server_entries, now_millis()).await;
 
-    // 13b. Remove revoked device leaves from groups
-    let revoked_keys: Vec<[u8; 32]> = log_state.devices.keys().copied().collect();
+    // 13b. Remove old device leaves from groups.
+    // log_state is from BEFORE the Recovery entry — all devices that were active
+    // at that point are now revoked by the Recovery entry we just pushed.
+    let revoked_keys: Vec<[u8; 32]> = log_state.devices.values()
+        .filter(|d| d.is_active())
+        .map(|d| d.verifying_key)
+        .collect();
     revoke_old_device_leaves(&state, relay_url, &revoked_keys).await;
 
     // 14. Clear old account's recovery seed if present

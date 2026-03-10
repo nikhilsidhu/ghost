@@ -55,6 +55,9 @@ pub async fn ws_upgrade(
         Ok(id) => id,
         Err(e) => return e.into_response(),
     };
+    if let Err(e) = state.check_membership(&id, &auth.account_fp) {
+        return e.into_response();
+    }
     ws.on_upgrade(move |socket| voice_connection(socket, id, state, auth))
 }
 

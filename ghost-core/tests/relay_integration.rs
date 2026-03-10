@@ -13,68 +13,45 @@ use openmls::prelude::ProtocolVersion;
 use openmls_rust_crypto::RustCrypto;
 
 #[tokio::test]
-async fn encrypted_message_through_relay() {
+async fn message_metadata_preserved_through_relay() {
     let relay_url = common::start_relay().await;
+    let mut s = setup_two_clients([0x01; 32], [0x02; 32]);
 
-    let mut sender = GhostClient::open_in_memory(Identity::from_seed([0x01; 32]).unwrap(), [0x01; 32]).unwrap();
-    let mut receiver = GhostClient::open_in_memory(Identity::from_seed([0x02; 32]).unwrap(), [0x02; 32]).unwrap();
-
-    // Local MLS setup
-    let server_id = sender.create_server("test", ServerKind::Server, 1000).unwrap();
-    let kp = receiver.generate_key_package().unwrap();
-    let recv_fp = *receiver.fingerprint();
-    let recv_name = receiver.identity().display_name.clone();
-    let (_, welcome_bytes) = sender
-        .invite_member(&server_id, kp, recv_fp, &recv_name, 1000)
-        .unwrap();
-    receiver
-        .join_server(&server_id, &welcome_bytes, "test", ServerKind::Server, 1000)
-        .unwrap();
-
-    let mls_gid = derive_mls_group_id(&server_id);
-    let mailbox_id = mls_group_mailbox_id(&mls_gid);
-    let channel_id = derive_default_channel_id(&server_id);
-
-    // Connect both to relay with auth
     let (mut send_relay, _) = RelayClient::new(&relay_url);
     let (mut recv_relay, mut events) = RelayClient::new(&relay_url);
-    common::setup_relay_auth(&relay_url, &mut send_relay, &sender).await;
-    common::setup_relay_auth(&relay_url, &mut recv_relay, &receiver).await;
-    send_relay.subscribe(mailbox_id, 0);
-    recv_relay.subscribe(mailbox_id, 0);
+    common::setup_relay_auth(&relay_url, &mut send_relay, &s.sender).await;
+    common::setup_relay_auth(&relay_url, &mut recv_relay, &s.receiver).await;
+    send_relay.subscribe(s.mailbox_id, 0);
+    recv_relay.subscribe(s.mailbox_id, 0);
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // Encrypt, send through relay, receive, decrypt
-    let (outbound, _) = sender
+    // Send a message with a specific timestamp and references
+    let fake_ref = [0xCC; 32];
+    let (outbound, message_id) = s
+        .sender
         .send_message(
-            &server_id,
-            &channel_id,
+            &s.server_id,
+            &s.channel_id,
             b"hello through relay".to_vec(),
-            vec![],
+            vec![fake_ref],
             2000,
         )
         .unwrap();
-    assert_eq!(outbound.mailbox_id, mailbox_id);
-    send_relay.send(&mailbox_id, outbound.blob).await.unwrap();
+    send_relay.send(&s.mailbox_id, outbound.blob).await.unwrap();
 
-    let incoming = tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            match events.recv().await {
-                Some(RelayEvent::Blob(blob)) => break blob,
-                Some(RelayEvent::Ack(_) | RelayEvent::Error { .. } | RelayEvent::Gap { .. } | RelayEvent::VoiceState { .. } | RelayEvent::Presence { .. } | RelayEvent::ConnectionState { .. }) => continue,
-                None => panic!("event channel closed"),
-            }
-        }
-    })
-    .await
-    .expect("timed out waiting for blob");
-    assert_eq!(incoming.mailbox_id, mailbox_id);
-
-    let msg = receiver
-        .receive_blob(&server_id, &incoming.payload, Some(incoming.received_at))
+    let incoming = recv_blob(&mut events).await;
+    let msg = s
+        .receiver
+        .receive_blob(&s.server_id, &incoming.payload, Some(incoming.received_at))
         .unwrap();
+
+    // Verify all metadata survived the relay roundtrip
     assert_eq!(msg.content, b"hello through relay");
-    assert_eq!(msg.sender_fp, *sender.fingerprint());
+    assert_eq!(msg.sender_fp, *s.sender.fingerprint());
+    assert_eq!(msg.channel_id, s.channel_id);
+    assert_eq!(msg.timestamp, 2000);
+    assert_eq!(msg.message_id, message_id);
+    assert_eq!(msg.references, vec![fake_ref]);
 }
 
 /// Wait for the next blob on an event receiver, ignoring acks/gaps/presence.

@@ -122,10 +122,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn generate_produces_valid_identity() {
-        let id = Identity::generate().unwrap();
-        assert_eq!(id.fingerprint.len(), 32);
-        assert!(id.display_name.starts_with("ghost-"));
+    fn generate_produces_unique_identities() {
+        let a = Identity::generate().unwrap();
+        let b = Identity::generate().unwrap();
+        assert_ne!(a.fingerprint, b.fingerprint, "generate must use randomness");
+        assert!(a.display_name.starts_with("ghost-"));
+        // Signing key actually works
+        use ed25519_dalek::Signer;
+        let sig = a.signing_key.sign(b"test");
+        a.verifying_key.verify_strict(b"test", &sig).unwrap();
     }
 
     #[test]

@@ -27,8 +27,11 @@ pub async fn put(
     }
 
     let revoked = state.storage.append_idlog_entry(&account_fp, &body)?;
-    for device_vk in revoked {
-        let _ = state.revocation_tx.send((account_fp, device_vk));
+    for device_vk in &revoked {
+        let _ = state.revocation_tx.send((account_fp, *device_vk));
+    }
+    for device_vk in &revoked {
+        state.generate_removal_proposals(&account_fp, device_vk).await;
     }
     Ok(StatusCode::CREATED)
 }

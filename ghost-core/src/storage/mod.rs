@@ -746,4 +746,217 @@ mod tests {
         let (v3, _) = store2.sync_get("order:channels").unwrap().unwrap();
         assert!(v3.is_none()); // tombstone
     }
+
+    // -- Config blob tests --
+
+    #[test]
+    fn config_blob_roundtrip() {
+        let store = test_store();
+        store.set_config_blob("theme", b"dark").unwrap();
+        assert_eq!(store.get_config_blob("theme").unwrap().unwrap(), b"dark");
+    }
+
+    #[test]
+    fn config_blob_missing_returns_none() {
+        let store = test_store();
+        assert!(store.get_config_blob("nonexistent").unwrap().is_none());
+    }
+
+    #[test]
+    fn config_blob_upsert_overwrites() {
+        let store = test_store();
+        store.set_config_blob("k", b"v1").unwrap();
+        store.set_config_blob("k", b"v2").unwrap();
+        assert_eq!(store.get_config_blob("k").unwrap().unwrap(), b"v2");
+    }
+
+    // -- _if_not_exists idempotency tests --
+
+    #[test]
+    fn insert_server_if_not_exists_is_idempotent() {
+        let store = test_store();
+        let s = make_server("grp");
+        store.insert_server_if_not_exists(&s).unwrap();
+        store.insert_server_if_not_exists(&s).unwrap(); // no error
+        let got = store.get_server(&s.server_id).unwrap();
+        assert_eq!(got.name, "grp");
+    }
+
+    #[test]
+    fn insert_channel_if_not_exists_is_idempotent() {
+        let store = test_store();
+        let s = make_server("grp");
+        store.insert_server(&s).unwrap();
+        let c = make_channel(s.server_id, "general", 0);
+        store.insert_channel_if_not_exists(&c).unwrap();
+        store.insert_channel_if_not_exists(&c).unwrap();
+        assert_eq!(store.list_channels(&s.server_id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn insert_member_if_not_exists_is_idempotent() {
+        let store = test_store();
+        let s = make_server("grp");
+        store.insert_server(&s).unwrap();
+        let m = make_member(s.server_id, MemberRole::Member);
+        store.insert_member_if_not_exists(&m).unwrap();
+        store.insert_member_if_not_exists(&m).unwrap();
+        assert_eq!(store.list_members(&s.server_id).unwrap().len(), 1);
+    }
+
+    // -- Member avatar tests --
+
+    #[test]
+    fn member_avatar_set_get_clear_cycle() {
+        let store = test_store();
+        let s = make_server("grp");
+        store.insert_server(&s).unwrap();
+        let m = make_member(s.server_id, MemberRole::Member);
+        store.insert_member(&m).unwrap();
+
+        // Initially no avatar
+        assert!(store.get_member_avatar_key(&s.server_id, &m.fingerprint).unwrap().is_none());
+
+        let hash = [0x11u8; 32];
+        let key = [0x22u8; 32];
+        store.update_member_avatar(&s.server_id, &m.fingerprint, &hash, &key).unwrap();
+
+        let got_key = store.get_member_avatar_key(&s.server_id, &m.fingerprint).unwrap();
+        assert_eq!(got_key.unwrap(), key);
+
+        let member = store.get_member(&s.server_id, &m.fingerprint).unwrap();
+        assert_eq!(member.avatar_hash.unwrap(), hash);
+
+        store.clear_member_avatar(&s.server_id, &m.fingerprint).unwrap();
+        assert!(store.get_member_avatar_key(&s.server_id, &m.fingerprint).unwrap().is_none());
+    }
+
+    #[test]
+    fn update_member_name() {
+        let store = test_store();
+        let s = make_server("grp");
+        store.insert_server(&s).unwrap();
+        let m = make_member(s.server_id, MemberRole::Member);
+        store.insert_member(&m).unwrap();
+
+        store.update_member_name(&s.server_id, &m.fingerprint, "new-name").unwrap();
+        let got = store.get_member(&s.server_id, &m.fingerprint).unwrap();
+        assert_eq!(got.display_name, "new-name");
+    }
+
+    // -- Rename error paths --
+
+    #[test]
+    fn rename_nonexistent_server_errors() {
+        let store = test_store();
+        assert!(store.rename_server(&rand_id(), "name").is_err());
+    }
+
+    #[test]
+    fn rename_nonexistent_channel_errors() {
+        let store = test_store();
+        assert!(store.rename_channel(&rand_id(), "name").is_err());
+    }
+
+    // -- Read state tests --
+
+    #[test]
+    fn unread_counts_all_unread() {
+        let store = test_store();
+        let s = make_server("grp");
+        store.insert_server(&s).unwrap();
+        let c = make_channel(s.server_id, "general", 0);
+        store.insert_channel(&c).unwrap();
+        let msg = make_message(c.channel_id, 1000, "hi");
+        store.insert_message(&msg).unwrap();
+
+        let counts = store.get_unread_counts(&s.server_id).unwrap();
+        assert_eq!(counts.len(), 1);
+        assert_eq!(counts[0].1, 1);
+    }
+
+    #[test]
+    fn mark_read_clears_unread() {
+        let store = test_store();
+        let s = make_server("grp");
+        store.insert_server(&s).unwrap();
+        let c = make_channel(s.server_id, "general", 0);
+        store.insert_channel(&c).unwrap();
+        let msg = make_message(c.channel_id, 1000, "hi");
+        store.insert_message(&msg).unwrap();
+
+        store.mark_channel_read(&c.channel_id, 1000).unwrap();
+        let counts = store.get_unread_counts(&s.server_id).unwrap();
+        assert_eq!(counts[0].1, 0);
+    }
+
+    #[test]
+    fn new_message_after_read_shows_unread() {
+        let store = test_store();
+        let s = make_server("grp");
+        store.insert_server(&s).unwrap();
+        let c = make_channel(s.server_id, "general", 0);
+        store.insert_channel(&c).unwrap();
+
+        let m1 = make_message(c.channel_id, 1000, "old");
+        store.insert_message(&m1).unwrap();
+        store.mark_channel_read(&c.channel_id, 1000).unwrap();
+
+        let m2 = make_message(c.channel_id, 2000, "new");
+        store.insert_message(&m2).unwrap();
+
+        let counts = store.get_unread_counts(&s.server_id).unwrap();
+        assert_eq!(counts[0].1, 1);
+    }
+
+    #[test]
+    fn servers_with_unread() {
+        let store = test_store();
+        let s1 = make_server("has-unread");
+        let s2 = make_server("all-read");
+        store.insert_server(&s1).unwrap();
+        store.insert_server(&s2).unwrap();
+
+        let c1 = make_channel(s1.server_id, "ch", 0);
+        let c2 = make_channel(s2.server_id, "ch", 0);
+        store.insert_channel(&c1).unwrap();
+        store.insert_channel(&c2).unwrap();
+
+        store.insert_message(&make_message(c1.channel_id, 1000, "hi")).unwrap();
+        store.insert_message(&make_message(c2.channel_id, 1000, "hi")).unwrap();
+
+        store.mark_channel_read(&c2.channel_id, 1000).unwrap();
+
+        let unread = store.servers_with_unread().unwrap();
+        assert!(unread.contains(&s1.server_id));
+        assert!(!unread.contains(&s2.server_id));
+    }
+
+    // -- Sync edge cases --
+
+    #[test]
+    fn sync_get_nonexistent_returns_none() {
+        let store = test_store();
+        assert!(store.sync_get("nonexistent").unwrap().is_none());
+    }
+
+    #[test]
+    fn sync_set_equal_timestamp_rejected() {
+        let store = test_store();
+        store.sync_set("k", b"first", 100).unwrap();
+        let applied = store.sync_set("k", b"second", 100).unwrap();
+        assert!(!applied);
+        let (value, _) = store.sync_get("k").unwrap().unwrap();
+        assert_eq!(value.unwrap(), b"first");
+    }
+
+    #[test]
+    fn get_messages_empty_channel() {
+        let store = test_store();
+        let s = make_server("grp");
+        store.insert_server(&s).unwrap();
+        let c = make_channel(s.server_id, "empty", 0);
+        store.insert_channel(&c).unwrap();
+        assert!(store.get_messages(&c.channel_id, None, 10).unwrap().is_empty());
+    }
 }

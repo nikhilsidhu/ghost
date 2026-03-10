@@ -329,14 +329,21 @@ async fn pairing_offer_response_encrypted_roundtrip() {
 // ── Sync MLS group ──────────────────────────────────────────────────
 
 #[test]
-fn sync_group_creation_at_genesis() {
-    let (mut client, _, _) = make_ghost_client("desktop");
-    assert!(!client.has_sync_group());
-    assert!(client.sync_mailbox_id().is_none());
+fn sync_group_produces_joinable_group_info() {
+    let (mut client_a, fp_a, _) = make_ghost_client("desktop");
+    assert!(!client_a.has_sync_group());
+    client_a.create_sync_group().unwrap();
 
-    client.create_sync_group().unwrap();
-    assert!(client.has_sync_group());
-    assert!(client.sync_mailbox_id().is_some());
+    // Verify the GroupInfo is valid by having another device successfully join
+    let gi = client_a.sync_group_info().unwrap();
+    assert!(!gi.is_empty());
+
+    let acct_b = Identity::create_account("phone").unwrap();
+    let identity_b = Identity::from_device(fp_a, acct_b.identity.signing_key.clone(), 2);
+    drop(acct_b);
+    let mut client_b = GhostClient::open_in_memory(identity_b, [0x02; 32]).unwrap();
+    let (_commit, mailbox_b) = client_b.join_sync_group(&gi).unwrap();
+    assert_eq!(mailbox_b, client_a.sync_mailbox_id().unwrap());
 }
 
 #[test]
@@ -432,22 +439,24 @@ fn sync_revocation_prevents_decryption() {
 }
 
 #[test]
-fn sync_snapshot_durable_with_sync_key() {
-    // Durable snapshots still use sync_key (AES-256-GCM) for HTTP storage
-    let sync_key = [0xAA; 32];
-    let entries = vec![
-        ("read:ch1".to_string(), Some(42u64.to_be_bytes().to_vec()), 100),
-        (SYNC_KEY_SERVER_ORDER.to_string(), Some(b"[\"s1\"]".to_vec()), 200),
-    ];
-    let dump = encode_sync_state_dump(&entries);
-    let sealed = sync_seal(&sync_key, &dump).unwrap();
+fn sync_state_survives_dump_import_cycle() {
+    let (client_a, _, _) = make_ghost_client("desktop");
 
-    // Different key can't decrypt
-    assert!(sync_open(&[0xBB; 32], &sealed).is_err());
+    // Set some sync state
+    client_a.sync_set("read:ch1", &42u64.to_be_bytes(), 100).unwrap();
+    client_a.sync_set(SYNC_KEY_SERVER_ORDER, b"[\"s1\"]", 200).unwrap();
 
-    // Correct key decrypts
-    let opened = sync_open(&sync_key, &sealed).unwrap();
-    assert_eq!(opened, dump);
+    // Dump it
+    let dump = client_a.sync_dump().unwrap();
+    assert_eq!(dump.len(), 2);
+
+    // Import into a fresh client — all state should arrive
+    let (client_b, _, _) = make_ghost_client("phone");
+    client_b.sync_import(&dump).unwrap();
+
+    let (val, ts) = client_b.sync_get("read:ch1").unwrap().unwrap();
+    assert_eq!(val.unwrap(), 42u64.to_be_bytes());
+    assert_eq!(ts, 100);
 }
 
 // ── Full pairing → identity log → MLS sync exchange ────────────────

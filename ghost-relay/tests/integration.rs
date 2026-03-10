@@ -11,6 +11,11 @@ use serde_json::Value;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio_tungstenite::tungstenite::Message;
 
+use openmls::prelude::*;
+use openmls_basic_credential::SignatureKeyPair;
+use openmls_rust_crypto::OpenMlsRustCrypto;
+use openmls_traits::OpenMlsProvider;
+
 use ghost_relay::config::Config;
 use ghost_relay::storage::Storage;
 use ghost_relay::{routes, state, udp};
@@ -923,12 +928,10 @@ async fn pairing_offer_overwrite() {
     client.post(pair_url(&base, &fp)).body(b"offer-1".to_vec()).send().await.unwrap();
     client.post(pair_url(&base, &fp)).body(b"offer-2".to_vec()).send().await.unwrap();
 
-    // Respond to the overwritten session — should succeed (new session exists)
-    let resp = client
-        .post(format!("{}/respond", pair_url(&base, &fp)))
-        .body(b"resp".to_vec())
-        .send().await.unwrap();
-    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    // Fetch back the offer — should be offer-2, not offer-1
+    let resp = client.get(pair_url(&base, &fp)).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.bytes().await.unwrap().as_ref(), b"offer-2");
 }
 
 // --- Auth tests ---
@@ -1341,4 +1344,302 @@ async fn ws_closed_on_device_revocation() {
             break;
         }
     }
+}
+
+// ── MLS enforcement test helpers ─────────────────────────────────
+
+/// Minimal MLS identity for integration tests.
+struct MlsTestIdentity {
+    signer: SignatureKeyPair,
+    credential: CredentialWithKey,
+}
+
+impl MlsTestIdentity {
+    fn new(label: &[u8]) -> Self {
+        let signer = SignatureKeyPair::new(SignatureScheme::ED25519).unwrap();
+        let credential = CredentialWithKey {
+            credential: Credential::new(CredentialType::Basic, label.to_vec()),
+            signature_key: SignaturePublicKey::from(signer.public().to_vec()),
+        };
+        Self { signer, credential }
+    }
+
+}
+
+/// Create an MLS group with ExternalSendersExtension, upload GroupInfo, return (group, mailbox_id).
+/// Derive mailbox_id from MLS group_id (same as ghost-core's wire::mls_group_mailbox_id).
+fn test_mls_group_mailbox_id(mls_group_id: &[u8]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(mls_group_id);
+    hasher.update(b"ghost-mailbox");
+    hasher.finalize().into()
+}
+
+fn create_test_mls_group(
+    provider: &OpenMlsRustCrypto,
+    identity: &MlsTestIdentity,
+    relay_vk: &[u8; 32],
+) -> (MlsGroup, [u8; 32]) {
+    let external_sender = ExternalSender::new(
+        SignaturePublicKey::from(relay_vk.to_vec()),
+        Credential::new(CredentialType::Basic, b"ghost-relay".to_vec()),
+    );
+    let extensions = Extensions::single(Extension::ExternalSenders(vec![external_sender])).unwrap();
+    let config = MlsGroupCreateConfig::builder()
+        .use_ratchet_tree_extension(true)
+        .max_past_epochs(1)
+        .wire_format_policy(MIXED_PLAINTEXT_WIRE_FORMAT_POLICY)
+        .with_group_context_extensions(extensions)
+        .build();
+
+    let group = MlsGroup::new(
+        provider,
+        &identity.signer,
+        &config,
+        identity.credential.clone(),
+    )
+    .unwrap();
+
+    let group_id = group.group_id().as_slice();
+    let mailbox_id: [u8; 32] = test_mls_group_mailbox_id(group_id);
+    (group, mailbox_id)
+}
+
+fn export_group_info_bytes(
+    group: &MlsGroup,
+    provider: &OpenMlsRustCrypto,
+    signer: &SignatureKeyPair,
+) -> Vec<u8> {
+    let msg = group
+        .export_group_info(provider.crypto(), signer, true)
+        .unwrap();
+    msg.to_bytes().unwrap()
+}
+
+async fn fetch_relay_vk(base: &str) -> [u8; 32] {
+    let client = reqwest::Client::new();
+    let resp = client.get(format!("{base}/relay_key")).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let hex_str = resp.text().await.unwrap();
+    let bytes = hex::decode(hex_str.trim()).unwrap();
+    bytes.try_into().unwrap()
+}
+
+async fn upload_group_info(
+    base: &str,
+    auth: &TestAuth,
+    mailbox_id: &[u8; 32],
+    group_info: &[u8],
+) {
+    let client = reqwest::Client::new();
+    let url = format!(
+        "{base}/box/{}/server_info",
+        URL_SAFE_NO_PAD.encode(mailbox_id)
+    );
+    let resp = auth.sign(client.put(url).body(group_info.to_vec()))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT, "upload GroupInfo failed");
+}
+
+// ── MLS enforcement tests ────────────────────────────────────────
+
+#[tokio::test]
+async fn relay_key_endpoint() {
+    let base = start_server(test_config()).await;
+    let vk = fetch_relay_vk(&base).await;
+    assert_ne!(vk, [0u8; 32]);
+    // Second fetch returns same key
+    let vk2 = fetch_relay_vk(&base).await;
+    assert_eq!(vk, vk2);
+}
+
+#[tokio::test]
+async fn non_member_blob_rejected_after_acl() {
+    let base = start_server(test_config()).await;
+    let alice = TestAuth::generate();
+    let bob = TestAuth::generate();
+    alice.register(&base).await;
+    bob.register(&base).await;
+
+    let relay_vk = fetch_relay_vk(&base).await;
+    let provider = OpenMlsRustCrypto::default();
+    let id = MlsTestIdentity::new(&alice.account_fp);
+    let (group, mailbox_id) = create_test_mls_group(&provider, &id, &relay_vk);
+    let gi = export_group_info_bytes(&group, &provider, &id.signer);
+
+    // Upload GroupInfo as alice (initializes ACL with alice as sole member)
+    upload_group_info(&base, &alice, &mailbox_id, &gi).await;
+
+    // Bob (not a member) tries to POST a blob → 403
+    let client = reqwest::Client::new();
+    let url = mailbox_url(&base, &mailbox_id);
+    let resp = bob
+        .sign(client.post(&url).body(test_envelope(b"intruder")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn member_blob_accepted() {
+    let base = start_server(test_config()).await;
+    let alice = TestAuth::generate();
+    alice.register(&base).await;
+
+    let relay_vk = fetch_relay_vk(&base).await;
+    let provider = OpenMlsRustCrypto::default();
+    let id = MlsTestIdentity::new(&alice.account_fp);
+    let (group, mailbox_id) = create_test_mls_group(&provider, &id, &relay_vk);
+    let gi = export_group_info_bytes(&group, &provider, &id.signer);
+
+    upload_group_info(&base, &alice, &mailbox_id, &gi).await;
+
+    // Alice (member) can POST application messages
+    let client = reqwest::Client::new();
+    let url = mailbox_url(&base, &mailbox_id);
+    let resp = alice
+        .sign(client.post(&url).body(test_envelope(b"hello")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn invalid_commit_rejected() {
+    let base = start_server(test_config()).await;
+    let alice = TestAuth::generate();
+    alice.register(&base).await;
+
+    let relay_vk = fetch_relay_vk(&base).await;
+    let provider = OpenMlsRustCrypto::default();
+    let id = MlsTestIdentity::new(&alice.account_fp);
+    let (group, mailbox_id) = create_test_mls_group(&provider, &id, &relay_vk);
+    let gi = export_group_info_bytes(&group, &provider, &id.signer);
+
+    upload_group_info(&base, &alice, &mailbox_id, &gi).await;
+
+    // POST a commit envelope with garbage MLS bytes → 403
+    let garbage_commit = envelope(ghost_wire::EnvelopeType::Commit, 0, b"not-valid-mls");
+    let client = reqwest::Client::new();
+    let url = mailbox_url(&base, &mailbox_id);
+    let resp = alice
+        .sign(client.post(&url).body(garbage_commit))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn desync_recovery_via_group_info_reupload() {
+    let base = start_server(test_config()).await;
+    let alice = TestAuth::generate();
+    alice.register(&base).await;
+
+    let relay_vk = fetch_relay_vk(&base).await;
+    let provider = OpenMlsRustCrypto::default();
+    let id = MlsTestIdentity::new(&alice.account_fp);
+    let (group, mailbox_id) = create_test_mls_group(&provider, &id, &relay_vk);
+    let gi = export_group_info_bytes(&group, &provider, &id.signer);
+
+    // Upload GroupInfo
+    upload_group_info(&base, &alice, &mailbox_id, &gi).await;
+
+    // Re-upload same GroupInfo (simulate desync recovery)
+    upload_group_info(&base, &alice, &mailbox_id, &gi).await;
+
+    // Alice can still POST application messages
+    let client = reqwest::Client::new();
+    let url = mailbox_url(&base, &mailbox_id);
+    let resp = alice
+        .sign(client.post(&url).body(test_envelope(b"still works")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn pre_upgrade_group_allows_all() {
+    // Groups without PublicGroup initialization (no server_info uploaded)
+    // should allow all operations (graceful degradation).
+    let base = start_server(test_config()).await;
+    let alice = TestAuth::generate();
+    alice.register(&base).await;
+
+    let mailbox_id = [0xAA; 32];
+    let client = reqwest::Client::new();
+    let url = mailbox_url(&base, &mailbox_id);
+
+    // POST should work even without PublicGroup (no ACL → skip check)
+    let resp = alice
+        .sign(client.post(&url).body(test_envelope(b"legacy")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn commit_validated_and_acl_updated() {
+    let (base, st) = start_server_with_state(test_config()).await;
+    let alice = TestAuth::generate();
+    alice.register(&base).await;
+    let bob = TestAuth::generate();
+    bob.register(&base).await;
+
+    let relay_vk = fetch_relay_vk(&base).await;
+    let provider = OpenMlsRustCrypto::default();
+    let id_a = MlsTestIdentity::new(&alice.account_fp);
+    let (mut group, mailbox_id) = create_test_mls_group(&provider, &id_a, &relay_vk);
+    let gi = export_group_info_bytes(&group, &provider, &id_a.signer);
+
+    upload_group_info(&base, &alice, &mailbox_id, &gi).await;
+
+    // Create bob's key package and add him to the group
+    let id_b = MlsTestIdentity::new(&bob.account_fp);
+    let kp_bundle = KeyPackage::builder()
+        .build(
+            Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519,
+            &provider,
+            &id_b.signer,
+            id_b.credential.clone(),
+        )
+        .unwrap();
+
+    let bundle = group.commit_builder()
+        .propose_adds([kp_bundle.key_package().clone()])
+        .load_psks(provider.storage())
+        .unwrap()
+        .build(provider.rand(), provider.crypto(), &id_a.signer, |_| true)
+        .unwrap()
+        .stage_commit(&provider)
+        .unwrap();
+
+    let commit_bytes = bundle.commit()
+        .to_bytes()
+        .unwrap();
+
+    group.merge_pending_commit(&provider).unwrap();
+
+    // Wrap in envelope and POST to relay
+    let commit_envelope = envelope(
+        ghost_wire::EnvelopeType::Commit,
+        0, // epoch 0
+        &commit_bytes,
+    );
+
+    let client = reqwest::Client::new();
+    let url = mailbox_url(&base, &mailbox_id);
+    let resp = alice
+        .sign(client.post(&url).body(commit_envelope))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Verify ACL was updated: bob should now be a member
+    assert!(st.storage.is_mailbox_member(&mailbox_id, &bob.account_fp).unwrap());
 }

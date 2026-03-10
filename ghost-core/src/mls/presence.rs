@@ -252,7 +252,7 @@ mod tests {
     fn trial_decryption() {
         let provider = GhostProvider::new_in_memory().unwrap();
         let id = Identity::from_seed([0x01u8; 32]).unwrap();
-        let group = super::super::group::GhostGroup::create(&provider, &id).unwrap();
+        let group = super::super::group::GhostGroup::create(&provider, &id, None).unwrap();
 
         let key = derive_online_presence_key(&group, &provider, &id.fingerprint).unwrap();
         let state = OnlinePresence {
@@ -272,10 +272,51 @@ mod tests {
     }
 
     #[test]
+    fn online_presence_roundtrip_partial_fields() {
+        // Only status_expiry set — tests offset logic when middle field absent
+        let state = OnlinePresence {
+            fingerprint: [0xDD; 32],
+            status: OnlineStatus::Idle,
+            status_message: None,
+            status_expiry: Some(1700000000000),
+            avatar_hash: Some([0xEE; 32]),
+        };
+        let bytes = state.to_bytes();
+        let parsed = OnlinePresence::from_bytes(&bytes).unwrap();
+        assert_eq!(state, parsed);
+    }
+
+    #[test]
+    fn online_presence_truncated_rejected() {
+        assert!(OnlinePresence::from_bytes(&[0x00; 10]).is_err());
+    }
+
+    #[test]
+    fn trial_decryption_no_match_fails() {
+        let provider = GhostProvider::new_in_memory().unwrap();
+        let id = Identity::from_seed([0x01u8; 32]).unwrap();
+        let group = super::super::group::GhostGroup::create(&provider, &id, None).unwrap();
+
+        let key = derive_online_presence_key(&group, &provider, &id.fingerprint).unwrap();
+        let state = OnlinePresence {
+            fingerprint: id.fingerprint,
+            status: OnlineStatus::Online,
+            status_message: None,
+            status_expiry: None,
+            avatar_hash: None,
+        };
+        let blob = seal_online_presence(&key, &state).unwrap();
+
+        // Try with wrong candidates — none match
+        let wrong = vec![[0xAA; 32], [0xBB; 32]];
+        assert!(try_open_online_presence(&wrong, &group, &provider, &blob).is_err());
+    }
+
+    #[test]
     fn key_differs_from_voice_presence_key() {
         let provider = GhostProvider::new_in_memory().unwrap();
         let id = Identity::from_seed([0x01u8; 32]).unwrap();
-        let group = super::super::group::GhostGroup::create(&provider, &id).unwrap();
+        let group = super::super::group::GhostGroup::create(&provider, &id, None).unwrap();
 
         let channel_id = [0xFF; 32];
         let voice = super::super::voice::derive_presence_key(

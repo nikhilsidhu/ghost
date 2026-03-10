@@ -47,24 +47,34 @@ pub(crate) struct BlobQuery {
 }
 
 pub async fn post_blob(
-    _auth: DeviceAuth,
+    auth: DeviceAuth,
     State(state): State<AppState>,
     Path(mailbox_id): Path<String>,
     body: Bytes,
 ) -> Result<(StatusCode, Json<PostBlobResponse>)> {
     let id = decode_mailbox_id(&mailbox_id)?;
+
+    // Skip membership check for commits/proposals — MLS validation handles their
+    // authorization, and external commits (joins) come from non-members by definition.
+    let (envelope_type, _) = ghost_wire::decode_envelope(&body)
+        .map_err(|e| crate::error::RelayError::BadRequest(format!("envelope: {e}")))?;
+    if envelope_type == ghost_wire::EnvelopeType::Application {
+        state.check_membership(&id, &auth.account_fp)?;
+    }
+
     let (seq, epoch_mismatch) = state.store_blob(&id, &body).await?;
     Ok((StatusCode::CREATED, Json(PostBlobResponse { seq, epoch_mismatch })))
 }
 
 pub async fn get_blobs(
-    _auth: DeviceAuth,
+    auth: DeviceAuth,
     State(state): State<AppState>,
     Path(mailbox_id): Path<String>,
     Query(query): Query<BlobQuery>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<BlobEntry>>> {
     let id = decode_mailbox_id(&mailbox_id)?;
+    state.check_membership(&id, &auth.account_fp)?;
     let after_seq = query.after.unwrap_or(0);
 
     let timeout_ms: u64 = headers

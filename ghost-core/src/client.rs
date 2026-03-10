@@ -55,6 +55,8 @@ pub struct GhostClient {
     mailbox_map: HashMap<[u8; 32], [u8; 32]>,
     /// MLS self-group for cross-device sync (separate from server groups)
     sync_group: Option<GhostGroup>,
+    /// Relay's Ed25519 verifying key for ExternalSendersExtension
+    relay_vk: Option<[u8; 32]>,
 }
 
 impl GhostClient {
@@ -93,6 +95,7 @@ impl GhostClient {
             servers,
             mailbox_map,
             sync_group,
+            relay_vk: None,
         })
     }
 
@@ -106,7 +109,13 @@ impl GhostClient {
             servers: HashMap::new(),
             mailbox_map: HashMap::new(),
             sync_group: None,
+            relay_vk: None,
         })
+    }
+
+    /// Set the relay's verifying key for ExternalSendersExtension in new groups.
+    pub fn set_relay_vk(&mut self, vk: [u8; 32]) {
+        self.relay_vk = Some(vk);
     }
 
     pub fn identity(&self) -> &Identity {
@@ -174,7 +183,7 @@ impl GhostClient {
 
     pub fn create_sync_group(&mut self) -> Result<()> {
         let sid = sync_server_id(&self.identity.fingerprint);
-        let group = GhostGroup::create_with_id(&self.provider, &self.identity, &sid)?;
+        let group = GhostGroup::create_with_id(&self.provider, &self.identity, &sid, self.relay_vk.as_ref())?;
         self.sync_group = Some(group);
         Ok(())
     }
@@ -404,7 +413,7 @@ impl GhostClient {
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut server_id);
 
         let ghost_group =
-            GhostGroup::create_with_id(&self.provider, &self.identity, &server_id)?;
+            GhostGroup::create_with_id(&self.provider, &self.identity, &server_id, self.relay_vk.as_ref())?;
 
         self.store.insert_server(&Server {
             server_id,
@@ -441,6 +450,50 @@ impl GhostClient {
         self.servers.insert(server_id, ghost_group);
         self.mailbox_map.insert(mailbox_id, server_id);
         Ok(server_id)
+    }
+
+    /// Migrate pre-upgrade groups to include ExternalSendersExtension.
+    /// Returns (server_id, commit_bytes) for each migrated group.
+    pub fn migrate_group_extensions(&mut self) -> Vec<([u8; 32], Vec<u8>)> {
+        let relay_vk = match self.relay_vk {
+            Some(vk) => vk,
+            None => return Vec::new(),
+        };
+
+        let servers = match self.store.list_servers() {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+
+        let mut results = Vec::new();
+        for server in &servers {
+            // Only migrate groups we created
+            if server.creator_fp != self.identity.fingerprint {
+                continue;
+            }
+            let group = match self.servers.get_mut(&server.server_id) {
+                Some(g) => g,
+                None => continue,
+            };
+            if group.has_external_senders() {
+                continue;
+            }
+            if let Ok(commit) = group.add_external_sender_extension(&self.provider, &relay_vk) {
+                results.push((server.server_id, commit));
+            }
+        }
+
+        // Also migrate sync group
+        if let Some(ref mut sync_group) = self.sync_group {
+            if !sync_group.has_external_senders() {
+                if let Ok(commit) = sync_group.add_external_sender_extension(&self.provider, &relay_vk) {
+                    let mailbox_id = mls_group_mailbox_id(sync_group.group_id());
+                    results.push((mailbox_id, commit));
+                }
+            }
+        }
+
+        results
     }
 
     pub fn send_message(
@@ -1069,16 +1122,16 @@ mod tests {
     }
 
     #[test]
-    fn open_in_memory_succeeds() {
-        let client = test_client([0x01; 32]);
-        assert_eq!(client.fingerprint().len(), 32);
-    }
-
-    #[test]
-    fn different_seeds_different_fingerprints() {
+    fn open_deterministic_and_stores_accessible() {
         let a = test_client([0x01; 32]);
-        let b = test_client([0x02; 32]);
-        assert_ne!(a.fingerprint(), b.fingerprint());
+        let b = test_client([0x01; 32]);
+        assert_eq!(a.fingerprint(), b.fingerprint());
+
+        let c = test_client([0x02; 32]);
+        assert_ne!(a.fingerprint(), c.fingerprint());
+
+        // Store is functional
+        assert!(a.store().list_servers().unwrap().is_empty());
     }
 
     #[test]

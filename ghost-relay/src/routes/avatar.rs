@@ -18,7 +18,7 @@ fn decode_fingerprint(hex: &str) -> Result<[u8; 32]> {
 }
 
 pub async fn put(
-    _auth: DeviceAuth,
+    auth: DeviceAuth,
     State(state): State<AppState>,
     Path((mailbox_id, fingerprint)): Path<(String, String)>,
     body: Bytes,
@@ -27,17 +27,19 @@ pub async fn put(
         return Err(RelayError::PayloadTooLarge);
     }
     let id = decode_mailbox_id(&mailbox_id)?;
+    state.check_membership(&id, &auth.account_fp)?;
     let fp = decode_fingerprint(&fingerprint)?;
     state.storage.put_avatar(&id, &fp, &body)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn get(
-    _auth: DeviceAuth,
+    auth: DeviceAuth,
     State(state): State<AppState>,
     Path((mailbox_id, fingerprint)): Path<(String, String)>,
 ) -> Result<impl IntoResponse> {
     let id = decode_mailbox_id(&mailbox_id)?;
+    state.check_membership(&id, &auth.account_fp)?;
     let fp = decode_fingerprint(&fingerprint)?;
     match state.storage.get_avatar(&id, &fp)? {
         Some(data) => Ok((StatusCode::OK, data)),
@@ -46,11 +48,12 @@ pub async fn get(
 }
 
 pub async fn delete(
-    _auth: DeviceAuth,
+    auth: DeviceAuth,
     State(state): State<AppState>,
     Path((mailbox_id, fingerprint)): Path<(String, String)>,
 ) -> Result<StatusCode> {
     let id = decode_mailbox_id(&mailbox_id)?;
+    state.check_membership(&id, &auth.account_fp)?;
     let fp = decode_fingerprint(&fingerprint)?;
     state.storage.delete_avatar(&id, &fp)?;
     Ok(StatusCode::NO_CONTENT)
