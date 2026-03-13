@@ -2,6 +2,7 @@ pub mod client;
 pub mod crypto;
 pub mod error;
 pub mod identity;
+pub mod idlog_cache;
 pub mod mls;
 pub mod relay;
 pub mod storage;

@@ -8,6 +8,7 @@ use rusqlite::Connection;
 use crate::crypto::{GhostProvider, MessageType};
 use crate::error::{GhostError, Result};
 use crate::identity::Identity;
+use crate::idlog_cache::IdLogCache;
 use crate::mls::credential::generate_key_package;
 use crate::mls::group::GhostGroup;
 use crate::storage::{
@@ -57,6 +58,8 @@ pub struct GhostClient {
     sync_group: Option<GhostGroup>,
     /// Relay's Ed25519 verifying key for ExternalSendersExtension
     relay_vk: Option<[u8; 32]>,
+    /// Cached identity log states for credential validation
+    idlog_cache: IdLogCache,
 }
 
 impl GhostClient {
@@ -96,6 +99,7 @@ impl GhostClient {
             mailbox_map,
             sync_group,
             relay_vk: None,
+            idlog_cache: IdLogCache::new(),
         })
     }
 
@@ -110,6 +114,7 @@ impl GhostClient {
             mailbox_map: HashMap::new(),
             sync_group: None,
             relay_vk: None,
+            idlog_cache: IdLogCache::new(),
         })
     }
 
@@ -136,6 +141,26 @@ impl GhostClient {
 
     pub fn store(&self) -> &GhostStore {
         &self.store
+    }
+
+    /// Access the identity log cache (e.g. to check device status).
+    pub fn idlog_cache(&self) -> &IdLogCache {
+        &self.idlog_cache
+    }
+
+    /// Cache identity log entries from the relay and validate the chain.
+    pub fn cache_identity_log(
+        &mut self,
+        account_fp: &[u8; 32],
+        entries: &[(u64, Vec<u8>)],
+    ) -> Result<()> {
+        self.idlog_cache
+            .cache_and_validate(&self.store, account_fp, entries)
+    }
+
+    /// Insert a pre-validated LogState directly (e.g. for our own account).
+    pub fn cache_own_identity_log(&mut self, state: ghost_wire::idlog::LogState) {
+        self.idlog_cache.insert(state);
     }
 
     /// Update own display name in identity and all server member records.
@@ -1024,7 +1049,7 @@ impl GhostClient {
             GhostError::ServerNotLoaded(hex::encode(&server_id[..8]))
         })?;
 
-        let inbound = match open_any(group, &self.provider, blob) {
+        let inbound = match open_any(group, &self.provider, blob, &self.idlog_cache) {
             Err(GhostError::SelfMessage) => return Ok(ReceiveResult::Skipped),
             other => other?,
         };
@@ -1100,13 +1125,45 @@ mod tests {
 
     fn test_client(seed: [u8; 32]) -> GhostClient {
         let identity = Identity::from_seed(seed).unwrap();
-        GhostClient::open_in_memory(identity, seed).unwrap()
+        let mut client = GhostClient::open_in_memory(identity, seed).unwrap();
+        // Register own identity so self-validation passes
+        register_identity_in_cache(&mut client, &Identity::from_seed(seed).unwrap());
+        client
+    }
+
+    /// Register an identity's device key as active in a client's idlog cache.
+    fn register_identity_in_cache(client: &mut GhostClient, identity: &Identity) {
+        use ghost_wire::idlog::{DeviceInfo, LogState};
+        let mut devices = HashMap::new();
+        devices.insert(
+            identity.verifying_key.to_bytes(),
+            DeviceInfo {
+                verifying_key: identity.verifying_key.to_bytes(),
+                label: "test".to_string(),
+                added_at_seq: 1,
+                revoked_at_seq: None,
+            },
+        );
+        let state = LogState {
+            account_fp: identity.fingerprint,
+            master_verifying_key: None,
+            devices,
+            head_seq: 1,
+            head_hash: [0u8; 32],
+        };
+        client.idlog_cache.insert(state);
     }
 
     /// Returns (creator, joiner, server_id) with both clients in a shared MLS group.
     fn setup_two_clients() -> (GhostClient, GhostClient, [u8; 32]) {
         let mut c1 = test_client([0x01; 32]);
         let mut c2 = test_client([0x02; 32]);
+
+        // Each client needs the other's identity in its cache for validation
+        let id1 = Identity::from_seed([0x01; 32]).unwrap();
+        let id2 = Identity::from_seed([0x02; 32]).unwrap();
+        register_identity_in_cache(&mut c1, &id2);
+        register_identity_in_cache(&mut c2, &id1);
 
         let server_id = c1.create_server("test", ServerKind::Server, 1000).unwrap();
 
@@ -1261,6 +1318,12 @@ mod tests {
     fn invite_full_roundtrip() {
         let mut c1 = test_client([0x01; 32]);
         let mut c2 = test_client([0x02; 32]);
+
+        // Register each other's identities for credential validation
+        let id1 = Identity::from_seed([0x01; 32]).unwrap();
+        let id2 = Identity::from_seed([0x02; 32]).unwrap();
+        register_identity_in_cache(&mut c1, &id2);
+        register_identity_in_cache(&mut c2, &id1);
 
         let server_id = c1.create_server("test", ServerKind::Server, 1000).unwrap();
 

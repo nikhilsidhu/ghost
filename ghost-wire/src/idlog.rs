@@ -456,10 +456,11 @@ fn decode_body(entry_type: EntryType, data: &[u8]) -> IdlogResult<EntryBody> {
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
-    use rand::rngs::OsRng;
+    use rand::Rng;
 
     fn random_key() -> SigningKey {
-        SigningKey::generate(&mut OsRng)
+        let secret: [u8; 32] = rand::thread_rng().gen();
+        SigningKey::from_bytes(&secret)
     }
 
     fn master_key_and_fp() -> (SigningKey, [u8; 32]) {

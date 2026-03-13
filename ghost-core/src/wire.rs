@@ -1,11 +1,11 @@
-use openmls::prelude::ProcessedMessageContent;
-use openmls::prelude::BasicCredential;
+use openmls::prelude::{BasicCredential, Credential, ProcessedMessageContent, Sender};
 
 use crate::crypto::{
     DEFAULT_CHANNEL_TAG, GhostProvider, MessageType, MAILBOX_ID_TAG, MLS_GROUP_ID_TAG,
     PROTOCOL_VERSION,
 };
 use crate::error::{GhostError, Result};
+use crate::idlog_cache::IdLogCache;
 use crate::mls::group::GhostGroup;
 use crate::storage::{ChannelKind, ServerKind, MemberRole};
 
@@ -761,23 +761,74 @@ pub enum InboundMessage {
     Commit { removed: Vec<[u8; 32]> },
 }
 
+/// Extract account fingerprint and device verifying key from MLS sender info.
+fn extract_sender_identity(
+    group: &GhostGroup,
+    credential: &Credential,
+    sender: &Sender,
+) -> Result<([u8; 32], [u8; 32])> {
+    let basic = BasicCredential::try_from(credential.clone())
+        .map_err(|_| GhostError::Mls("sender has non-basic credential".into()))?;
+    let account_fp: [u8; 32] = basic.identity().try_into().map_err(|_| {
+        GhostError::Format("credential identity is not 32 bytes".into())
+    })?;
+
+    let leaf_index = match sender {
+        Sender::Member(idx) => idx.u32(),
+        // Relay external proposals don't have identity log entries
+        Sender::External(_) => return Err(GhostError::Mls("external sender".into())),
+        _ => return Err(GhostError::Mls("unexpected sender type".into())),
+    };
+
+    let device_vk = group
+        .members()
+        .find(|m| m.index.u32() == leaf_index)
+        .map(|m| {
+            <[u8; 32]>::try_from(m.signature_key.as_slice()).map_err(|_| {
+                GhostError::Format("member signature key is not 32 bytes".into())
+            })
+        })
+        .ok_or_else(|| GhostError::Mls("sender leaf not found in group".into()))??;
+
+    Ok((account_fp, device_vk))
+}
+
+/// Verify a sender's device key is authorized in their account's identity log.
+fn validate_sender_credential(
+    cache: &IdLogCache,
+    account_fp: &[u8; 32],
+    device_vk: &[u8; 32],
+) -> Result<()> {
+    match cache.is_active_device(account_fp, device_vk)? {
+        true => Ok(()),
+        false => Err(GhostError::IdentityLog(format!(
+            "device {} not authorized for account {}",
+            hex::encode(&device_vk[..8]),
+            hex::encode(&account_fp[..8]),
+        ))),
+    }
+}
+
 /// Process an inbound blob that could be an application message or a commit.
 /// Strips the envelope header, then decrypts. App messages are returned;
 /// commits are merged into the group automatically.
+/// All sender credentials are validated against the identity log cache.
 pub fn open_any(
     group: &mut GhostGroup,
     provider: &GhostProvider,
     blob: &[u8],
+    idlog_cache: &IdLogCache,
 ) -> Result<InboundMessage> {
     ghost_wire::decode_envelope(blob)
         .map_err(|e| GhostError::Format(format!("envelope: {e}")))?;
     let mls_bytes = ghost_wire::envelope_payload(blob);
     let processed = group.process_message_bytes(provider, mls_bytes)?;
     let credential = processed.credential().clone();
+    let sender = processed.sender().clone();
 
     match processed.into_content() {
         ProcessedMessageContent::ApplicationMessage(app_msg) => {
-            let mls_basic = BasicCredential::try_from(credential)
+            let mls_basic = BasicCredential::try_from(credential.clone())
                 .map_err(|_| GhostError::Mls("sender has non-basic credential".into()))?;
             let msg = ApplicationMessage::from_bytes(&app_msg.into_bytes())?;
             if msg.sender_fp != mls_basic.identity() {
@@ -785,9 +836,36 @@ pub fn open_any(
                     "sender_fp does not match MLS credential".into(),
                 ));
             }
+
+            // Validate the sender's device key against their identity log
+            let (account_fp, device_vk) =
+                extract_sender_identity(group, &credential, &sender)?;
+            validate_sender_credential(idlog_cache, &account_fp, &device_vk)?;
+
             Ok(InboundMessage::Application(msg))
         }
         ProcessedMessageContent::StagedCommitMessage(staged_commit) => {
+            // Validate commit sender if it's a member (not external/relay)
+            if matches!(sender, Sender::Member(_)) {
+                let (account_fp, device_vk) =
+                    extract_sender_identity(group, &credential, &sender)?;
+                validate_sender_credential(idlog_cache, &account_fp, &device_vk)?;
+            }
+
+            // Validate credentials of newly added members before merging
+            for add_proposal in staged_commit.add_proposals() {
+                let kp = add_proposal.add_proposal().key_package();
+                let leaf = kp.leaf_node();
+                let kp_basic = BasicCredential::try_from(leaf.credential().clone())
+                    .map_err(|_| GhostError::Mls("added member has non-basic credential".into()))?;
+                let added_fp: [u8; 32] = kp_basic.identity().try_into().map_err(|_| {
+                    GhostError::Format("added member credential is not 32 bytes".into())
+                })?;
+                let added_vk: [u8; 32] = leaf.signature_key().as_slice().try_into()
+                    .map_err(|_| GhostError::Format("added member sig key is not 32 bytes".into()))?;
+                validate_sender_credential(idlog_cache, &added_fp, &added_vk)?;
+            }
+
             // Extract removed member fingerprints before merging
             let removed = extract_removed_fps(group, &staged_commit);
             group.merge_staged_commit(provider, *staged_commit)?;

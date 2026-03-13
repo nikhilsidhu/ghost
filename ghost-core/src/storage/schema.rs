@@ -105,6 +105,20 @@ pub fn initialize(conn: &Connection) -> Result<()> {
             value BLOB,
             ts    INTEGER NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS idlog_cache (
+            account_fp BLOB NOT NULL,
+            seq        INTEGER NOT NULL,
+            payload    BLOB NOT NULL,
+            PRIMARY KEY (account_fp, seq)
+        );
+
+        CREATE TABLE IF NOT EXISTS idlog_state (
+            account_fp BLOB PRIMARY KEY,
+            head_seq   INTEGER NOT NULL,
+            head_hash  BLOB NOT NULL,
+            master_vk  BLOB
+        );
         "
     ))
     .map_err(|e| GhostError::Database(format!("create tables: {e}")))?;

@@ -1,5 +1,6 @@
 pub mod channels;
 pub mod device_config;
+pub mod idlog_cache;
 pub mod servers;
 pub mod members;
 pub mod messages;
