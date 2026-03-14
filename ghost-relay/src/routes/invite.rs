@@ -6,6 +6,7 @@ use serde::Deserialize;
 use std::time::Duration;
 use tokio::sync::broadcast;
 
+use crate::auth::DeviceAuth;
 use crate::constants::{DEFAULT_LONG_POLL_MS, MAX_LONG_POLL_MS, NOTIFY_CAPACITY};
 use crate::error::{RelayError, Result};
 use crate::state::{AppState, Invite};
@@ -18,6 +19,7 @@ pub struct RegisterInvite {
 }
 
 pub async fn register(
+    _auth: DeviceAuth,
     State(state): State<AppState>,
     Json(body): Json<RegisterInvite>,
 ) -> Result<StatusCode> {
@@ -49,6 +51,7 @@ pub async fn register(
 }
 
 pub async fn join(
+    _auth: DeviceAuth,
     State(state): State<AppState>,
     Path(token): Path<String>,
     headers: HeaderMap,
@@ -124,6 +127,7 @@ pub async fn get_join(
 }
 
 pub async fn post_accept(
+    _auth: DeviceAuth,
     State(state): State<AppState>,
     Path(token): Path<String>,
     body: Bytes,

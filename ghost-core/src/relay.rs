@@ -245,10 +245,12 @@ impl RelayClient {
     }
 
     pub async fn register_invite(&self, token: &str, expires_at: u64) -> Result<()> {
-        let resp = self
+        let path = "/invite";
+        let req = self
             .http
-            .post(format!("{}/invite", self.base_url))
-            .json(&serde_json::json!({ "token": token, "expires_at": expires_at }))
+            .post(format!("{}{}", self.base_url, path))
+            .json(&serde_json::json!({ "token": token, "expires_at": expires_at }));
+        let resp = self.authenticated("POST", path, req)
             .send()
             .await
             .map_err(|e| GhostError::Network(e.to_string()))?;
@@ -262,10 +264,12 @@ impl RelayClient {
     }
 
     pub async fn post_join(&self, token: &str, payload: Vec<u8>) -> Result<()> {
-        let resp = self
+        let path = format!("/invite/{}/join", token);
+        let req = self
             .http
-            .post(format!("{}/invite/{}/join", self.base_url, token))
-            .body(payload)
+            .post(format!("{}{}", self.base_url, path))
+            .body(payload);
+        let resp = self.authenticated("POST", &path, req)
             .send()
             .await
             .map_err(|e| GhostError::Network(e.to_string()))?;
@@ -279,9 +283,11 @@ impl RelayClient {
     }
 
     pub async fn get_join(&self, token: &str) -> Result<Vec<u8>> {
-        let resp = self
+        let path = format!("/invite/{}/join", token);
+        let req = self
             .http
-            .get(format!("{}/invite/{}/join", self.base_url, token))
+            .get(format!("{}{}", self.base_url, path));
+        let resp = self.authenticated("GET", &path, req)
             .send()
             .await
             .map_err(|e| GhostError::Network(e.to_string()))?;
@@ -301,10 +307,12 @@ impl RelayClient {
     }
 
     pub async fn post_accept(&self, token: &str, payload: Vec<u8>) -> Result<()> {
-        let resp = self
+        let path = format!("/invite/{}/accept", token);
+        let req = self
             .http
-            .post(format!("{}/invite/{}/accept", self.base_url, token))
-            .body(payload)
+            .post(format!("{}{}", self.base_url, path))
+            .body(payload);
+        let resp = self.authenticated("POST", &path, req)
             .send()
             .await
             .map_err(|e| GhostError::Network(e.to_string()))?;
@@ -556,14 +564,12 @@ impl RelayClient {
         account_fp: &[u8; 32],
         payload: Vec<u8>,
     ) -> Result<()> {
-        let resp = self
+        let path = format!("/pair/{}", hex::encode(account_fp));
+        let req = self
             .http
-            .post(format!(
-                "{}/pair/{}",
-                self.base_url,
-                hex::encode(account_fp),
-            ))
-            .body(payload)
+            .post(format!("{}{}", self.base_url, path))
+            .body(payload);
+        let resp = self.authenticated("POST", &path, req)
             .send()
             .await
             .map_err(|e| GhostError::Network(e.to_string()))?;
@@ -601,13 +607,11 @@ impl RelayClient {
         &self,
         account_fp: &[u8; 32],
     ) -> Result<Option<Vec<u8>>> {
-        let resp = self
+        let path = format!("/pair/{}/response", hex::encode(account_fp));
+        let req = self
             .http
-            .get(format!(
-                "{}/pair/{}/response",
-                self.base_url,
-                hex::encode(account_fp),
-            ))
+            .get(format!("{}{}", self.base_url, path));
+        let resp = self.authenticated("GET", &path, req)
             .send()
             .await
             .map_err(|e| GhostError::Network(e.to_string()))?;

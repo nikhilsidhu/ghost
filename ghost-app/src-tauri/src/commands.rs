@@ -605,21 +605,21 @@ pub async fn create_invite(
     };
 
     let expires_at = now_millis() + INVITE_EXPIRY_MS;
-    state
-        .http
-        .post(format!("{}/invite", relay_url))
-        .json(&serde_json::json!({ "token": token, "expires_at": expires_at }))
+    let reg_path = "/invite";
+    sign_request(&state, "POST", reg_path, state.http
+        .post(format!("{}{}", relay_url, reg_path))
+        .json(&serde_json::json!({ "token": token, "expires_at": expires_at })))
         .send()
         .await
         .map_err(|e| format!("register invite: {e}"))?
         .error_for_status()
         .map_err(|e| format!("register invite: {e}"))?;
 
-    state
-        .http
-        .post(format!("{}/invite/{}/join", relay_url, token))
+    let join_path = format!("/invite/{}/join", token);
+    sign_request(&state, "POST", &join_path, state.http
+        .post(format!("{}{}", relay_url, join_path))
         .header(SEQ_HEADER, "0")
-        .body(payload_bytes)
+        .body(payload_bytes))
         .send()
         .await
         .map_err(|e| format!("upload invite payload: {e}"))?
@@ -693,11 +693,11 @@ pub async fn join_by_invite(
             .map_err(|e| e.to_string())?
     };
 
-    let resp = state
-        .http
-        .post(format!("{}/invite/{}/join", relay_url, token))
+    let refresh_path = format!("/invite/{}/join", token);
+    let resp = sign_request(&state, "POST", &refresh_path, state.http
+        .post(format!("{}{}", relay_url, refresh_path))
         .header(SEQ_HEADER, seq.to_string())
-        .body(updated_payload)
+        .body(updated_payload))
         .send()
         .await
         .map_err(|e| format!("refresh invite: {e}"))?;

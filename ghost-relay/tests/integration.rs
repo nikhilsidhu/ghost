@@ -520,41 +520,46 @@ async fn blob_size_limit() {
 #[tokio::test]
 async fn invite_full_flow() {
     let base = start_server(test_config()).await;
+    let auth = TestAuth::generate();
+    auth.register(&base).await;
     let client = reqwest::Client::new();
 
-    // Register
-    let resp = client
-        .post(format!("{base}/invite"))
-        .json(&serde_json::json!({ "token": "abc123", "expires_at": u64::MAX }))
+    // Register (authenticated)
+    let reg_url = format!("{base}/invite");
+    let resp = auth.sign("POST", &reg_url, client
+        .post(&reg_url)
+        .json(&serde_json::json!({ "token": "abc123", "expires_at": u64::MAX })))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
 
-    // Join
-    let resp = client
-        .post(format!("{base}/invite/abc123/join"))
-        .body(b"key-package".to_vec())
+    // Join (authenticated — creator uploads initial payload)
+    let join_url = format!("{base}/invite/abc123/join");
+    let resp = auth.sign("POST", &join_url, client
+        .post(&join_url)
+        .body(b"key-package".to_vec()))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
 
-    // Get join payload
+    // Get join payload (unauthenticated — joiner downloads)
     let resp = client.get(format!("{base}/invite/abc123/join")).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(resp.bytes().await.unwrap().as_ref(), b"key-package");
 
-    // Accept
-    let resp = client
-        .post(format!("{base}/invite/abc123/accept"))
-        .body(b"welcome".to_vec())
+    // Accept (authenticated)
+    let accept_url = format!("{base}/invite/abc123/accept");
+    let resp = auth.sign("POST", &accept_url, client
+        .post(&accept_url)
+        .body(b"welcome".to_vec()))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
-    // Get accept payload
+    // Get accept payload (unauthenticated — joiner polls)
     let resp = client.get(format!("{base}/invite/abc123/accept")).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(resp.bytes().await.unwrap().as_ref(), b"welcome");
@@ -563,19 +568,23 @@ async fn invite_full_flow() {
 #[tokio::test]
 async fn expired_invite_rejected() {
     let base = start_server(test_config()).await;
+    let auth = TestAuth::generate();
+    auth.register(&base).await;
     let client = reqwest::Client::new();
 
-    // Register with already-expired timestamp
-    client
-        .post(format!("{base}/invite"))
-        .json(&serde_json::json!({ "token": "expired", "expires_at": 1 }))
+    // Register with already-expired timestamp (authenticated)
+    let reg_url = format!("{base}/invite");
+    auth.sign("POST", &reg_url, client
+        .post(&reg_url)
+        .json(&serde_json::json!({ "token": "expired", "expires_at": 1 })))
         .send()
         .await
         .unwrap();
 
-    let resp = client
-        .post(format!("{base}/invite/expired/join"))
-        .body(b"kp".to_vec())
+    let join_url = format!("{base}/invite/expired/join");
+    let resp = auth.sign("POST", &join_url, client
+        .post(&join_url)
+        .body(b"kp".to_vec()))
         .send()
         .await
         .unwrap();
@@ -884,39 +893,40 @@ fn pair_url(base: &str, fp: &[u8; 32]) -> String {
 #[tokio::test]
 async fn pairing_full_flow() {
     let base = start_server(test_config()).await;
+    let auth = TestAuth::generate();
+    auth.register(&base).await;
     let client = reqwest::Client::new();
-    let fp = [0xB1; 32];
 
-    // Existing device posts offer
-    let resp = client
-        .post(pair_url(&base, &fp))
-        .body(b"encrypted-offer".to_vec())
+    // Existing device posts offer (authenticated)
+    let offer_url = pair_url(&base, &auth.account_fp);
+    let resp = auth.sign("POST", &offer_url, client
+        .post(&offer_url)
+        .body(b"encrypted-offer".to_vec()))
         .send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
 
-    // Poll for response — none yet
-    let resp = client
-        .get(format!("{}/response", pair_url(&base, &fp)))
+    // Poll for response — none yet (authenticated)
+    let resp_url = format!("{}/response", pair_url(&base, &auth.account_fp));
+    let resp = auth.sign("GET", &resp_url, client.get(&resp_url))
         .send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
-    // New device posts response
+    // New device posts response (unauthenticated)
+    let respond_url = format!("{}/respond", pair_url(&base, &auth.account_fp));
     let resp = client
-        .post(format!("{}/respond", pair_url(&base, &fp)))
+        .post(&respond_url)
         .body(b"encrypted-response".to_vec())
         .send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
-    // Existing device polls — gets response (non-destructive read)
-    let resp = client
-        .get(format!("{}/response", pair_url(&base, &fp)))
+    // Existing device polls — gets response (authenticated)
+    let resp = auth.sign("GET", &resp_url, client.get(&resp_url))
         .send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(resp.bytes().await.unwrap().as_ref(), b"encrypted-response");
 
-    // Second poll — session still alive (TTL-based cleanup, not one-shot)
-    let resp = client
-        .get(format!("{}/response", pair_url(&base, &fp)))
+    // Second poll — session still alive
+    let resp = auth.sign("GET", &resp_url, client.get(&resp_url))
         .send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 }
@@ -937,15 +947,17 @@ async fn pairing_respond_without_offer_rejected() {
 #[tokio::test]
 async fn pairing_offer_overwrite() {
     let base = start_server(test_config()).await;
+    let auth = TestAuth::generate();
+    auth.register(&base).await;
     let client = reqwest::Client::new();
-    let fp = [0xB5; 32];
 
-    // Post offer, then overwrite with new offer
-    client.post(pair_url(&base, &fp)).body(b"offer-1".to_vec()).send().await.unwrap();
-    client.post(pair_url(&base, &fp)).body(b"offer-2".to_vec()).send().await.unwrap();
+    // Post offer, then overwrite with new offer (authenticated)
+    let offer_url = pair_url(&base, &auth.account_fp);
+    auth.sign("POST", &offer_url, client.post(&offer_url).body(b"offer-1".to_vec())).send().await.unwrap();
+    auth.sign("POST", &offer_url, client.post(&offer_url).body(b"offer-2".to_vec())).send().await.unwrap();
 
-    // Fetch back the offer — should be offer-2, not offer-1
-    let resp = client.get(pair_url(&base, &fp)).send().await.unwrap();
+    // Fetch back the offer (unauthenticated — new device)
+    let resp = client.get(&offer_url).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(resp.bytes().await.unwrap().as_ref(), b"offer-2");
 }

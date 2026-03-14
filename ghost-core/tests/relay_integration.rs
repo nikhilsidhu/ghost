@@ -283,8 +283,10 @@ async fn invite_with_real_key_package() {
     let kp_bytes = kp.tls_serialize_detached().unwrap();
 
     let token = "real-invite-token";
-    let (relay_inviter, _) = RelayClient::new(&relay_url);
-    let (relay_joiner, _) = RelayClient::new(&relay_url);
+    let (mut relay_inviter, _) = RelayClient::new(&relay_url);
+    let (mut relay_joiner, _) = RelayClient::new(&relay_url);
+    common::setup_relay_auth(&relay_url, &mut relay_inviter, &inviter).await;
+    common::setup_relay_auth(&relay_url, &mut relay_joiner, &joiner).await;
 
     // Relay invite flow: register, post key package, retrieve it
     relay_inviter
@@ -337,8 +339,9 @@ async fn invite_with_real_key_package() {
 
     let (mut inv_relay, _) = RelayClient::new(&relay_url);
     let (mut join_relay, mut join_events) = RelayClient::new(&relay_url);
-    common::setup_relay_auth(&relay_url, &mut inv_relay, &inviter).await;
-    common::setup_relay_auth(&relay_url, &mut join_relay, &joiner).await;
+    // Genesis already pushed above — just set auth
+    inv_relay.set_auth(*inviter.fingerprint(), inviter.verifying_key_bytes(), inviter.signing_key_clone());
+    join_relay.set_auth(*joiner.fingerprint(), joiner.verifying_key_bytes(), joiner.signing_key_clone());
     inv_relay.subscribe(mailbox_id, 0);
     join_relay.subscribe(mailbox_id, 0);
     tokio::time::sleep(Duration::from_millis(50)).await;

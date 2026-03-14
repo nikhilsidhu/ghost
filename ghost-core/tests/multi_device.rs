@@ -285,9 +285,12 @@ fn sync_dump_import_between_clients() {
 #[tokio::test]
 async fn pairing_offer_response_encrypted_roundtrip() {
     let relay_url = common::start_relay().await;
-    let (relay_a, _) = RelayClient::new(&relay_url);
-    let (relay_b, _) = RelayClient::new(&relay_url);
-    let (_master, _device1, _genesis, fp, _seed) = make_account("desktop");
+    let (mut relay_a, _) = RelayClient::new(&relay_url);
+    let (_master, device1, genesis, fp, _seed) = make_account("desktop");
+
+    // Register genesis so device1 is active on the relay
+    relay_a.put_idlog_entry(&fp, genesis.to_bytes()).await.unwrap();
+    relay_a.set_auth(fp, device1.verifying_key().to_bytes(), device1.clone());
 
     let secret = [0x42u8; 32];
     let offer_pt = b"relay_url|display_name|avatar_hash";
@@ -295,7 +298,7 @@ async fn pairing_offer_response_encrypted_roundtrip() {
     relay_a.post_pairing_offer(&fp, offer_sealed).await.unwrap();
 
     // No response yet
-    assert!(relay_b.get_pairing_response(&fp).await.unwrap().is_none());
+    assert!(relay_a.get_pairing_response(&fp).await.unwrap().is_none());
 
     // Fetch offer via HTTP (simulating QR code scan)
     let http = reqwest::Client::new();
@@ -311,14 +314,15 @@ async fn pairing_offer_response_encrypted_roundtrip() {
     let offer_opened = sync_open(&secret, &offer_blob).unwrap();
     assert_eq!(offer_opened, offer_pt);
 
-    // Device B responds with its key
+    // Device B responds with its key (unauthenticated — new device)
     let device_b_key = SigningKey::generate(&mut OsRng);
     let mut response_pt = Vec::new();
     response_pt.extend_from_slice(&device_b_key.to_bytes());
     response_pt.extend_from_slice(b"phone");
     let response_sealed = sync_seal(&secret, &response_pt).unwrap();
-    relay_b
-        .post_pairing_response(&fp, response_sealed)
+    http.post(format!("{}/pair/{}/respond", relay_url, hex::encode(fp)))
+        .body(response_sealed)
+        .send()
         .await
         .unwrap();
 
@@ -513,11 +517,12 @@ async fn full_pairing_then_sync_exchange() {
     // 1. Device A creates account
     let (_master, device_a, genesis, fp, _seed) = make_account("desktop");
     let fp_hex = hex::encode(fp);
-    let (relay_a, _) = RelayClient::new(&relay_url);
+    let (mut relay_a, _) = RelayClient::new(&relay_url);
     relay_a
         .put_idlog_entry(&fp, genesis.to_bytes())
         .await
         .unwrap();
+    relay_a.set_auth(fp, device_a.verifying_key().to_bytes(), device_a.clone());
 
     // 2. Device A creates GhostClient, sync key, and sync MLS group
     let mut client_a = GhostClient::open_in_memory(
@@ -533,16 +538,12 @@ async fn full_pairing_then_sync_exchange() {
     client_a.set_sync_key(sync_key).unwrap();
     client_a.create_sync_group().unwrap();
 
-    // 3. Device A posts pairing offer
+    // 3. Device A posts pairing offer (authenticated)
     let secret = [0x42u8; 32];
     let offer = sync_seal(&secret, b"offer-data").unwrap();
-    http.post(format!("{}/pair/{}", relay_url, fp_hex))
-        .body(offer)
-        .send()
-        .await
-        .unwrap();
+    relay_a.post_pairing_offer(&fp, offer).await.unwrap();
 
-    // 4. Device B responds with its key
+    // 4. Device B responds with its key (unauthenticated)
     let device_b = SigningKey::generate(&mut OsRng);
     let mut response_pt = device_b.to_bytes().to_vec();
     response_pt.extend_from_slice(b"phone");
@@ -553,16 +554,8 @@ async fn full_pairing_then_sync_exchange() {
         .await
         .unwrap();
 
-    // 5. Device A gets response, builds provision blob with sync_key + GroupInfo + sync state
-    let resp_blob = http
-        .get(format!("{}/pair/{}/response", relay_url, fp_hex))
-        .send()
-        .await
-        .unwrap()
-        .bytes()
-        .await
-        .unwrap()
-        .to_vec();
+    // 5. Device A gets response (authenticated)
+    let resp_blob = relay_a.get_pairing_response(&fp).await.unwrap().unwrap();
     let resp_pt = sync_open(&secret, &resp_blob).unwrap();
     let b_key_bytes: [u8; 32] = resp_pt[..32].try_into().unwrap();
     let b_signing_key = SigningKey::from_bytes(&b_key_bytes);

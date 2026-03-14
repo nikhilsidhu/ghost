@@ -17,11 +17,15 @@ const MAX_PROVISION_PAYLOAD: usize = 256 * 1024; // 256 KB — carries all serve
 
 /// POST /pair/{account_fp} — existing device posts pairing offer.
 pub async fn post_offer(
+    auth: DeviceAuth,
     State(state): State<AppState>,
     Path(account_fp_hex): Path<String>,
     body: Bytes,
 ) -> Result<StatusCode> {
     let account_fp = decode_account_fp(&account_fp_hex)?;
+    if auth.account_fp != account_fp {
+        return Err(RelayError::Unauthorized("account mismatch".into()));
+    }
 
     if body.is_empty() {
         return Err(RelayError::BadRequest("empty payload".into()));
@@ -69,10 +73,14 @@ pub async fn post_respond(
 
 /// GET /pair/{account_fp}/response — existing device polls for response.
 pub async fn get_response(
+    auth: DeviceAuth,
     State(state): State<AppState>,
     Path(account_fp_hex): Path<String>,
 ) -> Result<impl IntoResponse> {
     let account_fp = decode_account_fp(&account_fp_hex)?;
+    if auth.account_fp != account_fp {
+        return Err(RelayError::Unauthorized("account mismatch".into()));
+    }
 
     let map = state.pairing.read().await;
     let session = map.get(&account_fp).ok_or(RelayError::NotFound)?;
