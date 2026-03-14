@@ -29,6 +29,9 @@ pub async fn put(
     let id = decode_mailbox_id(&mailbox_id)?;
     state.check_membership(&id, &auth.account_fp)?;
     let fp = decode_fingerprint(&fingerprint)?;
+    if fp != auth.account_fp {
+        return Err(RelayError::Forbidden("can only update your own avatar".into()));
+    }
     state.storage.put_avatar(&id, &fp, &body)?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -55,6 +58,9 @@ pub async fn delete(
     let id = decode_mailbox_id(&mailbox_id)?;
     state.check_membership(&id, &auth.account_fp)?;
     let fp = decode_fingerprint(&fingerprint)?;
+    if fp != auth.account_fp {
+        return Err(RelayError::Forbidden("can only delete your own avatar".into()));
+    }
     state.storage.delete_avatar(&id, &fp)?;
     Ok(StatusCode::NO_CONTENT)
 }
