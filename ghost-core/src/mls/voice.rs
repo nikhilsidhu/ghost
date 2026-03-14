@@ -25,17 +25,21 @@ fn derive_export_key(
 
 /// Each sender in a voice channel gets their own encryption key so nonces never collide.
 /// `device_vk` ensures two devices sharing a fingerprint derive different keys.
+/// `voice_salt` is a random 32-byte value generated per voice session to prevent
+/// nonce reuse when reconnecting within the same MLS epoch.
 pub fn derive_voice_key(
     group: &GhostGroup,
     provider: &GhostProvider,
     channel_id: &[u8; 32],
     sender_fp: &[u8; 32],
     device_vk: &[u8; 32],
+    voice_salt: &[u8; 32],
 ) -> Result<[u8; 32]> {
-    let mut context = Vec::with_capacity(96);
+    let mut context = Vec::with_capacity(128);
     context.extend_from_slice(channel_id);
     context.extend_from_slice(sender_fp);
     context.extend_from_slice(device_vk);
+    context.extend_from_slice(voice_salt);
     let secret = group.export_secret(provider, VOICE_EXPORT_LABEL, &context, 32)?;
     let key: [u8; 32] = secret
         .try_into()
@@ -85,27 +89,32 @@ pub struct PresenceState {
     pub muted: bool,
     pub deafened: bool,
     pub device_vk: [u8; 32],
+    /// Random value generated per voice session, mixed into key derivation to prevent
+    /// AES-GCM nonce reuse when reconnecting within the same MLS epoch.
+    pub voice_salt: [u8; 32],
 }
 
 impl PresenceState {
-    pub fn to_bytes(&self) -> [u8; 66] {
-        let mut buf = [0u8; 66];
+    pub fn to_bytes(&self) -> [u8; 98] {
+        let mut buf = [0u8; 98];
         buf[0..32].copy_from_slice(&self.fingerprint);
         buf[32] = self.muted as u8;
         buf[33] = self.deafened as u8;
         buf[34..66].copy_from_slice(&self.device_vk);
+        buf[66..98].copy_from_slice(&self.voice_salt);
         buf
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        if data.len() < 66 {
+        if data.len() < 98 {
             return Err(GhostError::Crypto("presence too short".into()));
         }
         let fingerprint: [u8; 32] = data[0..32].try_into().unwrap();
         let muted = data[32] != 0;
         let deafened = data[33] != 0;
         let device_vk: [u8; 32] = data[34..66].try_into().unwrap();
-        Ok(Self { fingerprint, muted, deafened, device_vk })
+        let voice_salt: [u8; 32] = data[66..98].try_into().unwrap();
+        Ok(Self { fingerprint, muted, deafened, device_vk, voice_salt })
     }
 }
 
@@ -206,8 +215,9 @@ mod tests {
 
         let channel_id = [0xFFu8; 32];
         let vk = *id.verifying_key.as_bytes();
-        let key1 = derive_voice_key(&group, &provider, &channel_id, &id.fingerprint, &vk).unwrap();
-        let key2 = derive_voice_key(&group, &provider, &channel_id, &id.fingerprint, &vk).unwrap();
+        let salt = [0x99u8; 32];
+        let key1 = derive_voice_key(&group, &provider, &channel_id, &id.fingerprint, &vk, &salt).unwrap();
+        let key2 = derive_voice_key(&group, &provider, &channel_id, &id.fingerprint, &vk, &salt).unwrap();
         assert_eq!(key1, key2);
     }
 
@@ -221,8 +231,9 @@ mod tests {
         let fp_a = [0xAAu8; 32];
         let fp_b = [0xBBu8; 32];
         let vk = [0x00u8; 32];
-        let key_a = derive_voice_key(&group, &provider, &channel_id, &fp_a, &vk).unwrap();
-        let key_b = derive_voice_key(&group, &provider, &channel_id, &fp_b, &vk).unwrap();
+        let salt = [0x99u8; 32];
+        let key_a = derive_voice_key(&group, &provider, &channel_id, &fp_a, &vk, &salt).unwrap();
+        let key_b = derive_voice_key(&group, &provider, &channel_id, &fp_b, &vk, &salt).unwrap();
         assert_ne!(key_a, key_b);
     }
 
@@ -235,8 +246,24 @@ mod tests {
         let channel_id = [0xFFu8; 32];
         let vk_a = [0xAAu8; 32];
         let vk_b = [0xBBu8; 32];
-        let key_a = derive_voice_key(&group, &provider, &channel_id, &id.fingerprint, &vk_a).unwrap();
-        let key_b = derive_voice_key(&group, &provider, &channel_id, &id.fingerprint, &vk_b).unwrap();
+        let salt = [0x99u8; 32];
+        let key_a = derive_voice_key(&group, &provider, &channel_id, &id.fingerprint, &vk_a, &salt).unwrap();
+        let key_b = derive_voice_key(&group, &provider, &channel_id, &id.fingerprint, &vk_b, &salt).unwrap();
+        assert_ne!(key_a, key_b);
+    }
+
+    #[test]
+    fn different_salt_different_key() {
+        let provider = GhostProvider::new_in_memory().unwrap();
+        let id = Identity::from_seed([0x01u8; 32]).unwrap();
+        let group = super::super::group::GhostGroup::create(&provider, &id, None).unwrap();
+
+        let channel_id = [0xFFu8; 32];
+        let vk = *id.verifying_key.as_bytes();
+        let salt_a = [0xAAu8; 32];
+        let salt_b = [0xBBu8; 32];
+        let key_a = derive_voice_key(&group, &provider, &channel_id, &id.fingerprint, &vk, &salt_a).unwrap();
+        let key_b = derive_voice_key(&group, &provider, &channel_id, &id.fingerprint, &vk, &salt_b).unwrap();
         assert_ne!(key_a, key_b);
     }
 
@@ -247,6 +274,7 @@ mod tests {
             muted: true,
             deafened: false,
             device_vk: [0xDD; 32],
+            voice_salt: [0xEE; 32],
         };
         let bytes = state.to_bytes();
         let parsed = PresenceState::from_bytes(&bytes).unwrap();
@@ -261,6 +289,7 @@ mod tests {
             muted: false,
             deafened: true,
             device_vk: [0xDD; 32],
+            voice_salt: [0xEE; 32],
         };
         let blob = seal_presence(&key, &state).unwrap();
         let opened = open_presence(&key, &blob).unwrap();
@@ -276,6 +305,7 @@ mod tests {
             muted: false,
             deafened: false,
             device_vk: [0xDD; 32],
+            voice_salt: [0xEE; 32],
         };
         let blob = seal_presence(&key1, &state).unwrap();
         assert!(open_presence(&key2, &blob).is_err());
@@ -296,6 +326,7 @@ mod tests {
             muted: true,
             deafened: false,
             device_vk: *id.verifying_key.as_bytes(),
+            voice_salt: [0x11; 32],
         };
         let blob = seal_presence(&key, &state).unwrap();
 
@@ -319,6 +350,7 @@ mod tests {
             muted: false,
             deafened: false,
             device_vk: *id.verifying_key.as_bytes(),
+            voice_salt: [0x11; 32],
         };
         let blob = seal_presence(&key, &state).unwrap();
 
@@ -334,8 +366,9 @@ mod tests {
         let group = super::super::group::GhostGroup::create(&provider, &id, None).unwrap();
 
         let vk = *id.verifying_key.as_bytes();
-        let key_a = derive_voice_key(&group, &provider, &[0xAA; 32], &id.fingerprint, &vk).unwrap();
-        let key_b = derive_voice_key(&group, &provider, &[0xBB; 32], &id.fingerprint, &vk).unwrap();
+        let salt = [0x99u8; 32];
+        let key_a = derive_voice_key(&group, &provider, &[0xAA; 32], &id.fingerprint, &vk, &salt).unwrap();
+        let key_b = derive_voice_key(&group, &provider, &[0xBB; 32], &id.fingerprint, &vk, &salt).unwrap();
         assert_ne!(key_a, key_b);
     }
 
@@ -352,7 +385,8 @@ mod tests {
 
         let channel_id = [0xFFu8; 32];
         let vk = *id.verifying_key.as_bytes();
-        let voice = derive_voice_key(&group, &provider, &channel_id, &id.fingerprint, &vk).unwrap();
+        let salt = [0x99u8; 32];
+        let voice = derive_voice_key(&group, &provider, &channel_id, &id.fingerprint, &vk, &salt).unwrap();
         let presence = derive_presence_key(&group, &provider, &channel_id, &id.fingerprint).unwrap();
         assert_ne!(voice, presence);
     }

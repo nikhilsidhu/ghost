@@ -239,7 +239,7 @@ async fn process_presence_blob(
         .open_presence_blob(server_id, channel_id, &blob)
         .map_err(|e| format!("presence decrypt: {e}"))?;
     let voice_key = c
-        .derive_voice_key(server_id, channel_id, &ps.fingerprint, &ps.device_vk)
+        .derive_voice_key(server_id, channel_id, &ps.fingerprint, &ps.device_vk, &ps.voice_salt)
         .map_err(|e| format!("derive key: {e}"))?;
     Ok((ps, voice_key))
 }
@@ -251,10 +251,11 @@ async fn seal_presence(
     channel_id: &[u8; 32],
     muted: bool,
     deafened: bool,
+    voice_salt: [u8; 32],
 ) -> Result<String, String> {
     let c = client.lock().await;
     let blob = c
-        .seal_presence_blob(server_id, channel_id, muted, deafened)
+        .seal_presence_blob(server_id, channel_id, muted, deafened, voice_salt)
         .map_err(|e| format!("seal presence: {e}"))?;
     Ok(B64.encode(&blob))
 }
@@ -266,6 +267,7 @@ async fn start_audio(
     channel_id: &[u8; 32],
     own_fp: &[u8; 32],
     own_device_vk: &[u8; 32],
+    own_voice_salt: &[u8; 32],
     own_slot_id: u32,
     relay_url: &str,
     port: u16,
@@ -276,7 +278,7 @@ async fn start_audio(
 ) -> Result<AudioSession, String> {
     let own_key = {
         let c = client.lock().await;
-        c.derive_voice_key(server_id, channel_id, own_fp, own_device_vk)
+        c.derive_voice_key(server_id, channel_id, own_fp, own_device_vk, own_voice_salt)
             .map_err(|e| format!("derive own key: {e}"))?
     };
 
@@ -330,6 +332,7 @@ struct PendingJoin {
     relay_url: String,
     own_fp: [u8; 32],
     own_device_vk: [u8; 32],
+    voice_salt: [u8; 32],
     input_device: Option<String>,
     output_device: Option<String>,
     ns_mode: u8,
@@ -356,9 +359,10 @@ async fn send_presence_update(
     channel_id: &[u8; 32],
     muted: bool,
     deafened: bool,
+    voice_salt: [u8; 32],
 ) {
     let Some(ref mut sink) = ws else { return };
-    match seal_presence(client, server_id, channel_id, muted, deafened).await {
+    match seal_presence(client, server_id, channel_id, muted, deafened, voice_salt).await {
         Ok(blob_b64) => {
             let msg = serde_json::to_string(&ClientMsg::Presence { blob: blob_b64 }).unwrap();
             let _ = sink.send(Message::Text(msg.into())).await;
@@ -407,6 +411,8 @@ pub async fn run(
     // Parsed IDs cached while connected (avoids re-parsing on every presence update)
     let mut active_server_id: Option<[u8; 32]> = None;
     let mut active_channel_id: Option<[u8; 32]> = None;
+    // Random salt generated per voice session, reused for all presence updates
+    let mut active_voice_salt: [u8; 32] = [0u8; 32];
 
     loop {
         tokio::select! {
@@ -436,6 +442,12 @@ pub async fn run(
                             *c.identity().verifying_key.as_bytes()
                         };
 
+                        // Generate a random salt for this voice session
+                        use rand::RngCore;
+                        let mut voice_salt = [0u8; 32];
+                        rand::rngs::OsRng.fill_bytes(&mut voice_salt);
+                        active_voice_salt = voice_salt;
+
                         let url = match ws_url(&relay_url, &channel_id) {
                             Ok(u) => u,
                             Err(e) => {
@@ -445,7 +457,7 @@ pub async fn run(
                         };
 
                         // Seal initial presence blob
-                        let presence_b64 = match seal_presence(&client, &server_id_bytes, &channel_id_bytes, muted, deafened).await {
+                        let presence_b64 = match seal_presence(&client, &server_id_bytes, &channel_id_bytes, muted, deafened, voice_salt).await {
                             Ok(b) => b,
                             Err(e) => {
                                 emit_error(&app, &format!("seal presence: {e}"));
@@ -496,6 +508,7 @@ pub async fn run(
                             relay_url,
                             own_fp,
                             own_device_vk,
+                            voice_salt,
                             input_device,
                             output_device,
                             ns_mode,
@@ -534,9 +547,9 @@ pub async fn run(
                         let _ = state_tx.send(state.clone());
                         let _ = app.emit("voice-state", &state);
                         if let (Some(sid), Some(cid)) = (active_server_id, active_channel_id) {
-                            send_presence_update(&mut ws, &client, &sid, &cid, state.muted, state.deafened).await;
+                            send_presence_update(&mut ws, &client, &sid, &cid, state.muted, state.deafened, active_voice_salt).await;
                             // Also broadcast over mailbox WS
-                            if let Ok(blob_b64) = seal_presence(&client, &sid, &cid, state.muted, state.deafened).await {
+                            if let Ok(blob_b64) = seal_presence(&client, &sid, &cid, state.muted, state.deafened, active_voice_salt).await {
                                 let ch_b64 = B64.encode(cid);
                                 let vs_json = serde_json::json!({"vs":{"ch":ch_b64,"p":blob_b64}}).to_string();
                                 send_mailbox_vs(&relay, &client, &sid, vs_json).await;
@@ -553,9 +566,9 @@ pub async fn run(
                         let _ = state_tx.send(state.clone());
                         let _ = app.emit("voice-state", &state);
                         if let (Some(sid), Some(cid)) = (active_server_id, active_channel_id) {
-                            send_presence_update(&mut ws, &client, &sid, &cid, state.muted, state.deafened).await;
+                            send_presence_update(&mut ws, &client, &sid, &cid, state.muted, state.deafened, active_voice_salt).await;
                             // Also broadcast over mailbox WS
-                            if let Ok(blob_b64) = seal_presence(&client, &sid, &cid, state.muted, state.deafened).await {
+                            if let Ok(blob_b64) = seal_presence(&client, &sid, &cid, state.muted, state.deafened, active_voice_salt).await {
                                 let ch_b64 = B64.encode(cid);
                                 let vs_json = serde_json::json!({"vs":{"ch":ch_b64,"p":blob_b64}}).to_string();
                                 send_mailbox_vs(&relay, &client, &sid, vs_json).await;
@@ -594,8 +607,8 @@ pub async fn run(
                             let _ = state_tx.send(state.clone());
                             let _ = app.emit("voice-state", &state);
                             if let (Some(sid), Some(cid)) = (active_server_id, active_channel_id) {
-                                send_presence_update(&mut ws, &client, &sid, &cid, state.muted, state.deafened).await;
-                                if let Ok(blob_b64) = seal_presence(&client, &sid, &cid, state.muted, state.deafened).await {
+                                send_presence_update(&mut ws, &client, &sid, &cid, state.muted, state.deafened, active_voice_salt).await;
+                                if let Ok(blob_b64) = seal_presence(&client, &sid, &cid, state.muted, state.deafened, active_voice_salt).await {
                                     let ch_b64 = B64.encode(cid);
                                     let vs_json = serde_json::json!({"vs":{"ch":ch_b64,"p":blob_b64}}).to_string();
                                     send_mailbox_vs(&relay, &client, &sid, vs_json).await;
@@ -702,7 +715,7 @@ pub async fn run(
 
                                 match start_audio(
                                     &client, &p.server_id, &p.channel_id, &p.own_fp, &p.own_device_vk,
-                                    slot_id, &p.relay_url, port, initial_keys, &state,
+                                    &p.voice_salt, slot_id, &p.relay_url, port, initial_keys, &state,
                                     p.input_device.clone(), p.output_device.clone(),
                                 ).await {
                                     Ok(session) => {

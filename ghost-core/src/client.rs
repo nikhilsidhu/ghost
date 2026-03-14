@@ -1020,17 +1020,20 @@ impl GhostClient {
     }
 
     /// Derive a per-sender encryption key for voice in this server+channel.
+    /// `voice_salt` is a random value from the sender's presence blob, ensuring
+    /// unique keys per voice session even within the same MLS epoch.
     pub fn derive_voice_key(
         &self,
         server_id: &[u8; 32],
         channel_id: &[u8; 32],
         sender_fp: &[u8; 32],
         device_vk: &[u8; 32],
+        voice_salt: &[u8; 32],
     ) -> Result<[u8; 32]> {
         let group = self.servers.get(server_id).ok_or_else(|| {
             GhostError::ServerNotLoaded(hex::encode(&server_id[..8]))
         })?;
-        crate::mls::voice::derive_voice_key(group, &self.provider, channel_id, sender_fp, device_vk)
+        crate::mls::voice::derive_voice_key(group, &self.provider, channel_id, sender_fp, device_vk, voice_salt)
     }
 
     /// Derive a per-sender presence encryption key for a voice channel.
@@ -1047,12 +1050,15 @@ impl GhostClient {
     }
 
     /// Seal an encrypted presence blob for the current identity.
+    /// `voice_salt` is a random value generated once per voice session and reused
+    /// for all presence updates within that session.
     pub fn seal_presence_blob(
         &self,
         server_id: &[u8; 32],
         channel_id: &[u8; 32],
         muted: bool,
         deafened: bool,
+        voice_salt: [u8; 32],
     ) -> Result<Vec<u8>> {
         let key = self.derive_presence_key(server_id, channel_id, &self.identity.fingerprint)?;
         let state = crate::mls::voice::PresenceState {
@@ -1060,6 +1066,7 @@ impl GhostClient {
             muted,
             deafened,
             device_vk: *self.identity.verifying_key.as_bytes(),
+            voice_salt,
         };
         crate::mls::voice::seal_presence(&key, &state)
     }
