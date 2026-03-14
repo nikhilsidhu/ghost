@@ -816,38 +816,53 @@ fn validate_device_credential(
     }
 }
 
-/// Validate that a member sender's device key is authorized by their identity log.
-/// Skips validation for non-member senders (external/relay proposals).
+/// Extract account fingerprint and device key from a leaf node's credential.
+fn extract_leaf_identity(leaf: &openmls::prelude::LeafNode) -> Result<([u8; 32], [u8; 32])> {
+    let basic = BasicCredential::try_from(leaf.credential().clone())
+        .map_err(|_| GhostError::Mls("non-basic credential".into()))?;
+    let account_fp: [u8; 32] = basic.identity().try_into()
+        .map_err(|_| GhostError::Format("credential identity is not 32 bytes".into()))?;
+    let device_vk: [u8; 32] = leaf.signature_key().as_slice().try_into()
+        .map_err(|_| GhostError::Format("signature key is not 32 bytes".into()))?;
+    Ok((account_fp, device_vk))
+}
+
+/// Validate that the sender and all added members have authorized device keys.
+/// For application messages, pass staged_commit as None.
 pub(crate) fn validate_sender(
     group: &GhostGroup,
     credential: &Credential,
     sender: &Sender,
     cache: &IdLogCache,
+    staged_commit: Option<&openmls::prelude::StagedCommit>,
 ) -> Result<()> {
-    if !matches!(sender, Sender::Member(_)) {
-        return Ok(());
+    match sender {
+        Sender::Member(_) => {
+            let (account_fp, device_vk) = extract_sender_identity(group, credential, sender)?;
+            validate_device_credential(cache, &account_fp, &device_vk)?;
+        }
+        Sender::NewMemberCommit => {
+            let staged = staged_commit
+                .ok_or_else(|| GhostError::Mls("NewMemberCommit without staged commit".into()))?;
+            let leaf = staged.update_path_leaf_node()
+                .ok_or_else(|| GhostError::Mls("external commit missing update path".into()))?;
+            let (account_fp, device_vk) = extract_leaf_identity(leaf)?;
+            validate_device_credential(cache, &account_fp, &device_vk)?;
+        }
+        // Relay external proposals — no identity log
+        Sender::External(_) => {}
+        Sender::NewMemberProposal => {}
     }
-    let (account_fp, device_vk) = extract_sender_identity(group, credential, sender)?;
-    validate_device_credential(cache, &account_fp, &device_vk)
-}
 
-/// Validate that all members being added in a commit have authorized device keys.
-pub(crate) fn validate_add_proposals(
-    staged: &openmls::prelude::StagedCommit,
-    cache: &IdLogCache,
-) -> Result<()> {
-    for add_proposal in staged.add_proposals() {
-        let kp = add_proposal.add_proposal().key_package();
-        let leaf = kp.leaf_node();
-        let kp_basic = BasicCredential::try_from(leaf.credential().clone())
-            .map_err(|_| GhostError::Mls("added member has non-basic credential".into()))?;
-        let added_fp: [u8; 32] = kp_basic.identity().try_into().map_err(|_| {
-            GhostError::Format("added member credential is not 32 bytes".into())
-        })?;
-        let added_vk: [u8; 32] = leaf.signature_key().as_slice().try_into()
-            .map_err(|_| GhostError::Format("added member sig key is not 32 bytes".into()))?;
-        validate_device_credential(cache, &added_fp, &added_vk)?;
+    // Validate credentials of all members being added
+    if let Some(staged) = staged_commit {
+        for add in staged.add_proposals() {
+            let leaf = add.add_proposal().key_package().leaf_node();
+            let (fp, vk) = extract_leaf_identity(leaf)?;
+            validate_device_credential(cache, &fp, &vk)?;
+        }
     }
+
     Ok(())
 }
 
@@ -879,12 +894,11 @@ pub fn open_any(
                 ));
             }
 
-            validate_sender(group, &credential, &sender, idlog_cache)?;
+            validate_sender(group, &credential, &sender, idlog_cache, None)?;
             Ok(InboundMessage::Application(msg))
         }
         ProcessedMessageContent::StagedCommitMessage(staged_commit) => {
-            validate_sender(group, &credential, &sender, idlog_cache)?;
-            validate_add_proposals(&staged_commit, idlog_cache)?;
+            validate_sender(group, &credential, &sender, idlog_cache, Some(&staged_commit))?;
 
             let removed = extract_removed_fps(group, &staged_commit);
             group.merge_staged_commit(provider, *staged_commit)?;

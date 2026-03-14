@@ -352,7 +352,10 @@ fn sync_group_produces_joinable_group_info() {
 
 #[test]
 fn sync_group_add_device_via_external_commit() {
-    let (mut client_a, fp_a, _) = make_ghost_client("desktop");
+    use ghost_wire::idlog::{DeviceInfo, LogState};
+    use std::collections::HashMap;
+
+    let (mut client_a, fp_a, sk_a) = make_ghost_client("desktop");
     client_a.create_sync_group().unwrap();
 
     // Export GroupInfo for pairing
@@ -360,9 +363,19 @@ fn sync_group_add_device_via_external_commit() {
 
     // Device B joins via external commit
     let acct_b = Identity::create_account("phone").unwrap();
+    let b_vk = acct_b.identity.signing_key.verifying_key().to_bytes();
     let identity_b = Identity::from_device(fp_a, acct_b.identity.signing_key.clone(), 2);
     drop(acct_b);
     let mut client_b = GhostClient::open_in_memory(identity_b, [0x02; 32]).unwrap();
+
+    // Cache identity log so external commit validation passes
+    let a_vk = sk_a.verifying_key().to_bytes();
+    let mut devices = HashMap::new();
+    devices.insert(a_vk, DeviceInfo { verifying_key: a_vk, label: "desktop".into(), added_at_seq: 1, revoked_at_seq: None });
+    devices.insert(b_vk, DeviceInfo { verifying_key: b_vk, label: "phone".into(), added_at_seq: 2, revoked_at_seq: None });
+    let log_state = LogState { account_fp: fp_a, master_verifying_key: None, devices, head_seq: 2, head_hash: [0u8; 32] };
+    client_a.cache_own_identity_log(log_state);
+
     let (commit, mailbox_b) = client_b.join_sync_group(&gi).unwrap();
     assert_eq!(mailbox_b, client_a.sync_mailbox_id().unwrap());
 

@@ -353,12 +353,11 @@ impl GhostClient {
                 let sender = processed.sender().clone();
                 match processed.into_content() {
                     openmls::prelude::ProcessedMessageContent::ApplicationMessage(app) => {
-                        crate::wire::validate_sender(group, &credential, &sender, &self.idlog_cache)?;
+                        crate::wire::validate_sender(group, &credential, &sender, &self.idlog_cache, None)?;
                         Ok(SyncReceiveResult::Application(app.into_bytes()))
                     }
                     openmls::prelude::ProcessedMessageContent::StagedCommitMessage(staged) => {
-                        crate::wire::validate_sender(group, &credential, &sender, &self.idlog_cache)?;
-                        crate::wire::validate_add_proposals(&staged, &self.idlog_cache)?;
+                        crate::wire::validate_sender(group, &credential, &sender, &self.idlog_cache, Some(&staged))?;
                         group.merge_staged_commit(&self.provider, *staged)?;
                         Ok(SyncReceiveResult::CommitProcessed)
                     }
