@@ -20,5 +20,8 @@ pub async fn run(state: AppState) {
 
         // Sweep expired pairing sessions
         crate::routes::pair::reap_expired(&state).await;
+
+        // Sweep expired rate limiter entries
+        state.recovery_limiter.sweep();
     }
 }

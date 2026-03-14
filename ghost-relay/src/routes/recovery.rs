@@ -32,12 +32,15 @@ pub async fn put(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// GET /recovery/{account_fp_hex} — fetch encrypted recovery blob.
+/// GET /recovery/{account_fp_hex} — fetch encrypted recovery blob (rate-limited).
 pub async fn get(
     State(state): State<AppState>,
     Path(account_fp_hex): Path<String>,
 ) -> Result<impl IntoResponse> {
     let account_fp = decode_account_fp(&account_fp_hex)?;
+    if !state.recovery_limiter.check(&account_fp) {
+        return Err(RelayError::RateLimited);
+    }
     match state.storage.get_recovery_blob(&account_fp)? {
         Some(data) => Ok((StatusCode::OK, data)),
         None => Err(RelayError::NotFound),

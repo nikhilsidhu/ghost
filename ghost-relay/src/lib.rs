@@ -4,6 +4,7 @@ pub mod constants;
 pub mod error;
 pub mod mailbox;
 pub mod mls_storage;
+pub mod rate_limit;
 pub mod routes;
 pub mod state;
 pub mod storage;

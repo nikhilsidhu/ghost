@@ -24,6 +24,9 @@ pub enum RelayError {
     #[error("conflict")]
     Conflict,
 
+    #[error("rate limited")]
+    RateLimited,
+
     #[error("storage error: {0}")]
     Storage(String),
 }
@@ -38,6 +41,7 @@ impl IntoResponse for RelayError {
             Self::Forbidden(msg) => (StatusCode::FORBIDDEN, msg.clone()),
             Self::PayloadTooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "payload too large".into()),
             Self::Conflict => (StatusCode::CONFLICT, "conflict".into()),
+            Self::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "rate limited".into()),
             Self::Storage(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
         };
         (status, body).into_response()
