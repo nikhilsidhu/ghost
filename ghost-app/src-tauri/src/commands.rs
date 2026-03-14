@@ -549,7 +549,8 @@ pub async fn kick_member(
     };
     match post_result {
         Ok(_seq) => {
-            let client = state.client.lock().await;
+            let mut client = state.client.lock().await;
+            let _ = client.merge_pending_commit_for_server(&sid);
             let _ = client.store().remove_member(&sid, &fp);
             if let Ok(gi) = client.export_server_info(&sid) {
                 let relay = state.relay.lock().await;
@@ -559,12 +560,11 @@ pub async fn kick_member(
             let _ = app.emit("sync", hex::encode(sid));
         }
         Err(e) => {
-            eprintln!("kick: relay rejected commit: {e}, recovering via external commit");
-            match recover_epoch(&state.client, &state.relay, &sid, &outbound.mailbox_id, "kick").await {
-                Ok(true) => return Err("epoch conflict — group re-synced, please try again".into()),
-                Ok(false) => return Err("kick: failed to recover after epoch conflict".into()),
-                Err(e) => return Err(e),
-            }
+            eprintln!("kick: relay rejected commit: {e}, clearing pending commit");
+            let mut client = state.client.lock().await;
+            let _ = client.clear_pending_commit_for_server(&sid);
+            drop(client);
+            return Err("epoch conflict — please try again".into());
         }
     }
 
@@ -1363,7 +1363,6 @@ pub async fn revoke_device(
     }
 
     // Remove from sync MLS group (forward secrecy — revoked device can't decrypt future sync)
-    // Generate commit once (merge_pending_commit advances local epoch), then retry POST.
     let sync_removal = {
         let mut client = state.client.lock().await;
         if client.has_sync_group() {
@@ -1380,21 +1379,20 @@ pub async fn revoke_device(
         }
     };
     if let Some((sync_mb, commit_blob)) = sync_removal {
-        let mut posted = false;
-        for attempt in 0..3 {
-            let post_result = {
-                let relay = state.relay.lock().await;
-                relay.post_blob(&sync_mb, commit_blob.clone()).await
-            };
-            match post_result {
-                Ok(_) => { posted = true; break; }
-                Err(e) => {
-                    eprintln!("revoke: sync group POST failed (attempt {}): {e}", attempt + 1);
-                }
+        let post_result = {
+            let relay = state.relay.lock().await;
+            relay.post_blob(&sync_mb, commit_blob).await
+        };
+        match post_result {
+            Ok(_) => {
+                let mut client = state.client.lock().await;
+                let _ = client.merge_pending_commit_for_sync();
             }
-        }
-        if !posted {
-            eprintln!("revoke: sync group removal commit lost — revoked device retains forward secrecy until next epoch advance");
+            Err(e) => {
+                eprintln!("revoke: sync group POST failed: {e}");
+                let mut client = state.client.lock().await;
+                let _ = client.clear_pending_commit_for_sync();
+            }
         }
     }
 
@@ -1416,19 +1414,17 @@ pub async fn revoke_device(
         };
         match post_result {
             Ok(_) => {
-                let client = state.client.lock().await;
+                let mut client = state.client.lock().await;
+                let _ = client.merge_pending_commit_for_server(&sid);
                 if let Ok(gi) = client.export_server_info(&sid) {
                     let relay = state.relay.lock().await;
                     let _ = relay.put_server_info(&out.mailbox_id, gi).await;
                 }
             }
             Err(e) => {
-                eprintln!("revoke: relay rejected commit for {}: {e}, recovering", hex::encode(&sid[..8]));
-                match recover_epoch(&state.client, &state.relay, &sid, &out.mailbox_id, "revoke").await {
-                    Ok(true) => {}
-                    Ok(false) => eprintln!("revoke: epoch recovery exhausted for {}", hex::encode(&sid[..8])),
-                    Err(e) => eprintln!("{e}"),
-                }
+                eprintln!("revoke: relay rejected commit for {}: {e}", hex::encode(&sid[..8]));
+                let mut client = state.client.lock().await;
+                let _ = client.clear_pending_commit_for_server(&sid);
             }
         }
     }
@@ -2287,7 +2283,7 @@ async fn rejoin_servers_from_sync(
     }
 }
 
-/// Remove revoked device leaves from all MLS groups, with epoch recovery on conflict.
+/// Remove revoked device leaves from all MLS groups, with deferred merge.
 async fn revoke_old_device_leaves(
     state: &AppState,
     relay_url: &str,
@@ -2299,6 +2295,10 @@ async fn revoke_old_device_leaves(
             client.revoke_device_leaves(revoked_vk)
         };
         for out in outbound {
+            let sid = {
+                let c = state.client.lock().await;
+                c.server_id_for_mailbox(&out.mailbox_id)
+            };
             let mailbox_b64 = base64::Engine::encode(
                 &base64::engine::general_purpose::URL_SAFE_NO_PAD,
                 &out.mailbox_id,
@@ -2311,8 +2311,9 @@ async fn revoke_old_device_leaves(
                 .await;
             match post_result {
                 Ok(r) if r.status().is_success() => {
-                    let client = state.client.lock().await;
-                    if let Some(sid) = client.server_id_for_mailbox(&out.mailbox_id) {
+                    if let Some(sid) = sid {
+                        let mut client = state.client.lock().await;
+                        let _ = client.merge_pending_commit_for_server(&sid);
                         if let Ok(gi) = client.export_server_info(&sid) {
                             drop(client);
                             let si_path = format!("/box/{}/server_info", mailbox_b64);
@@ -2325,14 +2326,10 @@ async fn revoke_old_device_leaves(
                     }
                 }
                 Ok(r) => {
-                    eprintln!("recovery: relay rejected revocation commit ({}), recovering", r.status());
-                    let sid = state.client.lock().await.server_id_for_mailbox(&out.mailbox_id);
+                    eprintln!("recovery: relay rejected revocation commit ({})", r.status());
                     if let Some(sid) = sid {
-                        match recover_epoch(&state.client, &state.relay, &sid, &out.mailbox_id, "recovery-revoke").await {
-                            Ok(true) => {}
-                            Ok(false) => eprintln!("recovery-revoke: epoch recovery exhausted for {}", hex::encode(&sid[..8])),
-                            Err(e) => eprintln!("{e}"),
-                        }
+                        let mut client = state.client.lock().await;
+                        let _ = client.clear_pending_commit_for_server(&sid);
                     }
                 }
                 Err(e) => eprintln!("recovery: failed to post revocation commit: {e}"),

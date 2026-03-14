@@ -96,6 +96,7 @@ fn setup_two_clients(sender_seed: [u8; 32], receiver_seed: [u8; 32]) -> TwoClien
     let (_, welcome_bytes) = sender
         .invite_member(&server_id, kp, recv_fp, &recv_name, 1000)
         .unwrap();
+    sender.merge_pending_commit_for_server(&server_id).unwrap();
     receiver
         .join_server(&server_id, &welcome_bytes, "test", ServerKind::Server, 1000)
         .unwrap();
@@ -312,6 +313,7 @@ async fn invite_with_real_key_package() {
     let (_, welcome_bytes) = inviter
         .invite_member(&server_id, validated_kp, joiner_fp, &joiner_name, 2000)
         .unwrap();
+    inviter.merge_pending_commit_for_server(&server_id).unwrap();
 
     // Send welcome bytes back through the relay
     relay_inviter

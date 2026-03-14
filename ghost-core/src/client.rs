@@ -988,7 +988,8 @@ impl GhostClient {
         let commit_blob = group.remove_members(&self.provider, &leaf_indices)?;
         let mailbox_id = mls_group_mailbox_id(group.group_id());
 
-        self.store.remove_member(server_id, target_fp)?;
+        // Store update deferred — caller must merge_pending_commit after relay
+        // confirms, and only then remove the member from the store.
 
         Ok(Outbound { mailbox_id, blob: commit_blob })
     }
@@ -1017,6 +1018,36 @@ impl GhostClient {
             }
         }
         outbound
+    }
+
+    /// Merge a pending commit for a server group after the relay accepted it.
+    pub fn merge_pending_commit_for_server(&mut self, server_id: &[u8; 32]) -> Result<()> {
+        let group = self.servers.get_mut(server_id).ok_or_else(|| {
+            GhostError::ServerNotLoaded(hex::encode(&server_id[..8]))
+        })?;
+        group.merge_pending_commit(&self.provider)
+    }
+
+    /// Discard a pending commit for a server group after the relay rejected it.
+    pub fn clear_pending_commit_for_server(&mut self, server_id: &[u8; 32]) -> Result<()> {
+        let group = self.servers.get_mut(server_id).ok_or_else(|| {
+            GhostError::ServerNotLoaded(hex::encode(&server_id[..8]))
+        })?;
+        group.clear_pending_commit(&self.provider)
+    }
+
+    /// Merge a pending commit for the sync group after the relay accepted it.
+    pub fn merge_pending_commit_for_sync(&mut self) -> Result<()> {
+        let group = self.sync_group.as_mut()
+            .ok_or_else(|| GhostError::Format("no sync group".into()))?;
+        group.merge_pending_commit(&self.provider)
+    }
+
+    /// Discard a pending commit for the sync group after the relay rejected it.
+    pub fn clear_pending_commit_for_sync(&mut self) -> Result<()> {
+        let group = self.sync_group.as_mut()
+            .ok_or_else(|| GhostError::Format("no sync group".into()))?;
+        group.clear_pending_commit(&self.provider)
     }
 
     /// Get the current MLS epoch for a server's group.
@@ -1312,6 +1343,7 @@ mod tests {
         let name = c2.identity().display_name.clone();
         let (_outbound, welcome_bytes) =
             c1.invite_member(&server_id, kp, fp, &name, 1000).unwrap();
+        c1.merge_pending_commit_for_server(&server_id).unwrap();
 
         c2.join_server(&server_id, &welcome_bytes, "test", ServerKind::Server, 1000).unwrap();
 
@@ -1414,6 +1446,7 @@ mod tests {
         let name = c2.identity().display_name.clone();
         let (_outbound, welcome) =
             c1.invite_member(&server_id, kp, fp, &name, 1000).unwrap();
+        c1.merge_pending_commit_for_server(&server_id).unwrap();
 
         // c2 joins
         c2.join_server(&server_id, &welcome, "full-flow", ServerKind::Server, 1000).unwrap();

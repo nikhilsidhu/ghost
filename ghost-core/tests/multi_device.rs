@@ -472,6 +472,7 @@ fn sync_revocation_prevents_decryption() {
 
     // Device A removes Device B from sync group
     let removal_commit = client_a.remove_device_from_sync_group(&b_vk).unwrap();
+    client_a.merge_pending_commit_for_sync().unwrap();
 
     // Device A sends a post-removal mutation
     let mutation = encode_mutation(MUTATION_SET, 10000, "read:ch2", &99u64.to_be_bytes());

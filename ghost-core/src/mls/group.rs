@@ -163,9 +163,8 @@ impl GhostGroup {
         let welcome_msg = bundle.welcome().cloned()
             .ok_or_else(|| GhostError::Mls("add commit produced no welcome".into()))?;
 
-        self.mls_group
-            .merge_pending_commit(provider)
-            .map_err(|e| GhostError::Mls(format!("merge add commit: {e}")))?;
+        // Commit is staged but NOT merged — caller must post to relay first,
+        // then call merge_pending_commit() on success or clear_pending_commit() on failure.
 
         // Serialize welcome as MlsMessageOut for the caller
         let welcome_out = MlsMessageOut::from_welcome(welcome_msg, ProtocolVersion::Mls10);
@@ -192,9 +191,8 @@ impl GhostGroup {
             .to_bytes()
             .map_err(|e| GhostError::Mls(format!("serialize commit: {e}")))?;
 
-        self.mls_group
-            .merge_pending_commit(provider)
-            .map_err(|e| GhostError::Mls(format!("merge remove commit: {e}")))?;
+        // Commit is staged but NOT merged — caller must post to relay first,
+        // then call merge_pending_commit() on success or clear_pending_commit() on failure.
 
         Ok(wrap_commit(&commit_bytes, epoch))
     }
@@ -244,6 +242,20 @@ impl GhostGroup {
                 ) => GhostError::SelfMessage,
                 _ => GhostError::Mls(format!("process message: {e}")),
             })
+    }
+
+    /// Merge a commit we created after the relay has accepted it.
+    pub fn merge_pending_commit(&mut self, provider: &GhostProvider) -> Result<()> {
+        self.mls_group
+            .merge_pending_commit(provider)
+            .map_err(|e| GhostError::Mls(format!("merge pending commit: {e}")))
+    }
+
+    /// Discard a pending commit after the relay rejected it.
+    /// Returns Ok(()) even if there is no pending commit.
+    pub fn clear_pending_commit(&mut self, provider: &GhostProvider) -> Result<()> {
+        let _ = self.mls_group.clear_pending_commit(provider.storage());
+        Ok(())
     }
 
     /// Apply a commit that we received and already validated via process_message.
@@ -367,9 +379,8 @@ impl GhostGroup {
             .to_bytes()
             .map_err(|e| GhostError::Mls(format!("serialize extension commit: {e}")))?;
 
-        self.mls_group
-            .merge_pending_commit(provider)
-            .map_err(|e| GhostError::Mls(format!("merge extension commit: {e}")))?;
+        // Commit is staged but NOT merged — caller must post to relay first,
+        // then call merge_pending_commit() on success or clear_pending_commit() on failure.
 
         Ok(wrap_commit(&commit_bytes, epoch))
     }
@@ -476,6 +487,7 @@ mod tests {
         let (_commit, welcome) = group_a
             .add_member(&provider_a, kp_b)
             .unwrap();
+        group_a.merge_pending_commit(&provider_a).unwrap();
         let mut group_b =
             GhostGroup::join(&provider_b, &id_b, &welcome.to_bytes().unwrap()).unwrap();
 
@@ -557,6 +569,7 @@ mod tests {
         let (_commit, _welcome) = group_a
             .add_member(&provider_a, kp_b)
             .unwrap();
+        group_a.merge_pending_commit(&provider_a).unwrap();
 
         let b_leaf: Vec<_> = group_a.members()
             .filter(|m| m.credential.serialized_content() == id_b.fingerprint.as_slice())
@@ -568,6 +581,7 @@ mod tests {
             &provider_a,
             &b_leaf,
         ).unwrap();
+        group_a.merge_pending_commit(&provider_a).unwrap();
 
         // Only creator's leaf should remain
         let member_count = group_a.members().count();
@@ -583,6 +597,7 @@ mod tests {
 
         let relay_vk = [0xFFu8; 32];
         let commit = group.add_external_sender_extension(&provider, &relay_vk).unwrap();
+        group.merge_pending_commit(&provider).unwrap();
         assert!(!commit.is_empty());
         assert!(group.has_external_senders());
     }

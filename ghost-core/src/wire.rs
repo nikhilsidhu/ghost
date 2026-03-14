@@ -1217,6 +1217,7 @@ mod tests {
             GhostGroup::create_with_id(&provider_a, &id_a, &server_id, None).unwrap();
         let kp_b = generate_key_package(&provider_b, &id_b).unwrap();
         let (_commit, welcome) = group_a.add_member(&provider_a, kp_b).unwrap();
+        group_a.merge_pending_commit(&provider_a).unwrap();
         let mut group_b =
             GhostGroup::join(&provider_b, &id_b, &welcome.to_bytes().unwrap()).unwrap();
 
@@ -1255,6 +1256,7 @@ mod tests {
             GhostGroup::create_with_id(&provider_a, &id_a, &server_id, None).unwrap();
         let kp_b = generate_key_package(&provider_b, &id_b).unwrap();
         let (_commit, welcome) = group_a.add_member(&provider_a, kp_b).unwrap();
+        group_a.merge_pending_commit(&provider_a).unwrap();
         let mut group_b =
             GhostGroup::join(&provider_b, &id_b, &welcome.to_bytes().unwrap()).unwrap();
 
