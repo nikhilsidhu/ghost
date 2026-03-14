@@ -10,6 +10,7 @@ pub async fn start_relay() -> String {
         max_blob_size: 10 * 1024 * 1024,
         voice_port: 0,
         max_voice_participants: 25,
+        db_path: None,
     };
     let storage = Storage::open_in_memory().unwrap();
     let st = state::new_state(config, storage);

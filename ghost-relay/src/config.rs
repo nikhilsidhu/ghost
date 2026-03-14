@@ -5,6 +5,7 @@ pub struct Config {
     pub max_blob_size: usize,
     pub voice_port: u16,
     pub max_voice_participants: usize,
+    pub db_path: Option<String>,
 }
 
 impl Config {
@@ -17,6 +18,7 @@ impl Config {
                 "GHOST_MAX_VOICE_PARTICIPANTS",
                 DEFAULT_MAX_VOICE_PARTICIPANTS,
             ),
+            db_path: std::env::var("GHOST_DB_PATH").ok(),
         }
     }
 }

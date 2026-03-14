@@ -12,7 +12,16 @@ async fn main() {
 
     let config = config::Config::from_env();
     let port = config.port;
-    let storage = storage::Storage::open_in_memory().expect("failed to open storage");
+    let storage = match &config.db_path {
+        Some(path) => {
+            tracing::info!("using persistent storage at {path}");
+            storage::Storage::open(std::path::Path::new(path)).expect("failed to open persistent storage")
+        }
+        None => {
+            tracing::warn!("no GHOST_DB_PATH set — using in-memory storage (state lost on restart)");
+            storage::Storage::open_in_memory().expect("failed to open storage")
+        }
+    };
     let state = state::new_state(config, storage);
 
     tokio::spawn(worker::run(state.clone()));

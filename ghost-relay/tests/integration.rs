@@ -155,6 +155,7 @@ fn test_config() -> Config {
         max_blob_size: 1024,
         voice_port: 0,
         max_voice_participants: 25,
+        db_path: None,
     }
 }
 
