@@ -27,6 +27,13 @@ pub async fn put(
         return Err(RelayError::PayloadTooLarge);
     }
 
+    // Rate-limit Recovery entries (entry_type byte at offset 72 = 0x04)
+    if body.len() > 72 && body[72] == 0x04 {
+        if !state.idlog_recovery_limiter.check(&account_fp) {
+            return Err(RelayError::RateLimited);
+        }
+    }
+
     let (revoked, entry_seq) = state.storage.append_idlog_entry(&account_fp, &body)?;
 
     // Record in the key transparency tree

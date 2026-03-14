@@ -23,5 +23,6 @@ pub async fn run(state: AppState) {
 
         // Sweep expired rate limiter entries
         state.recovery_limiter.sweep();
+        state.idlog_recovery_limiter.sweep();
     }
 }

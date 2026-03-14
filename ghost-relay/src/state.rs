@@ -84,6 +84,8 @@ pub struct Inner {
     pub kt_tree: RwLock<ghost_wire::merkle::MerkleTree>,
     /// Per-account rate limiter for unauthenticated recovery blob downloads
     pub recovery_limiter: RateLimiter,
+    /// Per-account rate limiter for identity log Recovery entries (account takeover defense)
+    pub idlog_recovery_limiter: RateLimiter,
 }
 
 impl Inner {
@@ -571,6 +573,7 @@ pub fn new_state(config: Config, storage: Storage) -> AppState {
         });
     let kt_tree = ghost_wire::merkle::MerkleTree::from_frontier(kt_frontier, kt_size);
     let recovery_limiter = RateLimiter::new(5, std::time::Duration::from_secs(15 * 60));
+    let idlog_recovery_limiter = RateLimiter::new(3, std::time::Duration::from_secs(24 * 60 * 60));
     Arc::new(Inner {
         mailboxes: RwLock::new(HashMap::new()),
         invites: RwLock::new(HashMap::new()),
@@ -593,5 +596,6 @@ pub fn new_state(config: Config, storage: Storage) -> AppState {
         relay_sk_bytes,
         kt_tree: RwLock::new(kt_tree),
         recovery_limiter,
+        idlog_recovery_limiter,
     })
 }
