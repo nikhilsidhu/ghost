@@ -52,6 +52,12 @@ pub struct IncomingBlob {
 }
 
 pub struct Ack {
+    pub mailbox_id: [u8; 32],
+    pub seq: u64,
+    pub epoch_mismatch: bool,
+}
+
+pub struct PostBlobResult {
     pub seq: u64,
     pub epoch_mismatch: bool,
 }
@@ -217,9 +223,8 @@ impl RelayClient {
             .map_err(|_| GhostError::Network("ws connection closed".into()))
     }
 
-    /// Send a blob to a mailbox via HTTP POST (no WebSocket subscription required).
-    /// Returns the seq assigned by the relay.
-    pub async fn post_blob(&self, mailbox_id: &[u8; 32], blob: Vec<u8>) -> Result<u64> {
+    /// Result of posting a blob via HTTP.
+    pub async fn post_blob(&self, mailbox_id: &[u8; 32], blob: Vec<u8>) -> Result<PostBlobResult> {
         let path = format!("/box/{}", URL_SAFE_NO_PAD.encode(mailbox_id));
         let req = self
             .http
@@ -236,12 +241,12 @@ impl RelayClient {
             )));
         }
         #[derive(serde::Deserialize)]
-        struct PostResp { seq: u64 }
+        struct PostResp { seq: u64, #[serde(default)] epoch_mismatch: bool }
         let body: PostResp = resp
             .json()
             .await
             .map_err(|e| GhostError::Network(e.to_string()))?;
-        Ok(body.seq)
+        Ok(PostBlobResult { seq: body.seq, epoch_mismatch: body.epoch_mismatch })
     }
 
     pub async fn register_invite(&self, token: &str, expires_at: u64) -> Result<()> {
@@ -856,7 +861,7 @@ async fn ws_task(
                                     mailbox_id,
                                     message: err_msg.to_string(),
                                 }).await;
-                            } else if let Some(ack) = parse_ack(s) {
+                            } else if let Some(ack) = parse_ack(s, mailbox_id) {
                                 let _ = event_tx.send(RelayEvent::Ack(ack)).await;
                             }
                         }
@@ -871,11 +876,11 @@ async fn ws_task(
     }
 }
 
-fn parse_ack(text: &str) -> Option<Ack> {
+fn parse_ack(text: &str, mailbox_id: [u8; 32]) -> Option<Ack> {
     let mut parts = text.splitn(2, ' ');
     let seq: u64 = parts.next()?.parse().ok()?;
     let epoch_mismatch = parts.next() == Some(WS_SIGNAL_EPOCH_MISMATCH);
-    Some(Ack { seq, epoch_mismatch })
+    Some(Ack { mailbox_id, seq, epoch_mismatch })
 }
 
 /// Extract host[:port] from a ws:// or wss:// URL for the Host header.

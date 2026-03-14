@@ -141,6 +141,9 @@ pub async fn run(
     let mut online_members: HashMap<[u8; 32], Vec<OnlineMember>> = HashMap::new();
     // Presence blobs that failed trial decryption (epoch mismatch), retried after commits
     let mut pending_presence: HashMap<[u8; 32], Vec<Vec<u8>>> = HashMap::new();
+    // Consecutive receive errors per mailbox — auto-recover after threshold
+    let mut consecutive_errors: HashMap<[u8; 32], u32> = HashMap::new();
+    const EPOCH_RECOVERY_ERROR_THRESHOLD: u32 = 3;
 
     while let Some(event) = events.recv().await {
         match event {
@@ -180,6 +183,11 @@ pub async fn run(
                         None => None,
                     }
                 };
+
+                // Reset consecutive error counter on any successful receive
+                if matches!(&result, Some((_, Ok(_)))) {
+                    consecutive_errors.remove(&mailbox_id);
+                }
 
                 match result {
                     Some((server_id, Ok(ReceiveResult::Message(msg) | ReceiveResult::MessageWithKtWarning(msg)))) if msg.message_type == MessageType::Metadata => {
@@ -312,14 +320,28 @@ pub async fn run(
                     }
                     Some((_, Err(e))) => {
                         eprintln!("relay: receive error seq={seq}: {e}");
-                        // Advance seq so we don't re-process this blob on reconnect
                         let c = client.lock().await;
                         let _ = c.store().set_last_seen_seq(&mailbox_id, seq);
+                        drop(c);
+                        let count = consecutive_errors.entry(mailbox_id).or_insert(0);
+                        *count += 1;
+                        if *count >= EPOCH_RECOVERY_ERROR_THRESHOLD {
+                            eprintln!("relay: {} consecutive errors on {}, triggering epoch recovery",
+                                *count, hex::encode(&mailbox_id[..8]));
+                            *count = 0;
+                            handle_gap(&client, &relay, &mailbox_id).await;
+                        }
                     }
                     None => {}
                 }
             }
-            RelayEvent::Ack(_) => {}
+            RelayEvent::Ack(ack) => {
+                if ack.epoch_mismatch {
+                    eprintln!("relay: epoch mismatch ack on {}, triggering recovery",
+                        hex::encode(&ack.mailbox_id[..8]));
+                    handle_gap(&client, &relay, &ack.mailbox_id).await;
+                }
+            }
             RelayEvent::Error { mailbox_id, message } => {
                 eprintln!("relay: ws error on {}: {}", hex::encode(&mailbox_id[..8]), message);
             }
@@ -410,7 +432,7 @@ async fn handle_sync_application(
                         let commit_seq = {
                             let r = relay.lock().await;
                             match r.post_blob(&mailbox_id, commit).await {
-                                Ok(seq) => seq,
+                                Ok(res) => res.seq,
                                 Err(e) => {
                                     eprintln!("sync: failed to post commit: {e}");
                                     continue;

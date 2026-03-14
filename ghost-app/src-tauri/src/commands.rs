@@ -548,7 +548,7 @@ pub async fn kick_member(
         relay.post_blob(&outbound.mailbox_id, outbound.blob).await
     };
     match post_result {
-        Ok(_seq) => {
+        Ok(_) => {
             let mut client = state.client.lock().await;
             let _ = client.merge_pending_commit_for_server(&sid);
             let _ = client.store().remove_member(&sid, &fp);
