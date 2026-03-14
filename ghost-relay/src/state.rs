@@ -100,14 +100,27 @@ impl Inner {
         let is_commit = et == ghost_wire::EnvelopeType::Commit as u8;
         let is_proposal = et == ghost_wire::EnvelopeType::Proposal as u8;
 
-        // MLS validation for commits and proposals
-        if is_commit || is_proposal {
-            self.validate_mls(mailbox_id, data, is_commit).await?;
-        }
+        // Hold groups write lock across both MLS validation and storage append
+        // to prevent PublicGroup epoch from diverging from persistent state.
+        let (seq, epoch_mismatch) = if is_commit || is_proposal {
+            let mut groups = self.groups.write().await;
+            self.validate_mls_locked(&mut groups, mailbox_id, data, is_commit)?;
+            match self.storage.append(mailbox_id, et, epoch, data) {
+                Ok((seq, _, epoch_mismatch)) => (seq, epoch_mismatch),
+                Err(e) => {
+                    // Storage failed after PG already advanced — evict the stale
+                    // PG so it re-initializes from the next GroupInfo upload.
+                    if is_commit {
+                        groups.remove(mailbox_id);
+                    }
+                    return Err(e);
+                }
+            }
+        } else {
+            let (seq, _, epoch_mismatch) = self.storage.append(mailbox_id, et, epoch, data)?;
+            (seq, epoch_mismatch)
+        };
 
-        let (seq, _, epoch_mismatch) =
-            self.storage
-                .append(mailbox_id, et, epoch, data)?;
         let map = self.mailboxes.read().await;
         if let Some(mailbox) = map.get(mailbox_id) {
             let _ = mailbox.seq_tx.send(seq);
@@ -170,13 +183,14 @@ impl Inner {
     /// Validate a commit or proposal via PublicGroup.
     /// For commits: process, check authorization, merge, update members.
     /// For proposals: process and queue.
-    async fn validate_mls(
+    /// Caller must hold the groups write lock and pass it in.
+    fn validate_mls_locked(
         &self,
+        groups: &mut HashMap<[u8; 32], (PublicGroup, [u8; 32])>,
         mailbox_id: &[u8; 32],
         data: &[u8],
         is_commit: bool,
     ) -> Result<(), RelayError> {
-        let mut groups = self.groups.write().await;
         let (pg, creator_fp) = match groups.get_mut(mailbox_id) {
             Some(entry) => entry,
             // No PublicGroup for this mailbox — skip validation (pre-upgrade group)
