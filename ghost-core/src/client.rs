@@ -1019,6 +1019,14 @@ impl GhostClient {
         outbound
     }
 
+    /// Get the current MLS epoch for a server's group.
+    pub fn voice_epoch(&self, server_id: &[u8; 32]) -> Result<u64> {
+        let group = self.servers.get(server_id).ok_or_else(|| {
+            GhostError::ServerNotLoaded(hex::encode(&server_id[..8]))
+        })?;
+        Ok(group.epoch())
+    }
+
     /// Derive a per-sender encryption key for voice in this server+channel.
     /// `voice_salt` is a random value from the sender's presence blob, ensuring
     /// unique keys per voice session even within the same MLS epoch.

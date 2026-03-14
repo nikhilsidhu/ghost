@@ -578,11 +578,13 @@ fn build_voice_packet(
     payload: &[u8],
 ) -> Vec<u8> {
     let header_len = ghost_wire::VOICE_HEADER_SIZE as u16;
+    let epoch: u64 = 0;
     [
         &header_len.to_be_bytes()[..],
         channel_id,
         &slot_id.to_be_bytes()[..],
         &[0x00], // flags
+        &epoch.to_be_bytes(),
         &sequence.to_be_bytes(),
         &(payload.len() as u16).to_be_bytes(),
         payload,

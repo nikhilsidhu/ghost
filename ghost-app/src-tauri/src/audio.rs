@@ -106,6 +106,7 @@ impl AudioControls {
 pub struct InboundFrame {
     pub slot_id: u32,
     pub sequence: u32,
+    pub epoch: u64,
     pub encrypted_payload: Vec<u8>,
 }
 
@@ -306,6 +307,7 @@ impl Agc {
 pub fn build_packet(
     channel_id: &[u8; 32],
     slot_id: u32,
+    epoch: u64,
     sequence: u32,
     payload: &[u8],
 ) -> Vec<u8> {
@@ -314,15 +316,16 @@ pub fn build_packet(
     pkt.extend_from_slice(channel_id);
     pkt.extend_from_slice(&slot_id.to_be_bytes());
     pkt.push(0x00); // flags
+    pkt.extend_from_slice(&epoch.to_be_bytes());
     pkt.extend_from_slice(&sequence.to_be_bytes());
     pkt.extend_from_slice(&(payload.len() as u16).to_be_bytes());
     pkt.extend_from_slice(payload);
     pkt
 }
 
-/// Returns (channel_id, slot_id, sequence, payload_len, header_len).
+/// Returns (channel_id, slot_id, epoch, sequence, payload_len, header_len).
 /// Payload starts at buf[header_len..header_len + payload_len].
-pub fn parse_header(buf: &[u8]) -> Option<([u8; 32], u32, u32, usize, usize)> {
+pub fn parse_header(buf: &[u8]) -> Option<([u8; 32], u32, u64, u32, usize, usize)> {
     if buf.len() < VOICE_HEADER_SIZE {
         return None;
     }
@@ -333,12 +336,13 @@ pub fn parse_header(buf: &[u8]) -> Option<([u8; 32], u32, u32, usize, usize)> {
     let channel_id: [u8; 32] = buf[2..34].try_into().ok()?;
     let slot_id = u32::from_be_bytes(buf[34..38].try_into().ok()?);
     // flags at byte 38
-    let sequence = u32::from_be_bytes(buf[39..43].try_into().ok()?);
-    let payload_len = u16::from_be_bytes(buf[43..45].try_into().ok()?) as usize;
+    let epoch = u64::from_be_bytes(buf[39..47].try_into().ok()?);
+    let sequence = u32::from_be_bytes(buf[47..51].try_into().ok()?);
+    let payload_len = u16::from_be_bytes(buf[51..53].try_into().ok()?) as usize;
     if buf.len() < header_len + payload_len {
         return None;
     }
-    Some((channel_id, slot_id, sequence, payload_len, header_len))
+    Some((channel_id, slot_id, epoch, sequence, payload_len, header_len))
 }
 
 struct SampleRateConverter {
@@ -394,6 +398,7 @@ impl AudioPipeline {
     pub fn start(
         own_slot_id: u32,
         own_key: [u8; 32],
+        own_epoch: u64,
         channel_id: [u8; 32],
         peer_keys: HashMap<u32, ([u8; 32], [u8; 32])>,
         input_device_name: Option<String>,
@@ -417,6 +422,7 @@ impl AudioPipeline {
                     inbound_rx,
                     own_slot_id,
                     own_key,
+                    own_epoch,
                     channel_id,
                     peer_keys_clone,
                     input_device_name,
@@ -714,6 +720,7 @@ fn run_audio_thread(
     mut inbound_rx: mpsc::Receiver<InboundFrame>,
     own_slot_id: u32,
     own_key: [u8; 32],
+    own_epoch: u64,
     channel_id: [u8; 32],
     peer_keys: Arc<Mutex<HashMap<u32, ([u8; 32], [u8; 32])>>>,
     input_device_name: Option<String>,
@@ -883,7 +890,7 @@ fn run_audio_thread(
                 // Always encode to keep Opus encoder state warm
                 if let Ok(len) = encoder.encode_float(&frame_48k, &mut encode_buf) {
                     if let Ok(encrypted) = encrypt_voice_frame(&own_key, sequence, &encode_buf[..len]) {
-                        let pkt = build_packet(&channel_id, own_slot_id, sequence, &encrypted);
+                        let pkt = build_packet(&channel_id, own_slot_id, own_epoch, sequence, &encrypted);
                         sequence = sequence.wrapping_add(1);
 
                         if speaking {
@@ -902,7 +909,7 @@ fn run_audio_thread(
                                 // Speech end: send silence frames for clean decoder reset
                                 for _ in 0..SILENCE_FRAME_COUNT {
                                     if let Ok(enc) = encrypt_voice_frame(&own_key, sequence, &OPUS_SILENCE) {
-                                        let spkt = build_packet(&channel_id, own_slot_id, sequence, &enc);
+                                        let spkt = build_packet(&channel_id, own_slot_id, own_epoch, sequence, &enc);
                                         let _ = outbound_tx.try_send(spkt);
                                         sequence = sequence.wrapping_add(1);
                                         diag_frames_sent += 1;
@@ -925,7 +932,7 @@ fn run_audio_thread(
                 if was_speaking {
                     for _ in 0..SILENCE_FRAME_COUNT {
                         if let Ok(enc) = encrypt_voice_frame(&own_key, sequence, &OPUS_SILENCE) {
-                            let spkt = build_packet(&channel_id, own_slot_id, sequence, &enc);
+                            let spkt = build_packet(&channel_id, own_slot_id, own_epoch, sequence, &enc);
                             let _ = outbound_tx.try_send(spkt);
                             sequence = sequence.wrapping_add(1);
                             diag_frames_sent += 1;

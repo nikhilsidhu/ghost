@@ -276,14 +276,17 @@ async fn start_audio(
     input_device: Option<String>,
     output_device: Option<String>,
 ) -> Result<AudioSession, String> {
-    let own_key = {
+    let (own_key, own_epoch) = {
         let c = client.lock().await;
-        c.derive_voice_key(server_id, channel_id, own_fp, own_device_vk, own_voice_salt)
-            .map_err(|e| format!("derive own key: {e}"))?
+        let key = c.derive_voice_key(server_id, channel_id, own_fp, own_device_vk, own_voice_salt)
+            .map_err(|e| format!("derive own key: {e}"))?;
+        let epoch = c.voice_epoch(server_id)
+            .map_err(|e| format!("voice epoch: {e}"))?;
+        (key, epoch)
     };
 
     let mut pipeline = AudioPipeline::start(
-        own_slot_id, own_key, *channel_id, peer_keys,
+        own_slot_id, own_key, own_epoch, *channel_id, peer_keys,
         input_device, output_device,
     )?;
     pipeline.controls.muted.store(voice_state.muted, Ordering::Relaxed);
@@ -293,7 +296,7 @@ async fn start_audio(
     let transport = Arc::new(UdpTransport::connect(&host, port).await?);
 
     // Registration packet so relay learns our UDP address before we transmit audio
-    let reg_pkt = crate::audio::build_packet(channel_id, own_slot_id, 0, &[]);
+    let reg_pkt = crate::audio::build_packet(channel_id, own_slot_id, own_epoch, 0, &[]);
     if let Err(e) = transport.socket.send(&reg_pkt).await {
         eprintln!("voice udp registration send: {e}");
     }

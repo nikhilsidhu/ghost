@@ -42,7 +42,7 @@ impl UdpTransport {
                 }
             };
 
-            let (_channel_id, slot_id, sequence, payload_len, header_len) =
+            let (_channel_id, slot_id, epoch, sequence, payload_len, header_len) =
                 match parse_header(&buf[..len]) {
                     Some(h) => h,
                     None => continue,
@@ -57,6 +57,7 @@ impl UdpTransport {
                 .try_send(InboundFrame {
                     slot_id,
                     sequence,
+                    epoch,
                     encrypted_payload: payload,
                 })
                 .ok();

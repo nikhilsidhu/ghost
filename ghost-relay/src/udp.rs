@@ -17,13 +17,13 @@ fn parse_header(buf: &[u8]) -> Option<([u8; 32], u32)> {
     }
     let channel_id: [u8; 32] = buf[2..34].try_into().ok()?;
     match header_len {
-        // [header_len:2][channel_id:32][slot_id:4]...
-        45 => {
+        // [header_len:2][channel_id:32][slot_id:4][flags:1][epoch:8][seq:4][payload_len:2]...
+        53 => {
             let slot_id = u32::from_be_bytes(buf[34..38].try_into().ok()?);
             Some((channel_id, slot_id))
         }
-        // [header_len:2][channel_id:32][fingerprint:32]... — reject, old clients must upgrade
-        73 => None,
+        // Old header formats — reject, clients must upgrade
+        45 | 73 => None,
         _ => None,
     }
 }
