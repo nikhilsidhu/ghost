@@ -767,6 +767,9 @@ pub enum InboundMessage {
     Application(ApplicationMessage),
     /// A commit was merged. Contains fingerprints of members removed by this commit.
     Commit { removed: Vec<[u8; 32]> },
+    /// A proposal was queued (e.g. relay-generated Remove). Pending proposals
+    /// should be committed by the group creator to advance the epoch.
+    ProposalProcessed,
 }
 
 /// Extract account fingerprint and device verifying key from MLS sender info.
@@ -904,7 +907,14 @@ pub fn open_any(
             group.merge_staged_commit(provider, *staged_commit)?;
             Ok(InboundMessage::Commit { removed })
         }
-        _ => Err(GhostError::Mls("unexpected message type".into())),
+        ProcessedMessageContent::ProposalMessage(_proposal) => {
+            // Proposal queued by OpenMLS during process_message_bytes().
+            // The group creator should commit pending proposals to advance the epoch.
+            Ok(InboundMessage::ProposalProcessed)
+        }
+        ProcessedMessageContent::ExternalJoinProposalMessage(_proposal) => {
+            Ok(InboundMessage::ProposalProcessed)
+        }
     }
 }
 

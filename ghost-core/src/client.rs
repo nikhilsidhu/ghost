@@ -45,6 +45,8 @@ pub enum ReceiveResult {
     Kicked,
     /// A commit removed these members (fingerprints) from the group.
     MembersRemoved(Vec<[u8; 32]>),
+    /// A proposal was queued (e.g. relay Remove). Creator should commit pending proposals.
+    ProposalProcessed,
     Skipped,
 }
 
@@ -1286,7 +1288,31 @@ impl GhostClient {
                     Ok(ReceiveResult::MembersRemoved(truly_removed))
                 }
             }
+            InboundMessage::ProposalProcessed => {
+                Ok(ReceiveResult::ProposalProcessed)
+            }
         }
+    }
+
+    /// Commit any pending proposals for a server's MLS group.
+    /// Used by the group creator to immediately commit relay-generated Remove proposals.
+    pub fn commit_pending_proposals(
+        &mut self,
+        server_id: &[u8; 32],
+    ) -> Result<Outbound> {
+        let group = self.servers.get_mut(server_id).ok_or_else(|| {
+            GhostError::ServerNotLoaded(hex::encode(&server_id[..8]))
+        })?;
+        let commit = group.commit_pending_proposals(&self.provider)?;
+        let mailbox_id = mls_group_mailbox_id(group.group_id());
+        Ok(Outbound { mailbox_id, blob: commit })
+    }
+
+    /// Check if this client is the creator of a server.
+    pub fn is_server_creator(&self, server_id: &[u8; 32]) -> bool {
+        self.store.get_server(server_id)
+            .map(|s| s.creator_fp == self.identity.fingerprint)
+            .unwrap_or(false)
     }
 }
 

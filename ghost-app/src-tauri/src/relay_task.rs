@@ -314,6 +314,49 @@ pub async fn run(
                         retry_pending_presence(&app, &client, &server_id, &mut online_members, &mut pending_presence).await;
                         let _ = app.emit("sync", hex::encode(server_id));
                     }
+                    Some((server_id, Ok(ReceiveResult::ProposalProcessed))) => {
+                        let c = client.lock().await;
+                        let _ = c.store().set_last_seen_seq(&mailbox_id, seq);
+                        let is_creator = c.is_server_creator(&server_id);
+                        drop(c);
+
+                        // Only the server creator auto-commits pending proposals
+                        if is_creator {
+                            let outbound = {
+                                let mut c = client.lock().await;
+                                c.commit_pending_proposals(&server_id)
+                            };
+                            match outbound {
+                                Ok(out) => {
+                                    let post_result = {
+                                        let r = relay.lock().await;
+                                        r.post_blob(&out.mailbox_id, out.blob).await
+                                    };
+                                    match post_result {
+                                        Ok(_) => {
+                                            let mut c = client.lock().await;
+                                            let _ = c.merge_pending_commit_for_server(&server_id);
+                                            if let Ok(gi) = c.export_server_info(&server_id) {
+                                                let r = relay.lock().await;
+                                                let _ = r.put_server_info(&mailbox_id, gi).await;
+                                            }
+                                            drop(c);
+                                            rebroadcast_presence(&client, &relay, &mailbox_id, &presence).await;
+                                            let _ = app.emit("sync", hex::encode(server_id));
+                                        }
+                                        Err(e) => {
+                                            eprintln!("relay: failed to post pending commit: {e}");
+                                            let mut c = client.lock().await;
+                                            let _ = c.clear_pending_commit_for_server(&server_id);
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("relay: failed to build pending commit: {e}");
+                                }
+                            }
+                        }
+                    }
                     Some((_, Ok(ReceiveResult::Skipped))) => {
                         let c = client.lock().await;
                         let _ = c.store().set_last_seen_seq(&mailbox_id, seq);

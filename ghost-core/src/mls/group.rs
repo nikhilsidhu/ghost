@@ -258,6 +258,27 @@ impl GhostGroup {
         Ok(())
     }
 
+    /// Commit all queued proposals (e.g. relay-generated Remove proposals).
+    /// Returns envelope-wrapped commit bytes.
+    pub fn commit_pending_proposals(
+        &mut self,
+        provider: &GhostProvider,
+    ) -> Result<Vec<u8>> {
+        let epoch = self.epoch();
+        let bundle = self.mls_group.commit_builder()
+            .load_psks(provider.storage())
+            .map_err(|e| GhostError::Mls(format!("load psks: {e}")))?
+            .build(provider.rand(), provider.crypto(), &self.signer, validate_pending_proposal)
+            .map_err(|e| GhostError::Mls(format!("build pending commit: {e}")))?
+            .stage_commit(provider)
+            .map_err(|e| GhostError::Mls(format!("stage pending commit: {e}")))?;
+
+        let commit_bytes = bundle.into_commit()
+            .to_bytes()
+            .map_err(|e| GhostError::Mls(format!("serialize pending commit: {e}")))?;
+        Ok(wrap_commit(&commit_bytes, epoch))
+    }
+
     /// Apply a commit that we received and already validated via process_message.
     pub fn merge_staged_commit(
         &mut self,
