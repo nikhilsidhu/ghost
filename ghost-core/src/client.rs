@@ -38,6 +38,8 @@ fn open_mls_connection(mls_db_key: &[u8; 32], app_db_path: &Path) -> Result<Conn
 
 pub enum ReceiveResult {
     Message(ApplicationMessage),
+    /// Message received, but sender's kt_head_hash doesn't match our cached copy. Likely stale cache; could indicate a split-view attack.
+    MessageWithKtWarning(ApplicationMessage),
     CommitProcessed,
     /// This client was removed from the group by a commit.
     Kicked,
@@ -153,9 +155,108 @@ impl GhostClient {
         &mut self,
         account_fp: &[u8; 32],
         entries: &[(u64, Vec<u8>)],
-    ) -> Result<()> {
+    ) -> Result<ghost_wire::idlog::LogState> {
         self.idlog_cache
             .cache_and_validate(&self.store, account_fp, entries)
+    }
+
+    /// Return the previously-seen KT tree size for this relay, or 0 if none.
+    /// The app layer uses this to decide whether to fetch a consistency proof.
+    pub fn kt_last_tree_size(&self, relay_url: &str) -> Result<u64> {
+        Ok(self
+            .store
+            .get_kt_state(relay_url)?
+            .map(|s| s.tree_size)
+            .unwrap_or(0))
+    }
+
+    /// Verify KT proofs and cache identity log entries.
+    ///
+    /// 1. Verify checkpoint signature (relay's Ed25519 key)
+    /// 2. Verify each entry's inclusion proof against the checkpoint root
+    /// 3. If we have a previous checkpoint, verify the consistency proof
+    ///    proving the old tree is a prefix of the new tree
+    /// 4. Persist the new checkpoint and cache the identity log chain
+    ///
+    /// `consistency_proof_bytes`: required when we already have a checkpoint
+    /// for this relay (i.e. `kt_last_tree_size() > 0`). Pass `None` on first
+    /// fetch.
+    pub fn cache_identity_log_with_proofs(
+        &mut self,
+        relay_url: &str,
+        account_fp: &[u8; 32],
+        response: &crate::relay::IdLogWithProofs,
+        consistency_proof_bytes: Option<&[u8]>,
+    ) -> Result<ghost_wire::idlog::LogState> {
+        use ghost_wire::merkle::{leaf_hash, Checkpoint, ConsistencyProof, InclusionProof};
+
+        let relay_vk = self.relay_vk.ok_or_else(|| {
+            GhostError::IdentityLog("no relay verifying key configured".into())
+        })?;
+        let vk = ed25519_dalek::VerifyingKey::from_bytes(&relay_vk)
+            .map_err(|e| GhostError::IdentityLog(format!("bad relay vk: {e}")))?;
+
+        // 1. Verify checkpoint signature
+        let checkpoint = Checkpoint::from_bytes(&response.checkpoint)
+            .map_err(|e| GhostError::IdentityLog(format!("bad checkpoint: {e}")))?;
+        checkpoint
+            .verify(&vk)
+            .map_err(|_| GhostError::IdentityLog("checkpoint signature invalid".into()))?;
+
+        // 2. Verify each entry's inclusion proof
+        for entry in &response.entries {
+            if entry.inclusion_proof.is_empty() {
+                continue; // entry predates KT tree
+            }
+            let proof = InclusionProof::from_bytes(&entry.inclusion_proof)
+                .map_err(|e| GhostError::IdentityLog(format!("bad inclusion proof: {e}")))?;
+            let lh = leaf_hash(&entry.payload);
+            if !proof.verify(&lh, &checkpoint.root_hash) {
+                return Err(GhostError::IdentityLog(
+                    "inclusion proof verification failed".into(),
+                ));
+            }
+        }
+
+        // 3. Verify consistency with previously-seen checkpoint
+        if let Some(prev) = self.store.get_kt_state(relay_url)? {
+            if checkpoint.tree_size < prev.tree_size {
+                return Err(GhostError::IdentityLog(
+                    "relay checkpoint went backwards".into(),
+                ));
+            }
+            if checkpoint.tree_size > prev.tree_size {
+                let proof_bytes = consistency_proof_bytes.ok_or_else(|| {
+                    GhostError::IdentityLog(
+                        "consistency proof required but not provided".into(),
+                    )
+                })?;
+                let proof = ConsistencyProof::from_bytes(proof_bytes)
+                    .map_err(|e| GhostError::IdentityLog(format!("bad consistency proof: {e}")))?;
+                if !proof.verify(&prev.root_hash, &checkpoint.root_hash) {
+                    return Err(GhostError::IdentityLog(
+                        "consistency proof verification failed — possible split-view attack".into(),
+                    ));
+                }
+            }
+            // tree_size == prev.tree_size: same checkpoint, no consistency proof needed
+        }
+
+        // 4. Persist new checkpoint and cache the identity log
+        self.store.set_kt_state(
+            relay_url,
+            checkpoint.tree_size,
+            &checkpoint.root_hash,
+            &response.checkpoint,
+        )?;
+
+        let entries: Vec<(u64, Vec<u8>)> = response
+            .entries
+            .iter()
+            .map(|e| (e.seq, e.payload.clone()))
+            .collect();
+        self.idlog_cache
+            .cache_and_validate(&self.store, account_fp, &entries)
     }
 
     /// Insert a pre-validated LogState directly (e.g. for our own account).
@@ -247,16 +348,23 @@ impl GhostClient {
         match group.process_message_bytes(&self.provider, mls_bytes) {
             Err(GhostError::SelfMessage) => Ok(SyncReceiveResult::SelfMessage),
             Err(e) => Err(e),
-            Ok(processed) => match processed.into_content() {
-                openmls::prelude::ProcessedMessageContent::ApplicationMessage(app) => {
-                    Ok(SyncReceiveResult::Application(app.into_bytes()))
+            Ok(processed) => {
+                let credential = processed.credential().clone();
+                let sender = processed.sender().clone();
+                match processed.into_content() {
+                    openmls::prelude::ProcessedMessageContent::ApplicationMessage(app) => {
+                        crate::wire::validate_sender(group, &credential, &sender, &self.idlog_cache)?;
+                        Ok(SyncReceiveResult::Application(app.into_bytes()))
+                    }
+                    openmls::prelude::ProcessedMessageContent::StagedCommitMessage(staged) => {
+                        crate::wire::validate_sender(group, &credential, &sender, &self.idlog_cache)?;
+                        crate::wire::validate_add_proposals(&staged, &self.idlog_cache)?;
+                        group.merge_staged_commit(&self.provider, *staged)?;
+                        Ok(SyncReceiveResult::CommitProcessed)
+                    }
+                    _ => Ok(SyncReceiveResult::CommitProcessed),
                 }
-                openmls::prelude::ProcessedMessageContent::StagedCommitMessage(staged) => {
-                    group.merge_staged_commit(&self.provider, *staged)?;
-                    Ok(SyncReceiveResult::CommitProcessed)
-                }
-                _ => Ok(SyncReceiveResult::CommitProcessed),
-            },
+            }
         }
     }
 
@@ -533,11 +641,17 @@ impl GhostClient {
             GhostError::ServerNotLoaded(hex::encode(&server_id[..8]))
         })?;
 
+        let kt_head_hash = self
+            .idlog_cache
+            .get(&self.identity.fingerprint)
+            .map(|s| s.head_hash)
+            .unwrap_or([0u8; 32]);
         let msg = ApplicationMessage::new(
             MessageType::Text,
             *channel_id,
             self.identity.fingerprint,
             timestamp,
+            kt_head_hash,
             references,
             content,
         )?;
@@ -586,6 +700,7 @@ impl GhostClient {
             [0u8; 32],
             self.identity.fingerprint,
             now,
+            [0u8; 32],
             vec![],
             content,
         )?;
@@ -1078,7 +1193,18 @@ impl GhostClient {
                     })?;
                 }
 
-                Ok(ReceiveResult::Message(msg))
+                // Gossip: compare sender's kt_head_hash against our cache
+                let kt_warning = self
+                    .idlog_cache
+                    .get(&msg.sender_fp)
+                    .map(|cached| cached.head_hash != msg.kt_head_hash)
+                    .unwrap_or(false);
+
+                if kt_warning {
+                    Ok(ReceiveResult::MessageWithKtWarning(msg))
+                } else {
+                    Ok(ReceiveResult::Message(msg))
+                }
             }
             InboundMessage::Commit { removed } => {
                 let group = self.servers.get(server_id).ok_or_else(|| {

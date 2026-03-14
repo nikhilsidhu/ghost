@@ -1643,3 +1643,112 @@ async fn commit_validated_and_acl_updated() {
     // Verify ACL was updated: bob should now be a member
     assert!(st.storage.is_mailbox_member(&mailbox_id, &bob.account_fp).unwrap());
 }
+
+// ── Key Transparency integration tests ──────────────────────────
+
+#[tokio::test]
+async fn idlog_append_creates_kt_leaf() {
+    let base = start_server(test_config()).await;
+    let alice = TestAuth::generate();
+    alice.register(&base).await;
+
+    // KT head should exist after genesis push
+    let client = reqwest::Client::new();
+    let resp = client.get(format!("{base}/kt/head")).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let checkpoint_bytes = resp.bytes().await.unwrap();
+    let checkpoint = ghost_wire::merkle::Checkpoint::from_bytes(&checkpoint_bytes).unwrap();
+    assert_eq!(checkpoint.tree_size, 1);
+}
+
+#[tokio::test]
+async fn get_idlog_returns_valid_proofs() {
+    let (base, st) = start_server_with_state(test_config()).await;
+    let alice = TestAuth::generate();
+    alice.register(&base).await;
+
+    // Fetch identity log — should include inclusion proof and checkpoint
+    let client = reqwest::Client::new();
+    let url = format!("{base}/idlog/{}", hex::encode(alice.account_fp));
+    let resp = client.get(&url).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = resp.json().await.unwrap();
+    let entries = body["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+
+    // Decode checkpoint and inclusion proof
+    let checkpoint_b64 = body["checkpoint"].as_str().unwrap();
+    let checkpoint_bytes = B64.decode(checkpoint_b64).unwrap();
+    let checkpoint = ghost_wire::merkle::Checkpoint::from_bytes(&checkpoint_bytes).unwrap();
+
+    let proof_b64 = entries[0]["inclusion_proof"].as_str().unwrap();
+    let proof_bytes = B64.decode(proof_b64).unwrap();
+    assert!(!proof_bytes.is_empty());
+
+    let proof = ghost_wire::merkle::InclusionProof::from_bytes(&proof_bytes).unwrap();
+
+    // Verify inclusion proof against checkpoint root
+    let payload_b64 = entries[0]["payload"].as_str().unwrap();
+    let payload = B64.decode(payload_b64).unwrap();
+    let leaf_hash = ghost_wire::merkle::leaf_hash(&payload);
+    assert!(proof.verify(&leaf_hash, &checkpoint.root_hash));
+
+    // Verify checkpoint signature with relay's key
+    let relay_vk = ed25519_dalek::VerifyingKey::from_bytes(&st.relay_vk).unwrap();
+    assert!(checkpoint.verify(&relay_vk).is_ok());
+}
+
+#[tokio::test]
+async fn kt_consistency_proof_valid() {
+    let base = start_server(test_config()).await;
+    let alice = TestAuth::generate();
+    alice.register(&base).await;
+
+    // Push a second identity log entry (add a device)
+    let device2 = SigningKey::generate(&mut OsRng);
+    let mut add_entry = ghost_wire::idlog::LogEntry {
+        seq: 2,
+        prev_hash: {
+            let h: [u8; 32] = blake3::hash(&alice.genesis_bytes()).into();
+            h
+        },
+        account_fp: alice.account_fp,
+        entry_type: ghost_wire::idlog::EntryType::AddDevice,
+        timestamp: 2000,
+        body: ghost_wire::idlog::EntryBody::AddDevice {
+            device_verifying_key: device2.verifying_key().to_bytes(),
+            device_label: "device2".to_string(),
+            authorizer_key: alice.master_key.verifying_key().to_bytes(),
+        },
+        signature: [0u8; 64],
+        counter_signature: None,
+    };
+    let msg = ghost_wire::idlog::sign_message(&add_entry);
+    add_entry.signature = alice.master_key.sign(&msg).to_bytes();
+    add_entry.counter_signature = Some(device2.sign(&msg).to_bytes());
+    let add_bytes = add_entry.to_bytes();
+
+    let client = reqwest::Client::new();
+    let url = format!("{}/idlog/{}", base, hex::encode(alice.account_fp));
+    let resp = client.put(&url).body(add_bytes).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Tree should now have 2 leaves. Get consistency proof from 1 to 2
+    let resp = client.get(format!("{base}/kt/consistency-proof?from=1&to=2"))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let proof_bytes = resp.bytes().await.unwrap();
+    let proof = ghost_wire::merkle::ConsistencyProof::from_bytes(&proof_bytes).unwrap();
+
+    // Get both checkpoints to verify
+    let head_resp = client.get(format!("{base}/kt/head")).send().await.unwrap();
+    let head_bytes = head_resp.bytes().await.unwrap();
+    let new_checkpoint = ghost_wire::merkle::Checkpoint::from_bytes(&head_bytes).unwrap();
+    assert_eq!(new_checkpoint.tree_size, 2);
+
+    // Compute old root from genesis entry alone
+    let genesis_hash = ghost_wire::merkle::leaf_hash(&alice.genesis_bytes());
+    let old_root = ghost_wire::merkle::compute_root(&[genesis_hash]);
+
+    assert!(proof.verify(&old_root, &new_checkpoint.root_hash));
+}

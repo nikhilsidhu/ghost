@@ -2,6 +2,7 @@ use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
+use ghost_wire::merkle::InclusionProof;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{RelayError, Result};
@@ -26,7 +27,11 @@ pub async fn put(
         return Err(RelayError::PayloadTooLarge);
     }
 
-    let revoked = state.storage.append_idlog_entry(&account_fp, &body)?;
+    let (revoked, entry_seq) = state.storage.append_idlog_entry(&account_fp, &body)?;
+
+    // Record in the key transparency tree
+    state.kt_append_and_sign(&body, &account_fp, entry_seq).await;
+
     for device_vk in &revoked {
         let _ = state.revocation_tx.send((account_fp, *device_vk));
     }
@@ -42,13 +47,22 @@ pub struct IdLogQuery {
 }
 
 #[derive(Serialize)]
-pub struct IdLogEntry {
-    pub seq: u64,
-    #[serde(with = "base64_payload")]
-    pub payload: Vec<u8>,
+pub struct IdLogResponse {
+    pub entries: Vec<IdLogEntryWithProof>,
+    #[serde(with = "base64_bytes")]
+    pub checkpoint: Vec<u8>,
 }
 
-mod base64_payload {
+#[derive(Serialize)]
+pub struct IdLogEntryWithProof {
+    pub seq: u64,
+    #[serde(with = "base64_bytes")]
+    pub payload: Vec<u8>,
+    #[serde(with = "base64_bytes")]
+    pub inclusion_proof: Vec<u8>,
+}
+
+mod base64_bytes {
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine;
     use serde::Serializer;
@@ -58,21 +72,46 @@ mod base64_payload {
     }
 }
 
-/// GET /idlog/{account_fp_hex}?after_seq=N — fetch identity log entries.
+/// GET /idlog/{account_fp_hex}?after_seq=N — fetch identity log entries with KT proofs.
 pub async fn get(
     State(state): State<AppState>,
     Path(account_fp_hex): Path<String>,
     Query(query): Query<IdLogQuery>,
-) -> Result<Json<Vec<IdLogEntry>>> {
+) -> Result<Json<IdLogResponse>> {
     let account_fp = decode_account_fp(&account_fp_hex)?;
     let after_seq = query.after_seq.unwrap_or(0);
     let rows = state.storage.get_idlog(&account_fp, after_seq)?;
-    let entries: Vec<IdLogEntry> = rows
-        .into_iter()
-        .map(|r| IdLogEntry {
+
+    // Load checkpoint + tree_size atomically from DB (both written in the
+    // same transaction by kt_persist_state).
+    let (checkpoint, tree_size) = state.storage.kt_load_checkpoint_with_size()?;
+
+    let storage = &state.storage;
+    let load = |start: u64, count: u64| -> Option<[u8; 32]> {
+        storage.kt_load_hash(start, count).ok().flatten()
+    };
+
+    let mut entries = Vec::with_capacity(rows.len());
+    for r in rows {
+        let proof_bytes =
+            match state.storage.kt_get_leaf_index(&account_fp, r.seq)? {
+                Some(leaf_index) if leaf_index < tree_size => {
+                    let proof =
+                        InclusionProof::generate_from_store(leaf_index, tree_size, &load);
+                    proof.to_bytes()
+                }
+                _ => Vec::new(),
+            };
+
+        entries.push(IdLogEntryWithProof {
             seq: r.seq,
             payload: r.payload,
-        })
-        .collect();
-    Ok(Json(entries))
+            inclusion_proof: proof_bytes,
+        });
+    }
+
+    Ok(Json(IdLogResponse {
+        entries,
+        checkpoint,
+    }))
 }

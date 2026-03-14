@@ -18,7 +18,7 @@ impl GhostStore {
         account_fp: &[u8; 32],
         entries: &[(u64, Vec<u8>)],
     ) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()
+        let tx = self.conn().unchecked_transaction()
             .map_err(|e| GhostError::Database(format!("idlog cache tx: {e}")))?;
         {
             let mut stmt = tx

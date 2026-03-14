@@ -11,8 +11,8 @@ use crate::storage::{ChannelKind, ServerKind, MemberRole};
 
 const MAX_REFERENCES: usize = 255;
 
-/// version + type + channel_id + sender_fp + timestamp + message_id + ref_count + content_len
-const FIXED_HEADER_LEN: usize = 1 + 1 + 32 + 32 + 8 + 32 + 1 + 4;
+/// version + type + channel_id + sender_fp + timestamp + message_id + kt_head_hash + ref_count + content_len
+const FIXED_HEADER_LEN: usize = 1 + 1 + 32 + 32 + 8 + 32 + 32 + 1 + 4;
 
 /// Application-layer message — the plaintext unit before MLS encryption.
 pub struct ApplicationMessage {
@@ -21,6 +21,9 @@ pub struct ApplicationMessage {
     pub sender_fp: [u8; 32],
     pub timestamp: u64,
     pub message_id: [u8; 32],
+    /// Sender's view of their own identity log head hash (key transparency gossip).
+    /// Receivers compare this against their cached copy to detect split-view attacks.
+    pub kt_head_hash: [u8; 32],
     pub references: Vec<[u8; 32]>,
     pub content: Vec<u8>,
 }
@@ -31,6 +34,7 @@ impl ApplicationMessage {
         channel_id: [u8; 32],
         sender_fp: [u8; 32],
         timestamp: u64,
+        kt_head_hash: [u8; 32],
         references: Vec<[u8; 32]>,
         content: Vec<u8>,
     ) -> Result<Self> {
@@ -51,6 +55,7 @@ impl ApplicationMessage {
             sender_fp,
             timestamp,
             message_id,
+            kt_head_hash,
             references,
             content,
         })
@@ -69,6 +74,7 @@ impl ApplicationMessage {
         buf.extend_from_slice(&self.sender_fp);
         buf.extend_from_slice(&self.timestamp.to_be_bytes());
         buf.extend_from_slice(&self.message_id);
+        buf.extend_from_slice(&self.kt_head_hash);
         buf.push(ref_count);
         for r in &self.references {
             buf.extend_from_slice(r);
@@ -97,6 +103,7 @@ impl ApplicationMessage {
         let sender_fp = read_blob32(data, &mut pos)?;
         let timestamp = read_u64(data, &mut pos)?;
         let message_id = read_blob32(data, &mut pos)?;
+        let kt_head_hash = read_blob32(data, &mut pos)?;
 
         let ref_count = read_u8(data, &mut pos)? as usize;
         let mut references = Vec::with_capacity(ref_count);
@@ -125,6 +132,7 @@ impl ApplicationMessage {
             sender_fp,
             timestamp,
             message_id,
+            kt_head_hash,
             references,
             content,
         })
@@ -793,8 +801,7 @@ fn extract_sender_identity(
     Ok((account_fp, device_vk))
 }
 
-/// Verify a sender's device key is authorized in their account's identity log.
-fn validate_sender_credential(
+fn validate_device_credential(
     cache: &IdLogCache,
     account_fp: &[u8; 32],
     device_vk: &[u8; 32],
@@ -807,6 +814,41 @@ fn validate_sender_credential(
             hex::encode(&account_fp[..8]),
         ))),
     }
+}
+
+/// Validate that a member sender's device key is authorized by their identity log.
+/// Skips validation for non-member senders (external/relay proposals).
+pub(crate) fn validate_sender(
+    group: &GhostGroup,
+    credential: &Credential,
+    sender: &Sender,
+    cache: &IdLogCache,
+) -> Result<()> {
+    if !matches!(sender, Sender::Member(_)) {
+        return Ok(());
+    }
+    let (account_fp, device_vk) = extract_sender_identity(group, credential, sender)?;
+    validate_device_credential(cache, &account_fp, &device_vk)
+}
+
+/// Validate that all members being added in a commit have authorized device keys.
+pub(crate) fn validate_add_proposals(
+    staged: &openmls::prelude::StagedCommit,
+    cache: &IdLogCache,
+) -> Result<()> {
+    for add_proposal in staged.add_proposals() {
+        let kp = add_proposal.add_proposal().key_package();
+        let leaf = kp.leaf_node();
+        let kp_basic = BasicCredential::try_from(leaf.credential().clone())
+            .map_err(|_| GhostError::Mls("added member has non-basic credential".into()))?;
+        let added_fp: [u8; 32] = kp_basic.identity().try_into().map_err(|_| {
+            GhostError::Format("added member credential is not 32 bytes".into())
+        })?;
+        let added_vk: [u8; 32] = leaf.signature_key().as_slice().try_into()
+            .map_err(|_| GhostError::Format("added member sig key is not 32 bytes".into()))?;
+        validate_device_credential(cache, &added_fp, &added_vk)?;
+    }
+    Ok(())
 }
 
 /// Process an inbound blob that could be an application message or a commit.
@@ -837,36 +879,13 @@ pub fn open_any(
                 ));
             }
 
-            // Validate the sender's device key against their identity log
-            let (account_fp, device_vk) =
-                extract_sender_identity(group, &credential, &sender)?;
-            validate_sender_credential(idlog_cache, &account_fp, &device_vk)?;
-
+            validate_sender(group, &credential, &sender, idlog_cache)?;
             Ok(InboundMessage::Application(msg))
         }
         ProcessedMessageContent::StagedCommitMessage(staged_commit) => {
-            // Validate commit sender if it's a member (not external/relay)
-            if matches!(sender, Sender::Member(_)) {
-                let (account_fp, device_vk) =
-                    extract_sender_identity(group, &credential, &sender)?;
-                validate_sender_credential(idlog_cache, &account_fp, &device_vk)?;
-            }
+            validate_sender(group, &credential, &sender, idlog_cache)?;
+            validate_add_proposals(&staged_commit, idlog_cache)?;
 
-            // Validate credentials of newly added members before merging
-            for add_proposal in staged_commit.add_proposals() {
-                let kp = add_proposal.add_proposal().key_package();
-                let leaf = kp.leaf_node();
-                let kp_basic = BasicCredential::try_from(leaf.credential().clone())
-                    .map_err(|_| GhostError::Mls("added member has non-basic credential".into()))?;
-                let added_fp: [u8; 32] = kp_basic.identity().try_into().map_err(|_| {
-                    GhostError::Format("added member credential is not 32 bytes".into())
-                })?;
-                let added_vk: [u8; 32] = leaf.signature_key().as_slice().try_into()
-                    .map_err(|_| GhostError::Format("added member sig key is not 32 bytes".into()))?;
-                validate_sender_credential(idlog_cache, &added_fp, &added_vk)?;
-            }
-
-            // Extract removed member fingerprints before merging
             let removed = extract_removed_fps(group, &staged_commit);
             group.merge_staged_commit(provider, *staged_commit)?;
             Ok(InboundMessage::Commit { removed })
@@ -972,6 +991,7 @@ mod tests {
             test_channel(),
             test_sender(),
             1000,
+            [0u8; 32],
             vec![],
             content.to_vec(),
         )
@@ -1001,6 +1021,7 @@ mod tests {
             test_channel(),
             test_sender(),
             2000,
+            [0u8; 32],
             vec![target],
             b"replying".to_vec(),
         )
@@ -1020,6 +1041,7 @@ mod tests {
             test_channel(),
             test_sender(),
             3000,
+            [0u8; 32],
             vec![target],
             vec![],
         )
@@ -1039,6 +1061,7 @@ mod tests {
             test_channel(),
             test_sender(),
             4000,
+            [0u8; 32],
             refs.clone(),
             b"many refs".to_vec(),
         )
@@ -1056,6 +1079,7 @@ mod tests {
             test_channel(),
             test_sender(),
             1000,
+            [0u8; 32],
             refs,
             vec![],
         )
@@ -1137,6 +1161,7 @@ mod tests {
             test_channel(),
             test_sender(),
             1000,
+            [0u8; 32],
             vec![target],
             b"hello".to_vec(),
         )
@@ -1181,11 +1206,13 @@ mod tests {
         let mut group_b =
             GhostGroup::join(&provider_b, &id_b, &welcome.to_bytes().unwrap()).unwrap();
 
+        let kt_hash = [0x42; 32];
         let msg = ApplicationMessage::new(
             MessageType::Text,
             test_channel(),
             id_a.fingerprint,
             1000,
+            kt_hash,
             vec![],
             b"hello from sender".to_vec(),
         )
@@ -1199,6 +1226,7 @@ mod tests {
         assert_eq!(decrypted.sender_fp, id_a.fingerprint);
         assert_eq!(decrypted.content, b"hello from sender");
         assert_eq!(decrypted.message_id, msg.message_id);
+        assert_eq!(decrypted.kt_head_hash, kt_hash);
     }
 
     #[test]
@@ -1222,6 +1250,7 @@ mod tests {
             test_channel(),
             id_b.fingerprint, // lying about sender
             1000,
+            [0u8; 32],
             vec![],
             b"forged".to_vec(),
         )

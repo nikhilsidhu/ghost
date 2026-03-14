@@ -131,7 +131,38 @@ impl Storage {
                  id INTEGER PRIMARY KEY CHECK (id = 1),
                  signing_key BLOB NOT NULL,
                  verifying_key BLOB NOT NULL
-             );",
+             );
+
+             CREATE TABLE IF NOT EXISTS kt_leaves (
+                 leaf_index INTEGER PRIMARY KEY,
+                 leaf_hash  BLOB NOT NULL
+             );
+
+             CREATE TABLE IF NOT EXISTS kt_frontier (
+                 level INTEGER PRIMARY KEY,
+                 hash  BLOB NOT NULL
+             );
+
+             CREATE TABLE IF NOT EXISTS kt_head (
+                 id         INTEGER PRIMARY KEY CHECK (id = 1),
+                 tree_size  INTEGER NOT NULL,
+                 root_hash  BLOB NOT NULL,
+                 checkpoint BLOB NOT NULL
+             );
+
+             CREATE TABLE IF NOT EXISTS kt_nodes (
+                 start  INTEGER NOT NULL,
+                 count  INTEGER NOT NULL,
+                 hash   BLOB NOT NULL,
+                 PRIMARY KEY (start, count)
+             ) WITHOUT ROWID;
+
+             CREATE TABLE IF NOT EXISTS kt_entry_index (
+                 account_fp BLOB NOT NULL,
+                 seq        INTEGER NOT NULL,
+                 leaf_index INTEGER NOT NULL,
+                 PRIMARY KEY (account_fp, seq)
+             ) WITHOUT ROWID;",
         )
         .map_err(|e| RelayError::Storage(e.to_string()))?;
         Ok(())
@@ -363,15 +394,12 @@ impl Storage {
         Ok(())
     }
 
-    /// Append an identity log entry with full cryptographic validation.
-    /// Returns the list of device keys revoked by this entry (empty for
-    /// Genesis/AddDevice, one key for RevokeDevice, all previously-active
-    /// keys for Recovery).
+    /// Append a validated identity log entry. Returns (revoked device keys, entry seq).
     pub fn append_idlog_entry(
         &self,
         account_fp: &[u8; 32],
         payload: &[u8],
-    ) -> Result<Vec<[u8; 32]>, RelayError> {
+    ) -> Result<(Vec<[u8; 32]>, u64), RelayError> {
         let entry = idlog::LogEntry::from_bytes(payload)
             .map_err(|e| RelayError::BadRequest(format!("invalid entry: {e}")))?;
 
@@ -413,7 +441,7 @@ impl Storage {
         Self::update_device_keys(&tx, account_fp, &entry)?;
 
         tx.commit().map_err(|e| RelayError::Storage(e.to_string()))?;
-        Ok(revoked)
+        Ok((revoked, entry.seq))
     }
 
     /// Reconstruct LogState from point-reads: last entry (head_seq, head_hash),
@@ -805,6 +833,274 @@ impl Storage {
         Ok(result)
     }
 
+    // ── Key transparency ────────────────────────────────────────────────
+
+    /// Append a leaf hash to the KT tree and record the (account_fp, seq) mapping.
+    /// Returns the assigned leaf index.
+    pub fn kt_append_leaf(
+        &self,
+        leaf_hash: &[u8; 32],
+        account_fp: &[u8; 32],
+        seq: u64,
+    ) -> Result<u64, RelayError> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()
+            .map_err(|e| RelayError::Storage(e.to_string()))?;
+
+        let leaf_index: i64 = tx
+            .query_row(
+                "SELECT COALESCE(MAX(leaf_index), -1) + 1 FROM kt_leaves",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| RelayError::Storage(e.to_string()))?;
+
+        tx.execute(
+            "INSERT INTO kt_leaves (leaf_index, leaf_hash) VALUES (?1, ?2)",
+            params![leaf_index, leaf_hash.as_slice()],
+        )
+        .map_err(|e| RelayError::Storage(e.to_string()))?;
+
+        tx.execute(
+            "INSERT INTO kt_entry_index (account_fp, seq, leaf_index) VALUES (?1, ?2, ?3)",
+            params![account_fp.as_slice(), seq as i64, leaf_index],
+        )
+        .map_err(|e| RelayError::Storage(e.to_string()))?;
+
+        tx.commit().map_err(|e| RelayError::Storage(e.to_string()))?;
+        Ok(leaf_index as u64)
+    }
+
+    /// Load the persisted Merkle tree frontier and tree size.
+    pub fn kt_load_frontier(&self) -> Result<(Vec<Option<[u8; 32]>>, u64), RelayError> {
+        let conn = self.conn.lock().unwrap();
+        let tree_size: i64 = conn
+            .query_row(
+                "SELECT COALESCE(tree_size, 0) FROM kt_head WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| RelayError::Storage(e.to_string()))?
+            .unwrap_or(0);
+
+        if tree_size == 0 {
+            return Ok((Vec::new(), 0));
+        }
+
+        let mut stmt = conn
+            .prepare_cached("SELECT level, hash FROM kt_frontier ORDER BY level")
+            .map_err(|e| RelayError::Storage(e.to_string()))?;
+        let rows: Vec<(i64, Vec<u8>)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(|e| RelayError::Storage(e.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| RelayError::Storage(e.to_string()))?;
+
+        let max_level = rows.iter().map(|(l, _)| *l).max().unwrap_or(0) as usize;
+        let mut frontier = vec![None; max_level + 1];
+        for (level, hash_bytes) in rows {
+            let mut h = [0u8; 32];
+            h.copy_from_slice(&hash_bytes);
+            frontier[level as usize] = Some(h);
+        }
+
+        Ok((frontier, tree_size as u64))
+    }
+
+    /// Atomically persist the frontier and checkpoint in a single transaction.
+    pub fn kt_persist_state(
+        &self,
+        frontier: &[Option<[u8; 32]>],
+        tree_size: u64,
+        root_hash: &[u8; 32],
+        checkpoint_bytes: &[u8],
+    ) -> Result<(), RelayError> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| RelayError::Storage(e.to_string()))?;
+
+        tx.execute("DELETE FROM kt_frontier", [])
+            .map_err(|e| RelayError::Storage(e.to_string()))?;
+        for (level, slot) in frontier.iter().enumerate() {
+            if let Some(h) = slot {
+                tx.execute(
+                    "INSERT INTO kt_frontier (level, hash) VALUES (?1, ?2)",
+                    params![level as i64, h.as_slice()],
+                )
+                .map_err(|e| RelayError::Storage(e.to_string()))?;
+            }
+        }
+
+        tx.execute(
+            "INSERT INTO kt_head (id, tree_size, root_hash, checkpoint)
+             VALUES (1, ?1, ?2, ?3)
+             ON CONFLICT (id) DO UPDATE SET tree_size = ?1, root_hash = ?2, checkpoint = ?3",
+            params![tree_size as i64, root_hash.as_slice(), checkpoint_bytes],
+        )
+        .map_err(|e| RelayError::Storage(e.to_string()))?;
+
+        tx.commit()
+            .map_err(|e| RelayError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Load the latest signed checkpoint.
+    pub fn kt_load_checkpoint(&self) -> Result<Option<Vec<u8>>, RelayError> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT checkpoint FROM kt_head WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| RelayError::Storage(e.to_string()))
+    }
+
+    /// Load checkpoint bytes and tree_size atomically (single query).
+    pub fn kt_load_checkpoint_with_size(&self) -> Result<(Vec<u8>, u64), RelayError> {
+        let conn = self.conn.lock().unwrap();
+        let result: Option<(Vec<u8>, i64)> = conn
+            .query_row(
+                "SELECT checkpoint, tree_size FROM kt_head WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| RelayError::Storage(e.to_string()))?;
+        match result {
+            Some((cp, size)) => Ok((cp, size as u64)),
+            None => Ok((Vec::new(), 0)),
+        }
+    }
+
+    /// Load leaf hashes in [from, to) range for proof generation.
+    pub fn kt_load_leaves(
+        &self,
+        from: u64,
+        to: u64,
+    ) -> Result<Vec<[u8; 32]>, RelayError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT leaf_hash FROM kt_leaves
+                 WHERE leaf_index >= ?1 AND leaf_index < ?2
+                 ORDER BY leaf_index",
+            )
+            .map_err(|e| RelayError::Storage(e.to_string()))?;
+        let rows: Vec<Vec<u8>> = stmt
+            .query_map(params![from as i64, to as i64], |row| row.get(0))
+            .map_err(|e| RelayError::Storage(e.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| RelayError::Storage(e.to_string()))?;
+
+        rows.into_iter()
+            .map(|h| {
+                h.try_into()
+                    .map_err(|_| RelayError::Storage("corrupt leaf hash".into()))
+            })
+            .collect()
+    }
+
+    /// Look up the KT leaf index for a given identity log entry.
+    pub fn kt_get_leaf_index(
+        &self,
+        account_fp: &[u8; 32],
+        seq: u64,
+    ) -> Result<Option<u64>, RelayError> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT leaf_index FROM kt_entry_index WHERE account_fp = ?1 AND seq = ?2",
+            params![account_fp.as_slice(), seq as i64],
+            |row| Ok(row.get::<_, i64>(0)? as u64),
+        )
+        .optional()
+        .map_err(|e| RelayError::Storage(e.to_string()))
+    }
+
+    /// Load a stored Merkle tree node by the leaf range it covers.
+    pub fn kt_load_node(
+        &self,
+        start: u64,
+        count: u64,
+    ) -> Result<Option<[u8; 32]>, RelayError> {
+        let conn = self.conn.lock().unwrap();
+        let result: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT hash FROM kt_nodes WHERE start = ?1 AND count = ?2",
+                params![start as i64, count as i64],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| RelayError::Storage(e.to_string()))?;
+        match result {
+            Some(h) => {
+                let arr: [u8; 32] = h
+                    .try_into()
+                    .map_err(|_| RelayError::Storage("corrupt node hash".into()))?;
+                Ok(Some(arr))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Load the hash for a subtree range: leaf hashes for count==1,
+    /// internal nodes for count>1.
+    pub fn kt_load_hash(&self, start: u64, count: u64) -> Result<Option<[u8; 32]>, RelayError> {
+        if count == 1 {
+            self.kt_load_leaf_hash(start)
+        } else {
+            self.kt_load_node(start, count)
+        }
+    }
+
+    /// Load a single leaf hash by index from kt_leaves.
+    pub fn kt_load_leaf_hash(&self, index: u64) -> Result<Option<[u8; 32]>, RelayError> {
+        let conn = self.conn.lock().unwrap();
+        let result: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT leaf_hash FROM kt_leaves WHERE leaf_index = ?1",
+                params![index as i64],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| RelayError::Storage(e.to_string()))?;
+        match result {
+            Some(h) => {
+                let arr: [u8; 32] = h
+                    .try_into()
+                    .map_err(|_| RelayError::Storage("corrupt leaf hash".into()))?;
+                Ok(Some(arr))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Batch-store multiple Merkle tree nodes in a single transaction.
+    /// Each entry is (start, count, hash).
+    pub fn kt_store_nodes(
+        &self,
+        nodes: &[(u64, u64, [u8; 32])],
+    ) -> Result<(), RelayError> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()
+            .map_err(|e| RelayError::Storage(e.to_string()))?;
+        {
+            let mut stmt = tx
+                .prepare_cached(
+                    "INSERT INTO kt_nodes (start, count, hash) VALUES (?1, ?2, ?3)
+                     ON CONFLICT (start, count) DO UPDATE SET hash = ?3",
+                )
+                .map_err(|e| RelayError::Storage(e.to_string()))?;
+            for &(start, count, ref hash) in nodes {
+                stmt.execute(params![start as i64, count as i64, hash.as_slice()])
+                    .map_err(|e| RelayError::Storage(e.to_string()))?;
+            }
+        }
+        tx.commit().map_err(|e| RelayError::Storage(e.to_string()))?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

@@ -15,6 +15,7 @@ use crate::error::RelayError;
 use crate::mailbox::Mailbox;
 use crate::mls_storage::MlsPublicStorage;
 use crate::storage::Storage;
+use crate::util::now_millis;
 use crate::voice::{RoutingTable, VoiceChannel};
 
 pub struct Invite {
@@ -78,6 +79,8 @@ pub struct Inner {
     pub relay_vk: [u8; 32],
     /// Raw ed25519 keypair bytes (64) for constructing OpenMLS signer
     pub relay_sk_bytes: [u8; 64],
+    /// In-memory Merkle tree for key transparency (frontier-based, O(log N) storage)
+    pub kt_tree: RwLock<ghost_wire::merkle::MerkleTree>,
 }
 
 impl Inner {
@@ -105,6 +108,58 @@ impl Inner {
             let _ = mailbox.seq_tx.send(seq);
         }
         Ok((seq, epoch_mismatch))
+    }
+
+    /// Hash an identity log entry, append it to the KT Merkle tree,
+    /// sign a new checkpoint, and persist everything.
+    pub async fn kt_append_and_sign(
+        &self,
+        entry_payload: &[u8],
+        account_fp: &[u8; 32],
+        seq: u64,
+    ) {
+        let lh = ghost_wire::merkle::leaf_hash(entry_payload);
+
+        // Hold the tree lock for the entire operation to prevent concurrent
+        // appends from racing on leaf_index or seeing partial DB state.
+        let mut tree = self.kt_tree.write().await;
+
+        if let Err(e) = self.storage.kt_append_leaf(&lh, account_fp, seq) {
+            tracing::warn!("kt_append_leaf failed: {e}");
+            return;
+        }
+
+        tree.append(lh);
+
+        let root = tree.root();
+        let size = tree.size();
+
+        // Update the O(log N) internal nodes along the right edge
+        let storage = &self.storage;
+        let mut pending_nodes = Vec::new();
+        ghost_wire::merkle::update_stored_nodes(
+            size,
+            &|start, count| storage.kt_load_hash(start, count).ok().flatten(),
+            &mut |start, count, hash| pending_nodes.push((start, count, hash)),
+        );
+        if let Err(e) = self.storage.kt_store_nodes(&pending_nodes) {
+            tracing::warn!("kt_store_nodes failed: {e}");
+            return;
+        }
+
+        let sk = match ed25519_dalek::SigningKey::from_keypair_bytes(&self.relay_sk_bytes) {
+            Ok(sk) => sk,
+            Err(e) => {
+                tracing::warn!("kt checkpoint sign: bad relay key: {e}");
+                return;
+            }
+        };
+        let cp = ghost_wire::merkle::Checkpoint::sign(size, root, now_millis(), &sk);
+        let cp_bytes = cp.to_bytes();
+
+        if let Err(e) = self.storage.kt_persist_state(tree.frontier(), size, &root, &cp_bytes) {
+            tracing::warn!("kt_persist_state failed: {e}");
+        }
     }
 
     /// Validate a commit or proposal via PublicGroup.
@@ -505,6 +560,13 @@ pub fn new_state(config: Config, storage: Storage) -> AppState {
         .get_or_create_relay_keypair()
         .expect("failed to initialize relay keypair");
     let groups = load_mls_groups(&storage);
+    let (kt_frontier, kt_size) = storage
+        .kt_load_frontier()
+        .unwrap_or_else(|e| {
+            tracing::warn!("failed to load KT frontier: {e}");
+            (Vec::new(), 0)
+        });
+    let kt_tree = ghost_wire::merkle::MerkleTree::from_frontier(kt_frontier, kt_size);
     Arc::new(Inner {
         mailboxes: RwLock::new(HashMap::new()),
         invites: RwLock::new(HashMap::new()),
@@ -525,5 +587,6 @@ pub fn new_state(config: Config, storage: Storage) -> AppState {
         relay_crypto: RustCrypto::default(),
         relay_vk,
         relay_sk_bytes,
+        kt_tree: RwLock::new(kt_tree),
     })
 }

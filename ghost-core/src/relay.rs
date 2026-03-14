@@ -18,15 +18,30 @@ const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 const RELAY_ERROR_PREFIX: &str = "error: ";
 
-pub struct IdLogBlob {
+/// Identity log entry with a KT inclusion proof.
+pub struct IdLogBlobWithProof {
     pub seq: u64,
     pub payload: Vec<u8>,
+    pub inclusion_proof: Vec<u8>,
+}
+
+/// Response from GET /idlog with KT proofs.
+pub struct IdLogWithProofs {
+    pub entries: Vec<IdLogBlobWithProof>,
+    pub checkpoint: Vec<u8>,
 }
 
 #[derive(serde::Deserialize)]
-struct IdLogBlobJson {
+struct IdLogResponseJson {
+    entries: Vec<IdLogEntryJson>,
+    checkpoint: String,
+}
+
+#[derive(serde::Deserialize)]
+struct IdLogEntryJson {
     seq: u64,
     payload: String,
+    inclusion_proof: String,
 }
 
 pub struct IncomingBlob {
@@ -104,6 +119,10 @@ impl RelayClient {
             auth: None,
         };
         (client, event_rx)
+    }
+
+    pub fn base_url(&self) -> &str {
+        &self.base_url
     }
 
     /// Set auth credentials for request signing. Called once after identity is loaded.
@@ -469,12 +488,12 @@ impl RelayClient {
         Ok(())
     }
 
-    /// Fetch identity log entries from the relay, optionally after a given seq.
+    /// Fetch identity log entries with KT inclusion proofs.
     pub async fn get_idlog(
         &self,
         account_fp: &[u8; 32],
         after_seq: u64,
-    ) -> Result<Vec<IdLogBlob>> {
+    ) -> Result<IdLogWithProofs> {
         let mut url = format!(
             "{}/idlog/{}",
             self.base_url,
@@ -492,22 +511,64 @@ impl RelayClient {
         if !resp.status().is_success() {
             return Err(GhostError::Network(format!("get idlog: {}", resp.status())));
         }
-        let entries: Vec<IdLogBlobJson> = resp
+        let body: IdLogResponseJson = resp
             .json()
             .await
             .map_err(|e| GhostError::Network(e.to_string()))?;
-        entries
+
+        let b64 = &base64::engine::general_purpose::STANDARD;
+        let checkpoint = b64
+            .decode(&body.checkpoint)
+            .map_err(|e| GhostError::Network(format!("base64: {e}")))?;
+        let entries = body
+            .entries
             .into_iter()
             .map(|e| {
-                let payload = base64::engine::general_purpose::STANDARD
+                let payload = b64
                     .decode(&e.payload)
-                    .map_err(|e| GhostError::Network(format!("base64 decode: {e}")))?;
-                Ok(IdLogBlob {
+                    .map_err(|e| GhostError::Network(format!("base64: {e}")))?;
+                let inclusion_proof = b64
+                    .decode(&e.inclusion_proof)
+                    .map_err(|e| GhostError::Network(format!("base64: {e}")))?;
+                Ok(IdLogBlobWithProof {
                     seq: e.seq,
                     payload,
+                    inclusion_proof,
                 })
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        Ok(IdLogWithProofs {
+            entries,
+            checkpoint,
+        })
+    }
+
+    /// Fetch a KT consistency proof proving the tree at `from` is a prefix of `to`.
+    pub async fn get_consistency_proof(
+        &self,
+        from: u64,
+        to: u64,
+    ) -> Result<Vec<u8>> {
+        let url = format!(
+            "{}/kt/consistency-proof?from={from}&to={to}",
+            self.base_url,
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| GhostError::Network(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(GhostError::Network(format!(
+                "get consistency proof: {}",
+                resp.status()
+            )));
+        }
+        resp.bytes()
+            .await
+            .map(|b| b.to_vec())
+            .map_err(|e| GhostError::Network(e.to_string()))
     }
 
     /// Post a pairing offer (existing device → relay).

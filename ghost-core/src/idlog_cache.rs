@@ -69,30 +69,41 @@ impl IdLogCache {
 
     /// Cache identity log entries from the relay into the local DB, validate
     /// the full chain, and store the resulting LogState in memory.
+    ///
+    /// Validates the full chain *before* persisting to avoid poisoning the
+    /// local cache with invalid entries.
     pub fn cache_and_validate(
         &mut self,
         store: &GhostStore,
         account_fp: &[u8; 32],
         raw_entries: &[(u64, Vec<u8>)],
-    ) -> Result<()> {
+    ) -> Result<LogState> {
         if raw_entries.is_empty() {
-            return Ok(());
+            return Ok(LogState::empty(*account_fp));
         }
 
-        // Persist to local DB first
-        store.cache_idlog_entries(account_fp, raw_entries)?;
+        // Merge new entries with any previously cached, sorted by seq
+        let mut all_raw = store.get_cached_idlog_entries(account_fp)?;
+        for (seq, payload) in raw_entries {
+            if !all_raw.iter().any(|(s, _)| s == seq) {
+                all_raw.push((*seq, payload.clone()));
+            }
+        }
+        all_raw.sort_by_key(|(s, _)| *s);
 
-        // Load all entries (including any previously cached) and validate
-        let all_entries = store.get_cached_idlog_entries(account_fp)?;
-        let entries: Vec<LogEntry> = all_entries
+        // Validate the full chain BEFORE writing anything to DB
+        let entries: Vec<LogEntry> = all_raw
             .iter()
             .map(|(_seq, payload)| LogEntry::from_bytes(payload))
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
         let state = validate_chain(&entries)?;
+
+        // Chain is valid — persist
+        store.cache_idlog_entries(account_fp, raw_entries)?;
         store.upsert_idlog_state(account_fp, &state)?;
-        self.states.insert(*account_fp, state);
-        Ok(())
+        self.states.insert(*account_fp, state.clone());
+        Ok(state)
     }
 }
 

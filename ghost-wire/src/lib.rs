@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod idlog;
+pub mod merkle;
 
 /// Envelope framing for blobs transiting the relay.
 ///

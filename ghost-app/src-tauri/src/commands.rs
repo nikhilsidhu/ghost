@@ -76,6 +76,57 @@ async fn sync_set_and_push(state: &AppState, key: &str, value: &[u8]) {
     push_sync_snapshot(state).await;
 }
 
+/// Fetch an identity log from the relay, verify KT proofs (inclusion + consistency),
+/// and cache the validated result. Returns the validated LogState.
+async fn fetch_and_verify_idlog(
+    state: &AppState,
+    account_fp: &[u8; 32],
+) -> Result<ghost_wire::idlog::LogState, String> {
+    let resp = {
+        let relay = state.relay.lock().await;
+        relay.get_idlog(account_fp, 0).await.map_err(|e| e.to_string())?
+    };
+
+    if resp.entries.is_empty() {
+        return Err("identity log is empty".into());
+    }
+
+    let relay_url = state.relay_url.lock().await.clone();
+
+    // Fetch consistency proof if we have a previous checkpoint
+    let consistency = if !resp.checkpoint.is_empty() {
+        let prev_tree_size = {
+            let client = state.client.lock().await;
+            client.kt_last_tree_size(&relay_url).unwrap_or(0)
+        };
+        if prev_tree_size > 0 {
+            let new_tree_size = ghost_wire::merkle::Checkpoint::from_bytes(&resp.checkpoint)
+                .map(|cp| cp.tree_size)
+                .unwrap_or(0);
+            if new_tree_size > prev_tree_size {
+                let relay = state.relay.lock().await;
+                Some(relay.get_consistency_proof(prev_tree_size, new_tree_size)
+                    .await.map_err(|e| e.to_string())?)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Verify proofs, validate chain, and cache
+    let mut client = state.client.lock().await;
+    client.cache_identity_log_with_proofs(
+        &relay_url,
+        account_fp,
+        &resp,
+        consistency.as_deref(),
+    ).map_err(|e| e.to_string())
+}
+
 /// Remove a sync state entry, broadcast to linked devices, and push snapshot.
 async fn sync_remove_and_push(state: &AppState, key: &str) {
     use ghost_core::wire::{encode_mutation, MUTATION_REMOVE, SyncMessageType};
@@ -1260,24 +1311,11 @@ pub async fn set_status_message(
 
 #[tauri::command]
 pub async fn get_devices(state: State<'_, AppState>) -> Result<Vec<DeviceDto>, String> {
-    use ghost_core::identity::log::{validate_chain, LogEntry};
-
     let (account_fp, own_device_vk) = {
         let client = state.client.lock().await;
         (*client.fingerprint(), client.identity().verifying_key.to_bytes())
     };
-    let blobs = {
-        let relay = state.relay.lock().await;
-        relay.get_idlog(&account_fp, 0).await.map_err(|e| e.to_string())?
-    };
-    if blobs.is_empty() {
-        return Ok(vec![]);
-    }
-    let entries: Vec<LogEntry> = blobs
-        .iter()
-        .map(|b| LogEntry::from_bytes(&b.payload).map_err(|e| e.to_string()))
-        .collect::<Result<Vec<_>, _>>()?;
-    let log_state = validate_chain(&entries).map_err(|e| e.to_string())?;
+    let log_state = fetch_and_verify_idlog(&state, &account_fp).await?;
     Ok(log_state
         .devices
         .values()
@@ -1296,7 +1334,7 @@ pub async fn revoke_device(
     device_key_hex: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    use ghost_core::identity::log::{validate_chain, create_revoke_device, LogEntry};
+    use ghost_core::identity::log::create_revoke_device;
 
     let target_key = parse_id(&device_key_hex)?;
 
@@ -1313,15 +1351,7 @@ pub async fn revoke_device(
     }
     let device_signing_key = ed25519_dalek::SigningKey::from_bytes(&signing_key_bytes);
 
-    let blobs = {
-        let relay = state.relay.lock().await;
-        relay.get_idlog(&account_fp, 0).await.map_err(|e| e.to_string())?
-    };
-    let entries: Vec<LogEntry> = blobs
-        .iter()
-        .map(|b| LogEntry::from_bytes(&b.payload).map_err(|e| e.to_string()))
-        .collect::<Result<Vec<_>, _>>()?;
-    let log_state = validate_chain(&entries).map_err(|e| e.to_string())?;
+    let log_state = fetch_and_verify_idlog(&state, &account_fp).await?;
 
     let revoke_entry = create_revoke_device(&log_state, &device_signing_key, &target_key);
     let payload = revoke_entry.to_bytes();
@@ -1531,6 +1561,15 @@ async fn rejoin_server(
                         .await;
                 }
 
+                // Cache identity logs for all group members (warm the AS cache)
+                let member_fps = {
+                    let client = state.client.lock().await;
+                    client.mls_member_fingerprints(&payload.server_id).unwrap_or_default()
+                };
+                for fp in &member_fps {
+                    let _ = fetch_and_verify_idlog(state, fp).await;
+                }
+
                 return true;
             }
             Err(e) => {
@@ -1682,7 +1721,7 @@ pub async fn start_pairing(state: State<'_, AppState>) -> Result<String, String>
 /// Poll for pairing response. Returns the new device label if complete, None if still waiting.
 #[tauri::command]
 pub async fn check_pairing(state: State<'_, AppState>) -> Result<Option<String>, String> {
-    use ghost_core::identity::log::{validate_chain, create_add_device, LogEntry};
+    use ghost_core::identity::log::create_add_device;
 
     let secret = {
         let guard = state.pairing_secret.lock().await;
@@ -1720,32 +1759,24 @@ pub async fn check_pairing(state: State<'_, AppState>) -> Result<Option<String>,
 
     let new_device_key = ed25519_dalek::SigningKey::from_bytes(&new_sk_bytes);
 
-    // Fetch current identity log to get state
-    let mut blobs = {
-        let relay = state.relay.lock().await;
-        relay.get_idlog(&account_fp, 0).await.map_err(|e| e.to_string())?
-    };
-
-    // If relay has no identity log, try re-pushing genesis (relay may have been restarted)
-    if blobs.is_empty() {
-        let genesis_path = state.config_path.parent()
-            .unwrap_or(&state.config_path)
-            .join("genesis.pending");
-        if let Ok(payload) = std::fs::read(&genesis_path) {
-            let relay = state.relay.lock().await;
-            relay.put_idlog_entry(&account_fp, payload).await
-                .map_err(|e| format!("re-push genesis: {e}"))?;
-            blobs = relay.get_idlog(&account_fp, 0).await.map_err(|e| e.to_string())?;
-        } else {
-            return Err("identity log empty on relay and no local genesis available".into());
+    // Fetch current identity log with KT proof verification
+    let log_state = match fetch_and_verify_idlog(&state, &account_fp).await {
+        Ok(ls) => ls,
+        Err(_) => {
+            // Identity log may be empty if relay was restarted — re-push genesis
+            let genesis_path = state.config_path.parent()
+                .unwrap_or(&state.config_path)
+                .join("genesis.pending");
+            if let Ok(payload) = std::fs::read(&genesis_path) {
+                let relay = state.relay.lock().await;
+                relay.put_idlog_entry(&account_fp, payload).await
+                    .map_err(|e| format!("re-push genesis: {e}"))?;
+            } else {
+                return Err("identity log empty on relay and no local genesis available".into());
+            }
+            fetch_and_verify_idlog(&state, &account_fp).await?
         }
-    }
-
-    let entries: Vec<LogEntry> = blobs
-        .iter()
-        .map(|b| LogEntry::from_bytes(&b.payload).map_err(|e| e.to_string()))
-        .collect::<Result<Vec<_>, _>>()?;
-    let log_state = validate_chain(&entries).map_err(|e| e.to_string())?;
+    };
 
     // Build provision blob BEFORE pushing AddDevice — device B starts
     // fetching provision as soon as it sees AddDevice in the identity log.

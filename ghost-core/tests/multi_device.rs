@@ -69,8 +69,9 @@ async fn push_and_validate(
     for e in entries {
         relay.put_idlog_entry(fp, e.to_bytes()).await.unwrap();
     }
-    let blobs = relay.get_idlog(fp, 0).await.unwrap();
-    let parsed: Vec<LogEntry> = blobs
+    let resp = relay.get_idlog(fp, 0).await.unwrap();
+    let parsed: Vec<LogEntry> = resp
+        .entries
         .iter()
         .map(|b| LogEntry::from_bytes(&b.payload).unwrap())
         .collect();
@@ -93,12 +94,13 @@ async fn idlog_genesis_add_revoke_full_lifecycle() {
 
     // Add device2: 2 active devices
     let add2 = create_add_device(&s1, &device1, &device2, "phone");
-    let blobs = relay.get_idlog(&fp, 0).await.unwrap();
+    let resp = relay.get_idlog(&fp, 0).await.unwrap();
     relay.put_idlog_entry(&fp, add2.to_bytes()).await.unwrap();
-    let blobs2 = relay.get_idlog(&fp, 0).await.unwrap();
-    assert_eq!(blobs2.len(), blobs.len() + 1);
+    let resp2 = relay.get_idlog(&fp, 0).await.unwrap();
+    assert_eq!(resp2.entries.len(), resp.entries.len() + 1);
 
-    let entries: Vec<LogEntry> = blobs2
+    let entries: Vec<LogEntry> = resp2
+        .entries
         .iter()
         .map(|b| LogEntry::from_bytes(&b.payload).unwrap())
         .collect();
@@ -109,8 +111,9 @@ async fn idlog_genesis_add_revoke_full_lifecycle() {
     let add3 = create_add_device(&s2, &device2, &device3, "tablet");
     relay.put_idlog_entry(&fp, add3.to_bytes()).await.unwrap();
 
-    let blobs3 = relay.get_idlog(&fp, 0).await.unwrap();
-    let entries3: Vec<LogEntry> = blobs3
+    let resp3 = relay.get_idlog(&fp, 0).await.unwrap();
+    let entries3: Vec<LogEntry> = resp3
+        .entries
         .iter()
         .map(|b| LogEntry::from_bytes(&b.payload).unwrap())
         .collect();
@@ -124,8 +127,9 @@ async fn idlog_genesis_add_revoke_full_lifecycle() {
         .await
         .unwrap();
 
-    let blobs4 = relay.get_idlog(&fp, 0).await.unwrap();
-    let entries4: Vec<LogEntry> = blobs4
+    let resp4 = relay.get_idlog(&fp, 0).await.unwrap();
+    let entries4: Vec<LogEntry> = resp4
+        .entries
         .iter()
         .map(|b| LogEntry::from_bytes(&b.payload).unwrap())
         .collect();
@@ -374,15 +378,29 @@ fn sync_group_add_device_via_external_commit() {
 
 #[test]
 fn sync_mutation_encrypted_decrypted() {
-    let (mut client_a, fp_a, _) = make_ghost_client("desktop");
+    use ghost_wire::idlog::{DeviceInfo, LogState};
+    use std::collections::HashMap;
+
+    let (mut client_a, fp_a, sk_a) = make_ghost_client("desktop");
     client_a.create_sync_group().unwrap();
     let gi = client_a.sync_group_info().unwrap();
 
     // Device B joins
     let acct_b = Identity::create_account("phone").unwrap();
+    let b_vk = acct_b.identity.signing_key.verifying_key().to_bytes();
     let identity_b = Identity::from_device(fp_a, acct_b.identity.signing_key.clone(), 2);
     drop(acct_b);
     let mut client_b = GhostClient::open_in_memory(identity_b, [0x02; 32]).unwrap();
+
+    // Cache identity log so sync credential validation passes
+    let a_vk = sk_a.verifying_key().to_bytes();
+    let mut devices = HashMap::new();
+    devices.insert(a_vk, DeviceInfo { verifying_key: a_vk, label: "desktop".into(), added_at_seq: 1, revoked_at_seq: None });
+    devices.insert(b_vk, DeviceInfo { verifying_key: b_vk, label: "phone".into(), added_at_seq: 2, revoked_at_seq: None });
+    let log_state = LogState { account_fp: fp_a, master_verifying_key: None, devices, head_seq: 2, head_hash: [0u8; 32] };
+    client_a.cache_own_identity_log(log_state.clone());
+    client_b.cache_own_identity_log(log_state);
+
     let (commit, _) = client_b.join_sync_group(&gi).unwrap();
     client_a.receive_sync(&commit).unwrap();
 
@@ -409,7 +427,10 @@ fn sync_mutation_encrypted_decrypted() {
 
 #[test]
 fn sync_revocation_prevents_decryption() {
-    let (mut client_a, fp_a, _) = make_ghost_client("desktop");
+    use ghost_wire::idlog::{DeviceInfo, LogState};
+    use std::collections::HashMap;
+
+    let (mut client_a, fp_a, sk_a) = make_ghost_client("desktop");
     client_a.create_sync_group().unwrap();
     let gi = client_a.sync_group_info().unwrap();
 
@@ -419,6 +440,16 @@ fn sync_revocation_prevents_decryption() {
     let identity_b = Identity::from_device(fp_a, acct_b.identity.signing_key.clone(), 2);
     drop(acct_b);
     let mut client_b = GhostClient::open_in_memory(identity_b, [0x02; 32]).unwrap();
+
+    // Cache identity log so sync credential validation passes
+    let a_vk = sk_a.verifying_key().to_bytes();
+    let mut devices = HashMap::new();
+    devices.insert(a_vk, DeviceInfo { verifying_key: a_vk, label: "desktop".into(), added_at_seq: 1, revoked_at_seq: None });
+    devices.insert(b_vk, DeviceInfo { verifying_key: b_vk, label: "phone".into(), added_at_seq: 2, revoked_at_seq: None });
+    let log_state = LogState { account_fp: fp_a, master_verifying_key: None, devices, head_seq: 2, head_hash: [0u8; 32] };
+    client_a.cache_own_identity_log(log_state.clone());
+    client_b.cache_own_identity_log(log_state);
+
     let (commit, _) = client_b.join_sync_group(&gi).unwrap();
     client_a.receive_sync(&commit).unwrap();
 
@@ -567,14 +598,18 @@ async fn full_pairing_then_sync_exchange() {
         .unwrap();
 
     // 6. Device B: validate chain, fetch provision, join sync group
-    let all_blobs = relay_a.get_idlog(&fp, 0).await.unwrap();
-    let all_entries: Vec<LogEntry> = all_blobs
+    let all_resp = relay_a.get_idlog(&fp, 0).await.unwrap();
+    let all_entries: Vec<LogEntry> = all_resp
+        .entries
         .iter()
         .map(|b| LogEntry::from_bytes(&b.payload).unwrap())
         .collect();
     let state = validate_chain(&all_entries).unwrap();
     assert_eq!(state.active_devices().count(), 2);
     assert!(state.is_active_device(&device_b.verifying_key().to_bytes()));
+
+    // Cache identity log in Device A so sync credential validation passes
+    client_a.cache_own_identity_log(state.clone());
 
     let prov_blob = http
         .get(format!("{}/pair/{}/provision", relay_url, fp_hex))
@@ -598,6 +633,7 @@ async fn full_pairing_then_sync_exchange() {
     .unwrap();
     client_b.set_sync_key(recovered_sync_key).unwrap();
     assert_eq!(client_b.sync_key().unwrap(), sync_key);
+    client_b.cache_own_identity_log(state);
 
     let (commit, sync_mb) = client_b.join_sync_group(recovered_gi).unwrap();
     assert_eq!(sync_mb, client_a.sync_mailbox_id().unwrap());
@@ -692,8 +728,9 @@ async fn recovery_full_flow() {
 
     // 5. Create Recovery entry, push to relay
     let recovery_device = SigningKey::generate(&mut OsRng);
-    let chain_blobs = relay.get_idlog(&fp, 0).await.unwrap();
-    let chain_entries: Vec<LogEntry> = chain_blobs
+    let chain_resp = relay.get_idlog(&fp, 0).await.unwrap();
+    let chain_entries: Vec<LogEntry> = chain_resp
+        .entries
         .iter()
         .map(|b| LogEntry::from_bytes(&b.payload).unwrap())
         .collect();
@@ -708,8 +745,9 @@ async fn recovery_full_flow() {
         .unwrap();
 
     // 6. Validate: only recovery device is active
-    let final_blobs = relay.get_idlog(&fp, 0).await.unwrap();
-    let final_entries: Vec<LogEntry> = final_blobs
+    let final_resp = relay.get_idlog(&fp, 0).await.unwrap();
+    let final_entries: Vec<LogEntry> = final_resp
+        .entries
         .iter()
         .map(|b| LogEntry::from_bytes(&b.payload).unwrap())
         .collect();

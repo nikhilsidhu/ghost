@@ -36,6 +36,49 @@ async fn rebroadcast_presence(
     presence::broadcast_presence_to_mailbox(client, relay, mailbox_id, &info).await;
 }
 
+/// Cache a member's identity log with KT proof verification.
+/// Best-effort — failures are logged but don't block processing.
+async fn cache_member_idlog(
+    client: &Arc<Mutex<GhostClient>>,
+    relay: &Arc<Mutex<RelayClient>>,
+    account_fp: &[u8; 32],
+) {
+    let (resp, relay_url) = {
+        let r = relay.lock().await;
+        let resp = match r.get_idlog(account_fp, 0).await {
+            Ok(resp) if !resp.entries.is_empty() => resp,
+            _ => return,
+        };
+        (resp, r.base_url().to_string())
+    };
+
+    let prev_tree_size = {
+        let c = client.lock().await;
+        c.kt_last_tree_size(&relay_url).unwrap_or(0)
+    };
+
+    let consistency = if !resp.checkpoint.is_empty() && prev_tree_size > 0 {
+        let new_ts = ghost_wire::merkle::Checkpoint::from_bytes(&resp.checkpoint)
+            .map(|cp| cp.tree_size)
+            .unwrap_or(0);
+        if new_ts > prev_tree_size {
+            let r = relay.lock().await;
+            r.get_consistency_proof(prev_tree_size, new_ts).await.ok()
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let mut c = client.lock().await;
+    if let Err(e) = c.cache_identity_log_with_proofs(
+        &relay_url, account_fp, &resp, consistency.as_deref(),
+    ) {
+        eprintln!("cache idlog for {}: {e}", hex::encode(&account_fp[..8]));
+    }
+}
+
 pub async fn run(
     app: AppHandle,
     client: Arc<Mutex<GhostClient>>,
@@ -78,7 +121,7 @@ pub async fn run(
             };
             let r = relay.lock().await;
             let needs_push = r.get_idlog(&account_fp, 0).await
-                .map(|entries| entries.is_empty())
+                .map(|resp| resp.entries.is_empty())
                 .unwrap_or(true);
             if needs_push {
                 if let Err(e) = r.put_idlog_entry(&account_fp, payload).await {
@@ -139,7 +182,7 @@ pub async fn run(
                 };
 
                 match result {
-                    Some((server_id, Ok(ReceiveResult::Message(msg)))) if msg.message_type == MessageType::Metadata => {
+                    Some((server_id, Ok(ReceiveResult::Message(msg) | ReceiveResult::MessageWithKtWarning(msg)))) if msg.message_type == MessageType::Metadata => {
                         let mut fetch_avatar = None;
                         let mut own_name_changed = false;
                         match decode_metadata(&msg.content) {
@@ -192,40 +235,47 @@ pub async fn run(
                         }
                         let _ = app.emit("sync", hex::encode(server_id));
                     }
-                    Some((_, Ok(ReceiveResult::Message(msg)))) => {
+                    Some((_, Ok(ReceiveResult::Message(msg)))) | Some((_, Ok(ReceiveResult::MessageWithKtWarning(msg)))) => {
                         let dto = MessageDto::from_incoming(&msg, received_at);
                         let _ = app.emit("message", &dto);
                         let c = client.lock().await;
                         let _ = c.store().set_last_seen_seq(&mailbox_id, seq);
                     }
                     Some((server_id, Ok(ReceiveResult::CommitProcessed))) => {
-                        let c = client.lock().await;
-                        let _ = c.store().set_last_seen_seq(&mailbox_id, seq);
-                        // Discover new members added by this commit (e.g. external join)
-                        if let Ok(mls_fps) = c.mls_member_fingerprints(&server_id) {
-                            let stored: HashSet<[u8; 32]> = c.store()
-                                .list_members(&server_id)
-                                .unwrap_or_default()
-                                .iter().map(|m| m.fingerprint).collect();
-                            for fp in &mls_fps {
-                                if !stored.contains(fp) {
-                                    let _ = c.store().insert_member(&Member {
-                                        server_id,
-                                        fingerprint: *fp,
-                                        display_name: hex::encode(&fp[..8]),
-                                        role: MemberRole::Member,
-                                        joined_at: received_at,
-                                        avatar_hash: None,
-                                        avatar_key: None,
-                                    });
+                        let mut new_member_fps = Vec::new();
+                        {
+                            let c = client.lock().await;
+                            let _ = c.store().set_last_seen_seq(&mailbox_id, seq);
+                            // Discover new members added by this commit (e.g. external join)
+                            if let Ok(mls_fps) = c.mls_member_fingerprints(&server_id) {
+                                let stored: HashSet<[u8; 32]> = c.store()
+                                    .list_members(&server_id)
+                                    .unwrap_or_default()
+                                    .iter().map(|m| m.fingerprint).collect();
+                                for fp in &mls_fps {
+                                    if !stored.contains(fp) {
+                                        new_member_fps.push(*fp);
+                                        let _ = c.store().insert_member(&Member {
+                                            server_id,
+                                            fingerprint: *fp,
+                                            display_name: hex::encode(&fp[..8]),
+                                            role: MemberRole::Member,
+                                            joined_at: received_at,
+                                            avatar_hash: None,
+                                            avatar_key: None,
+                                        });
+                                    }
                                 }
                             }
+                            if let Ok(gi) = c.export_server_info(&server_id) {
+                                let r = relay.lock().await;
+                                let _ = r.put_server_info(&mailbox_id, gi).await;
+                            }
                         }
-                        if let Ok(gi) = c.export_server_info(&server_id) {
-                            let r = relay.lock().await;
-                            let _ = r.put_server_info(&mailbox_id, gi).await;
+                        // Cache identity logs for newly discovered members
+                        for fp in &new_member_fps {
+                            cache_member_idlog(&client, &relay, fp).await;
                         }
-                        drop(c);
                         rebroadcast_presence(&client, &relay, &mailbox_id, &presence).await;
                         retry_pending_presence(&app, &client, &server_id, &mut online_members, &mut pending_presence).await;
                         let _ = app.emit("sync", hex::encode(server_id));

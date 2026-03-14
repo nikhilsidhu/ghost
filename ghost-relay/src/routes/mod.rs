@@ -1,6 +1,7 @@
 mod avatar;
 mod blob;
 mod idlog;
+mod kt;
 pub(crate) mod pair;
 mod recovery;
 mod relay_key;
@@ -35,6 +36,8 @@ pub fn router(state: AppState) -> Router {
         .route("/box/{mailbox_id}/server_info", put(server_info::put).get(server_info::get))
         .route("/box/{mailbox_id}/avatar/{fingerprint}", put(avatar::put).get(avatar::get).delete(avatar::delete))
         .route("/idlog/{account_fp}", put(idlog::put).get(idlog::get))
+        .route("/kt/head", get(kt::head))
+        .route("/kt/consistency-proof", get(kt::consistency_proof))
         .route("/pair/{account_fp}", post(pair::post_offer).get(pair::get_offer))
         .route("/pair/{account_fp}/respond", post(pair::post_respond))
         .route("/pair/{account_fp}/response", get(pair::get_response))

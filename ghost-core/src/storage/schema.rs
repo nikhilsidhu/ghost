@@ -119,6 +119,13 @@ pub fn initialize(conn: &Connection) -> Result<()> {
             head_hash  BLOB NOT NULL,
             master_vk  BLOB
         );
+
+        CREATE TABLE IF NOT EXISTS kt_state (
+            relay_url  TEXT PRIMARY KEY,
+            tree_size  INTEGER NOT NULL,
+            root_hash  BLOB NOT NULL,
+            checkpoint BLOB NOT NULL
+        );
         "
     ))
     .map_err(|e| GhostError::Database(format!("create tables: {e}")))?;
