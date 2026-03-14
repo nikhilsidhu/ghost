@@ -66,9 +66,12 @@ impl TestAuth {
         assert_eq!(resp.status(), StatusCode::CREATED, "genesis push failed");
     }
 
-    /// Sign a request builder with fresh auth headers.
-    fn sign(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    /// Sign a request builder with fresh auth headers bound to method + path.
+    fn sign(&self, method: &str, url: &str, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let path = extract_path(url);
         let h = ghost_wire::auth::sign_request_headers(
+            method,
+            &path,
             &self.account_fp,
             &self.device_key.verifying_key().to_bytes(),
             &self.device_key,
@@ -93,7 +96,10 @@ impl TestAuth {
             .unwrap()
             .as_secs();
         let vk = self.device_key.verifying_key().to_bytes();
-        let message = ghost_wire::auth::auth_message(&self.account_fp, &vk, timestamp);
+        let ws_path = url.find("//")
+            .and_then(|i| url[i+2..].find('/').map(|j| &url[i+2+j..]))
+            .unwrap_or("/");
+        let message = ghost_wire::auth::auth_message("GET", ws_path, &self.account_fp, &vk, timestamp);
         let signature = self.device_key.sign(&message);
 
         let request = http::Request::builder()
@@ -163,6 +169,13 @@ fn mailbox_url(base: &str, id: &[u8; 32]) -> String {
     format!("{base}/box/{}", URL_SAFE_NO_PAD.encode(id))
 }
 
+/// Extract the path portion from a full URL (e.g., "http://localhost:1234/box/abc" → "/box/abc")
+fn extract_path(url: &str) -> String {
+    url.find("//")
+        .and_then(|i| url[i+2..].find('/').map(|j| url[i+2+j..].to_string()))
+        .unwrap_or_else(|| "/".to_string())
+}
+
 fn envelope(typ: ghost_wire::EnvelopeType, epoch: u64, payload: &[u8]) -> Vec<u8> {
     let header = ghost_wire::encode_envelope(typ, epoch);
     let mut out = Vec::with_capacity(header.len() + payload.len());
@@ -219,24 +232,24 @@ async fn blob_post_and_get() {
     let url = mailbox_url(&base, &[0x01; 32]);
 
     // POST
-    let resp = auth.sign(client.post(&url).body(test_envelope(b"hello"))).send().await.unwrap();
+    let resp = auth.sign("POST", &url, client.post(&url).body(test_envelope(b"hello"))).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["seq"], 1);
 
     // GET returns it
-    let blobs: Vec<Value> = auth.sign(client.get(&url)).send().await.unwrap().json().await.unwrap();
+    let blobs: Vec<Value> = auth.sign("GET", &url, client.get(&url)).send().await.unwrap().json().await.unwrap();
     assert_eq!(blobs.len(), 1);
     assert_eq!(blobs[0]["seq"], 1);
 
     // POST another
-    let resp = auth.sign(client.post(&url).body(test_envelope(b"world"))).send().await.unwrap();
+    let resp = auth.sign("POST", &url, client.post(&url).body(test_envelope(b"world"))).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["seq"], 2);
 
     // GET with after=1 returns only second
-    let blobs: Vec<Value> = auth.sign(client.get(format!("{url}?after=1")))
+    let blobs: Vec<Value> = auth.sign("GET", &url, client.get(format!("{url}?after=1")))
         .send()
         .await
         .unwrap()
@@ -256,11 +269,11 @@ async fn long_poll_wakeup() {
     let url = mailbox_url(&base, &[0x02; 32]);
 
     let get_url = url.clone();
-    let get_req = auth.sign(client.get(&get_url).header("X-Ghost-Long-Poll", "5000"));
+    let get_req = auth.sign("GET", &get_url, client.get(&get_url).header("X-Ghost-Long-Poll", "5000"));
     let handle = tokio::spawn(async move { get_req.send().await.unwrap() });
 
     tokio::time::sleep(Duration::from_millis(50)).await;
-    auth.sign(client.post(&url).body(test_envelope(b"wake"))).send().await.unwrap();
+    auth.sign("POST", &url, client.post(&url).body(test_envelope(b"wake"))).send().await.unwrap();
 
     let resp = handle.await.unwrap();
     let blobs: Vec<Value> = resp.json().await.unwrap();
@@ -365,7 +378,7 @@ async fn invalid_envelope_rejected() {
     let client = reqwest::Client::new();
     let url = mailbox_url(&base, &[0x06; 32]);
 
-    let resp = auth.sign(client.post(&url).body(b"not an envelope".to_vec())).send().await.unwrap();
+    let resp = auth.sign("POST", &url, client.post(&url).body(b"not an envelope".to_vec())).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
@@ -380,59 +393,59 @@ async fn epoch_gating() {
     let url = mailbox_url(&base, &[0x07; 32]);
 
     // Application at epoch 0 — relay epoch is 0, no mismatch
-    let body: Value = auth.sign(client.post(&url)
+    let body: Value = auth.sign("POST", &url, client.post(&url)
         .body(envelope(EnvelopeType::Application, 0, b"msg1")))
         .send().await.unwrap().json().await.unwrap();
     assert_eq!(body["seq"], 1);
     assert!(body.get("epoch_mismatch").is_none());
 
     // Commit at epoch 0 — advances relay epoch to 1
-    let body: Value = auth.sign(client.post(&url)
+    let body: Value = auth.sign("POST", &url, client.post(&url)
         .body(envelope(EnvelopeType::Commit, 0, b"commit")))
         .send().await.unwrap().json().await.unwrap();
     assert_eq!(body["seq"], 2);
     assert!(body.get("epoch_mismatch").is_none());
 
     // Application at epoch 1 — matches new relay epoch
-    let body: Value = auth.sign(client.post(&url)
+    let body: Value = auth.sign("POST", &url, client.post(&url)
         .body(envelope(EnvelopeType::Application, 1, b"msg2")))
         .send().await.unwrap().json().await.unwrap();
     assert!(body.get("epoch_mismatch").is_none());
 
     // Application at epoch 0 — stale, relay expects 1
-    let body: Value = auth.sign(client.post(&url)
+    let body: Value = auth.sign("POST", &url, client.post(&url)
         .body(envelope(EnvelopeType::Application, 0, b"stale")))
         .send().await.unwrap().json().await.unwrap();
     assert_eq!(body["epoch_mismatch"], true);
 
     // Blob was still stored despite mismatch
-    let blobs: Vec<Value> = auth.sign(client.get(&url)).send().await.unwrap().json().await.unwrap();
+    let blobs: Vec<Value> = auth.sign("GET", &url, client.get(&url)).send().await.unwrap().json().await.unwrap();
     assert_eq!(blobs.len(), 4);
 
     // Stale commit at epoch 0 — rejected with 409
-    let resp = auth.sign(client.post(&url)
+    let resp = auth.sign("POST", &url, client.post(&url)
         .body(envelope(EnvelopeType::Commit, 0, b"stale-commit")))
         .send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::CONFLICT);
 
     // Application messages at stale epoch still stored (only commits are rejected)
-    let blobs: Vec<Value> = auth.sign(client.get(&url)).send().await.unwrap().json().await.unwrap();
+    let blobs: Vec<Value> = auth.sign("GET", &url, client.get(&url)).send().await.unwrap().json().await.unwrap();
     assert_eq!(blobs.len(), 4);
 
     // Application at epoch 1 still matches — relay didn't go backward
-    let body: Value = auth.sign(client.post(&url)
+    let body: Value = auth.sign("POST", &url, client.post(&url)
         .body(envelope(EnvelopeType::Application, 1, b"still-ok")))
         .send().await.unwrap().json().await.unwrap();
     assert!(body.get("epoch_mismatch").is_none());
 
     // Commit at epoch 1 succeeds — advances relay to 2
-    let body: Value = auth.sign(client.post(&url)
+    let body: Value = auth.sign("POST", &url, client.post(&url)
         .body(envelope(EnvelopeType::Commit, 1, b"commit2")))
         .send().await.unwrap().json().await.unwrap();
     assert!(body.get("epoch_mismatch").is_none());
 
     // Commit at epoch 1 now stale — rejected
-    let resp = auth.sign(client.post(&url)
+    let resp = auth.sign("POST", &url, client.post(&url)
         .body(envelope(EnvelopeType::Commit, 1, b"stale-commit2")))
         .send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::CONFLICT);
@@ -452,7 +465,7 @@ async fn ws_catchup_replay() {
 
     // Post 3 blobs via HTTP
     for i in 0..3u8 {
-        let resp = auth.sign(client.post(&url).body(test_envelope(&[i]))).send().await.unwrap();
+        let resp = auth.sign("POST", &url, client.post(&url).body(test_envelope(&[i]))).send().await.unwrap();
         assert_eq!(resp.status(), StatusCode::CREATED);
     }
 
@@ -500,7 +513,7 @@ async fn blob_size_limit() {
     let client = reqwest::Client::new();
     let url = mailbox_url(&base, &[0x04; 32]);
 
-    let resp = auth.sign(client.post(&url).body(vec![0u8; 2048])).send().await.unwrap();
+    let resp = auth.sign("POST", &url, client.post(&url).body(vec![0u8; 2048])).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
 }
 
@@ -1029,10 +1042,11 @@ async fn auth_rejects_revoked_device() {
         .unwrap()
         .as_secs();
     let vk = dk2.verifying_key().to_bytes();
-    let auth_msg = ghost_wire::auth::auth_message(&fp, &vk, timestamp);
+    let url = mailbox_url(&base, &[0xE1; 32]);
+    let url_path = extract_path(&url);
+    let auth_msg = ghost_wire::auth::auth_message("POST", &url_path, &fp, &vk, timestamp);
     let sig = dk2.sign(&auth_msg);
 
-    let url = mailbox_url(&base, &[0xE1; 32]);
     let resp = client
         .post(&url)
         .header("x-ghost-account", hex::encode(fp))
@@ -1047,7 +1061,7 @@ async fn auth_rejects_revoked_device() {
 
     // Active device 1 should succeed
     let vk1 = dk1.verifying_key().to_bytes();
-    let auth_msg1 = ghost_wire::auth::auth_message(&fp, &vk1, timestamp);
+    let auth_msg1 = ghost_wire::auth::auth_message("POST", &url_path, &fp, &vk1, timestamp);
     let sig1 = dk1.sign(&auth_msg1);
 
     let resp = client
@@ -1079,7 +1093,8 @@ async fn auth_rejects_bad_signature() {
 
     // Use wrong key to sign
     let wrong_key = SigningKey::generate(&mut OsRng);
-    let auth_msg = ghost_wire::auth::auth_message(&auth.account_fp, &vk, timestamp);
+    let url_path = extract_path(&url);
+    let auth_msg = ghost_wire::auth::auth_message("POST", &url_path, &auth.account_fp, &vk, timestamp);
     let bad_sig = wrong_key.sign(&auth_msg);
 
     let resp = client
@@ -1110,7 +1125,8 @@ async fn auth_rejects_stale_timestamp() {
         .as_secs()
         - 120;
     let vk = auth.device_key.verifying_key().to_bytes();
-    let auth_msg = ghost_wire::auth::auth_message(&auth.account_fp, &vk, timestamp);
+    let path = extract_path(&url);
+    let auth_msg = ghost_wire::auth::auth_message("POST", &path, &auth.account_fp, &vk, timestamp);
     let sig = auth.device_key.sign(&auth_msg);
 
     let resp = client
@@ -1156,7 +1172,8 @@ async fn auth_rejects_future_timestamp() {
         .as_secs()
         + 120;
     let vk = auth.device_key.verifying_key().to_bytes();
-    let auth_msg = ghost_wire::auth::auth_message(&auth.account_fp, &vk, timestamp);
+    let path = extract_path(&url);
+    let auth_msg = ghost_wire::auth::auth_message("POST", &path, &auth.account_fp, &vk, timestamp);
     let sig = auth.device_key.sign(&auth_msg);
 
     let resp = client
@@ -1187,15 +1204,15 @@ async fn auth_cross_account_sync_state_rejected() {
     // Account B writes its own sync state (should succeed)
     let client = reqwest::Client::new();
     let url_b = format!("{base}/sync_state/{}", hex::encode(auth_b.account_fp));
-    let resp = auth_b.sign(client.put(&url_b).body(b"b-state".to_vec())).send().await.unwrap();
+    let resp = auth_b.sign("PUT", &url_b, client.put(&url_b).body(b"b-state".to_vec())).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
     // Account A tries to read account B's sync state → rejected
-    let resp = auth_a.sign(client.get(&url_b)).send().await.unwrap();
+    let resp = auth_a.sign("GET", &url_b, client.get(&url_b)).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
     // Account A tries to overwrite account B's sync state → rejected
-    let resp = auth_a.sign(client.put(&url_b).body(b"evil".to_vec())).send().await.unwrap();
+    let resp = auth_a.sign("PUT", &url_b, client.put(&url_b).body(b"evil".to_vec())).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
@@ -1212,11 +1229,11 @@ async fn auth_cross_account_recovery_rejected() {
     // Account B stores its recovery blob
     let client = reqwest::Client::new();
     let url_b = format!("{base}/recovery/{}", hex::encode(auth_b.account_fp));
-    let resp = auth_b.sign(client.put(&url_b).body(b"recovery-blob".to_vec())).send().await.unwrap();
+    let resp = auth_b.sign("PUT", &url_b, client.put(&url_b).body(b"recovery-blob".to_vec())).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
     // Account A tries to overwrite B's recovery blob → rejected
-    let resp = auth_a.sign(client.put(&url_b).body(b"evil".to_vec())).send().await.unwrap();
+    let resp = auth_a.sign("PUT", &url_b, client.put(&url_b).body(b"evil".to_vec())).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
     // Recovery GET is public (no auth needed for bootstrap)
@@ -1238,7 +1255,7 @@ async fn auth_cross_account_provision_rejected() {
     // Account A tries to PUT provision for account B → rejected
     let client = reqwest::Client::new();
     let url_b = format!("{base}/pair/{}/provision", hex::encode(auth_b.account_fp));
-    let resp = auth_a.sign(client.put(&url_b).body(b"evil-provision".to_vec())).send().await.unwrap();
+    let resp = auth_a.sign("PUT", &url_b, client.put(&url_b).body(b"evil-provision".to_vec())).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
@@ -1439,7 +1456,7 @@ async fn upload_group_info(
         "{base}/box/{}/server_info",
         URL_SAFE_NO_PAD.encode(mailbox_id)
     );
-    let resp = auth.sign(client.put(url).body(group_info.to_vec()))
+    let resp = auth.sign("PUT", &url, client.put(&url).body(group_info.to_vec()))
         .send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::NO_CONTENT, "upload GroupInfo failed");
 }
@@ -1477,7 +1494,7 @@ async fn non_member_blob_rejected_after_acl() {
     let client = reqwest::Client::new();
     let url = mailbox_url(&base, &mailbox_id);
     let resp = bob
-        .sign(client.post(&url).body(test_envelope(b"intruder")))
+        .sign("POST", &url, client.post(&url).body(test_envelope(b"intruder")))
         .send()
         .await
         .unwrap();
@@ -1502,7 +1519,7 @@ async fn member_blob_accepted() {
     let client = reqwest::Client::new();
     let url = mailbox_url(&base, &mailbox_id);
     let resp = alice
-        .sign(client.post(&url).body(test_envelope(b"hello")))
+        .sign("POST", &url, client.post(&url).body(test_envelope(b"hello")))
         .send()
         .await
         .unwrap();
@@ -1528,7 +1545,7 @@ async fn invalid_commit_rejected() {
     let client = reqwest::Client::new();
     let url = mailbox_url(&base, &mailbox_id);
     let resp = alice
-        .sign(client.post(&url).body(garbage_commit))
+        .sign("POST", &url, client.post(&url).body(garbage_commit))
         .send()
         .await
         .unwrap();
@@ -1557,7 +1574,7 @@ async fn desync_recovery_via_group_info_reupload() {
     let client = reqwest::Client::new();
     let url = mailbox_url(&base, &mailbox_id);
     let resp = alice
-        .sign(client.post(&url).body(test_envelope(b"still works")))
+        .sign("POST", &url, client.post(&url).body(test_envelope(b"still works")))
         .send()
         .await
         .unwrap();
@@ -1578,7 +1595,7 @@ async fn pre_upgrade_group_allows_all() {
 
     // POST should work even without PublicGroup (no ACL → skip check)
     let resp = alice
-        .sign(client.post(&url).body(test_envelope(b"legacy")))
+        .sign("POST", &url, client.post(&url).body(test_envelope(b"legacy")))
         .send()
         .await
         .unwrap();
@@ -1637,7 +1654,7 @@ async fn commit_validated_and_acl_updated() {
     let client = reqwest::Client::new();
     let url = mailbox_url(&base, &mailbox_id);
     let resp = alice
-        .sign(client.post(&url).body(commit_envelope))
+        .sign("POST", &url, client.post(&url).body(commit_envelope))
         .send()
         .await
         .unwrap();

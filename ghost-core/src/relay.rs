@@ -85,8 +85,8 @@ pub struct AuthContext {
 }
 
 impl AuthContext {
-    fn sign_now(&self) -> ghost_wire::auth::AuthHeaders {
-        ghost_wire::auth::sign_request_headers(&self.account_fp, &self.device_vk, &self.signing_key)
+    fn sign_for(&self, method: &str, path: &str) -> ghost_wire::auth::AuthHeaders {
+        ghost_wire::auth::sign_request_headers(method, path, &self.account_fp, &self.device_vk, &self.signing_key)
     }
 }
 
@@ -153,10 +153,10 @@ impl RelayClient {
     }
 
     /// Apply auth headers to a request builder if auth is configured.
-    fn authenticated(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    fn authenticated(&self, method: &str, path: &str, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         match &self.auth {
             Some(auth) => {
-                let h = auth.sign_now();
+                let h = auth.sign_for(method, path);
                 req.header("X-Ghost-Account", &h.account)
                     .header("X-Ghost-Device", &h.device)
                     .header("X-Ghost-Timestamp", &h.timestamp)
@@ -220,15 +220,12 @@ impl RelayClient {
     /// Send a blob to a mailbox via HTTP POST (no WebSocket subscription required).
     /// Returns the seq assigned by the relay.
     pub async fn post_blob(&self, mailbox_id: &[u8; 32], blob: Vec<u8>) -> Result<u64> {
+        let path = format!("/box/{}", URL_SAFE_NO_PAD.encode(mailbox_id));
         let req = self
             .http
-            .post(format!(
-                "{}/box/{}",
-                self.base_url,
-                URL_SAFE_NO_PAD.encode(mailbox_id)
-            ))
+            .post(format!("{}{}", self.base_url, path))
             .body(blob);
-        let resp = self.authenticated(req)
+        let resp = self.authenticated("POST", &path, req)
             .send()
             .await
             .map_err(|e| GhostError::Network(e.to_string()))?;
@@ -343,15 +340,12 @@ impl RelayClient {
     }
 
     pub async fn put_server_info(&self, mailbox_id: &[u8; 32], data: Vec<u8>) -> Result<()> {
+        let path = format!("/box/{}/server_info", URL_SAFE_NO_PAD.encode(mailbox_id));
         let req = self
             .http
-            .put(format!(
-                "{}/box/{}/server_info",
-                self.base_url,
-                URL_SAFE_NO_PAD.encode(mailbox_id)
-            ))
+            .put(format!("{}{}", self.base_url, path))
             .body(data);
-        let resp = self.authenticated(req)
+        let resp = self.authenticated("PUT", &path, req)
             .send()
             .await
             .map_err(|e| GhostError::Network(e.to_string()))?;
@@ -365,14 +359,11 @@ impl RelayClient {
     }
 
     pub async fn get_server_info(&self, mailbox_id: &[u8; 32]) -> Result<Vec<u8>> {
+        let path = format!("/box/{}/server_info", URL_SAFE_NO_PAD.encode(mailbox_id));
         let req = self
             .http
-            .get(format!(
-                "{}/box/{}/server_info",
-                self.base_url,
-                URL_SAFE_NO_PAD.encode(mailbox_id)
-            ));
-        let resp = self.authenticated(req)
+            .get(format!("{}{}", self.base_url, path));
+        let resp = self.authenticated("GET", &path, req)
             .send()
             .await
             .map_err(|e| GhostError::Network(e.to_string()))?;
@@ -394,16 +385,12 @@ impl RelayClient {
         fingerprint: &[u8; 32],
         data: Vec<u8>,
     ) -> Result<()> {
+        let path = format!("/box/{}/avatar/{}", URL_SAFE_NO_PAD.encode(mailbox_id), hex::encode(fingerprint));
         let req = self
             .http
-            .put(format!(
-                "{}/box/{}/avatar/{}",
-                self.base_url,
-                URL_SAFE_NO_PAD.encode(mailbox_id),
-                hex::encode(fingerprint),
-            ))
+            .put(format!("{}{}", self.base_url, path))
             .body(data);
-        let resp = self.authenticated(req)
+        let resp = self.authenticated("PUT", &path, req)
             .send()
             .await
             .map_err(|e| GhostError::Network(e.to_string()))?;
@@ -418,15 +405,11 @@ impl RelayClient {
         mailbox_id: &[u8; 32],
         fingerprint: &[u8; 32],
     ) -> Result<Option<Vec<u8>>> {
+        let path = format!("/box/{}/avatar/{}", URL_SAFE_NO_PAD.encode(mailbox_id), hex::encode(fingerprint));
         let req = self
             .http
-            .get(format!(
-                "{}/box/{}/avatar/{}",
-                self.base_url,
-                URL_SAFE_NO_PAD.encode(mailbox_id),
-                hex::encode(fingerprint),
-            ));
-        let resp = self.authenticated(req)
+            .get(format!("{}{}", self.base_url, path));
+        let resp = self.authenticated("GET", &path, req)
             .send()
             .await
             .map_err(|e| GhostError::Network(e.to_string()))?;
@@ -447,15 +430,11 @@ impl RelayClient {
         mailbox_id: &[u8; 32],
         fingerprint: &[u8; 32],
     ) -> Result<()> {
+        let path = format!("/box/{}/avatar/{}", URL_SAFE_NO_PAD.encode(mailbox_id), hex::encode(fingerprint));
         let req = self
             .http
-            .delete(format!(
-                "{}/box/{}/avatar/{}",
-                self.base_url,
-                URL_SAFE_NO_PAD.encode(mailbox_id),
-                hex::encode(fingerprint),
-            ));
-        let resp = self.authenticated(req)
+            .delete(format!("{}{}", self.base_url, path));
+        let resp = self.authenticated("DELETE", &path, req)
             .send()
             .await
             .map_err(|e| GhostError::Network(e.to_string()))?;
@@ -650,15 +629,12 @@ impl RelayClient {
         account_fp: &[u8; 32],
         data: Vec<u8>,
     ) -> Result<()> {
+        let path = format!("/recovery/{}", hex::encode(account_fp));
         let req = self
             .http
-            .put(format!(
-                "{}/recovery/{}",
-                self.base_url,
-                hex::encode(account_fp),
-            ))
+            .put(format!("{}{}", self.base_url, path))
             .body(data);
-        let resp = self.authenticated(req)
+        let resp = self.authenticated("PUT", &path, req)
             .send()
             .await
             .map_err(|e| GhostError::Network(e.to_string()))?;
@@ -674,15 +650,12 @@ impl RelayClient {
         account_fp: &[u8; 32],
         data: Vec<u8>,
     ) -> Result<()> {
+        let path = format!("/sync_state/{}", hex::encode(account_fp));
         let req = self
             .http
-            .put(format!(
-                "{}/sync_state/{}",
-                self.base_url,
-                hex::encode(account_fp),
-            ))
+            .put(format!("{}{}", self.base_url, path))
             .body(data);
-        let resp = self.authenticated(req)
+        let resp = self.authenticated("PUT", &path, req)
             .send()
             .await
             .map_err(|e| GhostError::Network(e.to_string()))?;
@@ -697,14 +670,11 @@ impl RelayClient {
         &self,
         account_fp: &[u8; 32],
     ) -> Result<Option<Vec<u8>>> {
+        let path = format!("/sync_state/{}", hex::encode(account_fp));
         let req = self
             .http
-            .get(format!(
-                "{}/sync_state/{}",
-                self.base_url,
-                hex::encode(account_fp),
-            ));
-        let resp = self.authenticated(req)
+            .get(format!("{}{}", self.base_url, path));
+        let resp = self.authenticated("GET", &path, req)
             .send()
             .await
             .map_err(|e| GhostError::Network(e.to_string()))?;
@@ -777,7 +747,10 @@ async fn ws_task(
         first_attempt = false;
 
         let ws = if let Some(ref auth) = auth {
-            let h = auth.sign_now();
+            let ws_path = url.find("//")
+                .and_then(|i| url[i+2..].find('/').map(|j| &url[i+2+j..]))
+                .unwrap_or("/");
+            let h = auth.sign_for("GET", ws_path);
             let req = tokio_tungstenite::tungstenite::http::Request::builder()
                 .uri(&url)
                 .header("Host", url_host(&url))

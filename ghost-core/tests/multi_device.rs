@@ -589,7 +589,8 @@ async fn full_pairing_then_sync_exchange() {
         .unwrap()
         .as_secs();
     let da_vk = device_a.verifying_key().to_bytes();
-    let prov_msg = ghost_wire::auth::auth_message(&fp, &da_vk, prov_timestamp);
+    let prov_path = format!("/pair/{}/provision", fp_hex);
+    let prov_msg = ghost_wire::auth::auth_message("PUT", &prov_path, &fp, &da_vk, prov_timestamp);
     let prov_sig = device_a.sign(&prov_msg);
 
     http.put(format!("{}/pair/{}/provision", relay_url, fp_hex))

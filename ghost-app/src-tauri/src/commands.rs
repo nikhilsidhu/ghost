@@ -25,9 +25,9 @@ fn parse_id(hex_str: &str) -> Result<[u8; 32], String> {
 }
 
 /// Sign an HTTP request with the device's cached auth credentials.
-fn sign_request(state: &AppState, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+fn sign_request(state: &AppState, method: &str, path: &str, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
     let auth = state.auth.read().unwrap();
-    let h = ghost_wire::auth::sign_request_headers(&auth.account_fp, &auth.device_vk, &auth.signing_key);
+    let h = ghost_wire::auth::sign_request_headers(method, path, &auth.account_fp, &auth.device_vk, &auth.signing_key);
     drop(auth);
     req.header("X-Ghost-Account", &h.account)
         .header("X-Ghost-Device", &h.device)
@@ -673,8 +673,9 @@ pub async fn join_by_invite(
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mailbox_id);
     #[derive(serde::Deserialize)]
     struct PostBlobResp { seq: u64 }
-    let resp = sign_request(&state, state.http
-        .post(format!("{}/box/{}", relay_url, mailbox_b64))
+    let box_path = format!("/box/{}", mailbox_b64);
+    let resp = sign_request(&state, "POST", &box_path, state.http
+        .post(format!("{}{}", relay_url, box_path))
         .body(commit))
         .send()
         .await
@@ -1478,8 +1479,9 @@ async fn rejoin_server(
     );
 
     for _ in 0..MAX_REJOIN_ATTEMPTS {
-        let gi_resp = sign_request(state, state.http
-            .get(format!("{}/box/{}/server_info", relay_url, mailbox_b64)))
+        let si_path = format!("/box/{}/server_info", mailbox_b64);
+        let gi_resp = sign_request(state, "GET", &si_path, state.http
+            .get(format!("{}{}", relay_url, si_path)))
             .send()
             .await;
         let gi_bytes = match gi_resp {
@@ -1501,8 +1503,9 @@ async fn rejoin_server(
         match result {
             Ok((commit, mailbox_id)) => {
                 let commit_seq;
-                let resp = sign_request(state, state.http
-                    .post(format!("{}/box/{}", relay_url, mailbox_b64))
+                let box_path = format!("/box/{}", mailbox_b64);
+                let resp = sign_request(state, "POST", &box_path, state.http
+                    .post(format!("{}{}", relay_url, box_path))
                     .body(commit))
                     .send()
                     .await;
@@ -1537,8 +1540,9 @@ async fn rejoin_server(
                     let client = state.client.lock().await;
                     if let Ok(gi) = client.export_server_info(&payload.server_id) {
                         drop(client);
-                        let _ = sign_request(state, state.http
-                            .put(format!("{}/box/{}/server_info", relay_url, mailbox_b64))
+                        let si_put_path = format!("/box/{}/server_info", mailbox_b64);
+                        let _ = sign_request(state, "PUT", &si_put_path, state.http
+                            .put(format!("{}{}", relay_url, si_put_path))
                             .body(gi))
                             .send()
                             .await;
@@ -1554,8 +1558,9 @@ async fn rejoin_server(
                     )
                 };
                 if let Ok(outbound) = announce_result {
-                    let _ = sign_request(state, state.http
-                        .post(format!("{}/box/{}", relay_url, mailbox_b64))
+                    let ann_path = format!("/box/{}", mailbox_b64);
+                    let _ = sign_request(state, "POST", &ann_path, state.http
+                        .post(format!("{}{}", relay_url, ann_path))
                         .body(outbound.blob))
                         .send()
                         .await;
@@ -1819,8 +1824,9 @@ pub async fn check_pairing(state: State<'_, AppState>) -> Result<Option<String>,
     // PUT provision to relay first
     let relay_url = state.relay_url.lock().await.clone();
     let fp_hex = hex::encode(account_fp);
-    sign_request(&state, state.http
-        .put(format!("{}/pair/{}/provision", relay_url, fp_hex))
+    let prov_path = format!("/pair/{}/provision", fp_hex);
+    sign_request(&state, "PUT", &prov_path, state.http
+        .put(format!("{}{}", relay_url, prov_path))
         .body(provision_blob))
         .send()
         .await
@@ -2297,8 +2303,9 @@ async fn revoke_old_device_leaves(
                 &base64::engine::general_purpose::URL_SAFE_NO_PAD,
                 &out.mailbox_id,
             );
-            let post_result = sign_request(state, state.http
-                .post(format!("{}/box/{}", relay_url, mailbox_b64))
+            let box_path = format!("/box/{}", mailbox_b64);
+            let post_result = sign_request(state, "POST", &box_path, state.http
+                .post(format!("{}{}", relay_url, box_path))
                 .body(out.blob))
                 .send()
                 .await;
@@ -2308,8 +2315,9 @@ async fn revoke_old_device_leaves(
                     if let Some(sid) = client.server_id_for_mailbox(&out.mailbox_id) {
                         if let Ok(gi) = client.export_server_info(&sid) {
                             drop(client);
-                            let _ = sign_request(state, state.http
-                                .put(format!("{}/box/{}/server_info", relay_url, mailbox_b64))
+                            let si_path = format!("/box/{}/server_info", mailbox_b64);
+                            let _ = sign_request(state, "PUT", &si_path, state.http
+                                .put(format!("{}{}", relay_url, si_path))
                                 .body(gi))
                                 .send()
                                 .await;
@@ -2455,8 +2463,9 @@ pub async fn recover_account(
 
     if recovered.sync_key.is_some() {
         let entries = async {
-            let resp = sign_request(&state, state.http
-                .get(format!("{}/sync_state/{}", relay_url, fp_hex)))
+            let ss_path = format!("/sync_state/{}", fp_hex);
+            let resp = sign_request(&state, "GET", &ss_path, state.http
+                .get(format!("{}{}", relay_url, ss_path)))
                 .send().await.map_err(|e| format!("fetch: {e}"))?;
             if !resp.status().is_success() {
                 return Err(format!("HTTP {}", resp.status()));

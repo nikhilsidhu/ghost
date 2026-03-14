@@ -20,7 +20,9 @@ where
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
         let app_state = AppState::from_ref(state);
-        validate_auth_headers(&parts.headers, &app_state)
+        let method = parts.method.as_str();
+        let path = parts.uri.path();
+        validate_auth_headers(&parts.headers, method, path, &app_state)
     }
 }
 
@@ -39,6 +41,8 @@ impl FromRef<AppState> for AppState {
 /// Validate auth headers and return the authenticated device identity.
 pub fn validate_auth_headers(
     headers: &HeaderMap,
+    method: &str,
+    path: &str,
     state: &AppState,
 ) -> Result<DeviceAuth, RelayError> {
     let account_hex = header_str(headers, "x-ghost-account")?;
@@ -81,7 +85,7 @@ pub fn validate_auth_headers(
         .map_err(|_| RelayError::Unauthorized("invalid signature hex".into()))?;
     let signature = Signature::from_slice(&sig_bytes)
         .map_err(|_| RelayError::Unauthorized("invalid signature".into()))?;
-    let message = ghost_wire::auth::auth_message(&account_fp, &device_vk, timestamp);
+    let message = ghost_wire::auth::auth_message(method, path, &account_fp, &device_vk, timestamp);
     vk.verify_strict(&message, &signature)
         .map_err(|_| RelayError::Unauthorized("bad signature".into()))?;
 
