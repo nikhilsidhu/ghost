@@ -33,11 +33,12 @@ pub async fn put(
 }
 
 pub async fn get(
-    _auth: DeviceAuth,
+    auth: DeviceAuth,
     State(state): State<AppState>,
     Path(mailbox_id): Path<String>,
 ) -> Result<impl IntoResponse> {
     let id = decode_mailbox_id(&mailbox_id)?;
+    state.check_membership(&id, &auth.account_fp)?;
     match state.storage.get_server_info(&id)? {
         Some(data) => Ok((StatusCode::OK, data)),
         None => Err(crate::error::RelayError::NotFound),
