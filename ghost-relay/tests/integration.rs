@@ -162,6 +162,8 @@ fn test_config() -> Config {
         voice_port: 0,
         max_voice_participants: 25,
         db_path: None,
+        log_retention_hours: 72,
+        log_min_entries: 100,
     }
 }
 

@@ -6,6 +6,8 @@ pub struct Config {
     pub voice_port: u16,
     pub max_voice_participants: usize,
     pub db_path: Option<String>,
+    pub log_retention_hours: u64,
+    pub log_min_entries: u64,
 }
 
 impl Config {
@@ -19,6 +21,8 @@ impl Config {
                 DEFAULT_MAX_VOICE_PARTICIPANTS,
             ),
             db_path: std::env::var("GHOST_DB_PATH").ok(),
+            log_retention_hours: parse_env("GHOST_LOG_RETENTION_HOURS", DEFAULT_LOG_RETENTION_HOURS),
+            log_min_entries: parse_env("GHOST_LOG_MIN_ENTRIES", DEFAULT_LOG_MIN_ENTRIES),
         }
     }
 }

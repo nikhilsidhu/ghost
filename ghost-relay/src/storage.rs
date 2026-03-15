@@ -287,6 +287,23 @@ impl Storage {
             .map_err(|e| RelayError::Storage(e.to_string()))
     }
 
+    /// Sweep log entries older than `cutoff_ms` while keeping at least `min_entries` per mailbox.
+    pub fn sweep_log(&self, cutoff_ms: u64, min_entries: u64) -> Result<u64, RelayError> {
+        let conn = self.conn.lock().unwrap();
+        let deleted: usize = conn
+            .execute(
+                "DELETE FROM log WHERE received_at < ?1
+                 AND seq <= (
+                     SELECT ms.next_seq - ?2 - 1
+                     FROM mailbox_state ms
+                     WHERE ms.mailbox_id = log.mailbox_id
+                 )",
+                params![cutoff_ms as i64, min_entries as i64],
+            )
+            .map_err(|e| RelayError::Storage(e.to_string()))?;
+        Ok(deleted as u64)
+    }
+
     /// Get the current epoch for a mailbox, or 0 if untracked.
     pub fn get_epoch(&self, mailbox_id: &[u8; 32]) -> Result<u64, RelayError> {
         let conn = self.conn.lock().unwrap();

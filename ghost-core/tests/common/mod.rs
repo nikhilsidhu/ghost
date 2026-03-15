@@ -11,6 +11,8 @@ pub async fn start_relay() -> String {
         voice_port: 0,
         max_voice_participants: 25,
         db_path: None,
+        log_retention_hours: 72,
+        log_min_entries: 100,
     };
     let storage = Storage::open_in_memory().unwrap();
     let st = state::new_state(config, storage);

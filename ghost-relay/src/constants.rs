@@ -17,5 +17,9 @@ pub const MAX_PRESENCE_BLOB_SIZE: usize = 2048;
 pub const PRESENCE_RATE_LIMIT: u32 = 2;
 pub const SPEAKING_RATE_LIMIT: u32 = 20;
 
+// Log retention
+pub const DEFAULT_LOG_RETENTION_HOURS: u64 = 72; // 3 days
+pub const DEFAULT_LOG_MIN_ENTRIES: u64 = 100; // keep at least this many per mailbox
+
 // Avatar blob storage
 pub const MAX_AVATAR_SIZE: usize = 512 * 1024; // 512 KB
