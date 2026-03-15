@@ -45,9 +45,18 @@ impl VoiceChannel {
     }
 }
 
+/// Minimum time before a slot's address can be updated by a different sender.
+const SLOT_REBIND_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(5);
+
+struct SlotEntry {
+    slot_id: u32,
+    addr: SocketAddr,
+    last_seen: Instant,
+}
+
 /// Maps channel → participant addresses for UDP packet forwarding.
 pub struct RoutingTable {
-    channels: DashMap<[u8; 32], Vec<(u32, SocketAddr)>>,
+    channels: DashMap<[u8; 32], Vec<SlotEntry>>,
 }
 
 impl RoutingTable {
@@ -61,13 +70,13 @@ impl RoutingTable {
         self.channels
             .entry(channel_id)
             .or_default()
-            .push((slot_id, addr));
+            .push(SlotEntry { slot_id, addr, last_seen: Instant::now() });
     }
 
     pub fn remove(&self, channel_id: &[u8; 32], slot_id: &u32) {
         let mut remove_channel = false;
         if let Some(mut entries) = self.channels.get_mut(channel_id) {
-            entries.retain(|(s, _)| s != slot_id);
+            entries.retain(|e| e.slot_id != *slot_id);
             remove_channel = entries.is_empty();
         }
         if remove_channel {
@@ -86,30 +95,44 @@ impl RoutingTable {
             .map(|entries| {
                 entries
                     .iter()
-                    .filter(|(_, addr)| addr != sender)
-                    .map(|(_, addr)| *addr)
+                    .filter(|e| e.addr != *sender)
+                    .map(|e| e.addr)
                     .collect()
             })
             .unwrap_or_default()
     }
 
+    /// Update slot address. Only allows rebinding from a different sender
+    /// if the current owner hasn't sent anything for SLOT_REBIND_COOLDOWN.
     pub fn update_addr(
         &self,
         channel_id: &[u8; 32],
         slot_id: &u32,
         new_addr: SocketAddr,
-    ) {
+    ) -> bool {
         if let Some(mut entries) = self.channels.get_mut(channel_id) {
-            if let Some((_, addr)) = entries.iter_mut().find(|(s, _)| s == slot_id) {
-                *addr = new_addr;
+            if let Some(entry) = entries.iter_mut().find(|e| e.slot_id == *slot_id) {
+                if entry.addr == new_addr {
+                    // Same sender — just refresh timestamp
+                    entry.last_seen = Instant::now();
+                    return true;
+                }
+                // Different sender — only allow if cooldown elapsed
+                if entry.last_seen.elapsed() >= SLOT_REBIND_COOLDOWN {
+                    entry.addr = new_addr;
+                    entry.last_seen = Instant::now();
+                    return true;
+                }
+                return false; // Rejected: slot still active
             }
         }
+        false
     }
 
     pub fn contains(&self, channel_id: &[u8; 32], slot_id: &u32) -> bool {
         self.channels
             .get(channel_id)
-            .map(|entries| entries.iter().any(|(s, _)| s == slot_id))
+            .map(|entries| entries.iter().any(|e| e.slot_id == *slot_id))
             .unwrap_or(false)
     }
 }

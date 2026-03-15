@@ -61,11 +61,11 @@ pub async fn run(state: AppState) {
             None => continue,
         };
 
-        // Register or update the slot's address (handles NAT rebinding)
+        // Register or update the slot's address (cooldown prevents hijacking)
         if !state.routing.contains(&channel_id, &slot_id) {
             state.routing.insert(channel_id, slot_id, sender_addr);
-        } else {
-            state.routing.update_addr(&channel_id, &slot_id, sender_addr);
+        } else if !state.routing.update_addr(&channel_id, &slot_id, sender_addr) {
+            continue; // Address change rejected (cooldown active)
         }
 
         let peers = state.routing.peers(&channel_id, &sender_addr);
