@@ -73,7 +73,9 @@ impl GhostClient {
         let mls_conn = open_mls_connection(&mls_db_key, db_path)?;
         let provider = GhostProvider::new(mls_conn)?;
 
-        // Reload MLS groups that were persisted from previous sessions
+        // Reload MLS groups that were persisted from previous sessions.
+        // Clean up orphan server records whose MLS group is missing
+        // (crash between MLS write and app-DB write during join/leave).
         let mut servers = HashMap::new();
         if let Ok(stored_servers) = store.list_servers() {
             for s in &stored_servers {
@@ -81,6 +83,8 @@ impl GhostClient {
                     GhostGroup::load(&provider, &identity, &s.server_id)
                 {
                     servers.insert(s.server_id, ghost_group);
+                } else {
+                    let _ = store.delete_server(&s.server_id);
                 }
             }
         }
