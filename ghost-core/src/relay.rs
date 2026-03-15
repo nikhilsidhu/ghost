@@ -486,17 +486,14 @@ impl RelayClient {
         account_fp: &[u8; 32],
         after_seq: u64,
     ) -> Result<IdLogWithProofs> {
-        let mut url = format!(
-            "{}/idlog/{}",
-            self.base_url,
-            hex::encode(account_fp),
-        );
+        let path = format!("/idlog/{}", hex::encode(account_fp));
+        let mut url = format!("{}{}", self.base_url, path);
         if after_seq > 0 {
             url.push_str(&format!("?after_seq={after_seq}"));
         }
+        let req = self.http.get(&url);
         let resp = self
-            .http
-            .get(&url)
+            .authenticated("GET", &path, req)
             .send()
             .await
             .map_err(|e| GhostError::Network(e.to_string()))?;

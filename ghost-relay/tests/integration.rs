@@ -1737,7 +1737,8 @@ async fn get_idlog_returns_valid_proofs() {
     // Fetch identity log — should include inclusion proof and checkpoint
     let client = reqwest::Client::new();
     let url = format!("{base}/idlog/{}", hex::encode(alice.account_fp));
-    let resp = client.get(&url).send().await.unwrap();
+    let req = client.get(&url);
+    let resp = alice.sign("GET", &url, req).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body: Value = resp.json().await.unwrap();
     let entries = body["entries"].as_array().unwrap();

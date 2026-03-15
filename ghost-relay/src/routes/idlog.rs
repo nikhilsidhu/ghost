@@ -5,6 +5,7 @@ use axum::Json;
 use ghost_wire::merkle::InclusionProof;
 use serde::{Deserialize, Serialize};
 
+use crate::auth::DeviceAuth;
 use crate::error::{RelayError, Result};
 use crate::state::AppState;
 
@@ -81,6 +82,7 @@ mod base64_bytes {
 
 /// GET /idlog/{account_fp_hex}?after_seq=N — fetch identity log entries with KT proofs.
 pub async fn get(
+    _auth: DeviceAuth,
     State(state): State<AppState>,
     Path(account_fp_hex): Path<String>,
     Query(query): Query<IdLogQuery>,

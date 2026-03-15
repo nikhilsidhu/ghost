@@ -83,8 +83,9 @@ async fn push_and_validate(
 #[tokio::test]
 async fn idlog_genesis_add_revoke_full_lifecycle() {
     let relay_url = common::start_relay().await;
-    let (relay, _) = RelayClient::new(&relay_url);
+    let (mut relay, _) = RelayClient::new(&relay_url);
     let (_master, device1, genesis, fp, _seed) = make_account("desktop");
+    relay.set_auth(fp, device1.verifying_key().to_bytes(), device1.clone());
     let device2 = SigningKey::generate(&mut OsRng);
     let device3 = SigningKey::generate(&mut OsRng);
 
@@ -519,6 +520,7 @@ async fn full_pairing_then_sync_exchange() {
     let (_master, device_a, genesis, fp, _seed) = make_account("desktop");
     let fp_hex = hex::encode(fp);
     let (mut relay_a, _) = RelayClient::new(&relay_url);
+    relay_a.set_auth(fp, device_a.verifying_key().to_bytes(), device_a.clone());
     relay_a
         .put_idlog_entry(&fp, genesis.to_bytes())
         .await
@@ -695,6 +697,7 @@ async fn recovery_full_flow() {
 
     // 1. Create account with 2 devices
     let (master, device1, genesis, fp, seed) = make_account("desktop");
+    relay.set_auth(fp, device1.verifying_key().to_bytes(), device1.clone());
     let device2 = SigningKey::generate(&mut OsRng);
 
     relay
@@ -751,6 +754,9 @@ async fn recovery_full_flow() {
         .put_idlog_entry(&fp, recovery_entry.to_bytes())
         .await
         .unwrap();
+
+    // Re-auth as recovery device (device1 was revoked by recovery)
+    relay.set_auth(fp, recovery_device.verifying_key().to_bytes(), recovery_device.clone());
 
     // 6. Validate: only recovery device is active
     let final_resp = relay.get_idlog(&fp, 0).await.unwrap();
