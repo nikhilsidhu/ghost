@@ -304,6 +304,27 @@ impl Storage {
         Ok(deleted as u64)
     }
 
+    /// Delete all persistent state for a mailbox (logs, state, ACL, GroupInfo, proposals, avatars).
+    pub fn delete_mailbox(&self, mailbox_id: &[u8; 32]) -> Result<(), RelayError> {
+        let conn = self.conn.lock().unwrap();
+        let mid = mailbox_id.as_slice();
+        conn.execute("DELETE FROM log WHERE mailbox_id = ?1", params![mid])
+            .map_err(|e| RelayError::Storage(e.to_string()))?;
+        conn.execute("DELETE FROM mailbox_state WHERE mailbox_id = ?1", params![mid])
+            .map_err(|e| RelayError::Storage(e.to_string()))?;
+        conn.execute("DELETE FROM server_info WHERE mailbox_id = ?1", params![mid])
+            .map_err(|e| RelayError::Storage(e.to_string()))?;
+        conn.execute("DELETE FROM mailbox_members WHERE mailbox_id = ?1", params![mid])
+            .map_err(|e| RelayError::Storage(e.to_string()))?;
+        conn.execute("DELETE FROM mls_public_group WHERE mailbox_id = ?1", params![mid])
+            .map_err(|e| RelayError::Storage(e.to_string()))?;
+        conn.execute("DELETE FROM mls_proposals WHERE mailbox_id = ?1", params![mid])
+            .map_err(|e| RelayError::Storage(e.to_string()))?;
+        conn.execute("DELETE FROM avatar WHERE mailbox_id = ?1", params![mid])
+            .map_err(|e| RelayError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
     /// Get the current epoch for a mailbox, or 0 if untracked.
     pub fn get_epoch(&self, mailbox_id: &[u8; 32]) -> Result<u64, RelayError> {
         let conn = self.conn.lock().unwrap();

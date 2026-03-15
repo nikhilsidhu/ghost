@@ -32,7 +32,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health::health))
         .route("/relay_key", get(relay_key::get))
-        .route("/box/{mailbox_id}", post(blob::post_blob).get(blob::get_blobs))
+        .route("/box/{mailbox_id}", post(blob::post_blob).get(blob::get_blobs).delete(blob::delete_mailbox))
         .route("/box/{mailbox_id}/server_info", put(server_info::put).get(server_info::get))
         .route("/box/{mailbox_id}/avatar/{fingerprint}", put(avatar::put).get(avatar::get).delete(avatar::delete))
         .route("/idlog/{account_fp}", put(idlog::put).get(idlog::get))

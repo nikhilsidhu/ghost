@@ -118,3 +118,18 @@ fn to_entries(entries: Vec<crate::storage::LogEntry>) -> Vec<BlobEntry> {
         })
         .collect()
 }
+
+pub async fn delete_mailbox(
+    auth: DeviceAuth,
+    State(state): State<AppState>,
+    Path(mailbox_id): Path<String>,
+) -> Result<StatusCode> {
+    let id = decode_mailbox_id(&mailbox_id)?;
+    if !state.is_creator(&id, &auth.account_fp).await {
+        return Err(crate::error::RelayError::Forbidden(
+            "only group creator can delete a mailbox".into(),
+        ));
+    }
+    state.delete_mailbox(&id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}

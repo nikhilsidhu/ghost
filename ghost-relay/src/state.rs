@@ -267,6 +267,14 @@ impl Inner {
         }
     }
 
+    /// Delete all state for a mailbox (storage + in-memory).
+    pub async fn delete_mailbox(&self, mailbox_id: &[u8; 32]) -> crate::error::Result<()> {
+        self.storage.delete_mailbox(mailbox_id)?;
+        self.groups.write().await.remove(mailbox_id);
+        self.mailboxes.write().await.remove(mailbox_id);
+        Ok(())
+    }
+
     /// Check commit authorization rules.
     /// Add/remove require the sender to be the group creator (stored at init time).
     fn check_commit_authorization(
