@@ -2359,6 +2359,7 @@ async fn revoke_old_device_leaves(
 pub async fn recover_account(
     recovery_code: String,
     passphrase: String,
+    new_passphrase: String,
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
@@ -2367,6 +2368,10 @@ pub async fn recover_account(
     use ghost_core::crypto::keys::derive_ed25519_seed;
     use ghost_core::wire::{SyncServerMeta,
         decode_sync_state_dump, encode_sync_state_dump, sync_open, sync_seal};
+
+    if new_passphrase.chars().count() < 12 {
+        return Err("new passphrase must be at least 12 characters".into());
+    }
 
     // 1. Parse recovery code: relay_url#fp_hex
     let parts: Vec<&str> = recovery_code.splitn(2, '#').collect();
@@ -2538,8 +2543,8 @@ pub async fn recover_account(
     // 14. Clear old account's recovery seed if present
     *state.recovery_seed.lock().await = None;
 
-    // 15. Re-upload recovery blob as v2 with same passphrase
-    let new_blob = export_recovery_blob(&*seed, &sync_key, &passphrase).map_err(|e| e.to_string())?;
+    // 15. Re-upload recovery blob with new passphrase (never re-use the old one)
+    let new_blob = export_recovery_blob(&*seed, &sync_key, &new_passphrase).map_err(|e| e.to_string())?;
     drop(seed);
     {
         let relay = state.relay.lock().await;

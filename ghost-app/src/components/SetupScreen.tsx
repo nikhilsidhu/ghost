@@ -29,6 +29,8 @@ export function SetupScreen(props: Props) {
   // Recover account state
   const [recoverCode, setRecoverCode] = createSignal("");
   const [recoverPassphrase, setRecoverPassphrase] = createSignal("");
+  const [recoverNewPassphrase, setRecoverNewPassphrase] = createSignal("");
+  const [recoverNewPassphraseConfirm, setRecoverNewPassphraseConfirm] = createSignal("");
 
   const handleNewAccount = async () => {
     const trimmedName = name().trim();
@@ -110,13 +112,19 @@ export function SetupScreen(props: Props) {
   const handleRecoverAccount = async () => {
     const code = recoverCode().trim();
     const pp = recoverPassphrase();
-    if (!code || !pp) return;
+    const newPp = recoverNewPassphrase();
+    const newPpConfirm = recoverNewPassphraseConfirm();
+    if (!code || !pp || !newPp) return;
+    if (newPp !== newPpConfirm) { setError("new passphrases don't match"); return; }
+    if (newPp.length < 12) { setError("new passphrase must be at least 12 characters"); return; }
 
     setLoading(true);
     setError(null);
     try {
-      await recoverAccount(code, pp);
+      await recoverAccount(code, pp, newPp);
       setRecoverPassphrase("");
+      setRecoverNewPassphrase("");
+      setRecoverNewPassphraseConfirm("");
       setLoading(false);
       props.onComplete();
     } catch (e: any) {
@@ -195,7 +203,7 @@ export function SetupScreen(props: Props) {
   const backButton = (target: Mode) => (
     <button
       class="flex items-center gap-1 text-xs text-[var(--neutral-500)] hover:text-[var(--neutral-400)] cursor-pointer w-fit"
-      onClick={() => { setMode(target); setError(null); setLoading(false); setLinkStatus(null); setPassphrase(""); setPassphraseConfirm(""); setRecoverPassphrase(""); setRecoverCode(""); setPairingCode(""); }}
+      onClick={() => { setMode(target); setError(null); setLoading(false); setLinkStatus(null); setPassphrase(""); setPassphraseConfirm(""); setRecoverPassphrase(""); setRecoverNewPassphrase(""); setRecoverNewPassphraseConfirm(""); setRecoverCode(""); setPairingCode(""); }}
     >
       <ArrowLeft size={12} />
       back
@@ -348,13 +356,35 @@ export function SetupScreen(props: Props) {
               </div>
 
               <div>
-                <label class="text-xs text-[var(--neutral-400)] mb-1 block">recovery passphrase</label>
+                <label class="text-xs text-[var(--neutral-400)] mb-1 block">current recovery passphrase</label>
                 <input
                   class={inputClass}
                   type="password"
                   placeholder="the passphrase you set during setup"
                   value={recoverPassphrase()}
                   onInput={(e) => setRecoverPassphrase(e.currentTarget.value)}
+                />
+              </div>
+
+              <div>
+                <label class="text-xs text-[var(--neutral-400)] mb-1 block">new recovery passphrase</label>
+                <input
+                  class={inputClass}
+                  type="password"
+                  placeholder="set a new passphrase (12+ characters)"
+                  value={recoverNewPassphrase()}
+                  onInput={(e) => setRecoverNewPassphrase(e.currentTarget.value)}
+                />
+              </div>
+
+              <div>
+                <label class="text-xs text-[var(--neutral-400)] mb-1 block">confirm new passphrase</label>
+                <input
+                  class={inputClass}
+                  type="password"
+                  placeholder="confirm new passphrase"
+                  value={recoverNewPassphraseConfirm()}
+                  onInput={(e) => setRecoverNewPassphraseConfirm(e.currentTarget.value)}
                   onKeyDown={(e) => { if (e.key === "Enter") handleRecoverAccount(); }}
                 />
               </div>
@@ -373,7 +403,7 @@ export function SetupScreen(props: Props) {
               <button
                 class="w-full h-9 rounded text-sm font-medium bg-[var(--purple-600)] text-white hover:bg-[var(--purple-500)] disabled:opacity-50 cursor-pointer disabled:cursor-default"
                 onClick={handleRecoverAccount}
-                disabled={!recoverCode().trim() || !recoverPassphrase() || loading()}
+                disabled={!recoverCode().trim() || !recoverPassphrase() || !recoverNewPassphrase() || !recoverNewPassphraseConfirm() || loading()}
               >
                 {loading() ? "recovering…" : "recover account"}
               </button>

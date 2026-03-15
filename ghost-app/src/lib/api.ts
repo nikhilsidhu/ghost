@@ -138,8 +138,8 @@ export const getRecoveryCode = () => invoke<string>("get_recovery_code");
 export const changeRecoveryPassphrase = (currentPassphrase: string, newPassphrase: string) =>
   invoke<void>("change_recovery_passphrase", { currentPassphrase, newPassphrase });
 export const hasRecoveryBlob = () => invoke<boolean>("has_recovery_blob");
-export const recoverAccount = (recoveryCode: string, passphrase: string) =>
-  invoke<string>("recover_account", { recoveryCode, passphrase });
+export const recoverAccount = (recoveryCode: string, passphrase: string, newPassphrase: string) =>
+  invoke<string>("recover_account", { recoveryCode, passphrase, newPassphrase });
 
 // Dev testing
 export const spawnDevInstance = () => invoke<number>("spawn_dev_instance");
