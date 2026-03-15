@@ -1843,10 +1843,16 @@ pub async fn check_pairing(state: State<'_, AppState>) -> Result<Option<String>,
     // Build provision blob BEFORE pushing AddDevice — device B starts
     // fetching provision as soon as it sees AddDevice in the identity log.
     let provision_blob = {
-        let client = state.client.lock().await;
+        let mut client = state.client.lock().await;
 
         let sync_key = client.sync_key()
             .ok_or_else(|| "sync_key not set — account may not be initialized".to_string())?;
+
+        // Create sync group on first pairing if it doesn't exist yet
+        if !client.has_sync_group() {
+            client.create_sync_group()
+                .map_err(|e| format!("create sync group: {e}"))?;
+        }
 
         let gi_bytes = client.sync_group_info()
             .map_err(|e| format!("sync group info: {e}"))?;

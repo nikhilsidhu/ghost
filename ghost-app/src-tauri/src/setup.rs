@@ -167,11 +167,10 @@ pub fn initialize() -> SetupResult {
     let mut client = GhostClient::open(identity, db_key, mls_db_key, &db_path())
         .expect("failed to open database");
 
-    // New account: create sync MLS group + generate snapshot key
+    // Generate snapshot key for new accounts.
+    // Sync MLS group is created lazily during pairing (not here)
+    // to avoid MLS overhead for single-device users.
     if recovery_seed.is_some() {
-        if !client.has_sync_group() {
-            client.create_sync_group().expect("failed to create sync group");
-        }
         if client.sync_key().is_none() {
             let mut k = [0u8; 32];
             rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut k);
