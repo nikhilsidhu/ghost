@@ -193,8 +193,9 @@ impl Inner {
     ) -> Result<(), RelayError> {
         let (pg, creator_fp) = match groups.get_mut(mailbox_id) {
             Some(entry) => entry,
-            // No PublicGroup for this mailbox — skip validation (pre-upgrade group)
-            None => return Ok(()),
+            None => return Err(RelayError::Forbidden(
+                "no PublicGroup state for this mailbox".into(),
+            )),
         };
 
         let mls_bytes = ghost_wire::envelope_payload(data);

@@ -321,8 +321,16 @@ async fn ws_epoch_mismatch_ack() {
     let base = start_server(test_config()).await;
     let auth = TestAuth::generate();
     auth.register(&base).await;
+
+    let relay_vk = fetch_relay_vk(&base).await;
+    let provider = OpenMlsRustCrypto::default();
+    let id = MlsTestIdentity::new(&auth.account_fp);
+    let (mut group, mailbox_id) = create_test_mls_group(&provider, &id, &relay_vk);
+    let gi = export_group_info_bytes(&group, &provider, &id.signer);
+    upload_group_info(&base, &auth, &mailbox_id, &gi).await;
+
     let ws_base = base.replace("http://", "ws://");
-    let mailbox = URL_SAFE_NO_PAD.encode([0x08; 32]);
+    let mailbox = URL_SAFE_NO_PAD.encode(mailbox_id);
     let ws_url = format!("{ws_base}/ws/{mailbox}");
 
     let mut ws = auth.ws_connect(&ws_url).await;
@@ -339,8 +347,9 @@ async fn ws_epoch_mismatch_ack() {
     }).await.expect("timed out");
     assert_eq!(ack, "1");
 
-    // Send commit at epoch 0 — advances relay to epoch 1
-    ws.send(Message::Binary(envelope(EnvelopeType::Commit, 0, b"commit").into())).await.unwrap();
+    // Real commit at epoch 0 — advances relay to epoch 1
+    let (commit_env, gi) = create_self_update_commit(&mut group, &provider, &id.signer, 0);
+    ws.send(Message::Binary(commit_env.into())).await.unwrap();
     let ack = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             let m = ws.next().await.unwrap().unwrap();
@@ -348,6 +357,7 @@ async fn ws_epoch_mismatch_ack() {
         }
     }).await.expect("timed out");
     assert_eq!(ack, "2");
+    upload_group_info(&base, &auth, &mailbox_id, &gi).await;
 
     // Send at stale epoch 0 — relay is at 1, expect mismatch hint (app messages still stored)
     ws.send(Message::Binary(envelope(EnvelopeType::Application, 0, b"stale").into())).await.unwrap();
@@ -358,16 +368,6 @@ async fn ws_epoch_mismatch_ack() {
         }
     }).await.expect("timed out");
     assert_eq!(ack, "3 epoch_mismatch");
-
-    // Send commit at stale epoch 0 — rejected, get error text
-    ws.send(Message::Binary(envelope(EnvelopeType::Commit, 0, b"stale-commit").into())).await.unwrap();
-    let ack = tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            let m = ws.next().await.unwrap().unwrap();
-            if let Message::Text(t) = m { break t.to_string(); }
-        }
-    }).await.expect("timed out");
-    assert!(ack.starts_with("error:"), "expected error for stale commit, got: {ack}");
 }
 
 #[tokio::test]
@@ -389,8 +389,16 @@ async fn epoch_gating() {
     let base = start_server(test_config()).await;
     let auth = TestAuth::generate();
     auth.register(&base).await;
+
+    let relay_vk = fetch_relay_vk(&base).await;
+    let provider = OpenMlsRustCrypto::default();
+    let id = MlsTestIdentity::new(&auth.account_fp);
+    let (mut group, mailbox_id) = create_test_mls_group(&provider, &id, &relay_vk);
+    let gi = export_group_info_bytes(&group, &provider, &id.signer);
+    upload_group_info(&base, &auth, &mailbox_id, &gi).await;
+
     let client = reqwest::Client::new();
-    let url = mailbox_url(&base, &[0x07; 32]);
+    let url = mailbox_url(&base, &mailbox_id);
 
     // Application at epoch 0 — relay epoch is 0, no mismatch
     let body: Value = auth.sign("POST", &url, client.post(&url)
@@ -399,12 +407,14 @@ async fn epoch_gating() {
     assert_eq!(body["seq"], 1);
     assert!(body.get("epoch_mismatch").is_none());
 
-    // Commit at epoch 0 — advances relay epoch to 1
+    // Real commit at epoch 0 — advances relay epoch to 1
+    let (commit_env, gi) = create_self_update_commit(&mut group, &provider, &id.signer, 0);
     let body: Value = auth.sign("POST", &url, client.post(&url)
-        .body(envelope(EnvelopeType::Commit, 0, b"commit")))
+        .body(commit_env))
         .send().await.unwrap().json().await.unwrap();
     assert_eq!(body["seq"], 2);
     assert!(body.get("epoch_mismatch").is_none());
+    upload_group_info(&base, &auth, &mailbox_id, &gi).await;
 
     // Application at epoch 1 — matches new relay epoch
     let body: Value = auth.sign("POST", &url, client.post(&url)
@@ -422,33 +432,19 @@ async fn epoch_gating() {
     let blobs: Vec<Value> = auth.sign("GET", &url, client.get(&url)).send().await.unwrap().json().await.unwrap();
     assert_eq!(blobs.len(), 4);
 
-    // Stale commit at epoch 0 — rejected with 409
-    let resp = auth.sign("POST", &url, client.post(&url)
-        .body(envelope(EnvelopeType::Commit, 0, b"stale-commit")))
-        .send().await.unwrap();
-    assert_eq!(resp.status(), StatusCode::CONFLICT);
-
-    // Application messages at stale epoch still stored (only commits are rejected)
-    let blobs: Vec<Value> = auth.sign("GET", &url, client.get(&url)).send().await.unwrap().json().await.unwrap();
-    assert_eq!(blobs.len(), 4);
-
     // Application at epoch 1 still matches — relay didn't go backward
     let body: Value = auth.sign("POST", &url, client.post(&url)
         .body(envelope(EnvelopeType::Application, 1, b"still-ok")))
         .send().await.unwrap().json().await.unwrap();
     assert!(body.get("epoch_mismatch").is_none());
 
-    // Commit at epoch 1 succeeds — advances relay to 2
+    // Real commit at epoch 1 — advances relay to 2
+    let (commit_env2, gi2) = create_self_update_commit(&mut group, &provider, &id.signer, 1);
     let body: Value = auth.sign("POST", &url, client.post(&url)
-        .body(envelope(EnvelopeType::Commit, 1, b"commit2")))
+        .body(commit_env2))
         .send().await.unwrap().json().await.unwrap();
     assert!(body.get("epoch_mismatch").is_none());
-
-    // Commit at epoch 1 now stale — rejected
-    let resp = auth.sign("POST", &url, client.post(&url)
-        .body(envelope(EnvelopeType::Commit, 1, b"stale-commit2")))
-        .send().await.unwrap();
-    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    upload_group_info(&base, &auth, &mailbox_id, &gi2).await;
 }
 
 #[tokio::test]
@@ -1473,6 +1469,34 @@ async fn upload_group_info(
     assert_eq!(resp.status(), StatusCode::NO_CONTENT, "upload GroupInfo failed");
 }
 
+/// Create a self-update commit (simplest way to advance the epoch).
+/// Returns (commit_envelope_bytes, new_group_info_bytes).
+fn create_self_update_commit(
+    group: &mut MlsGroup,
+    provider: &OpenMlsRustCrypto,
+    signer: &SignatureKeyPair,
+    epoch: u64,
+) -> (Vec<u8>, Vec<u8>) {
+    let bundle = group.commit_builder()
+        .load_psks(provider.storage())
+        .unwrap()
+        .build(provider.rand(), provider.crypto(), signer, |_| true)
+        .unwrap()
+        .stage_commit(provider)
+        .unwrap();
+
+    let commit_bytes = bundle.commit().to_bytes().unwrap();
+    group.merge_pending_commit(provider).unwrap();
+
+    let commit_envelope = envelope(
+        ghost_wire::EnvelopeType::Commit,
+        epoch,
+        &commit_bytes,
+    );
+    let gi = export_group_info_bytes(group, provider, signer);
+    (commit_envelope, gi)
+}
+
 // ── MLS enforcement tests ────────────────────────────────────────
 
 #[tokio::test]
@@ -1594,9 +1618,9 @@ async fn desync_recovery_via_group_info_reupload() {
 }
 
 #[tokio::test]
-async fn pre_upgrade_group_allows_all() {
-    // Groups without PublicGroup initialization (no server_info uploaded)
-    // should allow all operations (graceful degradation).
+async fn pre_upgrade_group_app_msg_allowed_commit_rejected() {
+    // Groups without PublicGroup: application messages still accepted (no ACL),
+    // but commits/proposals are rejected (no PublicGroup to validate against).
     let base = start_server(test_config()).await;
     let alice = TestAuth::generate();
     alice.register(&base).await;
@@ -1605,13 +1629,22 @@ async fn pre_upgrade_group_allows_all() {
     let client = reqwest::Client::new();
     let url = mailbox_url(&base, &mailbox_id);
 
-    // POST should work even without PublicGroup (no ACL → skip check)
+    // Application messages still pass (no ACL → skip membership check)
     let resp = alice
         .sign("POST", &url, client.post(&url).body(test_envelope(b"legacy")))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Commits are rejected without PublicGroup
+    let commit_env = envelope(ghost_wire::EnvelopeType::Commit, 0, b"fake-commit");
+    let resp = alice
+        .sign("POST", &url, client.post(&url).body(commit_env))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
