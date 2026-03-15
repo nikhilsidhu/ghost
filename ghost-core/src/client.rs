@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use openmls::prelude::KeyPackage;
+use openmls::prelude::{KeyPackage, LeafNodeIndex};
 use rusqlite::Connection;
 
 use crate::crypto::{GhostProvider, MessageType};
@@ -1029,6 +1029,27 @@ impl GhostClient {
             }
         }
         outbound
+    }
+
+    /// Find leaf indices for a device in a server group.
+    pub fn find_device_leaves(&self, server_id: &[u8; 32], device_vk: &[u8; 32]) -> Vec<LeafNodeIndex> {
+        let Some(group) = self.servers.get(server_id) else { return vec![] };
+        group.members()
+            .filter(|m| m.signature_key.as_slice() == device_vk.as_slice())
+            .map(|m| m.index)
+            .collect()
+    }
+
+    /// Create a remove-members commit for a specific server group.
+    pub fn remove_server_members(
+        &mut self,
+        server_id: &[u8; 32],
+        members: &[LeafNodeIndex],
+    ) -> Result<Vec<u8>> {
+        let group = self.servers.get_mut(server_id).ok_or_else(|| {
+            GhostError::ServerNotLoaded(hex::encode(&server_id[..8]))
+        })?;
+        group.remove_members(&self.provider, members)
     }
 
     /// Merge a pending commit for a server group after the relay accepted it.

@@ -1439,9 +1439,53 @@ pub async fn revoke_device(
                 }
             }
             Err(e) => {
-                eprintln!("revoke: relay rejected commit for {}: {e}", hex::encode(&sid[..8]));
-                let mut client = state.client.lock().await;
-                let _ = client.clear_pending_commit_for_server(&sid);
+                eprintln!("revoke: relay rejected commit for {}: {e}, retrying", hex::encode(&sid[..8]));
+                {
+                    let mut client = state.client.lock().await;
+                    let _ = client.clear_pending_commit_for_server(&sid);
+                }
+
+                // Retry: recover epoch then re-create and post removal commit
+                match recover_epoch(&state.client, &state.relay, &sid, &out.mailbox_id, "revoke-retry").await {
+                    Ok(true) => {
+                        let retry_blob = {
+                            let mut client = state.client.lock().await;
+                            let leaf_indices: Vec<_> = client.find_device_leaves(&sid, &target_key);
+                            if leaf_indices.is_empty() {
+                                continue;
+                            }
+                            match client.remove_server_members(&sid, &leaf_indices) {
+                                Ok(blob) => blob,
+                                Err(e) => {
+                                    eprintln!("revoke: retry remove_members failed: {e}");
+                                    continue;
+                                }
+                            }
+                        };
+                        let post_result = {
+                            let relay = state.relay.lock().await;
+                            relay.post_blob(&out.mailbox_id, retry_blob).await
+                        };
+                        match post_result {
+                            Ok(_) => {
+                                let mut client = state.client.lock().await;
+                                let _ = client.merge_pending_commit_for_server(&sid);
+                                if let Ok(gi) = client.export_server_info(&sid) {
+                                    let relay = state.relay.lock().await;
+                                    let _ = relay.put_server_info(&out.mailbox_id, gi).await;
+                                }
+                            }
+                            Err(e2) => {
+                                eprintln!("revoke: retry also failed for {}: {e2}", hex::encode(&sid[..8]));
+                                let mut client = state.client.lock().await;
+                                let _ = client.clear_pending_commit_for_server(&sid);
+                            }
+                        }
+                    }
+                    Ok(false) | Err(_) => {
+                        eprintln!("revoke: epoch recovery failed for {}", hex::encode(&sid[..8]));
+                    }
+                }
             }
         }
     }
