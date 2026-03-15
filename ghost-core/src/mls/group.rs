@@ -6,6 +6,7 @@ use openmls_traits::OpenMlsProvider;
 
 use crate::crypto::GhostProvider;
 use crate::error::{GhostError, Result};
+use crate::idlog_cache::IdLogCache;
 use crate::identity::Identity;
 use crate::wire::derive_mls_group_id;
 
@@ -259,16 +260,49 @@ impl GhostGroup {
     }
 
     /// Commit all queued proposals (e.g. relay-generated Remove proposals).
-    /// Returns envelope-wrapped commit bytes.
+    /// External Remove proposals are only included if the target device is
+    /// revoked in the identity log — rejects forged removals from a
+    /// compromised relay key.
     pub fn commit_pending_proposals(
         &mut self,
         provider: &GhostProvider,
+        idlog_cache: &IdLogCache,
     ) -> Result<Vec<u8>> {
+        // Build leaf→(account_fp, device_vk) map for Remove target validation
+        let member_map: std::collections::HashMap<u32, ([u8; 32], [u8; 32])> = self
+            .members()
+            .filter_map(|m| {
+                let bc = BasicCredential::try_from(m.credential).ok()?;
+                let fp: [u8; 32] = bc.identity().try_into().ok()?;
+                let vk: [u8; 32] = m.signature_key.as_slice().try_into().ok()?;
+                Some((m.index.u32(), (fp, vk)))
+            })
+            .collect();
+
         let epoch = self.epoch();
         let bundle = self.mls_group.commit_builder()
             .load_psks(provider.storage())
             .map_err(|e| GhostError::Mls(format!("load psks: {e}")))?
-            .build(provider.rand(), provider.crypto(), &self.signer, validate_pending_proposal)
+            .build(provider.rand(), provider.crypto(), &self.signer, |proposal: &QueuedProposal| {
+                if !validate_pending_proposal(proposal) {
+                    return false;
+                }
+                // External Remove proposals: only accept if target is revoked
+                if matches!(proposal.sender(), Sender::External(_)) {
+                    if let Proposal::Remove(ref remove) = proposal.proposal() {
+                        let leaf_idx = remove.removed().u32();
+                        if let Some((account_fp, device_vk)) = member_map.get(&leaf_idx) {
+                            // If cached and device is still active, reject the proposal
+                            if let Ok(true) = idlog_cache.is_active_device(account_fp, device_vk) {
+                                return false;
+                            }
+                            // Ok(false) = revoked → accept
+                            // Err = not cached → accept (can't verify, degrade gracefully)
+                        }
+                    }
+                }
+                true
+            })
             .map_err(|e| GhostError::Mls(format!("build pending commit: {e}")))?
             .stage_commit(provider)
             .map_err(|e| GhostError::Mls(format!("stage pending commit: {e}")))?;

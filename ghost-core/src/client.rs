@@ -1303,7 +1303,7 @@ impl GhostClient {
         let group = self.servers.get_mut(server_id).ok_or_else(|| {
             GhostError::ServerNotLoaded(hex::encode(&server_id[..8]))
         })?;
-        let commit = group.commit_pending_proposals(&self.provider)?;
+        let commit = group.commit_pending_proposals(&self.provider, &self.idlog_cache)?;
         let mailbox_id = mls_group_mailbox_id(group.group_id());
         Ok(Outbound { mailbox_id, blob: commit })
     }

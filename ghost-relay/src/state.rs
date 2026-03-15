@@ -296,7 +296,17 @@ impl Inner {
                 // External commit (new device joining) — validated by PublicGroup
             }
             Sender::External(_) => {
-                // External sender (relay) — allowed for remove proposals
+                // External sender (relay) — only Remove proposals allowed
+                let has_non_remove = staged_commit.queued_proposals().any(|qp| {
+                    matches!(qp.sender(), Sender::External(_))
+                        && !matches!(qp.proposal(), Proposal::Remove(_))
+                        && !matches!(qp.proposal(), Proposal::GroupContextExtensions(_))
+                });
+                if has_non_remove {
+                    return Err(RelayError::Forbidden(
+                        "external sender restricted to Remove and GroupContextExtensions".into(),
+                    ));
+                }
             }
             _ => {
                 return Err(RelayError::Forbidden("unexpected sender type".into()));
