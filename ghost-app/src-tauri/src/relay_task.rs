@@ -611,6 +611,17 @@ async fn handle_sync_application(
                 &settings, app, client, relay, config, config_path, presence, voice_cmd_tx,
             ).await;
         }
+        x if x == SyncMessageType::SyncKeyRotate as u8 => {
+            if body.len() != 32 {
+                eprintln!("sync: bad SyncKeyRotate payload (expected 32 bytes, got {})", body.len());
+                return;
+            }
+            let new_key: [u8; 32] = body.try_into().unwrap();
+            let c = client.lock().await;
+            if let Err(e) = c.set_sync_key(new_key) {
+                eprintln!("sync: failed to store rotated sync key: {e}");
+            }
+        }
         _ => {
             eprintln!("sync: unknown message type {msg_type:#04x}");
         }

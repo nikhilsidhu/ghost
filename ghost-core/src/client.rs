@@ -287,6 +287,15 @@ impl GhostClient {
         self.store.set_config_blob("sync_key", &key)
     }
 
+    /// Generate a new random sync key and store it. Returns the new key.
+    pub fn rotate_sync_key(&self) -> Result<[u8; 32]> {
+        use rand::RngCore;
+        let mut new_key = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut new_key);
+        self.set_sync_key(new_key)?;
+        Ok(new_key)
+    }
+
     pub fn sync_get(&self, key: &str) -> Result<Option<(Option<Vec<u8>>, u64)>> {
         self.store.sync_get(key)
     }

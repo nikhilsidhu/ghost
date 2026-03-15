@@ -362,6 +362,7 @@ pub enum SyncMessageType {
     ServerLeft = 0x02,
     VoiceTakeover = 0x03,
     MutationSync = 0x04,
+    SyncKeyRotate = 0x05,
 }
 
 /// Result of processing an inbound sync MLS message.

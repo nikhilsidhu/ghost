@@ -1394,6 +1394,23 @@ pub async fn revoke_device(
                 let _ = client.clear_pending_commit_for_sync();
             }
         }
+
+        // Rotate sync key so the revoked device can't decrypt future snapshots
+        {
+            let client_guard = state.client.lock().await;
+            if let Ok(new_key) = client_guard.rotate_sync_key() {
+                drop(client_guard);
+                // Broadcast new key to remaining devices via sync MLS group
+                crate::sync_utils::post_sync_message(
+                    &state.client,
+                    &state.relay,
+                    ghost_core::wire::SyncMessageType::SyncKeyRotate as u8,
+                    &new_key,
+                ).await;
+                // Re-encrypt snapshot with new key
+                crate::sync_utils::push_sync_snapshot(&state.client, &state.relay).await;
+            }
+        }
     }
 
     // Remove leaves via HTTP so we detect epoch conflicts
