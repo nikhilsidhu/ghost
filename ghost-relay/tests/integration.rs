@@ -75,6 +75,7 @@ impl TestAuth {
             &self.account_fp,
             &self.device_key.verifying_key().to_bytes(),
             &self.device_key,
+            None,
         );
         req.header("x-ghost-account", &h.account)
             .header("x-ghost-device", &h.device)
@@ -99,7 +100,7 @@ impl TestAuth {
         let ws_path = url.find("//")
             .and_then(|i| url[i+2..].find('/').map(|j| &url[i+2+j..]))
             .unwrap_or("/");
-        let message = ghost_wire::auth::auth_message("GET", ws_path, &self.account_fp, &vk, timestamp);
+        let message = ghost_wire::auth::auth_message("GET", ws_path, &self.account_fp, &vk, timestamp, None);
         let signature = self.device_key.sign(&message);
 
         let request = http::Request::builder()
@@ -1054,7 +1055,7 @@ async fn auth_rejects_revoked_device() {
     let vk = dk2.verifying_key().to_bytes();
     let url = mailbox_url(&base, &[0xE1; 32]);
     let url_path = extract_path(&url);
-    let auth_msg = ghost_wire::auth::auth_message("POST", &url_path, &fp, &vk, timestamp);
+    let auth_msg = ghost_wire::auth::auth_message("POST", &url_path, &fp, &vk, timestamp, None);
     let sig = dk2.sign(&auth_msg);
 
     let resp = client
@@ -1071,7 +1072,7 @@ async fn auth_rejects_revoked_device() {
 
     // Active device 1 should succeed
     let vk1 = dk1.verifying_key().to_bytes();
-    let auth_msg1 = ghost_wire::auth::auth_message("POST", &url_path, &fp, &vk1, timestamp);
+    let auth_msg1 = ghost_wire::auth::auth_message("POST", &url_path, &fp, &vk1, timestamp, None);
     let sig1 = dk1.sign(&auth_msg1);
 
     let resp = client
@@ -1104,7 +1105,7 @@ async fn auth_rejects_bad_signature() {
     // Use wrong key to sign
     let wrong_key = SigningKey::generate(&mut OsRng);
     let url_path = extract_path(&url);
-    let auth_msg = ghost_wire::auth::auth_message("POST", &url_path, &auth.account_fp, &vk, timestamp);
+    let auth_msg = ghost_wire::auth::auth_message("POST", &url_path, &auth.account_fp, &vk, timestamp, None);
     let bad_sig = wrong_key.sign(&auth_msg);
 
     let resp = client
@@ -1136,7 +1137,7 @@ async fn auth_rejects_stale_timestamp() {
         - 120;
     let vk = auth.device_key.verifying_key().to_bytes();
     let path = extract_path(&url);
-    let auth_msg = ghost_wire::auth::auth_message("POST", &path, &auth.account_fp, &vk, timestamp);
+    let auth_msg = ghost_wire::auth::auth_message("POST", &path, &auth.account_fp, &vk, timestamp, None);
     let sig = auth.device_key.sign(&auth_msg);
 
     let resp = client
@@ -1183,7 +1184,7 @@ async fn auth_rejects_future_timestamp() {
         + 120;
     let vk = auth.device_key.verifying_key().to_bytes();
     let path = extract_path(&url);
-    let auth_msg = ghost_wire::auth::auth_message("POST", &path, &auth.account_fp, &vk, timestamp);
+    let auth_msg = ghost_wire::auth::auth_message("POST", &path, &auth.account_fp, &vk, timestamp, None);
     let sig = auth.device_key.sign(&auth_msg);
 
     let resp = client

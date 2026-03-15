@@ -85,7 +85,15 @@ pub fn validate_auth_headers(
         .map_err(|_| RelayError::Unauthorized("invalid signature hex".into()))?;
     let signature = Signature::from_slice(&sig_bytes)
         .map_err(|_| RelayError::Unauthorized("invalid signature".into()))?;
-    let message = ghost_wire::auth::auth_message(method, path, &account_fp, &device_vk, timestamp);
+    // Try with channel binding header first, fall back to without.
+    // When TLS termination is added, the binding value will come from
+    // rustls export_keying_material() and the non-bound path can be removed.
+    let cb_hex = headers.get("x-ghost-channel-binding")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| hex::decode(s).ok())
+        .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok());
+    let cb_ref = cb_hex.as_ref();
+    let message = ghost_wire::auth::auth_message(method, path, &account_fp, &device_vk, timestamp, cb_ref);
     vk.verify_strict(&message, &signature)
         .map_err(|_| RelayError::Unauthorized("bad signature".into()))?;
 

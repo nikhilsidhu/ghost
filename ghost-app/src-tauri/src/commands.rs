@@ -27,7 +27,7 @@ fn parse_id(hex_str: &str) -> Result<[u8; 32], String> {
 /// Sign an HTTP request with the device's cached auth credentials.
 fn sign_request(state: &AppState, method: &str, path: &str, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
     let auth = state.auth.read().unwrap();
-    let h = ghost_wire::auth::sign_request_headers(method, path, &auth.account_fp, &auth.device_vk, &auth.signing_key);
+    let h = ghost_wire::auth::sign_request_headers(method, path, &auth.account_fp, &auth.device_vk, &auth.signing_key, None);
     drop(auth);
     req.header("X-Ghost-Account", &h.account)
         .header("X-Ghost-Device", &h.device)

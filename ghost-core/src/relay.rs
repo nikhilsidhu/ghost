@@ -92,7 +92,8 @@ pub struct AuthContext {
 
 impl AuthContext {
     fn sign_for(&self, method: &str, path: &str) -> ghost_wire::auth::AuthHeaders {
-        ghost_wire::auth::sign_request_headers(method, path, &self.account_fp, &self.device_vk, &self.signing_key)
+        // channel_binding: None until TLS termination is added to the relay
+        ghost_wire::auth::sign_request_headers(method, path, &self.account_fp, &self.device_vk, &self.signing_key, None)
     }
 }
 
