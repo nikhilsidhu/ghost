@@ -1,10 +1,17 @@
 use aes_gcm::aead::{Aead, AeadCore, OsRng};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+use sframe::frame::{EncryptedFrameView, MediaFrameView};
+use sframe::frame::MonotonicCounter;
+use sframe::key::{DecryptionKey, EncryptionKey};
+use sframe::CipherSuite;
 
 use crate::crypto::{GhostProvider, VOICE_EXPORT_LABEL, VOICE_PRESENCE_EXPORT_LABEL};
 use crate::error::{GhostError, Result};
 
 use super::group::GhostGroup;
+
+/// SFrame cipher suite for voice frames.
+const VOICE_CIPHER_SUITE: CipherSuite = CipherSuite::AesGcm256Sha512;
 
 fn derive_export_key(
     group: &GhostGroup,
@@ -47,36 +54,41 @@ pub fn derive_voice_key(
     Ok(key)
 }
 
-/// Encrypt one audio frame before sending it to the voice channel.
+/// Encrypt a media frame using SFrame (RFC 9605). Codec-agnostic — works for
+/// any encoded media payload (Opus audio, future video codecs, etc.).
+/// Output is an SFrame-framed blob: [sframe_header][ciphertext][auth_tag].
 pub fn encrypt_voice_frame(
     key: &[u8; 32],
     sequence: u32,
-    opus_frame: &[u8],
+    frame: &[u8],
 ) -> Result<Vec<u8>> {
-    let cipher = Aes256Gcm::new(key.into());
-    let nonce = voice_nonce(sequence);
-    cipher
-        .encrypt(Nonce::from_slice(&nonce), opus_frame)
-        .map_err(|e| GhostError::Crypto(format!("voice encrypt: {e}")))
+    let enc_key = EncryptionKey::derive_from(VOICE_CIPHER_SUITE, 0u64, key)
+        .map_err(|e| GhostError::Crypto(format!("sframe key derive: {e}")))?;
+    let mut counter = MonotonicCounter::with_start_value(sequence as u64, u64::MAX);
+    let media = MediaFrameView::new(&mut counter, frame);
+    let mut buf = Vec::new();
+    media
+        .encrypt_into(&enc_key, &mut buf)
+        .map_err(|e| GhostError::Crypto(format!("sframe encrypt: {e}")))?;
+    Ok(buf)
 }
 
-/// Decrypt a received audio frame from another sender.
+/// Decrypt an SFrame-framed media payload. The SFrame header carries the
+/// counter so the sequence is extracted automatically.
 pub fn decrypt_voice_frame(
     key: &[u8; 32],
-    sequence: u32,
+    _sequence: u32,
     encrypted: &[u8],
 ) -> Result<Vec<u8>> {
-    let cipher = Aes256Gcm::new(key.into());
-    let nonce = voice_nonce(sequence);
-    cipher
-        .decrypt(Nonce::from_slice(&nonce), encrypted)
-        .map_err(|e| GhostError::Crypto(format!("voice decrypt: {e}")))
-}
-
-fn voice_nonce(sequence: u32) -> [u8; 12] {
-    let mut nonce = [0u8; 12];
-    nonce[8..12].copy_from_slice(&sequence.to_be_bytes());
-    nonce
+    let mut dec_key = DecryptionKey::derive_from(VOICE_CIPHER_SUITE, 0u64, key)
+        .map_err(|e| GhostError::Crypto(format!("sframe key derive: {e}")))?;
+    let frame = EncryptedFrameView::try_from(encrypted)
+        .map_err(|e| GhostError::Crypto(format!("sframe parse: {e}")))?;
+    let mut buf = Vec::new();
+    frame
+        .decrypt_into(&mut dec_key, &mut buf)
+        .map_err(|e| GhostError::Crypto(format!("sframe decrypt: {e}")))?;
+    Ok(buf)
 }
 
 // --- Presence blob crypto ---
@@ -191,11 +203,13 @@ mod tests {
     }
 
     #[test]
-    fn wrong_sequence_fails() {
+    fn tampered_sframe_header_fails() {
         let key = [0x42u8; 32];
         let frame = b"opus";
-        let encrypted = encrypt_voice_frame(&key, 1, frame).unwrap();
-        assert!(decrypt_voice_frame(&key, 2, &encrypted).is_err());
+        let mut encrypted = encrypt_voice_frame(&key, 1, frame).unwrap();
+        // Flip a byte in the SFrame header (authenticated as AAD)
+        encrypted[0] ^= 0xFF;
+        assert!(decrypt_voice_frame(&key, 1, &encrypted).is_err());
     }
 
     #[test]

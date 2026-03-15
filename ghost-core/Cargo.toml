@@ -17,6 +17,7 @@ openmls_rust_crypto = "0.5"
 openmls_basic_credential = "0.5"
 openmls_sqlite_storage = "0.2"
 openmls_traits = "0.5"
+sframe = { version = "1.1", default-features = false, features = ["rust-crypto"] }
 serde = "1"
 rusqlite = { version = "0.32", features = ["bundled-sqlcipher"] }
 rand = "0.8"
