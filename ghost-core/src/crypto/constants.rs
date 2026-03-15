@@ -18,10 +18,6 @@ pub const ED25519_DERIVE_LABEL: &[u8] = b"ghost-ed25519";
 /// How many bytes of a fingerprint to use for short display names (produces 2x hex chars).
 pub const FINGERPRINT_SHORT_BYTES: usize = 8;
 
-/// Label used when deriving the SQLCipher database encryption key from the identity seed.
-pub const DB_KEY_DERIVE_LABEL: &[u8] = b"ghost-db-key";
-pub const MLS_DB_KEY_DERIVE_LABEL: &[u8] = b"ghost-mls-db-key";
-
 // Wire protocol version
 pub const PROTOCOL_VERSION: u8 = 0x01;
 
