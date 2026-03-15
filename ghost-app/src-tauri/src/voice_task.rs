@@ -271,7 +271,7 @@ async fn start_audio(
     own_slot_id: u32,
     relay_url: &str,
     port: u16,
-    peer_keys: HashMap<u32, ([u8; 32], [u8; 32])>,
+    peer_keys: HashMap<u32, crate::audio::PeerVoiceKeys>,
     voice_state: &VoiceStateEvent,
     input_device: Option<String>,
     output_device: Option<String>,
@@ -663,12 +663,16 @@ pub async fn run(
                                     // Resync: relay pushed fresh state after broadcast lag
                                     let Some(ref session) = audio else { continue };
                                     let (Some(sid), Some(cid)) = (active_server_id, active_channel_id) else { continue };
+                                    let resync_epoch = {
+                                        let c = client.lock().await;
+                                        c.voice_epoch(&sid).unwrap_or(0)
+                                    };
                                     let mut new_peer_state: HashMap<u32, PresenceState> = HashMap::new();
-                                    let mut new_keys: HashMap<u32, ([u8; 32], [u8; 32])> = HashMap::new();
+                                    let mut new_keys: HashMap<u32, crate::audio::PeerVoiceKeys> = HashMap::new();
                                     for peer in &peers {
                                         match process_presence_blob(&client, &sid, &cid, &peer.presence).await {
                                             Ok((ps, voice_key)) => {
-                                                new_keys.insert(peer.slot_id, (ps.fingerprint, voice_key));
+                                                new_keys.insert(peer.slot_id, crate::audio::PeerVoiceKeys::new(ps.fingerprint, resync_epoch, voice_key));
                                                 new_peer_state.insert(peer.slot_id, ps);
                                             }
                                             Err(e) => eprintln!("voice: resync decrypt (slot {}): {e}", peer.slot_id),
@@ -692,11 +696,15 @@ pub async fn run(
                                 };
 
                                 // Decrypt peer presence blobs and collect voice keys
-                                let mut initial_keys: HashMap<u32, ([u8; 32], [u8; 32])> = HashMap::new();
+                                let current_epoch = {
+                                    let c = client.lock().await;
+                                    c.voice_epoch(&p.server_id).unwrap_or(0)
+                                };
+                                let mut initial_keys: HashMap<u32, crate::audio::PeerVoiceKeys> = HashMap::new();
                                 for peer in &peers {
                                     match process_presence_blob(&client, &p.server_id, &p.channel_id, &peer.presence).await {
                                         Ok((ps, voice_key)) => {
-                                            initial_keys.insert(peer.slot_id, (ps.fingerprint, voice_key));
+                                            initial_keys.insert(peer.slot_id, crate::audio::PeerVoiceKeys::new(ps.fingerprint, current_epoch, voice_key));
                                             peer_state.insert(peer.slot_id, ps);
                                         }
                                         Err(e) => eprintln!("voice: failed to decrypt peer presence (slot {}): {e}", peer.slot_id),
@@ -738,8 +746,12 @@ pub async fn run(
                                             deafened: ps.deafened,
                                         });
                                         if let Some(ref session) = audio {
+                                            let join_epoch = {
+                                                let c = client.lock().await;
+                                                c.voice_epoch(&sid).unwrap_or(0)
+                                            };
                                             if let Ok(mut pk) = session.pipeline.peer_keys.lock() {
-                                                pk.insert(slot_id, (ps.fingerprint, voice_key));
+                                                pk.insert(slot_id, crate::audio::PeerVoiceKeys::new(ps.fingerprint, join_epoch, voice_key));
                                             }
                                         }
                                         peer_state.insert(slot_id, ps);

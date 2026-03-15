@@ -110,11 +110,38 @@ pub struct InboundFrame {
     pub encrypted_payload: Vec<u8>,
 }
 
+/// Per-peer voice keys keyed by epoch for graceful epoch transitions.
+/// Retains at most 2 epochs so in-flight packets from the old epoch can still decrypt.
+#[derive(Clone)]
+pub struct PeerVoiceKeys {
+    pub fingerprint: [u8; 32],
+    pub keys: HashMap<u64, [u8; 32]>,
+}
+
+impl PeerVoiceKeys {
+    pub fn new(fingerprint: [u8; 32], epoch: u64, key: [u8; 32]) -> Self {
+        let mut keys = HashMap::new();
+        keys.insert(epoch, key);
+        Self { fingerprint, keys }
+    }
+
+    /// Add a new epoch key, keeping at most 2 epochs.
+    pub fn add_epoch(&mut self, epoch: u64, key: [u8; 32]) {
+        self.keys.insert(epoch, key);
+        // Keep only the 2 most recent epochs
+        while self.keys.len() > 2 {
+            if let Some(&oldest) = self.keys.keys().min() {
+                self.keys.remove(&oldest);
+            }
+        }
+    }
+}
+
 // Per-sender jitter buffer. Buffers N frames before starting playback, then
 // keeps playing continuously using loss concealment for missing frames.
 
 struct JitterBuffer {
-    buffer: BTreeMap<u32, Vec<u8>>,
+    buffer: BTreeMap<u32, (u64, Vec<u8>)>,  // seq → (epoch, encrypted_payload)
     next_seq: u32,
     initialized: bool,
     playing: bool,
@@ -154,7 +181,7 @@ impl JitterBuffer {
         }
     }
 
-    fn insert(&mut self, seq: u32, payload: Vec<u8>) {
+    fn insert(&mut self, seq: u32, epoch: u64, payload: Vec<u8>) {
         if self.initialized && seq < self.next_seq {
             self.late_count += 1;
             return;
@@ -162,7 +189,7 @@ impl JitterBuffer {
         if self.buffer.len() >= JITTER_MAX_ENTRIES {
             return;
         }
-        self.buffer.insert(seq, payload);
+        self.buffer.insert(seq, (epoch, payload));
     }
 
     fn ready(&self) -> bool {
@@ -172,19 +199,21 @@ impl JitterBuffer {
         self.buffer.len() >= self.target_depth as usize
     }
 
-    fn pop_frame(&mut self, key: &[u8; 32], out: &mut [f32]) -> bool {
+    fn pop_frame(&mut self, keys: &HashMap<u64, [u8; 32]>, out: &mut [f32]) -> bool {
         self.playing = true;
         self.quality_frames += 1;
         let seq = self.next_seq;
         self.next_seq = seq.wrapping_add(1);
 
-        if let Some(encrypted) = self.buffer.remove(&seq) {
-            if let Ok(opus_bytes) = decrypt_voice_frame(key, seq, &encrypted) {
-                self.on_time_count += 1;
-                self.consecutive_misses = 0;
-                let _ = self.decoder.decode_float(&opus_bytes, out, false);
-                self.adapt_depth();
-                return true;
+        if let Some((epoch, encrypted)) = self.buffer.remove(&seq) {
+            if let Some(key) = keys.get(&epoch) {
+                if let Ok(opus_bytes) = decrypt_voice_frame(key, seq, &encrypted) {
+                    self.on_time_count += 1;
+                    self.consecutive_misses = 0;
+                    let _ = self.decoder.decode_float(&opus_bytes, out, false);
+                    self.adapt_depth();
+                    return true;
+                }
             }
         }
 
@@ -205,11 +234,13 @@ impl JitterBuffer {
         // Try forward error correction: if the next packet is available,
         // decode it with fec=true to recover a rough version of this missing frame
         let next_seq = seq.wrapping_add(1);
-        if let Some(next_encrypted) = self.buffer.get(&next_seq) {
-            if let Ok(next_opus) = decrypt_voice_frame(key, next_seq, next_encrypted) {
-                let _ = self.decoder.decode_float(&next_opus, out, true);
-                self.adapt_depth();
-                return true;
+        if let Some((next_epoch, next_encrypted)) = self.buffer.get(&next_seq) {
+            if let Some(key) = keys.get(next_epoch) {
+                if let Ok(next_opus) = decrypt_voice_frame(key, next_seq, next_encrypted) {
+                    let _ = self.decoder.decode_float(&next_opus, out, true);
+                    self.adapt_depth();
+                    return true;
+                }
             }
         }
 
@@ -390,8 +421,7 @@ pub struct AudioPipeline {
     pub controls: Arc<AudioControls>,
     pub outbound_rx: Option<mpsc::Receiver<Vec<u8>>>,
     pub inbound_tx: mpsc::Sender<InboundFrame>,
-    // slot_id → (fingerprint, voice_key) — single map eliminates double-lock in output callback
-    pub peer_keys: Arc<Mutex<HashMap<u32, ([u8; 32], [u8; 32])>>>,
+    pub peer_keys: Arc<Mutex<HashMap<u32, PeerVoiceKeys>>>,
 }
 
 impl AudioPipeline {
@@ -400,7 +430,7 @@ impl AudioPipeline {
         own_key: [u8; 32],
         own_epoch: u64,
         channel_id: [u8; 32],
-        peer_keys: HashMap<u32, ([u8; 32], [u8; 32])>,
+        peer_keys: HashMap<u32, PeerVoiceKeys>,
         input_device_name: Option<String>,
         output_device_name: Option<String>,
     ) -> Result<Self, String> {
@@ -528,7 +558,7 @@ fn setup_streams(
     input_device_name: &Option<String>,
     output_device_name: &Option<String>,
     playback_shared: Arc<Mutex<PlaybackShared>>,
-    peer_keys: Arc<Mutex<HashMap<u32, ([u8; 32], [u8; 32])>>>,
+    peer_keys: Arc<Mutex<HashMap<u32, PeerVoiceKeys>>>,
     controls: Arc<AudioControls>,
 ) -> Result<AudioStreams, String> {
     let input_device = resolve_device(host, input_device_name, "input")?;
@@ -680,7 +710,7 @@ fn energy_vad(samples: &[f32]) -> f32 {
 // Mix all ready jitter buffers into mix_buf, return true if any audio was mixed
 fn mix_playback(
     jitter_buffers: &mut HashMap<u32, JitterBuffer>,
-    peer_keys: &Mutex<HashMap<u32, ([u8; 32], [u8; 32])>>,
+    peer_keys: &Mutex<HashMap<u32, PeerVoiceKeys>>,
     mix_buf: &mut [f32],
     decode_buf: &mut [f32],
 ) -> bool {
@@ -694,8 +724,8 @@ fn mix_playback(
         if !jb.ready() {
             continue;
         }
-        if let Some((_, key)) = keys.get(sid) {
-            if jb.pop_frame(key, decode_buf) {
+        if let Some(pvk) = keys.get(sid) {
+            if jb.pop_frame(&pvk.keys, decode_buf) {
                 any_audio = true;
                 for i in 0..OPUS_FRAME_SIZE {
                     mix_buf[i] += decode_buf[i];
@@ -722,7 +752,7 @@ fn run_audio_thread(
     own_key: [u8; 32],
     own_epoch: u64,
     channel_id: [u8; 32],
-    peer_keys: Arc<Mutex<HashMap<u32, ([u8; 32], [u8; 32])>>>,
+    peer_keys: Arc<Mutex<HashMap<u32, PeerVoiceKeys>>>,
     input_device_name: Option<String>,
     output_device_name: Option<String>,
 ) -> Result<(), String> {
@@ -805,7 +835,7 @@ fn run_audio_thread(
                     .entry(frame.slot_id)
                     .or_insert_with(|| JitterBuffer::new().expect("jitter buffer init"));
                 jb.set_next_seq(frame.sequence);
-                jb.insert(frame.sequence, frame.encrypted_payload);
+                jb.insert(frame.sequence, frame.epoch, frame.encrypted_payload);
             }
         }
 
