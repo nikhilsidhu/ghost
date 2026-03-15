@@ -90,6 +90,15 @@ pub async fn run(
     config_path: PathBuf,
     voice_cmd_tx: mpsc::Sender<crate::voice_task::VoiceCommand>,
 ) {
+    // Fetch the relay's verifying key so KT checkpoint verification works
+    {
+        let r = relay.lock().await;
+        match r.get_relay_key().await {
+            Ok(vk) => client.lock().await.set_relay_vk(vk),
+            Err(e) => eprintln!("failed to fetch relay key: {e}"),
+        }
+    }
+
     // Subscribe to all existing server mailboxes with persisted last_seen_seq
     // and the sync MLS group mailbox if it exists
     let sync_mb = {
