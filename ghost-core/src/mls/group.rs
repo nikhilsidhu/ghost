@@ -98,18 +98,19 @@ impl GhostGroup {
         Ok(Self { mls_group, signer })
     }
 
-    /// Start a new group with a deterministic MLS group ID derived from the application group_id.
+    /// Start a new group with a deterministic MLS group ID derived from server_id + channel_id.
     pub fn create_with_id(
         provider: &GhostProvider,
         identity: &Identity,
         server_id: &[u8; 32],
+        channel_id: &[u8; 32],
         relay_vk: Option<&[u8; 32]>,
     ) -> Result<Self> {
         let signer = signer_from_identity(identity);
         let credential = credential_from_identity(identity);
         let config = Self::build_create_config(relay_vk)?;
 
-        let mls_group_id = derive_mls_group_id(server_id);
+        let mls_group_id = derive_mls_group_id(server_id, channel_id);
         let mls_group = MlsGroup::new_with_group_id(
             provider,
             &signer,
@@ -122,16 +123,58 @@ impl GhostGroup {
         Ok(Self { mls_group, signer })
     }
 
-    /// Reload a group from persistent storage.
+    /// Start a new group with a raw MLS group ID (for special-purpose groups like sync).
+    pub fn create_with_raw_id(
+        provider: &GhostProvider,
+        identity: &Identity,
+        raw_group_id: &[u8; 32],
+        relay_vk: Option<&[u8; 32]>,
+    ) -> Result<Self> {
+        let signer = signer_from_identity(identity);
+        let credential = credential_from_identity(identity);
+        let config = Self::build_create_config(relay_vk)?;
+
+        let mls_group = MlsGroup::new_with_group_id(
+            provider,
+            &signer,
+            &config,
+            GroupId::from_slice(raw_group_id),
+            credential,
+        )
+        .map_err(|e| GhostError::Mls(format!("create group: {e}")))?;
+
+        Ok(Self { mls_group, signer })
+    }
+
+    /// Reload a group from persistent storage by server_id + channel_id.
     pub fn load(
         provider: &GhostProvider,
         identity: &Identity,
         server_id: &[u8; 32],
+        channel_id: &[u8; 32],
     ) -> Result<Option<Self>> {
-        let mls_group_id = derive_mls_group_id(server_id);
+        let mls_group_id = derive_mls_group_id(server_id, channel_id);
         let mls_group = MlsGroup::load(
             provider.storage(),
             &GroupId::from_slice(&mls_group_id),
+        )
+        .map_err(|e| GhostError::Mls(format!("load group: {e}")))?;
+
+        Ok(mls_group.map(|g| Self {
+            mls_group: g,
+            signer: signer_from_identity(identity),
+        }))
+    }
+
+    /// Reload a group by raw MLS group ID (for special-purpose groups like sync).
+    pub fn load_by_group_id(
+        provider: &GhostProvider,
+        identity: &Identity,
+        mls_group_id: &[u8; 32],
+    ) -> Result<Option<Self>> {
+        let mls_group = MlsGroup::load(
+            provider.storage(),
+            &GroupId::from_slice(mls_group_id),
         )
         .map_err(|e| GhostError::Mls(format!("load group: {e}")))?;
 
@@ -595,16 +638,18 @@ mod tests {
 
     #[test]
     fn load_persisted_group() {
+        use crate::wire::derive_default_channel_id;
         let provider = GhostProvider::new_in_memory().unwrap();
         let id = Identity::from_seed([0x01u8; 32]).unwrap();
         let server_id = [0x42u8; 32];
+        let channel_id = derive_default_channel_id(&server_id);
 
         let original = GhostGroup::create_with_id(
-            &provider, &id, &server_id, None,
+            &provider, &id, &server_id, &channel_id, None,
         ).unwrap();
         let original_mls_id = original.group_id().to_vec();
 
-        let loaded = GhostGroup::load(&provider, &id, &server_id)
+        let loaded = GhostGroup::load(&provider, &id, &server_id, &channel_id)
             .unwrap()
             .expect("group should be loadable");
         assert_eq!(loaded.group_id(), original_mls_id.as_slice());
@@ -659,21 +704,26 @@ mod tests {
 
     #[test]
     fn delete_then_load_returns_none() {
+        use crate::wire::derive_default_channel_id;
         let provider = GhostProvider::new_in_memory().unwrap();
         let id = Identity::from_seed([0x01u8; 32]).unwrap();
         let server_id = [0x42u8; 32];
+        let channel_id = derive_default_channel_id(&server_id);
 
-        let group = GhostGroup::create_with_id(&provider, &id, &server_id, None).unwrap();
-        assert!(GhostGroup::load(&provider, &id, &server_id).unwrap().is_some());
+        let group = GhostGroup::create_with_id(&provider, &id, &server_id, &channel_id, None).unwrap();
+        assert!(GhostGroup::load(&provider, &id, &server_id, &channel_id).unwrap().is_some());
         group.delete(&provider).unwrap();
-        assert!(GhostGroup::load(&provider, &id, &server_id).unwrap().is_none());
+        assert!(GhostGroup::load(&provider, &id, &server_id, &channel_id).unwrap().is_none());
     }
 
     #[test]
     fn load_nonexistent_returns_none() {
+        use crate::wire::derive_default_channel_id;
         let provider = GhostProvider::new_in_memory().unwrap();
         let id = Identity::from_seed([0x01u8; 32]).unwrap();
-        assert!(GhostGroup::load(&provider, &id, &[0x99u8; 32]).unwrap().is_none());
+        let fake_server = [0x99u8; 32];
+        let fake_channel = derive_default_channel_id(&fake_server);
+        assert!(GhostGroup::load(&provider, &id, &fake_server, &fake_channel).unwrap().is_none());
     }
 
     #[test]

@@ -236,10 +236,10 @@ async fn process_presence_blob(
     let blob = B64.decode(blob_b64).map_err(|e| format!("bad base64: {e}"))?;
     let c = client.lock().await;
     let ps = c
-        .open_presence_blob(server_id, channel_id, &blob)
+        .open_presence_blob(channel_id, &blob)
         .map_err(|e| format!("presence decrypt: {e}"))?;
     let voice_key = c
-        .derive_voice_key(server_id, channel_id, &ps.fingerprint, &ps.device_vk, &ps.voice_salt)
+        .derive_voice_key(channel_id, &ps.fingerprint, &ps.device_vk, &ps.voice_salt)
         .map_err(|e| format!("derive key: {e}"))?;
     Ok((ps, voice_key))
 }
@@ -255,7 +255,7 @@ async fn seal_presence(
 ) -> Result<String, String> {
     let c = client.lock().await;
     let blob = c
-        .seal_presence_blob(server_id, channel_id, muted, deafened, voice_salt)
+        .seal_presence_blob(channel_id, muted, deafened, voice_salt)
         .map_err(|e| format!("seal presence: {e}"))?;
     Ok(B64.encode(&blob))
 }
@@ -278,9 +278,9 @@ async fn start_audio(
 ) -> Result<AudioSession, String> {
     let (own_key, own_epoch) = {
         let c = client.lock().await;
-        let key = c.derive_voice_key(server_id, channel_id, own_fp, own_device_vk, own_voice_salt)
+        let key = c.derive_voice_key(channel_id, own_fp, own_device_vk, own_voice_salt)
             .map_err(|e| format!("derive own key: {e}"))?;
-        let epoch = c.voice_epoch(server_id)
+        let epoch = c.voice_epoch(channel_id)
             .map_err(|e| format!("voice epoch: {e}"))?;
         (key, epoch)
     };

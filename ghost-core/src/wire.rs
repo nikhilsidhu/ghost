@@ -153,9 +153,10 @@ pub fn derive_message_id(
     hasher.finalize().into()
 }
 
-pub fn derive_mls_group_id(server_id: &[u8; 32]) -> [u8; 32] {
+pub fn derive_mls_group_id(server_id: &[u8; 32], channel_id: &[u8; 32]) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(server_id);
+    hasher.update(channel_id);
     hasher.update(MLS_GROUP_ID_TAG);
     hasher.finalize().into()
 }
@@ -188,6 +189,8 @@ pub struct InviteChannel {
     pub name: String,
     pub kind: ChannelKind,
     pub position: i32,
+    /// Per-channel MLS GroupInfo for external-commit joins.
+    pub group_info_bytes: Vec<u8>,
 }
 
 pub struct InvitePayload {
@@ -196,7 +199,6 @@ pub struct InvitePayload {
     pub kind: ServerKind,
     pub members: Vec<InviteMember>,
     pub channels: Vec<InviteChannel>,
-    pub group_info_bytes: Vec<u8>,
 }
 
 fn write_string(buf: &mut Vec<u8>, s: &str) {
@@ -294,10 +296,10 @@ impl InvitePayload {
             write_string(&mut buf, &c.name);
             buf.push(c.kind.to_byte());
             buf.extend_from_slice(&c.position.to_be_bytes());
+            buf.extend_from_slice(&(c.group_info_bytes.len() as u32).to_be_bytes());
+            buf.extend_from_slice(&c.group_info_bytes);
         }
 
-        buf.extend_from_slice(&(self.group_info_bytes.len() as u32).to_be_bytes());
-        buf.extend_from_slice(&self.group_info_bytes);
         buf
     }
 
@@ -321,25 +323,29 @@ impl InvitePayload {
         let channel_count = read_u16(data, &mut pos)? as usize;
         let mut channels = Vec::with_capacity(channel_count);
         for _ in 0..channel_count {
+            let channel_id = read_blob32(data, &mut pos)?;
+            let name = read_string(data, &mut pos)?;
+            let kind = ChannelKind::from_byte(read_u8(data, &mut pos)?)?;
+            let position = read_i32(data, &mut pos)?;
+            let gi_len = read_u32(data, &mut pos)? as usize;
+            if pos + gi_len > data.len() {
+                return Err(GhostError::Format("truncated channel group info".into()));
+            }
+            let group_info_bytes = data[pos..pos + gi_len].to_vec();
+            pos += gi_len;
             channels.push(InviteChannel {
-                channel_id: read_blob32(data, &mut pos)?,
-                name: read_string(data, &mut pos)?,
-                kind: ChannelKind::from_byte(read_u8(data, &mut pos)?)?,
-                position: read_i32(data, &mut pos)?,
+                channel_id, name, kind, position, group_info_bytes,
             });
         }
 
-        let gi_len = read_u32(data, &mut pos)? as usize;
-        if pos + gi_len != data.len() {
+        if pos != data.len() {
             return Err(GhostError::Format(format!(
-                "group info: expected {} bytes, got {}",
-                gi_len,
+                "invite payload: {} trailing bytes",
                 data.len() - pos
             )));
         }
-        let group_info_bytes = data[pos..].to_vec();
 
-        Ok(Self { server_id, server_name, kind, members, channels, group_info_bytes })
+        Ok(Self { server_id, server_name, kind, members, channels })
     }
 }
 
@@ -580,6 +586,7 @@ impl ProvisionPayload {
                 name: read_string(data, &mut pos)?,
                 kind: ChannelKind::from_byte(read_u8(data, &mut pos)?)?,
                 position: read_i32(data, &mut pos)?,
+                group_info_bytes: vec![],
             });
         }
 
@@ -635,6 +642,7 @@ impl SyncServerMeta {
                 name: read_string(data, &mut pos)?,
                 kind: ChannelKind::from_byte(read_u8(data, &mut pos)?)?,
                 position: read_i32(data, &mut pos)?,
+                group_info_bytes: vec![],
             });
         }
         if pos != data.len() {
@@ -943,6 +951,7 @@ fn extract_removed_fps(group: &GhostGroup, staged: &openmls::prelude::StagedComm
 
 /// Encrypted blob addressed to a relay mailbox.
 pub struct Outbound {
+    pub channel_id: [u8; 32],
     pub mailbox_id: [u8; 32],
     pub blob: Vec<u8>,
 }
@@ -1136,7 +1145,7 @@ mod tests {
         assert_ne!(a, different);
 
         // Must differ from MLS group ID derivation for same input
-        assert_ne!(a, derive_mls_group_id(&gid));
+        assert_ne!(a, derive_mls_group_id(&gid, &gid));
     }
 
     #[test]
@@ -1210,9 +1219,10 @@ mod tests {
         let provider = GhostProvider::new_in_memory().unwrap();
         let id = Identity::from_seed([0x01; 32]).unwrap();
         let server_id = [0x42; 32];
-        let group = GhostGroup::create_with_id(&provider, &id, &server_id, None).unwrap();
+        let channel_id = derive_default_channel_id(&server_id);
+        let group = GhostGroup::create_with_id(&provider, &id, &server_id, &channel_id, None).unwrap();
 
-        let expected = derive_mls_group_id(&server_id);
+        let expected = derive_mls_group_id(&server_id, &channel_id);
         assert_eq!(group.group_id(), expected);
     }
 
@@ -1224,8 +1234,9 @@ mod tests {
         let id_b = Identity::from_seed([0x02; 32]).unwrap();
 
         let server_id = [0x42; 32];
+        let channel_id = derive_default_channel_id(&server_id);
         let mut group_a =
-            GhostGroup::create_with_id(&provider_a, &id_a, &server_id, None).unwrap();
+            GhostGroup::create_with_id(&provider_a, &id_a, &server_id, &channel_id, None).unwrap();
         let kp_b = generate_key_package(&provider_b, &id_b).unwrap();
         let (_commit, welcome) = group_a.add_member(&provider_a, kp_b).unwrap();
         group_a.merge_pending_commit(&provider_a).unwrap();
@@ -1263,8 +1274,9 @@ mod tests {
         let id_b = Identity::from_seed([0x02; 32]).unwrap();
 
         let server_id = [0x42; 32];
+        let channel_id = derive_default_channel_id(&server_id);
         let mut group_a =
-            GhostGroup::create_with_id(&provider_a, &id_a, &server_id, None).unwrap();
+            GhostGroup::create_with_id(&provider_a, &id_a, &server_id, &channel_id, None).unwrap();
         let kp_b = generate_key_package(&provider_b, &id_b).unwrap();
         let (_commit, welcome) = group_a.add_member(&provider_a, kp_b).unwrap();
         group_a.merge_pending_commit(&provider_a).unwrap();
@@ -1458,12 +1470,14 @@ mod tests {
                     name: "general".to_string(),
                     kind: ChannelKind::Text,
                     position: 0,
+                    group_info_bytes: vec![],
                 },
                 InviteChannel {
                     channel_id: [0x55; 32],
                     name: "voice".to_string(),
                     kind: ChannelKind::Voice,
                     position: 1,
+                    group_info_bytes: vec![],
                 },
             ],
             mailbox_id: [0x66; 32],
@@ -1541,6 +1555,7 @@ mod tests {
                 name: "gen".to_string(),
                 kind: ChannelKind::Text,
                 position: 0,
+                group_info_bytes: vec![],
             }],
             mailbox_id: [0x33; 32],
         };
@@ -1599,7 +1614,8 @@ mod tests {
     fn derivation_domain_separation() {
         // All derivation functions must produce different outputs for the same input
         let id = [0xAA; 32];
-        let mls_gid = derive_mls_group_id(&id);
+        let ch = [0xBB; 32];
+        let mls_gid = derive_mls_group_id(&id, &ch);
         let channel = derive_default_channel_id(&id);
         let mailbox = mls_group_mailbox_id(&id);
         let sync_sid = sync_server_id(&id);
@@ -1637,8 +1653,8 @@ mod tests {
                 name: "general".to_string(),
                 kind: ChannelKind::Text,
                 position: 5,
+                group_info_bytes: vec![0xDE, 0xAD, 0xBE, 0xEF],
             }],
-            group_info_bytes: vec![0xDE, 0xAD, 0xBE, 0xEF],
         };
 
         let bytes = payload.to_bytes();
@@ -1655,7 +1671,7 @@ mod tests {
         assert_eq!(decoded.channels[0].channel_id, [0x44; 32]);
         assert_eq!(decoded.channels[0].name, "general");
         assert_eq!(decoded.channels[0].position, 5);
-        assert_eq!(decoded.group_info_bytes, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        assert_eq!(decoded.channels[0].group_info_bytes, vec![0xDE, 0xAD, 0xBE, 0xEF]);
     }
 
     #[test]
@@ -1666,7 +1682,6 @@ mod tests {
             kind: ServerKind::Server,
             members: vec![],
             channels: vec![],
-            group_info_bytes: vec![0xAA; 16],
         };
         let bytes = payload.to_bytes();
         assert!(InvitePayload::from_bytes(&bytes[..bytes.len() - 4]).is_err());
@@ -1680,7 +1695,6 @@ mod tests {
             kind: ServerKind::Server,
             members: vec![],
             channels: vec![],
-            group_info_bytes: vec![0xBB; 8],
         };
         let mut bytes = payload.to_bytes();
         bytes.push(0xFF);
@@ -1720,12 +1734,14 @@ mod tests {
                     name: "general".into(),
                     kind: ChannelKind::Text,
                     position: 0,
+                    group_info_bytes: vec![],
                 },
                 InviteChannel {
                     channel_id: [0xCC; 32],
                     name: "voice".into(),
                     kind: ChannelKind::Voice,
                     position: 1,
+                    group_info_bytes: vec![],
                 },
             ],
         };

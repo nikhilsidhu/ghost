@@ -196,7 +196,7 @@ const MAX_PROVISION_FETCH_ATTEMPTS: usize = 5;
 pub(crate) async fn recover_epoch(
     client: &std::sync::Arc<tokio::sync::Mutex<ghost_core::client::GhostClient>>,
     relay: &std::sync::Arc<tokio::sync::Mutex<ghost_core::relay::RelayClient>>,
-    server_id: &[u8; 32],
+    channel_id: &[u8; 32],
     mailbox_id: &[u8; 32],
     label: &str,
 ) -> Result<bool, String> {
@@ -210,7 +210,7 @@ pub(crate) async fn recover_epoch(
         };
         let commit = {
             let mut c = client.lock().await;
-            match c.recover_via_external_commit(server_id, &server_info) {
+            match c.recover_via_external_commit(channel_id, &server_info) {
                 Ok((commit, _)) => commit,
                 Err(e) => {
                     eprintln!("{label}: external commit failed (attempt {attempt}): {e}");
@@ -227,9 +227,11 @@ pub(crate) async fn recover_epoch(
         };
         if all_ok {
             let c = client.lock().await;
-            if let Ok(gi) = c.export_server_info(server_id) {
-                let r = relay.lock().await;
-                let _ = r.put_server_info(mailbox_id, gi).await;
+            if let Some(sid) = c.server_id_for_mailbox(mailbox_id) {
+                if let Ok(gi) = c.export_server_info(&sid) {
+                    let r = relay.lock().await;
+                    let _ = r.put_server_info(mailbox_id, gi).await;
+                }
             }
             return Ok(true);
         }
@@ -537,35 +539,44 @@ pub async fn kick_member(
     let sid = parse_id(&server_id)?;
     let fp = parse_id(&fingerprint)?;
 
-    let outbound = {
+    let outbounds = {
         let mut client = state.client.lock().await;
         client.kick_member(&sid, &fp).map_err(|e| e.to_string())?
     };
 
-    // Post commit via HTTP (not WebSocket) so we detect epoch conflicts
-    let post_result = {
-        let relay = state.relay.lock().await;
-        relay.post_blob(&outbound.mailbox_id, outbound.blob).await
-    };
-    match post_result {
-        Ok(_) => {
-            let mut client = state.client.lock().await;
-            let _ = client.merge_pending_commit_for_server(&sid);
-            let _ = client.store().remove_member(&sid, &fp);
-            if let Ok(gi) = client.export_server_info(&sid) {
-                let relay = state.relay.lock().await;
-                let _ = relay.put_server_info(&outbound.mailbox_id, gi).await;
+    // Post commits via HTTP for each channel group the member was in
+    let mut all_ok = true;
+    for out in &outbounds {
+        let post_result = {
+            let relay = state.relay.lock().await;
+            relay.post_blob(&out.mailbox_id, out.blob.clone()).await
+        };
+        match post_result {
+            Ok(_) => {
+                let mut client = state.client.lock().await;
+                let _ = client.merge_pending_commit_for_channel(&out.channel_id);
             }
-            drop(client);
-            let _ = app.emit("sync", hex::encode(sid));
+            Err(e) => {
+                eprintln!("kick: relay rejected commit for channel {}: {e}", hex::encode(&out.channel_id[..8]));
+                let mut client = state.client.lock().await;
+                let _ = client.clear_pending_commit_for_channel(&out.channel_id);
+                all_ok = false;
+            }
         }
-        Err(e) => {
-            eprintln!("kick: relay rejected commit: {e}, clearing pending commit");
-            let mut client = state.client.lock().await;
-            let _ = client.clear_pending_commit_for_server(&sid);
-            drop(client);
-            return Err("epoch conflict — please try again".into());
+    }
+    if all_ok {
+        let mut client = state.client.lock().await;
+        let _ = client.store().remove_member(&sid, &fp);
+        if let Ok(gi) = client.export_server_info(&sid) {
+            if let Some(mb) = client.mailbox_id_for_server(&sid) {
+                let relay = state.relay.lock().await;
+                let _ = relay.put_server_info(&mb, gi).await;
+            }
         }
+        drop(client);
+        let _ = app.emit("sync", hex::encode(sid));
+    } else {
+        return Err("epoch conflict on one or more channels — please try again".into());
     }
 
     Ok(())
@@ -661,29 +672,39 @@ pub async fn join_by_invite(
         .await
         .map_err(|e| format!("read invite body: {e}"))?;
 
-    let (server_id, commit, mailbox_id) = {
+    let (server_id, channel_results) = {
         let mut client = state.client.lock().await;
         client
             .join_by_invite(&payload_bytes, now_millis())
             .map_err(|e| e.to_string())?
     };
 
-    // Broadcast the external commit so existing members see us
-    let mailbox_b64 =
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mailbox_id);
+    // Broadcast the external commit for each channel group
     #[derive(serde::Deserialize)]
     struct PostBlobResp { seq: u64 }
-    let box_path = format!("/box/{}", mailbox_b64);
-    let resp = sign_request(&state, "POST", &box_path, state.http
-        .post(format!("{}{}", relay_url, box_path))
-        .body(commit))
-        .send()
-        .await
-        .map_err(|e| format!("broadcast commit: {e}"))?
-        .error_for_status()
-        .map_err(|e| format!("broadcast commit: {e}"))?;
-    let commit_seq = resp.json::<PostBlobResp>().await
-        .map(|r| r.seq).unwrap_or(0);
+    // Use the first (default) channel's mailbox for subscribe and announce
+    let default_mailbox_id = channel_results.first()
+        .map(|(_, _, mb)| *mb)
+        .ok_or_else(|| "no channel groups created".to_string())?;
+    let mut last_commit_seq = 0u64;
+    for (_ch_id, commit, mailbox_id) in &channel_results {
+        let mailbox_b64 =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mailbox_id);
+        let box_path = format!("/box/{}", mailbox_b64);
+        let resp = sign_request(&state, "POST", &box_path, state.http
+            .post(format!("{}{}", relay_url, box_path))
+            .body(commit.clone()))
+            .send()
+            .await
+            .map_err(|e| format!("broadcast commit: {e}"))?
+            .error_for_status()
+            .map_err(|e| format!("broadcast commit: {e}"))?;
+        let commit_seq = resp.json::<PostBlobResp>().await
+            .map(|r| r.seq).unwrap_or(0);
+        if *mailbox_id == default_mailbox_id {
+            last_commit_seq = commit_seq;
+        }
+    }
 
     // Refresh the invite payload with fresh GroupInfo for the next joiner
     let updated_payload = {
@@ -709,7 +730,7 @@ pub async fn join_by_invite(
     // Subscribe from the commit seq so we don't replay stale messages
     let announce = {
         let mut client = state.client.lock().await;
-        let _ = client.store().set_last_seen_seq(&mailbox_id, commit_seq);
+        let _ = client.store().set_last_seen_seq(&default_mailbox_id, last_commit_seq);
         let name = client.identity().display_name.clone();
         match client.send_control(&server_id, encode_member_announce(&name)) {
             Ok(out) => Some(out),
@@ -721,7 +742,7 @@ pub async fn join_by_invite(
     };
     {
         let mut relay = state.relay.lock().await;
-        relay.subscribe(mailbox_id, commit_seq);
+        relay.subscribe(default_mailbox_id, last_commit_seq);
         if let Some(outbound) = announce {
             let _ = relay.send(&outbound.mailbox_id, outbound.blob).await;
         }
@@ -1419,12 +1440,6 @@ pub async fn revoke_device(
         client.revoke_device_leaves(&target_key)
     };
     for out in outbound {
-        let server_id = {
-            let c = state.client.lock().await;
-            c.server_id_for_mailbox(&out.mailbox_id)
-        };
-        let Some(sid) = server_id else { continue };
-
         let post_result = {
             let relay = state.relay.lock().await;
             relay.post_blob(&out.mailbox_id, out.blob).await
@@ -1432,29 +1447,31 @@ pub async fn revoke_device(
         match post_result {
             Ok(_) => {
                 let mut client = state.client.lock().await;
-                let _ = client.merge_pending_commit_for_server(&sid);
-                if let Ok(gi) = client.export_server_info(&sid) {
-                    let relay = state.relay.lock().await;
-                    let _ = relay.put_server_info(&out.mailbox_id, gi).await;
+                let _ = client.merge_pending_commit_for_channel(&out.channel_id);
+                if let Some(sid) = client.server_id_for_mailbox(&out.mailbox_id) {
+                    if let Ok(gi) = client.export_server_info(&sid) {
+                        let relay = state.relay.lock().await;
+                        let _ = relay.put_server_info(&out.mailbox_id, gi).await;
+                    }
                 }
             }
             Err(e) => {
-                eprintln!("revoke: relay rejected commit for {}: {e}, retrying", hex::encode(&sid[..8]));
+                eprintln!("revoke: relay rejected commit for channel {}: {e}, retrying", hex::encode(&out.channel_id[..8]));
                 {
                     let mut client = state.client.lock().await;
-                    let _ = client.clear_pending_commit_for_server(&sid);
+                    let _ = client.clear_pending_commit_for_channel(&out.channel_id);
                 }
 
                 // Retry: recover epoch then re-create and post removal commit
-                match recover_epoch(&state.client, &state.relay, &sid, &out.mailbox_id, "revoke-retry").await {
+                match recover_epoch(&state.client, &state.relay, &out.channel_id, &out.mailbox_id, "revoke-retry").await {
                     Ok(true) => {
                         let retry_blob = {
                             let mut client = state.client.lock().await;
-                            let leaf_indices: Vec<_> = client.find_device_leaves(&sid, &target_key);
+                            let leaf_indices: Vec<_> = client.find_device_leaves(&out.channel_id, &target_key);
                             if leaf_indices.is_empty() {
                                 continue;
                             }
-                            match client.remove_server_members(&sid, &leaf_indices) {
+                            match client.remove_channel_members(&out.channel_id, &leaf_indices) {
                                 Ok(blob) => blob,
                                 Err(e) => {
                                     eprintln!("revoke: retry remove_members failed: {e}");
@@ -1469,21 +1486,23 @@ pub async fn revoke_device(
                         match post_result {
                             Ok(_) => {
                                 let mut client = state.client.lock().await;
-                                let _ = client.merge_pending_commit_for_server(&sid);
-                                if let Ok(gi) = client.export_server_info(&sid) {
-                                    let relay = state.relay.lock().await;
-                                    let _ = relay.put_server_info(&out.mailbox_id, gi).await;
+                                let _ = client.merge_pending_commit_for_channel(&out.channel_id);
+                                if let Some(sid) = client.server_id_for_mailbox(&out.mailbox_id) {
+                                    if let Ok(gi) = client.export_server_info(&sid) {
+                                        let relay = state.relay.lock().await;
+                                        let _ = relay.put_server_info(&out.mailbox_id, gi).await;
+                                    }
                                 }
                             }
                             Err(e2) => {
-                                eprintln!("revoke: retry also failed for {}: {e2}", hex::encode(&sid[..8]));
+                                eprintln!("revoke: retry also failed for channel {}: {e2}", hex::encode(&out.channel_id[..8]));
                                 let mut client = state.client.lock().await;
-                                let _ = client.clear_pending_commit_for_server(&sid);
+                                let _ = client.clear_pending_commit_for_channel(&out.channel_id);
                             }
                         }
                     }
                     Ok(false) | Err(_) => {
-                        eprintln!("revoke: epoch recovery failed for {}", hex::encode(&sid[..8]));
+                        eprintln!("revoke: epoch recovery failed for channel {}", hex::encode(&out.channel_id[..8]));
                     }
                 }
             }
@@ -1558,38 +1577,45 @@ async fn rejoin_server(
         };
 
         match result {
-            Ok((commit, mailbox_id)) => {
-                let commit_seq;
-                let box_path = format!("/box/{}", mailbox_b64);
-                let resp = sign_request(state, "POST", &box_path, state.http
-                    .post(format!("{}{}", relay_url, box_path))
-                    .body(commit))
-                    .send()
-                    .await;
-                match resp {
-                    Ok(r) if r.status().is_success() => {
-                        commit_seq = r.json::<serde_json::Value>().await
-                            .ok()
-                            .and_then(|v| v["seq"].as_u64())
-                            .unwrap_or(0);
+            Ok(channel_results) => {
+                // Post commits for all channel groups
+                let mut last_commit_seq = 0u64;
+                for (_ch_id, commit, mailbox_id) in &channel_results {
+                    let box_b64 = base64::Engine::encode(
+                        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                        mailbox_id,
+                    );
+                    let box_path = format!("/box/{}", box_b64);
+                    let resp = sign_request(state, "POST", &box_path, state.http
+                        .post(format!("{}{}", relay_url, box_path))
+                        .body(commit.clone()))
+                        .send()
+                        .await;
+                    let commit_seq = match resp {
+                        Ok(r) if r.status().is_success() => {
+                            r.json::<serde_json::Value>().await
+                                .ok()
+                                .and_then(|v| v["seq"].as_u64())
+                                .unwrap_or(0)
+                        }
+                        Ok(r) => {
+                            eprintln!("{label}: relay rejected commit (status {})", r.status());
+                            continue;
+                        }
+                        Err(e) => {
+                            eprintln!("{label}: failed to post commit: {e}");
+                            continue;
+                        }
+                    };
+                    {
+                        let client = state.client.lock().await;
+                        let _ = client.store().set_last_seen_seq(mailbox_id, commit_seq);
                     }
-                    Ok(r) => {
-                        eprintln!("{label}: relay rejected commit (status {})", r.status());
-                        continue;
+                    {
+                        let mut relay = state.relay.lock().await;
+                        relay.subscribe(*mailbox_id, commit_seq);
                     }
-                    Err(e) => {
-                        eprintln!("{label}: failed to post commit: {e}");
-                        continue;
-                    }
-                }
-
-                {
-                    let client = state.client.lock().await;
-                    let _ = client.store().set_last_seen_seq(&mailbox_id, commit_seq);
-                }
-                {
-                    let mut relay = state.relay.lock().await;
-                    relay.subscribe(mailbox_id, commit_seq);
+                    last_commit_seq = commit_seq;
                 }
 
                 // Upload GroupInfo so future joiners see the updated epoch

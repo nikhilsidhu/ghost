@@ -55,9 +55,12 @@ pub struct GhostClient {
     identity: Identity,
     provider: GhostProvider,
     store: GhostStore,
-    servers: HashMap<[u8; 32], GhostGroup>,
-    /// mailbox_id → server_id for O(1) reverse lookup
+    /// Per-channel MLS groups: channel_id → GhostGroup
+    channel_groups: HashMap<[u8; 32], GhostGroup>,
+    /// mailbox_id → channel_id for O(1) reverse lookup
     mailbox_map: HashMap<[u8; 32], [u8; 32]>,
+    /// channel_id → server_id for reverse lookup
+    channel_server: HashMap<[u8; 32], [u8; 32]>,
     /// MLS self-group for cross-device sync (separate from server groups)
     sync_group: Option<GhostGroup>,
     /// Relay's Ed25519 verifying key for ExternalSendersExtension
@@ -73,29 +76,34 @@ impl GhostClient {
         let mls_conn = open_mls_connection(&mls_db_key, db_path)?;
         let provider = GhostProvider::new(mls_conn)?;
 
-        // Reload MLS groups that were persisted from previous sessions.
-        // Clean up orphan server records whose MLS group is missing
-        // (crash between MLS write and app-DB write during join/leave).
-        let mut servers = HashMap::new();
+        // Reload per-channel MLS groups from previous sessions.
+        // Clean up orphan server records whose channels have no loadable MLS groups.
+        let mut channel_groups = HashMap::new();
+        let mut mailbox_map = HashMap::new();
+        let mut channel_server = HashMap::new();
         if let Ok(stored_servers) = store.list_servers() {
             for s in &stored_servers {
-                if let Ok(Some(ghost_group)) =
-                    GhostGroup::load(&provider, &identity, &s.server_id)
-                {
-                    servers.insert(s.server_id, ghost_group);
-                } else {
+                let channels = store.list_channels(&s.server_id).unwrap_or_default();
+                let mut has_any_group = false;
+                for ch in &channels {
+                    if let Ok(Some(group)) =
+                        GhostGroup::load(&provider, &identity, &s.server_id, &ch.channel_id)
+                    {
+                        let mb = mls_group_mailbox_id(group.group_id());
+                        mailbox_map.insert(mb, ch.channel_id);
+                        channel_server.insert(ch.channel_id, s.server_id);
+                        channel_groups.insert(ch.channel_id, group);
+                        has_any_group = true;
+                    }
+                }
+                if !has_any_group {
                     let _ = store.delete_server(&s.server_id);
                 }
             }
         }
 
-        let mailbox_map = servers
-            .iter()
-            .map(|(sid, g)| (mls_group_mailbox_id(g.group_id()), *sid))
-            .collect();
-
-        let sid = sync_server_id(&identity.fingerprint);
-        let sync_group = GhostGroup::load(&provider, &identity, &sid)
+        let sync_sid = sync_server_id(&identity.fingerprint);
+        let sync_group = GhostGroup::load_by_group_id(&provider, &identity, &sync_sid)
             .ok()
             .flatten();
 
@@ -103,8 +111,9 @@ impl GhostClient {
             identity,
             provider,
             store,
-            servers,
+            channel_groups,
             mailbox_map,
+            channel_server,
             sync_group,
             relay_vk: None,
             idlog_cache: IdLogCache::new(),
@@ -118,12 +127,29 @@ impl GhostClient {
             identity,
             provider,
             store,
-            servers: HashMap::new(),
+            channel_groups: HashMap::new(),
             mailbox_map: HashMap::new(),
+            channel_server: HashMap::new(),
             sync_group: None,
             relay_vk: None,
             idlog_cache: IdLogCache::new(),
         })
+    }
+
+    /// Get the default channel's MLS group for a server (for server-wide operations).
+    fn default_group(&self, server_id: &[u8; 32]) -> Result<&GhostGroup> {
+        let ch = derive_default_channel_id(server_id);
+        self.channel_groups.get(&ch).ok_or_else(|| {
+            GhostError::ServerNotLoaded(hex::encode(&server_id[..8]))
+        })
+    }
+
+    /// Get all channel_ids belonging to a server.
+    fn server_channel_ids(&self, server_id: &[u8; 32]) -> Vec<[u8; 32]> {
+        self.channel_server.iter()
+            .filter(|(_, sid)| *sid == server_id)
+            .map(|(cid, _)| *cid)
+            .collect()
     }
 
     /// Set the relay's verifying key for ExternalSendersExtension in new groups.
@@ -273,7 +299,8 @@ impl GhostClient {
     /// Update own display name in identity and all server member records.
     pub fn set_display_name(&mut self, name: String) {
         let fp = self.identity.fingerprint;
-        for server_id in self.servers.keys() {
+        let server_ids: Vec<[u8; 32]> = self.channel_server.values().copied().collect::<std::collections::HashSet<_>>().into_iter().collect();
+        for server_id in &server_ids {
             let _ = self.store.update_member_name(server_id, &fp, &name);
         }
         self.identity.display_name = name;
@@ -324,7 +351,7 @@ impl GhostClient {
 
     pub fn create_sync_group(&mut self) -> Result<()> {
         let sid = sync_server_id(&self.identity.fingerprint);
-        let group = GhostGroup::create_with_id(&self.provider, &self.identity, &sid, self.relay_vk.as_ref())?;
+        let group = GhostGroup::create_with_raw_id(&self.provider, &self.identity, &sid, self.relay_vk.as_ref())?;
         self.sync_group = Some(group);
         Ok(())
     }
@@ -350,7 +377,7 @@ impl GhostClient {
         blob.extend_from_slice(&header);
         blob.extend_from_slice(&mls_bytes);
         let mailbox_id = mls_group_mailbox_id(group.group_id());
-        Ok(Outbound { mailbox_id, blob })
+        Ok(Outbound { channel_id: [0u8; 32], mailbox_id, blob })
     }
 
     /// Decrypt an inbound sync blob (envelope-wrapped MLS ciphertext).
@@ -419,13 +446,11 @@ impl GhostClient {
 
     /// Export server metadata for provisioning a sibling device (no role check).
     pub fn export_provision_payload(&self, server_id: &[u8; 32]) -> Result<ProvisionPayload> {
-        let group = self.servers.get(server_id).ok_or_else(|| {
-            GhostError::ServerNotLoaded(hex::encode(&server_id[..8]))
-        })?;
+        let default_group = self.default_group(server_id)?;
         let meta = self.store.get_server(server_id)?;
         let members = self.store.list_members(server_id)?;
         let channels = self.store.list_channels(server_id)?;
-        let mailbox_id = mls_group_mailbox_id(group.group_id());
+        let mailbox_id = mls_group_mailbox_id(default_group.group_id());
 
         Ok(ProvisionPayload {
             server_id: *server_id,
@@ -446,6 +471,7 @@ impl GhostClient {
                     name: c.name.clone(),
                     kind: c.kind,
                     position: c.position,
+                    group_info_bytes: Vec::new(),
                 })
                 .collect(),
             mailbox_id,
@@ -454,12 +480,10 @@ impl GhostClient {
 
     /// Export lightweight server metadata for sync_state (no members).
     pub fn export_server_meta(&self, server_id: &[u8; 32]) -> Result<SyncServerMeta> {
-        let group = self.servers.get(server_id).ok_or_else(|| {
-            GhostError::ServerNotLoaded(hex::encode(&server_id[..8]))
-        })?;
+        let default_group = self.default_group(server_id)?;
         let meta = self.store.get_server(server_id)?;
         let channels = self.store.list_channels(server_id)?;
-        let mailbox_id = mls_group_mailbox_id(group.group_id());
+        let mailbox_id = mls_group_mailbox_id(default_group.group_id());
 
         Ok(SyncServerMeta {
             server_name: meta.name,
@@ -472,6 +496,7 @@ impl GhostClient {
                     name: c.name.clone(),
                     kind: c.kind,
                     position: c.position,
+                    group_info_bytes: Vec::new(),
                 })
                 .collect(),
         })
@@ -479,23 +504,18 @@ impl GhostClient {
 
     /// Core join logic: external commit → persist metadata → register.
     /// `idempotent`: true uses `_if_not_exists` inserts (provision/sync), false uses strict inserts (invite).
+    /// Join a server by joining each channel's MLS group.
+    /// Returns Vec of (channel_id, commit_bytes, mailbox_id) — one per channel.
     fn join_server_common(
         &mut self,
         server_id: [u8; 32],
         server_name: String,
         kind: ServerKind,
-        group_info_bytes: &[u8],
         members: &[InviteMember],
         channels: &[InviteChannel],
         timestamp: u64,
         idempotent: bool,
-    ) -> Result<(Vec<u8>, [u8; 32])> {
-        let (ghost_group, commit_bytes) = GhostGroup::join_by_external_commit(
-            &self.provider,
-            &self.identity,
-            group_info_bytes,
-        )?;
-
+    ) -> Result<Vec<([u8; 32], Vec<u8>, [u8; 32])>> {
         let creator_fp = members
             .iter()
             .find(|m| m.role == MemberRole::Creator)
@@ -532,22 +552,43 @@ impl GhostClient {
         if idempotent { self.store.insert_member_if_not_exists(&self_member)?; }
         else { self.store.insert_member(&self_member)?; }
 
-        let mailbox_id = mls_group_mailbox_id(ghost_group.group_id());
-        self.servers.insert(server_id, ghost_group);
-        self.mailbox_map.insert(mailbox_id, server_id);
-        Ok((commit_bytes, mailbox_id))
+        let mut results = Vec::with_capacity(channels.len());
+        for ch in channels {
+            let (ghost_group, commit_bytes) = GhostGroup::join_by_external_commit(
+                &self.provider,
+                &self.identity,
+                &ch.group_info_bytes,
+            )?;
+            let mailbox_id = mls_group_mailbox_id(ghost_group.group_id());
+            self.channel_groups.insert(ch.channel_id, ghost_group);
+            self.mailbox_map.insert(mailbox_id, ch.channel_id);
+            self.channel_server.insert(ch.channel_id, server_id);
+            results.push((ch.channel_id, commit_bytes, mailbox_id));
+        }
+        Ok(results)
     }
 
-    /// Join a server from a provision payload + fresh GroupInfo (handles duplicates).
+    /// Join a server from a provision payload (handles duplicates).
+    /// Returns Vec of (channel_id, commit_bytes, mailbox_id) for each channel.
     pub fn join_from_provision(
         &mut self,
         payload: &ProvisionPayload,
         group_info_bytes: &[u8],
         timestamp: u64,
-    ) -> Result<(Vec<u8>, [u8; 32])> {
+    ) -> Result<Vec<([u8; 32], Vec<u8>, [u8; 32])>> {
+        // Provision payloads carry channel metadata but the GroupInfo comes
+        // separately (fetched from the relay's server_info endpoint).
+        // Inject it into the default channel's group_info_bytes.
+        let mut channels = payload.channels.clone();
+        let default_ch = derive_default_channel_id(&payload.server_id);
+        for ch in &mut channels {
+            if ch.channel_id == default_ch {
+                ch.group_info_bytes = group_info_bytes.to_vec();
+            }
+        }
         self.join_server_common(
             payload.server_id, payload.server_name.clone(), payload.kind,
-            group_info_bytes, &payload.members, &payload.channels, timestamp, true,
+            &payload.members, &channels, timestamp, true,
         )
     }
 
@@ -559,8 +600,14 @@ impl GhostClient {
         let mut server_id = [0u8; 32];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut server_id);
 
+        let channel_name = match kind {
+            ServerKind::Dm | ServerKind::Group => "messages",
+            ServerKind::Server => "general",
+        };
+        let channel_id = derive_default_channel_id(&server_id);
+
         let ghost_group =
-            GhostGroup::create_with_id(&self.provider, &self.identity, &server_id, self.relay_vk.as_ref())?;
+            GhostGroup::create_with_id(&self.provider, &self.identity, &server_id, &channel_id, self.relay_vk.as_ref())?;
 
         self.store.insert_server(&Server {
             server_id,
@@ -570,11 +617,6 @@ impl GhostClient {
             created_at: timestamp,
         })?;
 
-        let channel_name = match kind {
-            ServerKind::Dm | ServerKind::Group => "messages",
-            ServerKind::Server => "general",
-        };
-        let channel_id = derive_default_channel_id(&server_id);
         self.store.insert_channel(&Channel {
             channel_id,
             server_id,
@@ -594,8 +636,9 @@ impl GhostClient {
         })?;
 
         let mailbox_id = mls_group_mailbox_id(ghost_group.group_id());
-        self.servers.insert(server_id, ghost_group);
-        self.mailbox_map.insert(mailbox_id, server_id);
+        self.channel_groups.insert(channel_id, ghost_group);
+        self.mailbox_map.insert(mailbox_id, channel_id);
+        self.channel_server.insert(channel_id, server_id);
         Ok(server_id)
     }
 
@@ -614,19 +657,25 @@ impl GhostClient {
 
         let mut results = Vec::new();
         for server in &servers {
-            // Only migrate groups we created
             if server.creator_fp != self.identity.fingerprint {
                 continue;
             }
-            let group = match self.servers.get_mut(&server.server_id) {
-                Some(g) => g,
-                None => continue,
-            };
-            if group.has_external_senders() {
-                continue;
-            }
-            if let Ok(commit) = group.add_external_sender_extension(&self.provider, &relay_vk) {
-                results.push((server.server_id, commit));
+            let channel_ids: Vec<[u8; 32]> = self.channel_server.iter()
+                .filter(|(_, sid)| **sid == server.server_id)
+                .map(|(cid, _)| *cid)
+                .collect();
+            for cid in channel_ids {
+                let group = match self.channel_groups.get_mut(&cid) {
+                    Some(g) => g,
+                    None => continue,
+                };
+                if group.has_external_senders() {
+                    continue;
+                }
+                if let Ok(commit) = group.add_external_sender_extension(&self.provider, &relay_vk) {
+                    let mailbox_id = mls_group_mailbox_id(group.group_id());
+                    results.push((mailbox_id, commit));
+                }
             }
         }
 
@@ -645,14 +694,14 @@ impl GhostClient {
 
     pub fn send_message(
         &mut self,
-        server_id: &[u8; 32],
+        _server_id: &[u8; 32],
         channel_id: &[u8; 32],
         content: Vec<u8>,
         references: Vec<[u8; 32]>,
         timestamp: u64,
     ) -> Result<(Outbound, [u8; 32])> {
-        let group = self.servers.get_mut(server_id).ok_or_else(|| {
-            GhostError::ServerNotLoaded(hex::encode(&server_id[..8]))
+        let group = self.channel_groups.get_mut(channel_id).ok_or_else(|| {
+            GhostError::ServerNotLoaded(format!("channel {}", hex::encode(&channel_id[..8])))
         })?;
 
         let kt_head_hash = self
@@ -691,16 +740,19 @@ impl GhostClient {
             references: msg.references,
         })?;
 
-        Ok((Outbound { mailbox_id, blob }, message_id))
+        Ok((Outbound { channel_id: *channel_id, mailbox_id, blob }, message_id))
     }
 
     /// Send a control message (e.g. channel ops). MLS-encrypted but not stored locally.
+    /// Sent via the default channel's MLS group.
     pub fn send_control(
         &mut self,
         server_id: &[u8; 32],
         content: Vec<u8>,
     ) -> Result<Outbound> {
-        let group = self.servers.get_mut(server_id).ok_or_else(|| {
+        let fingerprint = self.identity.fingerprint;
+        let channel_id = derive_default_channel_id(server_id);
+        let group = self.channel_groups.get_mut(&channel_id).ok_or_else(|| {
             GhostError::ServerNotLoaded(hex::encode(&server_id[..8]))
         })?;
 
@@ -712,7 +764,7 @@ impl GhostClient {
         let msg = ApplicationMessage::new(
             MessageType::Metadata,
             [0u8; 32],
-            self.identity.fingerprint,
+            fingerprint,
             now,
             [0u8; 32],
             vec![],
@@ -721,19 +773,19 @@ impl GhostClient {
 
         let blob = seal(group, &self.provider, &msg)?;
         let mailbox_id = mls_group_mailbox_id(group.group_id());
-        Ok(Outbound { mailbox_id, blob })
+        Ok(Outbound { channel_id, mailbox_id, blob })
     }
 
     /// Decrypt a blob and store the message. Uses relay-stamped arrival time if
     /// provided, otherwise falls back to local clock.
     pub fn receive_blob(
         &mut self,
-        server_id: &[u8; 32],
+        channel_id: &[u8; 32],
         blob: &[u8],
         received_at: Option<u64>,
     ) -> Result<ApplicationMessage> {
-        let group = self.servers.get_mut(server_id).ok_or_else(|| {
-            GhostError::ServerNotLoaded(hex::encode(&server_id[..8]))
+        let group = self.channel_groups.get_mut(channel_id).ok_or_else(|| {
+            GhostError::ServerNotLoaded(format!("channel {}", hex::encode(&channel_id[..8])))
         })?;
 
         let msg = open(group, &self.provider, blob)?;
@@ -768,7 +820,8 @@ impl GhostClient {
         invitee_name: &str,
         timestamp: u64,
     ) -> Result<(Outbound, Vec<u8>)> {
-        let group = self.servers.get_mut(server_id).ok_or_else(|| {
+        let channel_id = derive_default_channel_id(server_id);
+        let group = self.channel_groups.get_mut(&channel_id).ok_or_else(|| {
             GhostError::ServerNotLoaded(hex::encode(&server_id[..8]))
         })?;
 
@@ -789,7 +842,7 @@ impl GhostClient {
             avatar_key: None,
         })?;
 
-        Ok((Outbound { mailbox_id, blob: commit_blob }, welcome_bytes))
+        Ok((Outbound { channel_id, mailbox_id, blob: commit_blob }, welcome_bytes))
     }
 
     pub fn join_server(
@@ -835,20 +888,38 @@ impl GhostClient {
         })?;
 
         let mailbox_id = mls_group_mailbox_id(ghost_group.group_id());
-        self.servers.insert(*server_id, ghost_group);
-        self.mailbox_map.insert(mailbox_id, *server_id);
+        self.channel_groups.insert(channel_id, ghost_group);
+        self.mailbox_map.insert(mailbox_id, channel_id);
+        self.channel_server.insert(channel_id, *server_id);
         Ok(())
     }
 
     fn build_invite_payload(
+        &self,
         server_id: &[u8; 32],
         server_name: &str,
         kind: ServerKind,
         members: &[Member],
         channels: &[Channel],
-        group_info_bytes: Vec<u8>,
-    ) -> InvitePayload {
-        InvitePayload {
+    ) -> Result<InvitePayload> {
+        let invite_channels: Vec<InviteChannel> = channels
+            .iter()
+            .map(|c| {
+                let group = self.channel_groups.get(&c.channel_id).ok_or_else(|| {
+                    GhostError::ServerNotLoaded(format!("channel {}", hex::encode(&c.channel_id[..8])))
+                })?;
+                let gi = group.export_group_info(&self.provider)?;
+                Ok(InviteChannel {
+                    channel_id: c.channel_id,
+                    name: c.name.clone(),
+                    kind: c.kind,
+                    position: c.position,
+                    group_info_bytes: gi,
+                })
+            })
+            .collect::<Result<_>>()?;
+
+        Ok(InvitePayload {
             server_id: *server_id,
             server_name: server_name.to_string(),
             kind,
@@ -860,20 +931,11 @@ impl GhostClient {
                     role: m.role,
                 })
                 .collect(),
-            channels: channels
-                .iter()
-                .map(|c| InviteChannel {
-                    channel_id: c.channel_id,
-                    name: c.name.clone(),
-                    kind: c.kind,
-                    position: c.position,
-                })
-                .collect(),
-            group_info_bytes,
-        }
+            channels: invite_channels,
+        })
     }
 
-    /// Creator exports an invite payload containing GroupInfo + server metadata.
+    /// Creator exports an invite payload with per-channel GroupInfo.
     /// Returns (random_token, serialized_payload).
     pub fn create_invite(&self, server_id: &[u8; 32]) -> Result<(String, Vec<u8>)> {
         let member = self.store.get_member(server_id, &self.identity.fingerprint)?;
@@ -883,16 +945,11 @@ impl GhostClient {
             ));
         }
 
-        let group = self.servers.get(server_id).ok_or_else(|| {
-            GhostError::ServerNotLoaded(hex::encode(&server_id[..8]))
-        })?;
-
-        let group_info_bytes = group.export_group_info(&self.provider)?;
         let meta = self.store.get_server(server_id)?;
         let members = self.store.list_members(server_id)?;
         let channels = self.store.list_channels(server_id)?;
 
-        let payload = Self::build_invite_payload(server_id, &meta.name, meta.kind, &members, &channels, group_info_bytes);
+        let payload = self.build_invite_payload(server_id, &meta.name, meta.kind, &members, &channels)?;
 
         let mut token_bytes = [0u8; 16];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut token_bytes);
@@ -902,51 +959,48 @@ impl GhostClient {
     }
 
     /// Join a server via an invite payload (external commit).
-    /// Returns (server_id, commit_to_broadcast, mailbox_id).
+    /// Join a server via an invite payload (external commit).
+    /// Returns (server_id, Vec<(channel_id, commit_bytes, mailbox_id)>).
     pub fn join_by_invite(
         &mut self,
         payload_bytes: &[u8],
         timestamp: u64,
-    ) -> Result<([u8; 32], Vec<u8>, [u8; 32])> {
+    ) -> Result<([u8; 32], Vec<([u8; 32], Vec<u8>, [u8; 32])>)> {
         let payload = InvitePayload::from_bytes(payload_bytes)?;
-        let (commit, mailbox_id) = self.join_server_common(
+        let channel_results = self.join_server_common(
             payload.server_id, payload.server_name, payload.kind,
-            &payload.group_info_bytes, &payload.members, &payload.channels, timestamp, false,
+            &payload.members, &payload.channels, timestamp, false,
         )?;
-        Ok((payload.server_id, commit, mailbox_id))
+        Ok((payload.server_id, channel_results))
     }
 
     /// Re-export an invite payload with fresh GroupInfo (after joining via external commit).
     pub fn refresh_invite_payload(&self, server_id: &[u8; 32]) -> Result<Vec<u8>> {
-        let group = self.servers.get(server_id).ok_or_else(|| {
-            GhostError::ServerNotLoaded(hex::encode(&server_id[..8]))
-        })?;
-
-        let group_info_bytes = group.export_group_info(&self.provider)?;
         let meta = self.store.get_server(server_id)?;
         let members = self.store.list_members(server_id)?;
         let channels = self.store.list_channels(server_id)?;
 
-        let payload = Self::build_invite_payload(server_id, &meta.name, meta.kind, &members, &channels, group_info_bytes);
+        let payload = self.build_invite_payload(server_id, &meta.name, meta.kind, &members, &channels)?;
         Ok(payload.to_bytes())
     }
 
-    /// Export GroupInfo for a server so other clients can recover via external commit.
+    /// Export GroupInfo for a server's default channel so other clients can recover via external commit.
     pub fn export_server_info(&self, server_id: &[u8; 32]) -> Result<Vec<u8>> {
-        let group = self.servers.get(server_id).ok_or_else(|| {
-            GhostError::ServerNotLoaded(hex::encode(&server_id[..8]))
-        })?;
+        let group = self.default_group(server_id)?;
         group.export_group_info(&self.provider)
     }
 
-    /// Rejoin a server via external commit after falling too far behind.
+    /// Rejoin a channel's MLS group via external commit after falling too far behind.
     /// Deletes old MLS state and creates a fresh session from GroupInfo.
     pub fn recover_via_external_commit(
         &mut self,
-        server_id: &[u8; 32],
+        channel_id: &[u8; 32],
         group_info_bytes: &[u8],
     ) -> Result<(Vec<u8>, [u8; 32])> {
-        if let Some(old_group) = self.servers.remove(server_id) {
+        if let Some(old_group) = self.channel_groups.remove(channel_id) {
+            // Remove old mailbox mapping
+            let old_mb = mls_group_mailbox_id(old_group.group_id());
+            self.mailbox_map.remove(&old_mb);
             let _ = old_group.delete(&self.provider);
         }
 
@@ -957,18 +1011,19 @@ impl GhostClient {
         )?;
 
         let mailbox_id = mls_group_mailbox_id(ghost_group.group_id());
-        self.servers.insert(*server_id, ghost_group);
-        self.mailbox_map.insert(mailbox_id, *server_id);
+        self.channel_groups.insert(*channel_id, ghost_group);
+        self.mailbox_map.insert(mailbox_id, *channel_id);
 
         Ok((commit_bytes, mailbox_id))
     }
 
-    /// Creator-only: remove a member from the MLS group and broadcast the commit.
+    /// Creator-only: remove a member from ALL channel MLS groups in the server.
+    /// Returns one Outbound per channel group where the member was found.
     pub fn kick_member(
         &mut self,
         server_id: &[u8; 32],
         target_fp: &[u8; 32],
-    ) -> Result<Outbound> {
+    ) -> Result<Vec<Outbound>> {
         if target_fp == &self.identity.fingerprint {
             return Err(GhostError::PermissionDenied("cannot kick yourself".into()));
         }
@@ -980,42 +1035,51 @@ impl GhostClient {
             ));
         }
 
-        let group = self.servers.get_mut(server_id).ok_or_else(|| {
-            GhostError::ServerNotLoaded(hex::encode(&server_id[..8]))
-        })?;
+        let channel_ids = self.server_channel_ids(server_id);
+        let mut outbound = Vec::new();
+        let mut found_any = false;
 
-        // Collect ALL leaves matching target — a user may have multiple devices
-        let leaf_indices: Vec<_> = group
-            .members()
-            .filter(|m| {
-                openmls::prelude::BasicCredential::try_from(m.credential.clone())
-                    .ok()
-                    .map(|bc| bc.identity() == target_fp.as_slice())
-                    .unwrap_or(false)
-            })
-            .map(|m| m.index)
-            .collect();
+        for cid in channel_ids {
+            let group = match self.channel_groups.get_mut(&cid) {
+                Some(g) => g,
+                None => continue,
+            };
 
-        if leaf_indices.is_empty() {
-            return Err(GhostError::Mls("member not found in MLS group".into()));
+            let leaf_indices: Vec<_> = group
+                .members()
+                .filter(|m| {
+                    openmls::prelude::BasicCredential::try_from(m.credential.clone())
+                        .ok()
+                        .map(|bc: openmls::prelude::BasicCredential| bc.identity() == target_fp.as_slice())
+                        .unwrap_or(false)
+                })
+                .map(|m| m.index)
+                .collect();
+
+            if leaf_indices.is_empty() {
+                continue;
+            }
+
+            found_any = true;
+            let commit_blob = group.remove_members(&self.provider, &leaf_indices)?;
+            let mailbox_id = mls_group_mailbox_id(group.group_id());
+            outbound.push(Outbound { channel_id: cid, mailbox_id, blob: commit_blob });
         }
 
-        let commit_blob = group.remove_members(&self.provider, &leaf_indices)?;
-        let mailbox_id = mls_group_mailbox_id(group.group_id());
+        if !found_any {
+            return Err(GhostError::Mls("member not found in any channel group".into()));
+        }
 
-        // Store update deferred — caller must merge_pending_commit after relay
-        // confirms, and only then remove the member from the store.
-
-        Ok(Outbound { mailbox_id, blob: commit_blob })
+        Ok(outbound)
     }
 
-    /// Remove a specific device's leaf from all MLS groups by its verifying key.
+    /// Remove a specific device's leaf from all channel MLS groups by its verifying key.
     /// Returns a list of (mailbox_id, commit_blob) to broadcast.
     pub fn revoke_device_leaves(&mut self, device_vk: &[u8; 32]) -> Vec<Outbound> {
-        let server_ids: Vec<[u8; 32]> = self.servers.keys().copied().collect();
+        let channel_ids: Vec<[u8; 32]> = self.channel_groups.keys().copied().collect();
         let mut outbound = Vec::new();
-        for sid in server_ids {
-            let group = match self.servers.get_mut(&sid) {
+        for cid in channel_ids {
+            let group = match self.channel_groups.get_mut(&cid) {
                 Some(g) => g,
                 None => continue,
             };
@@ -1029,47 +1093,59 @@ impl GhostClient {
             }
             if let Ok(commit_blob) = group.remove_members(&self.provider, &leaf_indices) {
                 let mailbox_id = mls_group_mailbox_id(group.group_id());
-                outbound.push(Outbound { mailbox_id, blob: commit_blob });
+                outbound.push(Outbound { channel_id: cid, mailbox_id, blob: commit_blob });
             }
         }
         outbound
     }
 
-    /// Find leaf indices for a device in a server group.
-    pub fn find_device_leaves(&self, server_id: &[u8; 32], device_vk: &[u8; 32]) -> Vec<LeafNodeIndex> {
-        let Some(group) = self.servers.get(server_id) else { return vec![] };
+    /// Find leaf indices for a device in a channel's MLS group.
+    pub fn find_device_leaves(&self, channel_id: &[u8; 32], device_vk: &[u8; 32]) -> Vec<LeafNodeIndex> {
+        let Some(group) = self.channel_groups.get(channel_id) else { return vec![] };
         group.members()
             .filter(|m| m.signature_key.as_slice() == device_vk.as_slice())
             .map(|m| m.index)
             .collect()
     }
 
-    /// Create a remove-members commit for a specific server group.
-    pub fn remove_server_members(
+    /// Create a remove-members commit for a specific channel's MLS group.
+    pub fn remove_channel_members(
         &mut self,
-        server_id: &[u8; 32],
+        channel_id: &[u8; 32],
         members: &[LeafNodeIndex],
     ) -> Result<Vec<u8>> {
-        let group = self.servers.get_mut(server_id).ok_or_else(|| {
-            GhostError::ServerNotLoaded(hex::encode(&server_id[..8]))
+        let group = self.channel_groups.get_mut(channel_id).ok_or_else(|| {
+            GhostError::ServerNotLoaded(format!("channel {}", hex::encode(&channel_id[..8])))
         })?;
         group.remove_members(&self.provider, members)
     }
 
-    /// Merge a pending commit for a server group after the relay accepted it.
-    pub fn merge_pending_commit_for_server(&mut self, server_id: &[u8; 32]) -> Result<()> {
-        let group = self.servers.get_mut(server_id).ok_or_else(|| {
-            GhostError::ServerNotLoaded(hex::encode(&server_id[..8]))
+    /// Merge a pending commit for a channel's MLS group after the relay accepted it.
+    pub fn merge_pending_commit_for_channel(&mut self, channel_id: &[u8; 32]) -> Result<()> {
+        let group = self.channel_groups.get_mut(channel_id).ok_or_else(|| {
+            GhostError::ServerNotLoaded(format!("channel {}", hex::encode(&channel_id[..8])))
         })?;
         group.merge_pending_commit(&self.provider)
     }
 
-    /// Discard a pending commit for a server group after the relay rejected it.
-    pub fn clear_pending_commit_for_server(&mut self, server_id: &[u8; 32]) -> Result<()> {
-        let group = self.servers.get_mut(server_id).ok_or_else(|| {
-            GhostError::ServerNotLoaded(hex::encode(&server_id[..8]))
+    /// Convenience: merge pending commit using server_id (operates on default channel).
+    pub fn merge_pending_commit_for_server(&mut self, server_id: &[u8; 32]) -> Result<()> {
+        let channel_id = derive_default_channel_id(server_id);
+        self.merge_pending_commit_for_channel(&channel_id)
+    }
+
+    /// Discard a pending commit for a channel's MLS group after the relay rejected it.
+    pub fn clear_pending_commit_for_channel(&mut self, channel_id: &[u8; 32]) -> Result<()> {
+        let group = self.channel_groups.get_mut(channel_id).ok_or_else(|| {
+            GhostError::ServerNotLoaded(format!("channel {}", hex::encode(&channel_id[..8])))
         })?;
         group.clear_pending_commit(&self.provider)
+    }
+
+    /// Convenience: clear pending commit using server_id (operates on default channel).
+    pub fn clear_pending_commit_for_server(&mut self, server_id: &[u8; 32]) -> Result<()> {
+        let channel_id = derive_default_channel_id(server_id);
+        self.clear_pending_commit_for_channel(&channel_id)
     }
 
     /// Merge a pending commit for the sync group after the relay accepted it.
@@ -1086,27 +1162,26 @@ impl GhostClient {
         group.clear_pending_commit(&self.provider)
     }
 
-    /// Get the current MLS epoch for a server's group.
-    pub fn voice_epoch(&self, server_id: &[u8; 32]) -> Result<u64> {
-        let group = self.servers.get(server_id).ok_or_else(|| {
-            GhostError::ServerNotLoaded(hex::encode(&server_id[..8]))
+    /// Get the current MLS epoch for a channel's group.
+    pub fn voice_epoch(&self, channel_id: &[u8; 32]) -> Result<u64> {
+        let group = self.channel_groups.get(channel_id).ok_or_else(|| {
+            GhostError::ServerNotLoaded(format!("channel {}", hex::encode(&channel_id[..8])))
         })?;
         Ok(group.epoch())
     }
 
-    /// Derive a per-sender encryption key for voice in this server+channel.
+    /// Derive a per-sender encryption key for voice in this channel.
     /// `voice_salt` is a random value from the sender's presence blob, ensuring
     /// unique keys per voice session even within the same MLS epoch.
     pub fn derive_voice_key(
         &self,
-        server_id: &[u8; 32],
         channel_id: &[u8; 32],
         sender_fp: &[u8; 32],
         device_vk: &[u8; 32],
         voice_salt: &[u8; 32],
     ) -> Result<[u8; 32]> {
-        let group = self.servers.get(server_id).ok_or_else(|| {
-            GhostError::ServerNotLoaded(hex::encode(&server_id[..8]))
+        let group = self.channel_groups.get(channel_id).ok_or_else(|| {
+            GhostError::ServerNotLoaded(format!("channel {}", hex::encode(&channel_id[..8])))
         })?;
         crate::mls::voice::derive_voice_key(group, &self.provider, channel_id, sender_fp, device_vk, voice_salt)
     }
@@ -1114,12 +1189,11 @@ impl GhostClient {
     /// Derive a per-sender presence encryption key for a voice channel.
     pub fn derive_presence_key(
         &self,
-        server_id: &[u8; 32],
         channel_id: &[u8; 32],
         sender_fp: &[u8; 32],
     ) -> Result<[u8; 32]> {
-        let group = self.servers.get(server_id).ok_or_else(|| {
-            GhostError::ServerNotLoaded(hex::encode(&server_id[..8]))
+        let group = self.channel_groups.get(channel_id).ok_or_else(|| {
+            GhostError::ServerNotLoaded(format!("channel {}", hex::encode(&channel_id[..8])))
         })?;
         crate::mls::voice::derive_presence_key(group, &self.provider, channel_id, sender_fp)
     }
@@ -1129,13 +1203,12 @@ impl GhostClient {
     /// for all presence updates within that session.
     pub fn seal_presence_blob(
         &self,
-        server_id: &[u8; 32],
         channel_id: &[u8; 32],
         muted: bool,
         deafened: bool,
         voice_salt: [u8; 32],
     ) -> Result<Vec<u8>> {
-        let key = self.derive_presence_key(server_id, channel_id, &self.identity.fingerprint)?;
+        let key = self.derive_presence_key(channel_id, &self.identity.fingerprint)?;
         let state = crate::mls::voice::PresenceState {
             fingerprint: self.identity.fingerprint,
             muted,
@@ -1146,17 +1219,16 @@ impl GhostClient {
         crate::mls::voice::seal_presence(&key, &state)
     }
 
-    /// Decrypt a presence blob by trial-decrypting with all server members' keys.
+    /// Decrypt a presence blob by trial-decrypting with all channel members' keys.
     pub fn open_presence_blob(
         &self,
-        server_id: &[u8; 32],
         channel_id: &[u8; 32],
         blob: &[u8],
     ) -> Result<crate::mls::voice::PresenceState> {
-        let group = self.servers.get(server_id).ok_or_else(|| {
-            GhostError::ServerNotLoaded(hex::encode(&server_id[..8]))
+        let group = self.channel_groups.get(channel_id).ok_or_else(|| {
+            GhostError::ServerNotLoaded(format!("channel {}", hex::encode(&channel_id[..8])))
         })?;
-        let member_fps = self.mls_member_fingerprints(server_id)?;
+        let member_fps = self.mls_member_fingerprints_for_channel(channel_id)?;
         crate::mls::voice::try_open_presence(&member_fps, group, &self.provider, channel_id, blob)
     }
 
@@ -1169,9 +1241,7 @@ impl GhostClient {
         status_expiry: Option<u64>,
         avatar_hash: Option<[u8; 32]>,
     ) -> Result<Vec<u8>> {
-        let group = self.servers.get(server_id).ok_or_else(|| {
-            GhostError::ServerNotLoaded(hex::encode(&server_id[..8]))
-        })?;
+        let group = self.default_group(server_id)?;
         let key = crate::mls::presence::derive_online_presence_key(
             group, &self.provider, &self.identity.fingerprint,
         )?;
@@ -1186,42 +1256,68 @@ impl GhostClient {
     }
 
     /// Decrypt an online presence blob by trial-decrypting with all server members' keys.
+    /// Uses the default channel's MLS group for server-wide presence.
     pub fn open_online_presence_blob(
         &self,
         server_id: &[u8; 32],
         blob: &[u8],
     ) -> Result<crate::mls::presence::OnlinePresence> {
-        let group = self.servers.get(server_id).ok_or_else(|| {
+        let default_ch = derive_default_channel_id(server_id);
+        let group = self.channel_groups.get(&default_ch).ok_or_else(|| {
             GhostError::ServerNotLoaded(hex::encode(&server_id[..8]))
         })?;
-        let member_fps = self.mls_member_fingerprints(server_id)?;
+        let member_fps = self.mls_member_fingerprints_for_channel(&default_ch)?;
         crate::mls::presence::try_open_online_presence(&member_fps, group, &self.provider, blob)
     }
 
-    /// Returns (server_id, mailbox_id) for every loaded server.
-    pub fn server_mailboxes(&self) -> Vec<([u8; 32], [u8; 32])> {
-        self.servers
+    /// Returns (channel_id, mailbox_id) for every loaded channel group.
+    pub fn channel_mailboxes(&self) -> Vec<([u8; 32], [u8; 32])> {
+        self.channel_groups
             .iter()
-            .map(|(sid, g)| (*sid, mls_group_mailbox_id(g.group_id())))
+            .map(|(cid, g)| (*cid, mls_group_mailbox_id(g.group_id())))
             .collect()
     }
 
-    /// Direct lookup: get mailbox_id for a server.
+    /// Returns (server_id, mailbox_id) for each server's default channel.
+    /// Deduplicated by server_id — one entry per server.
+    pub fn server_mailboxes(&self) -> Vec<([u8; 32], [u8; 32])> {
+        let mut seen = std::collections::HashSet::new();
+        let mut result = Vec::new();
+        for (cid, g) in &self.channel_groups {
+            if let Some(&sid) = self.channel_server.get(cid) {
+                let default_ch = derive_default_channel_id(&sid);
+                if *cid == default_ch && seen.insert(sid) {
+                    result.push((sid, mls_group_mailbox_id(g.group_id())));
+                }
+            }
+        }
+        result
+    }
+
+    /// Direct lookup: get mailbox_id for the default channel of a server.
     pub fn mailbox_id_for_server(&self, server_id: &[u8; 32]) -> Option<[u8; 32]> {
-        self.servers
-            .get(server_id)
+        let ch = derive_default_channel_id(server_id);
+        self.channel_groups
+            .get(&ch)
             .map(|g| mls_group_mailbox_id(g.group_id()))
+    }
+
+    /// Reverse lookup: find channel_id for a given mailbox_id.
+    pub fn channel_id_for_mailbox(&self, mailbox_id: &[u8; 32]) -> Option<[u8; 32]> {
+        self.mailbox_map.get(mailbox_id).copied()
     }
 
     /// Reverse lookup: find server_id for a given mailbox_id.
     pub fn server_id_for_mailbox(&self, mailbox_id: &[u8; 32]) -> Option<[u8; 32]> {
-        self.mailbox_map.get(mailbox_id).copied()
+        self.mailbox_map.get(mailbox_id)
+            .and_then(|cid| self.channel_server.get(cid))
+            .copied()
     }
 
-    /// Extract fingerprints of all MLS group members (from credentials).
-    pub fn mls_member_fingerprints(&self, server_id: &[u8; 32]) -> Result<Vec<[u8; 32]>> {
-        let group = self.servers.get(server_id).ok_or_else(|| {
-            GhostError::ServerNotLoaded(hex::encode(&server_id[..8]))
+    /// Extract fingerprints of all MLS group members from a channel's group.
+    pub fn mls_member_fingerprints_for_channel(&self, channel_id: &[u8; 32]) -> Result<Vec<[u8; 32]>> {
+        let group = self.channel_groups.get(channel_id).ok_or_else(|| {
+            GhostError::ServerNotLoaded(format!("channel {}", hex::encode(&channel_id[..8])))
         })?;
         let mut fps = Vec::new();
         for member in group.members() {
@@ -1234,15 +1330,22 @@ impl GhostClient {
         Ok(fps)
     }
 
+    /// Convenience: extract member fingerprints from a server's default channel group.
+    pub fn mls_member_fingerprints(&self, server_id: &[u8; 32]) -> Result<Vec<[u8; 32]>> {
+        let ch = derive_default_channel_id(server_id);
+        self.mls_member_fingerprints_for_channel(&ch)
+    }
+
     /// Process an inbound blob — could be an app message, a commit, or a self-message.
+    /// Takes channel_id to identify which MLS group to decrypt with.
     pub fn receive_any(
         &mut self,
-        server_id: &[u8; 32],
+        channel_id: &[u8; 32],
         blob: &[u8],
         received_at: Option<u64>,
     ) -> Result<ReceiveResult> {
-        let group = self.servers.get_mut(server_id).ok_or_else(|| {
-            GhostError::ServerNotLoaded(hex::encode(&server_id[..8]))
+        let group = self.channel_groups.get_mut(channel_id).ok_or_else(|| {
+            GhostError::ServerNotLoaded(format!("channel {}", hex::encode(&channel_id[..8])))
         })?;
 
         let inbound = match open_any(group, &self.provider, blob, &self.idlog_cache) {
@@ -1288,16 +1391,16 @@ impl GhostClient {
                 }
             }
             InboundMessage::Commit { removed } => {
-                let group = self.servers.get(server_id).ok_or_else(|| {
-                    GhostError::ServerNotLoaded(hex::encode(&server_id[..8]))
+                let group = self.channel_groups.get(channel_id).ok_or_else(|| {
+                    GhostError::ServerNotLoaded(format!("channel {}", hex::encode(&channel_id[..8])))
                 })?;
 
-                // Check if we were fully kicked (all our leaves removed)
+                // Check if we were fully kicked (all our leaves removed from this channel)
                 if removed.contains(&self.identity.fingerprint) {
                     let still_in = group.members().any(|m| {
                         openmls::prelude::BasicCredential::try_from(m.credential)
                             .ok()
-                            .map(|bc| bc.identity() == self.identity.fingerprint.as_slice())
+                            .map(|bc: openmls::prelude::BasicCredential| bc.identity() == self.identity.fingerprint.as_slice())
                             .unwrap_or(false)
                     });
                     if !still_in {
@@ -1311,7 +1414,7 @@ impl GhostClient {
                     !group.members().any(|m| {
                         openmls::prelude::BasicCredential::try_from(m.credential)
                             .ok()
-                            .map(|bc| bc.identity() == fp.as_slice())
+                            .map(|bc: openmls::prelude::BasicCredential| bc.identity() == fp.as_slice())
                             .unwrap_or(false)
                     })
                 }).collect();
@@ -1328,18 +1431,18 @@ impl GhostClient {
         }
     }
 
-    /// Commit any pending proposals for a server's MLS group.
+    /// Commit any pending proposals for a channel's MLS group.
     /// Used by the group creator to immediately commit relay-generated Remove proposals.
     pub fn commit_pending_proposals(
         &mut self,
-        server_id: &[u8; 32],
+        channel_id: &[u8; 32],
     ) -> Result<Outbound> {
-        let group = self.servers.get_mut(server_id).ok_or_else(|| {
-            GhostError::ServerNotLoaded(hex::encode(&server_id[..8]))
+        let group = self.channel_groups.get_mut(channel_id).ok_or_else(|| {
+            GhostError::ServerNotLoaded(format!("channel {}", hex::encode(&channel_id[..8])))
         })?;
         let commit = group.commit_pending_proposals(&self.provider, &self.idlog_cache)?;
         let mailbox_id = mls_group_mailbox_id(group.group_id());
-        Ok(Outbound { mailbox_id, blob: commit })
+        Ok(Outbound { channel_id: *channel_id, mailbox_id, blob: commit })
     }
 
     /// Check if this client is the creator of a server.
@@ -1483,7 +1586,7 @@ mod tests {
             .send_message(&server_id, &channel_id, b"hello".to_vec(), vec![], 2000)
             .unwrap();
 
-        let received = c2.receive_blob(&server_id, &outbound.blob, None).unwrap();
+        let received = c2.receive_blob(&channel_id, &outbound.blob, None).unwrap();
         assert_eq!(received.content, b"hello");
         assert_eq!(received.sender_fp, *c1.fingerprint());
         assert_eq!(received.message_id, msg_id);
@@ -1515,7 +1618,7 @@ mod tests {
         let (out1, id1) = c1
             .send_message(&server_id, &channel_id, b"from c1".to_vec(), vec![], 2000)
             .unwrap();
-        let recv1 = c2.receive_blob(&server_id, &out1.blob, None).unwrap();
+        let recv1 = c2.receive_blob(&channel_id, &out1.blob, None).unwrap();
         assert_eq!(recv1.content, b"from c1");
         assert_eq!(recv1.sender_fp, *c1.fingerprint());
 
@@ -1523,7 +1626,7 @@ mod tests {
         let (out2, id2) = c2
             .send_message(&server_id, &channel_id, b"from c2".to_vec(), vec![], 3000)
             .unwrap();
-        let recv2 = c1.receive_blob(&server_id, &out2.blob, None).unwrap();
+        let recv2 = c1.receive_blob(&channel_id, &out2.blob, None).unwrap();
         assert_eq!(recv2.content, b"from c2");
         assert_eq!(recv2.sender_fp, *c2.fingerprint());
 
@@ -1562,7 +1665,7 @@ mod tests {
 
         let (_token, payload_bytes) = c1.create_invite(&server_id).unwrap();
 
-        let (joined_server_id, commit, _mailbox_id) =
+        let (joined_server_id, channel_results) =
             c2.join_by_invite(&payload_bytes, 2000).unwrap();
         assert_eq!(joined_server_id, server_id);
 
@@ -1575,8 +1678,9 @@ mod tests {
         let members = c2.store().list_members(&server_id).unwrap();
         assert_eq!(members.len(), 2); // c1 + c2
 
-        // c1 processes the external commit
-        let result = c1.receive_any(&server_id, &commit, Some(2000)).unwrap();
+        // c1 processes the external commit for the default channel
+        let (channel_id, commit, _mailbox_id) = &channel_results[0];
+        let result = c1.receive_any(channel_id, commit, Some(2000)).unwrap();
         assert!(matches!(result, ReceiveResult::CommitProcessed));
 
         // After merging, c1's MLS group should include c2
@@ -1602,6 +1706,6 @@ mod tests {
         // Should include c1 + c2
         assert_eq!(payload.members.len(), 2);
         assert_eq!(payload.server_name, "test");
-        assert!(!payload.group_info_bytes.is_empty());
+        assert!(!payload.channels[0].group_info_bytes.is_empty());
     }
 }

@@ -103,7 +103,7 @@ pub async fn run(
     // and the sync MLS group mailbox if it exists
     let sync_mb = {
         let c = client.lock().await;
-        let mailboxes = c.server_mailboxes();
+        let mailboxes = c.channel_mailboxes();
         let mut r = relay.lock().await;
         for (_, mailbox_id) in &mailboxes {
             let seq = c.store().get_last_seen_seq(mailbox_id).unwrap_or(0);
@@ -480,34 +480,42 @@ async fn handle_sync_application(
                 };
 
                 match result {
-                    Ok((commit, mailbox_id)) => {
-                        let commit_seq = {
-                            let r = relay.lock().await;
-                            match r.post_blob(&mailbox_id, commit).await {
-                                Ok(res) => res.seq,
-                                Err(e) => {
-                                    eprintln!("sync: failed to post commit: {e}");
-                                    continue;
+                    Ok(channel_results) => {
+                        // Post commits for each channel, subscribe to each mailbox
+                        let mut default_mailbox_id = payload.mailbox_id;
+                        let mut default_commit_seq = 0u64;
+                        for (_ch_id, commit, mailbox_id) in &channel_results {
+                            let commit_seq = {
+                                let r = relay.lock().await;
+                                match r.post_blob(mailbox_id, commit.clone()).await {
+                                    Ok(res) => res.seq,
+                                    Err(e) => {
+                                        eprintln!("sync: failed to post commit: {e}");
+                                        continue;
+                                    }
                                 }
+                            };
+                            {
+                                let c = client.lock().await;
+                                let _ = c.store().set_last_seen_seq(mailbox_id, commit_seq);
+                                drop(c);
+                                let mut r = relay.lock().await;
+                                r.subscribe(*mailbox_id, commit_seq);
                             }
-                        };
+                            // Track default channel's mailbox for announce
+                            if channel_results.len() == 1 || _ch_id == &ghost_core::wire::derive_default_channel_id(&payload.server_id) {
+                                default_mailbox_id = *mailbox_id;
+                                default_commit_seq = commit_seq;
+                            }
+                        }
 
                         // Upload fresh GroupInfo
                         {
                             let c = client.lock().await;
                             if let Ok(gi) = c.export_server_info(&payload.server_id) {
                                 let r = relay.lock().await;
-                                let _ = r.put_server_info(&mailbox_id, gi).await;
+                                let _ = r.put_server_info(&default_mailbox_id, gi).await;
                             }
-                        }
-
-                        // Subscribe from the commit seq — skips undecryptable pre-join blobs
-                        {
-                            let c = client.lock().await;
-                            let _ = c.store().set_last_seen_seq(&mailbox_id, commit_seq);
-                            drop(c);
-                            let mut r = relay.lock().await;
-                            r.subscribe(mailbox_id, commit_seq);
                         }
 
                         // Send member announce
@@ -724,13 +732,13 @@ async fn handle_gap(
     relay: &Arc<Mutex<RelayClient>>,
     mailbox_id: &[u8; 32],
 ) {
-    let server_id = {
+    let channel_id = {
         let c = client.lock().await;
-        let Some(sid) = c.server_id_for_mailbox(mailbox_id) else { return };
-        sid
+        let Some(cid) = c.channel_id_for_mailbox(mailbox_id) else { return };
+        cid
     };
 
-    match crate::commands::recover_epoch(client, relay, &server_id, mailbox_id, "gap recovery").await {
+    match crate::commands::recover_epoch(client, relay, &channel_id, mailbox_id, "gap recovery").await {
         Ok(true) => {}
         Ok(false) => eprintln!("gap recovery: failed after attempts"),
         Err(e) => {
@@ -799,7 +807,7 @@ async fn handle_voice_state(
                 let Some(p_b64) = get_json_str(entry, "p") else { continue };
                 let Some(channel_id) = decode_channel_id(ch_b64) else { continue };
                 let Some(blob) = decode_b64_blob(p_b64) else { continue };
-                if let Ok(ps) = c.open_presence_blob(&server_id, &channel_id, &blob) {
+                if let Ok(ps) = c.open_presence_blob(&channel_id, &blob) {
                     voice_members.entry(channel_id).or_default().push(ps);
                     mailbox_channels.entry(*mailbox_id).or_default().insert(channel_id);
                 }
@@ -824,7 +832,7 @@ async fn handle_voice_state(
                 let Some(blob) = decode_b64_blob(p_b64) else { return };
                 let c = client.lock().await;
                 let Some(server_id) = c.server_id_for_mailbox(mailbox_id) else { return };
-                let Ok(ps) = c.open_presence_blob(&server_id, &channel_id, &blob) else { return };
+                let Ok(ps) = c.open_presence_blob(&channel_id, &blob) else { return };
                 drop(c);
 
                 if vs.leave == Some(true) {

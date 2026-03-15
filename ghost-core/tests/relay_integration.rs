@@ -42,7 +42,7 @@ async fn message_metadata_preserved_through_relay() {
     let incoming = recv_blob(&mut events).await;
     let msg = s
         .receiver
-        .receive_blob(&s.server_id, &incoming.payload, Some(incoming.received_at))
+        .receive_blob(&s.channel_id, &incoming.payload, Some(incoming.received_at))
         .unwrap();
 
     // Verify all metadata survived the relay roundtrip
@@ -101,7 +101,7 @@ fn setup_two_clients(sender_seed: [u8; 32], receiver_seed: [u8; 32]) -> TwoClien
         .join_server(&server_id, &welcome_bytes, "test", ServerKind::Server, 1000)
         .unwrap();
 
-    let mls_gid = derive_mls_group_id(&server_id);
+    let mls_gid = derive_mls_group_id(&server_id, &derive_default_channel_id(&server_id));
     let mailbox_id = mls_group_mailbox_id(&mls_gid);
     let channel_id = derive_default_channel_id(&server_id);
 
@@ -152,7 +152,7 @@ async fn multiple_messages_in_order() {
         let incoming = recv_blob(&mut events).await;
         let msg = s
             .receiver
-            .receive_blob(&s.server_id, &incoming.payload, Some(incoming.received_at))
+            .receive_blob(&s.channel_id, &incoming.payload, Some(incoming.received_at))
             .unwrap();
         assert_eq!(&msg.content, expected);
         assert_eq!(msg.sender_fp, *s.sender.fingerprint());
@@ -189,7 +189,7 @@ async fn bidirectional_messaging() {
     let incoming_b = recv_blob(&mut events_b).await;
     let msg_at_b = s
         .receiver
-        .receive_blob(&s.server_id, &incoming_b.payload, Some(incoming_b.received_at))
+        .receive_blob(&s.channel_id, &incoming_b.payload, Some(incoming_b.received_at))
         .unwrap();
     assert_eq!(msg_at_b.content, b"from A");
     assert_eq!(msg_at_b.sender_fp, *s.sender.fingerprint());
@@ -210,7 +210,7 @@ async fn bidirectional_messaging() {
     let incoming_a = recv_blob(&mut events_a).await;
     let msg_at_a = s
         .sender
-        .receive_blob(&s.server_id, &incoming_a.payload, Some(incoming_a.received_at))
+        .receive_blob(&s.channel_id, &incoming_a.payload, Some(incoming_a.received_at))
         .unwrap();
     assert_eq!(msg_at_a.content, b"from B");
     assert_eq!(msg_at_a.sender_fp, *s.receiver.fingerprint());
@@ -257,7 +257,7 @@ async fn self_message_not_echoed_as_new() {
     // receive_any detects self-authored MLS messages and returns Skipped
     let result = s
         .sender
-        .receive_any(&s.server_id, &incoming.payload, Some(incoming.received_at))
+        .receive_any(&s.channel_id, &incoming.payload, Some(incoming.received_at))
         .unwrap();
     assert!(
         matches!(result, ReceiveResult::Skipped),
@@ -335,7 +335,7 @@ async fn invite_with_real_key_package() {
         .unwrap();
 
     // Verify both can exchange encrypted messages through the relay
-    let mls_gid = derive_mls_group_id(&server_id);
+    let mls_gid = derive_mls_group_id(&server_id, &derive_default_channel_id(&server_id));
     let mailbox_id = mls_group_mailbox_id(&mls_gid);
     let channel_id = derive_default_channel_id(&server_id);
 
@@ -361,7 +361,7 @@ async fn invite_with_real_key_package() {
 
     let incoming = recv_blob(&mut join_events).await;
     let msg = joiner
-        .receive_blob(&server_id, &incoming.payload, Some(incoming.received_at))
+        .receive_blob(&channel_id, &incoming.payload, Some(incoming.received_at))
         .unwrap();
     assert_eq!(msg.content, b"welcome aboard");
     assert_eq!(msg.sender_fp, *inviter.fingerprint());
