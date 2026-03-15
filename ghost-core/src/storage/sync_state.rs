@@ -4,9 +4,22 @@ use crate::error::{GhostError, Result};
 
 use super::GhostStore;
 
+/// Max clock skew allowed: 5 minutes in the future.
+const MAX_FUTURE_MS: u64 = 5 * 60 * 1000;
+
+fn clamp_sync_ts(ts: u64) -> u64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    ts.min(now + MAX_FUTURE_MS)
+}
+
 impl GhostStore {
     /// Set a key. Returns true if the row was actually written (ts was newer).
+    /// Timestamps are clamped to now + 5 minutes to prevent poisoning.
     pub fn sync_set(&self, key: &str, value: &[u8], ts: u64) -> Result<bool> {
+        let ts = clamp_sync_ts(ts);
         let rows = self
             .conn
             .execute(
@@ -19,7 +32,9 @@ impl GhostStore {
     }
 
     /// Remove a key (tombstone). Returns true if the row was actually updated.
+    /// Timestamps are clamped to now + 5 minutes to prevent poisoning.
     pub fn sync_remove(&self, key: &str, ts: u64) -> Result<bool> {
+        let ts = clamp_sync_ts(ts);
         let rows = self
             .conn
             .execute(
@@ -73,13 +88,15 @@ impl GhostStore {
     }
 
     /// Bulk import, skipping entries where ts <= existing per key.
+    /// Timestamps are clamped to now + 5 minutes to prevent poisoning.
     pub fn sync_import(&self, entries: &[(String, Option<Vec<u8>>, u64)]) -> Result<()> {
         for (key, value, ts) in entries {
+            let ts = clamp_sync_ts(*ts);
             self.conn
                 .execute(
                     "INSERT INTO sync_state (key, value, ts) VALUES (?1, ?2, ?3)
                      ON CONFLICT(key) DO UPDATE SET value = ?2, ts = ?3 WHERE ts < ?3",
-                    params![key, value.as_deref(), *ts as i64],
+                    params![key, value.as_deref(), ts as i64],
                 )
                 .map_err(|e| GhostError::Database(format!("sync_import: {e}")))?;
         }
