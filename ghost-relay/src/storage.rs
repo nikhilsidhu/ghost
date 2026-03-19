@@ -127,6 +127,11 @@ impl Storage {
                  PRIMARY KEY (mailbox_id, account_fp)
              ) WITHOUT ROWID;
 
+             CREATE TABLE IF NOT EXISTS mailbox_group_map (
+                 mailbox_id BLOB PRIMARY KEY,
+                 group_id BLOB NOT NULL
+             );
+
              CREATE TABLE IF NOT EXISTS relay_keypair (
                  id INTEGER PRIMARY KEY CHECK (id = 1),
                  signing_key BLOB NOT NULL,
@@ -294,7 +299,7 @@ impl Storage {
             .execute(
                 "DELETE FROM log WHERE received_at < ?1
                  AND seq <= (
-                     SELECT ms.next_seq - ?2 - 1
+                     SELECT MAX(ms.next_seq - ?2 - 1, 0)
                      FROM mailbox_state ms
                      WHERE ms.mailbox_id = log.mailbox_id
                  )",
@@ -308,20 +313,35 @@ impl Storage {
     pub fn delete_mailbox(&self, mailbox_id: &[u8; 32]) -> Result<(), RelayError> {
         let conn = self.conn.lock().unwrap();
         let mid = mailbox_id.as_slice();
-        conn.execute("DELETE FROM log WHERE mailbox_id = ?1", params![mid])
+        let tx = conn.unchecked_transaction()
             .map_err(|e| RelayError::Storage(e.to_string()))?;
-        conn.execute("DELETE FROM mailbox_state WHERE mailbox_id = ?1", params![mid])
+
+        // Look up the MLS group_id for this mailbox so we can clean MLS tables
+        let group_id: Option<Vec<u8>> = tx.query_row(
+            "SELECT group_id FROM mailbox_group_map WHERE mailbox_id = ?1",
+            params![mid],
+            |row| row.get(0),
+        ).optional().map_err(|e| RelayError::Storage(e.to_string()))?;
+
+        tx.execute("DELETE FROM log WHERE mailbox_id = ?1", params![mid])
             .map_err(|e| RelayError::Storage(e.to_string()))?;
-        conn.execute("DELETE FROM server_info WHERE mailbox_id = ?1", params![mid])
+        tx.execute("DELETE FROM mailbox_state WHERE mailbox_id = ?1", params![mid])
             .map_err(|e| RelayError::Storage(e.to_string()))?;
-        conn.execute("DELETE FROM mailbox_members WHERE mailbox_id = ?1", params![mid])
+        tx.execute("DELETE FROM server_info WHERE mailbox_id = ?1", params![mid])
             .map_err(|e| RelayError::Storage(e.to_string()))?;
-        conn.execute("DELETE FROM mls_public_group WHERE mailbox_id = ?1", params![mid])
+        tx.execute("DELETE FROM mailbox_members WHERE mailbox_id = ?1", params![mid])
             .map_err(|e| RelayError::Storage(e.to_string()))?;
-        conn.execute("DELETE FROM mls_proposals WHERE mailbox_id = ?1", params![mid])
+        if let Some(gid) = &group_id {
+            tx.execute("DELETE FROM mls_public_group WHERE group_id = ?1", params![gid.as_slice()])
+                .map_err(|e| RelayError::Storage(e.to_string()))?;
+            tx.execute("DELETE FROM mls_proposals WHERE group_id = ?1", params![gid.as_slice()])
+                .map_err(|e| RelayError::Storage(e.to_string()))?;
+        }
+        tx.execute("DELETE FROM mailbox_group_map WHERE mailbox_id = ?1", params![mid])
             .map_err(|e| RelayError::Storage(e.to_string()))?;
-        conn.execute("DELETE FROM avatar WHERE mailbox_id = ?1", params![mid])
+        tx.execute("DELETE FROM avatar WHERE mailbox_id = ?1", params![mid])
             .map_err(|e| RelayError::Storage(e.to_string()))?;
+        tx.commit().map_err(|e| RelayError::Storage(e.to_string()))?;
         Ok(())
     }
 
@@ -787,6 +807,21 @@ impl Storage {
             .map_err(|e| RelayError::Storage(e.to_string()))?;
         }
         tx.commit().map_err(|e| RelayError::Storage(e.to_string()))
+    }
+
+    /// Store the mapping from mailbox_id to MLS group_id for cleanup.
+    pub fn set_mailbox_group_id(
+        &self,
+        mailbox_id: &[u8; 32],
+        group_id: &[u8],
+    ) -> Result<(), RelayError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO mailbox_group_map (mailbox_id, group_id) VALUES (?1, ?2)",
+            params![mailbox_id.as_slice(), group_id],
+        )
+        .map_err(|e| RelayError::Storage(e.to_string()))?;
+        Ok(())
     }
 
     pub fn is_mailbox_member(

@@ -114,7 +114,7 @@ pub struct InboundFrame {
 /// Retains at most 2 epochs so in-flight packets from the old epoch can still decrypt.
 #[derive(Clone)]
 pub struct PeerVoiceKeys {
-    pub fingerprint: [u8; 32],
+    pub _fingerprint: [u8; 32],
     pub keys: HashMap<u64, [u8; 32]>,
 }
 
@@ -122,11 +122,11 @@ impl PeerVoiceKeys {
     pub fn new(fingerprint: [u8; 32], epoch: u64, key: [u8; 32]) -> Self {
         let mut keys = HashMap::new();
         keys.insert(epoch, key);
-        Self { fingerprint, keys }
+        Self { _fingerprint: fingerprint, keys }
     }
 
     /// Add a new epoch key, keeping at most 2 epochs.
-    pub fn add_epoch(&mut self, epoch: u64, key: [u8; 32]) {
+    pub fn _add_epoch(&mut self, epoch: u64, key: [u8; 32]) {
         self.keys.insert(epoch, key);
         // Keep only the 2 most recent epochs
         while self.keys.len() > 2 {

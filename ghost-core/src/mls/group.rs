@@ -315,8 +315,7 @@ impl GhostGroup {
         let member_map: std::collections::HashMap<u32, ([u8; 32], [u8; 32])> = self
             .members()
             .filter_map(|m| {
-                let bc = BasicCredential::try_from(m.credential).ok()?;
-                let fp: [u8; 32] = bc.identity().try_into().ok()?;
+                let fp = super::credential::parse_credential(&m.credential).ok()?.account_fp;
                 let vk: [u8; 32] = m.signature_key.as_slice().try_into().ok()?;
                 Some((m.index.u32(), (fp, vk)))
             })
@@ -335,12 +334,12 @@ impl GhostGroup {
                     if let Proposal::Remove(ref remove) = proposal.proposal() {
                         let leaf_idx = remove.removed().u32();
                         if let Some((account_fp, device_vk)) = member_map.get(&leaf_idx) {
-                            // If cached and device is still active, reject the proposal
-                            if let Ok(true) = idlog_cache.is_active_device(account_fp, device_vk) {
-                                return false;
+                            match idlog_cache.is_active_device(account_fp, device_vk) {
+                                Ok(false) => {} // revoked → accept
+                                _ => return false, // active or not cached → reject
                             }
-                            // Ok(false) = revoked → accept
-                            // Err = not cached → accept (can't verify, degrade gracefully)
+                        } else {
+                            return false; // unknown leaf → reject
                         }
                     }
                 }
@@ -672,7 +671,12 @@ mod tests {
         group_a.merge_pending_commit(&provider_a).unwrap();
 
         let b_leaf: Vec<_> = group_a.members()
-            .filter(|m| m.credential.serialized_content() == id_b.fingerprint.as_slice())
+            .filter(|m| {
+                crate::mls::credential::parse_credential(&m.credential)
+                    .ok()
+                    .map(|pc| pc.account_fp == id_b.fingerprint)
+                    .unwrap_or(false)
+            })
             .map(|m| m.index)
             .collect();
         assert_eq!(b_leaf.len(), 1);

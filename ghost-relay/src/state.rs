@@ -258,12 +258,23 @@ impl Inner {
         Ok(())
     }
 
-    /// Check if account_fp matches the group creator. Returns true if no PublicGroup exists.
+    /// Check if account_fp matches the group creator.
+    /// Returns true if no PublicGroup exists (bootstrap: creator hasn't uploaded commit yet).
     pub async fn is_creator(&self, mailbox_id: &[u8; 32], account_fp: &[u8; 32]) -> bool {
         let groups = self.groups.read().await;
         match groups.get(mailbox_id) {
             Some((_pg, creator_fp)) => *creator_fp == *account_fp,
             None => true,
+        }
+    }
+
+    /// Strict creator check that requires a PublicGroup to exist.
+    /// Use for destructive operations where defaulting to true is dangerous.
+    pub async fn is_creator_strict(&self, mailbox_id: &[u8; 32], account_fp: &[u8; 32]) -> bool {
+        let groups = self.groups.read().await;
+        match groups.get(mailbox_id) {
+            Some((_pg, creator_fp)) => *creator_fp == *account_fp,
+            None => false,
         }
     }
 
@@ -276,7 +287,7 @@ impl Inner {
     }
 
     /// Check commit authorization rules.
-    /// Add/remove require the sender to be the group creator (stored at init time).
+    /// Adds require the sender to be the group creator. Any member can commit removes.
     fn check_commit_authorization(
         &self,
         pg: &PublicGroup,
@@ -285,21 +296,21 @@ impl Inner {
         staged_commit: &StagedCommit,
     ) -> Result<(), RelayError> {
         let has_adds = staged_commit.add_proposals().next().is_some();
-        let has_removes = staged_commit.remove_proposals().next().is_some();
 
         match sender {
             Sender::Member(leaf_index) => {
-                if has_adds || has_removes {
+                if has_adds {
                     let sender_fp = credential_fp(pg, *leaf_index);
                     match sender_fp {
                         Some(s) if s == *creator_fp => {}
                         _ => {
                             return Err(RelayError::Forbidden(
-                                "only group creator can add/remove members".into(),
+                                "only group creator can add members".into(),
                             ));
                         }
                     }
                 }
+                // Any member can commit Remove proposals
             }
             Sender::NewMemberCommit => {
                 // External commit (new device joining) — validated by PublicGroup
@@ -501,6 +512,9 @@ impl Inner {
         let creator_fp = credential_fp(&pg, LeafNodeIndex::new(0))
             .unwrap_or(*mailbox_id); // fallback: shouldn't happen with valid groups
 
+        let group_id_bytes = serde_json::to_vec(pg.group_id())
+            .map_err(|e| RelayError::BadRequest(format!("serialize group_id: {e}")))?;
+        self.storage.set_mailbox_group_id(mailbox_id, &group_id_bytes)?;
         let members = extract_member_fps(&pg);
         self.storage.update_mailbox_members(mailbox_id, &members)?;
         groups.insert(*mailbox_id, (pg, creator_fp));
@@ -534,15 +548,14 @@ fn load_mls_groups(storage: &Storage) -> HashMap<[u8; 32], (PublicGroup, [u8; 32
             Ok(Some(pg)) => {
                 let raw = gid.as_slice();
                 if raw.len() == 32 {
-                    let mut key = [0u8; 32];
-                    key.copy_from_slice(raw);
+                    let mailbox_id = ghost_wire::mls_group_mailbox_id(raw);
                     let creator_fp = credential_fp(&pg, LeafNodeIndex::new(0))
-                        .unwrap_or(key);
+                        .unwrap_or(mailbox_id);
                     let members = extract_member_fps(&pg);
-                    if let Err(e) = storage.update_mailbox_members(&key, &members) {
+                    if let Err(e) = storage.update_mailbox_members(&mailbox_id, &members) {
                         tracing::warn!("failed to update members for loaded group: {e}");
                     }
-                    groups.insert(key, (pg, creator_fp));
+                    groups.insert(mailbox_id, (pg, creator_fp));
                 }
             }
             Ok(None) => {
@@ -556,18 +569,14 @@ fn load_mls_groups(storage: &Storage) -> HashMap<[u8; 32], (PublicGroup, [u8; 32
     groups
 }
 
-/// Extract account fingerprints from a PublicGroup's member credentials.
 /// Extract account fingerprint from a member's credential at the given leaf.
 fn credential_fp(pg: &PublicGroup, leaf: LeafNodeIndex) -> Option<[u8; 32]> {
     for member in pg.members() {
         if member.index == leaf {
-            if let Ok(basic) = BasicCredential::try_from(member.credential.clone()) {
-                let id = basic.identity();
-                if id.len() == 32 {
-                    let mut fp = [0u8; 32];
-                    fp.copy_from_slice(id);
-                    return Some(fp);
-                }
+            let basic = BasicCredential::try_from(member.credential.clone()).ok()?;
+            let id = basic.identity();
+            if id.len() >= 32 {
+                return Some(id[..32].try_into().unwrap());
             }
         }
     }
@@ -579,10 +588,8 @@ pub fn extract_member_fps(pg: &PublicGroup) -> Vec<[u8; 32]> {
     for member in pg.members() {
         if let Ok(basic) = openmls::prelude::BasicCredential::try_from(member.credential.clone()) {
             let id = basic.identity();
-            if id.len() == 32 {
-                let mut fp = [0u8; 32];
-                fp.copy_from_slice(id);
-                fps.push(fp);
+            if id.len() >= 32 {
+                fps.push(id[..32].try_into().unwrap());
             }
         }
     }
@@ -605,7 +612,9 @@ pub fn new_state(config: Config, storage: Storage) -> AppState {
             (Vec::new(), 0)
         });
     let kt_tree = ghost_wire::merkle::MerkleTree::from_frontier(kt_frontier, kt_size);
+    // Recovery blob download: 5 requests per 15-minute sliding window
     let recovery_limiter = RateLimiter::new(5, std::time::Duration::from_secs(15 * 60));
+    // Identity log Recovery entries: 3 per 24-hour sliding window
     let idlog_recovery_limiter = RateLimiter::new(3, std::time::Duration::from_secs(24 * 60 * 60));
     Arc::new(Inner {
         mailboxes: RwLock::new(HashMap::new()),

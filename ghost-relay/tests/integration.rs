@@ -1026,7 +1026,9 @@ async fn auth_rejects_revoked_device() {
     add.signature = dk1.sign(&msg).to_bytes();
     add.counter_signature = Some(dk2.sign(&msg).to_bytes());
     let add_bytes = add.to_bytes();
-    client.put(idlog_url(&base, &fp)).body(add_bytes).send().await.unwrap();
+    let dk1_auth = TestAuth { account_fp: fp, master_key: mk.clone(), device_key: dk1.clone() };
+    let add_url = idlog_url(&base, &fp);
+    dk1_auth.sign("PUT", &add_url, client.put(&add_url).body(add_bytes)).send().await.unwrap();
 
     // Revoke device 2
     let add_hash = ghost_wire::idlog::entry_hash(&add);
@@ -1045,7 +1047,8 @@ async fn auth_rejects_revoked_device() {
     };
     let msg = ghost_wire::idlog::sign_message(&revoke);
     revoke.signature = dk1.sign(&msg).to_bytes();
-    client.put(idlog_url(&base, &fp)).body(revoke.to_bytes()).send().await.unwrap();
+    let revoke_url = idlog_url(&base, &fp);
+    dk1_auth.sign("PUT", &revoke_url, client.put(&revoke_url).body(revoke.to_bytes())).send().await.unwrap();
 
     // Revoked device 2 should be rejected
     let timestamp = std::time::SystemTime::now()
@@ -1331,14 +1334,15 @@ async fn ws_closed_on_device_revocation() {
     let msg = ghost_wire::idlog::sign_message(&add);
     add.signature = dk1.sign(&msg).to_bytes();
     add.counter_signature = Some(dk2.sign(&msg).to_bytes());
-    client.put(idlog_url(&base, &fp)).body(add.to_bytes()).send().await.unwrap();
+    let dk1_auth = TestAuth { account_fp: fp, master_key: mk.clone(), device_key: dk1.clone() };
+    let dk2_auth = TestAuth { account_fp: fp, master_key: mk.clone(), device_key: dk2.clone() };
+    let add_url = idlog_url(&base, &fp);
+    let resp = dk1_auth.sign("PUT", &add_url, client.put(&add_url).body(add.to_bytes())).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
 
     // Connect dk1 to WS
     let mailbox_id = [0xF1; 32];
     let ws_url = format!("{ws_base}/ws/{}", URL_SAFE_NO_PAD.encode(mailbox_id));
-
-    // Build WS auth for dk1
-    let dk1_auth = TestAuth { account_fp: fp, master_key: mk.clone(), device_key: dk1.clone() };
     let mut ws = dk1_auth.ws_connect(&ws_url).await;
     ws_handshake(&mut ws, 0).await;
 
@@ -1359,7 +1363,9 @@ async fn ws_closed_on_device_revocation() {
     };
     let msg = ghost_wire::idlog::sign_message(&revoke);
     revoke.signature = dk2.sign(&msg).to_bytes();
-    client.put(idlog_url(&base, &fp)).body(revoke.to_bytes()).send().await.unwrap();
+    let revoke_url = idlog_url(&base, &fp);
+    let resp = dk2_auth.sign("PUT", &revoke_url, client.put(&revoke_url).body(revoke.to_bytes())).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
 
     // dk1's WS should receive a close frame with code 4001 (may arrive after other messages)
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -1799,7 +1805,7 @@ async fn kt_consistency_proof_valid() {
 
     let client = reqwest::Client::new();
     let url = format!("{}/idlog/{}", base, hex::encode(alice.account_fp));
-    let resp = client.put(&url).body(add_bytes).send().await.unwrap();
+    let resp = alice.sign("PUT", &url, client.put(&url).body(add_bytes)).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
 
     // Tree should now have 2 leaves. Get consistency proof from 1 to 2

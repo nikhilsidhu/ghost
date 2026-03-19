@@ -5,7 +5,7 @@ use axum::Json;
 use ghost_wire::merkle::InclusionProof;
 use serde::{Deserialize, Serialize};
 
-use crate::auth::DeviceAuth;
+
 use crate::error::{RelayError, Result};
 use crate::state::AppState;
 
@@ -13,9 +13,19 @@ use super::decode_account_fp;
 
 const MAX_IDLOG_ENTRY_SIZE: usize = 4096;
 
+/// Byte offset of entry_type in the binary-encoded LogEntry.
+/// Layout: seq(8) + prev_hash(32) + account_fp(32) = 72
+const ENTRY_TYPE_OFFSET: usize = 72;
+const ENTRY_TYPE_GENESIS: u8 = 0x01;
+const ENTRY_TYPE_RECOVERY: u8 = 0x04;
+
 /// PUT /idlog/{account_fp_hex} — append a new identity log entry.
+/// Genesis entries (entry_type 0x01) are self-authenticating; all others require DeviceAuth.
 pub async fn put(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    method: axum::http::Method,
+    uri: axum::http::Uri,
     Path(account_fp_hex): Path<String>,
     body: Bytes,
 ) -> Result<StatusCode> {
@@ -28,8 +38,15 @@ pub async fn put(
         return Err(RelayError::PayloadTooLarge);
     }
 
-    // Rate-limit Recovery entries (entry_type byte at offset 72 = 0x04)
-    if body.len() > 72 && body[72] == 0x04 {
+    let is_genesis = body.len() > ENTRY_TYPE_OFFSET && body[ENTRY_TYPE_OFFSET] == ENTRY_TYPE_GENESIS;
+    if !is_genesis {
+        let auth = crate::auth::validate_auth_headers(&headers, method.as_str(), uri.path(), &state)?;
+        if auth.account_fp != account_fp {
+            return Err(RelayError::Forbidden("account mismatch".into()));
+        }
+    }
+
+    if body.len() > ENTRY_TYPE_OFFSET && body[ENTRY_TYPE_OFFSET] == ENTRY_TYPE_RECOVERY {
         if !state.idlog_recovery_limiter.check(&account_fp) {
             return Err(RelayError::RateLimited);
         }
@@ -82,7 +99,6 @@ mod base64_bytes {
 
 /// GET /idlog/{account_fp_hex}?after_seq=N — fetch identity log entries with KT proofs.
 pub async fn get(
-    _auth: DeviceAuth,
     State(state): State<AppState>,
     Path(account_fp_hex): Path<String>,
     Query(query): Query<IdLogQuery>,

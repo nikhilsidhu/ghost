@@ -10,7 +10,7 @@ use ghost_core::mls::presence::OnlineStatus;
 use ghost_core::mls::voice::PresenceState;
 use ghost_core::relay::{RelayClient, RelayEvent};
 use ghost_core::storage::{Channel, Member, MemberRole};
-use ghost_core::wire::{decode_metadata, ChannelOpPayload, MetadataPayload, ProvisionPayload, SyncMessageType, SyncReceiveResult};
+use ghost_core::wire::{decode_metadata, ChannelOpPayload, MetadataPayload, ProvisionPayload, SyncMessageType, SyncReceiveResult, SyncServerMeta};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 use tokio::sync::{mpsc, Mutex};
@@ -140,6 +140,23 @@ pub async fn run(
         }
     }
 
+    // Cache identity logs for gossip (kt_head_hash) and remove-proposal validation.
+    // No longer required for message processing — credentials are self-validating.
+    {
+        let own_fp = {
+            let c = client.lock().await;
+            *c.fingerprint()
+        };
+        cache_member_idlog(&client, &relay, &own_fp).await;
+        let member_fps = {
+            let c = client.lock().await;
+            c.all_member_fingerprints()
+        };
+        for fp in &member_fps {
+            cache_member_idlog(&client, &relay, fp).await;
+        }
+    }
+
     // Per-channel voice members visible to all mailbox subscribers
     let mut voice_members: HashMap<[u8; 32], Vec<PresenceState>> = HashMap::new();
     // Track which channels belong to which mailbox (so snapshots don't clobber other servers)
@@ -187,19 +204,19 @@ pub async fn run(
 
                 let result = {
                     let mut c = client.lock().await;
-                    match c.server_id_for_mailbox(&mailbox_id) {
-                        Some(sid) => Some((sid, c.receive_any(&sid, &blob.payload, Some(received_at)))),
-                        None => None,
+                    match (c.channel_id_for_mailbox(&mailbox_id), c.server_id_for_mailbox(&mailbox_id)) {
+                        (Some(cid), Some(sid)) => Some((sid, cid, c.receive_any(&cid, &blob.payload, Some(received_at)))),
+                        _ => None,
                     }
                 };
 
                 // Reset consecutive error counter on any successful receive
-                if matches!(&result, Some((_, Ok(_)))) {
+                if matches!(&result, Some((_, _, Ok(_)))) {
                     consecutive_errors.remove(&mailbox_id);
                 }
 
                 match result {
-                    Some((server_id, Ok(ReceiveResult::Message(msg) | ReceiveResult::MessageWithKtWarning(msg)))) if msg.message_type == MessageType::Metadata => {
+                    Some((server_id, _channel_id, Ok(ReceiveResult::Message(msg) | ReceiveResult::MessageWithKtWarning(msg)))) if msg.message_type == MessageType::Metadata => {
                         let mut fetch_avatar = None;
                         let mut own_name_changed = false;
                         match decode_metadata(&msg.content) {
@@ -252,13 +269,13 @@ pub async fn run(
                         }
                         let _ = app.emit("sync", hex::encode(server_id));
                     }
-                    Some((_, Ok(ReceiveResult::Message(msg)))) | Some((_, Ok(ReceiveResult::MessageWithKtWarning(msg)))) => {
+                    Some((_, _, Ok(ReceiveResult::Message(msg)))) | Some((_, _, Ok(ReceiveResult::MessageWithKtWarning(msg)))) => {
                         let dto = MessageDto::from_incoming(&msg, received_at);
                         let _ = app.emit("message", &dto);
                         let c = client.lock().await;
                         let _ = c.store().set_last_seen_seq(&mailbox_id, seq);
                     }
-                    Some((server_id, Ok(ReceiveResult::CommitProcessed))) => {
+                    Some((server_id, _channel_id, Ok(ReceiveResult::CommitProcessed))) => {
                         let mut new_member_fps = Vec::new();
                         {
                             let c = client.lock().await;
@@ -289,7 +306,7 @@ pub async fn run(
                                 let _ = r.put_server_info(&mailbox_id, gi).await;
                             }
                         }
-                        // Cache identity logs for newly discovered members
+                        // Cache identity logs for gossip enrichment (not required for message processing)
                         for fp in &new_member_fps {
                             cache_member_idlog(&client, &relay, fp).await;
                         }
@@ -297,7 +314,7 @@ pub async fn run(
                         retry_pending_presence(&app, &client, &server_id, &mut online_members, &mut pending_presence).await;
                         let _ = app.emit("sync", hex::encode(server_id));
                     }
-                    Some((server_id, Ok(ReceiveResult::Kicked))) => {
+                    Some((server_id, _channel_id, Ok(ReceiveResult::Kicked))) => {
                         use ghost_core::wire::{SyncMessageType, SYNC_KEY_SERVER_PREFIX};
                         let c = client.lock().await;
                         let _ = c.store().set_last_seen_seq(&mailbox_id, seq);
@@ -308,7 +325,7 @@ pub async fn run(
                         crate::sync_utils::push_sync_snapshot(&client, &relay).await;
                         let _ = app.emit("kicked", hex::encode(server_id));
                     }
-                    Some((server_id, Ok(ReceiveResult::MembersRemoved(removed)))) => {
+                    Some((server_id, _channel_id, Ok(ReceiveResult::MembersRemoved(removed)))) => {
                         let c = client.lock().await;
                         let _ = c.store().set_last_seen_seq(&mailbox_id, seq);
                         for fp in &removed {
@@ -323,17 +340,16 @@ pub async fn run(
                         retry_pending_presence(&app, &client, &server_id, &mut online_members, &mut pending_presence).await;
                         let _ = app.emit("sync", hex::encode(server_id));
                     }
-                    Some((server_id, Ok(ReceiveResult::ProposalProcessed))) => {
+                    Some((server_id, channel_id, Ok(ReceiveResult::ProposalProcessed))) => {
                         let c = client.lock().await;
                         let _ = c.store().set_last_seen_seq(&mailbox_id, seq);
-                        let is_creator = c.is_server_creator(&server_id);
                         drop(c);
 
-                        // Only the server creator auto-commits pending proposals
-                        if is_creator {
+                        // Any member can commit Remove proposals; relay enforces add-only-by-creator
+                        {
                             let outbound = {
                                 let mut c = client.lock().await;
-                                c.commit_pending_proposals(&server_id)
+                                c.commit_pending_proposals(&channel_id)
                             };
                             match outbound {
                                 Ok(out) => {
@@ -344,7 +360,7 @@ pub async fn run(
                                     match post_result {
                                         Ok(_) => {
                                             let mut c = client.lock().await;
-                                            let _ = c.merge_pending_commit_for_server(&server_id);
+                                            let _ = c.merge_pending_commit_for_channel(&channel_id);
                                             if let Ok(gi) = c.export_server_info(&server_id) {
                                                 let r = relay.lock().await;
                                                 let _ = r.put_server_info(&mailbox_id, gi).await;
@@ -356,7 +372,7 @@ pub async fn run(
                                         Err(e) => {
                                             eprintln!("relay: failed to post pending commit: {e}");
                                             let mut c = client.lock().await;
-                                            let _ = c.clear_pending_commit_for_server(&server_id);
+                                            let _ = c.clear_pending_commit_for_channel(&channel_id);
                                         }
                                     }
                                 }
@@ -366,11 +382,11 @@ pub async fn run(
                             }
                         }
                     }
-                    Some((_, Ok(ReceiveResult::Skipped))) => {
+                    Some((_, _, Ok(ReceiveResult::Skipped))) => {
                         let c = client.lock().await;
                         let _ = c.store().set_last_seen_seq(&mailbox_id, seq);
                     }
-                    Some((_, Err(e))) => {
+                    Some((_, _, Err(e))) => {
                         eprintln!("relay: receive error seq={seq}: {e}");
                         let c = client.lock().await;
                         let _ = c.store().set_last_seen_seq(&mailbox_id, seq);
@@ -483,7 +499,7 @@ async fn handle_sync_application(
                     Ok(channel_results) => {
                         // Post commits for each channel, subscribe to each mailbox
                         let mut default_mailbox_id = payload.mailbox_id;
-                        let mut default_commit_seq = 0u64;
+                        let mut _default_commit_seq = 0u64;
                         for (_ch_id, commit, mailbox_id) in &channel_results {
                             let commit_seq = {
                                 let r = relay.lock().await;
@@ -505,7 +521,7 @@ async fn handle_sync_application(
                             // Track default channel's mailbox for announce
                             if channel_results.len() == 1 || _ch_id == &ghost_core::wire::derive_default_channel_id(&payload.server_id) {
                                 default_mailbox_id = *mailbox_id;
-                                default_commit_seq = commit_seq;
+                                _default_commit_seq = commit_seq;
                             }
                         }
 
@@ -627,6 +643,10 @@ async fn handle_sync_application(
             crate::sync_utils::apply_sync_side_effects(
                 &settings, app, client, relay, config, config_path, presence, voice_cmd_tx,
             ).await;
+            // Join any servers we learned about that we don't have locally.
+            for (server_id, meta) in &settings.server_entries {
+                join_server_if_unknown(app, client, relay, *server_id, meta).await;
+            }
         }
         x if x == SyncMessageType::SyncKeyRotate as u8 => {
             if body.len() != 32 {
@@ -675,7 +695,13 @@ async fn fetch_and_merge_sync_state(
             let dump_blob = {
                 let c = client.lock().await;
                 let entries = c.sync_dump().unwrap_or_default();
-                encode_sync_state_dump(&entries)
+                match encode_sync_state_dump(&entries) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        eprintln!("encode_sync_state_dump failed: {e}");
+                        return;
+                    }
+                }
             };
             if let Ok(s) = sync_seal(&sync_key, &dump_blob) {
                 let r = relay.lock().await;
@@ -714,17 +740,130 @@ async fn fetch_and_merge_sync_state(
     crate::sync_utils::apply_sync_side_effects(
         &settings, app, client, relay, config, config_path, presence, voice_cmd_tx,
     ).await;
+    // Join servers found in snapshot that we don't have locally.
+    for (server_id, meta) in &settings.server_entries {
+        join_server_if_unknown(app, client, relay, *server_id, meta).await;
+    }
 
     // PUT our merged state back
     let merged_blob = {
         let c = client.lock().await;
         let merged = c.sync_dump().unwrap_or_default();
-        encode_sync_state_dump(&merged)
+        match encode_sync_state_dump(&merged) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("encode_sync_state_dump failed: {e}");
+                return;
+            }
+        }
     };
     if let Ok(s) = sync_seal(&sync_key, &merged_blob) {
         let r = relay.lock().await;
         let _ = r.put_sync_state(&account_fp, s).await;
     }
+}
+
+/// Join a server from its relay-stored GroupInfo if we don't already have it locally.
+/// Used for recovery when ServerProvisioned was missed (e.g. epoch mismatch at link time).
+async fn join_server_if_unknown(
+    app: &AppHandle,
+    client: &Arc<Mutex<GhostClient>>,
+    relay: &Arc<Mutex<RelayClient>>,
+    server_id: [u8; 32],
+    meta: &SyncServerMeta,
+) {
+    use ghost_core::wire::SYNC_KEY_SERVER_PREFIX;
+
+    {
+        let c = client.lock().await;
+        if c.store().get_server(&server_id).is_ok() {
+            return; // already joined
+        }
+    }
+
+    let gi_bytes = {
+        let r = relay.lock().await;
+        match r.get_server_info(&meta.mailbox_id).await {
+            Ok(gi) => gi,
+            Err(e) => {
+                eprintln!("sync: join_server_if_unknown: get_server_info failed for {}: {e}",
+                    hex::encode(&server_id[..8]));
+                return;
+            }
+        }
+    };
+
+    let payload = ProvisionPayload {
+        server_id,
+        server_name: meta.server_name.clone(),
+        kind: meta.kind,
+        members: vec![],
+        channels: meta.channels.clone(),
+        mailbox_id: meta.mailbox_id,
+    };
+
+    let channel_results = {
+        let mut c = client.lock().await;
+        match c.join_from_provision(&payload, &gi_bytes, now_ms()) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("sync: join_server_if_unknown: join_from_provision failed for {}: {e}",
+                    hex::encode(&server_id[..8]));
+                return;
+            }
+        }
+    };
+
+    let mut default_mailbox_id = meta.mailbox_id;
+    for (_ch_id, commit, mailbox_id) in &channel_results {
+        let commit_seq = {
+            let r = relay.lock().await;
+            match r.post_blob(mailbox_id, commit.clone()).await {
+                Ok(res) => res.seq,
+                Err(e) => { eprintln!("sync: join_server_if_unknown: post commit failed: {e}"); continue; }
+            }
+        };
+        {
+            let c = client.lock().await;
+            let _ = c.store().set_last_seen_seq(mailbox_id, commit_seq);
+            drop(c);
+            let mut r = relay.lock().await;
+            r.subscribe(*mailbox_id, commit_seq);
+        }
+        if channel_results.len() == 1
+            || _ch_id == &ghost_core::wire::derive_default_channel_id(&server_id)
+        {
+            default_mailbox_id = *mailbox_id;
+        }
+    }
+
+    {
+        let c = client.lock().await;
+        if let Ok(gi) = c.export_server_info(&server_id) {
+            let r = relay.lock().await;
+            let _ = r.put_server_info(&default_mailbox_id, gi).await;
+        }
+    }
+
+    let announce = {
+        let mut c = client.lock().await;
+        let name = c.identity().display_name.clone();
+        c.send_control(&server_id, ghost_core::wire::encode_member_announce(&name))
+    };
+    if let Ok(outbound) = announce {
+        let r = relay.lock().await;
+        let _ = r.send(&outbound.mailbox_id, outbound.blob).await;
+    }
+
+    {
+        let c = client.lock().await;
+        if let Ok(meta_out) = c.export_server_meta(&server_id) {
+            let key = format!("{}{}", SYNC_KEY_SERVER_PREFIX, hex::encode(server_id));
+            let _ = c.sync_set(&key, &meta_out.to_bytes(), now_ms());
+        }
+    }
+
+    let _ = app.emit("sync", hex::encode(server_id));
 }
 
 async fn handle_gap(
@@ -801,7 +940,7 @@ async fn handle_voice_state(
                 }
             }
             let c = client.lock().await;
-            let Some(server_id) = c.server_id_for_mailbox(mailbox_id) else { return };
+            let Some(_server_id) = c.server_id_for_mailbox(mailbox_id) else { return };
             for entry in arr {
                 let Some(ch_b64) = get_json_str(entry, "ch") else { continue };
                 let Some(p_b64) = get_json_str(entry, "p") else { continue };
@@ -831,7 +970,7 @@ async fn handle_voice_state(
                 let Some(p_b64) = &vs.p else { return };
                 let Some(blob) = decode_b64_blob(p_b64) else { return };
                 let c = client.lock().await;
-                let Some(server_id) = c.server_id_for_mailbox(mailbox_id) else { return };
+                let Some(_server_id) = c.server_id_for_mailbox(mailbox_id) else { return };
                 let Ok(ps) = c.open_presence_blob(&channel_id, &blob) else { return };
                 drop(c);
 

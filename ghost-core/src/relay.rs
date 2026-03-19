@@ -464,14 +464,10 @@ impl RelayClient {
         account_fp: &[u8; 32],
         payload: Vec<u8>,
     ) -> Result<()> {
-        let resp = self
-            .http
-            .put(format!(
-                "{}/idlog/{}",
-                self.base_url,
-                hex::encode(account_fp),
-            ))
-            .body(payload)
+        let path = format!("/idlog/{}", hex::encode(account_fp));
+        let url = format!("{}{}", self.base_url, path);
+        let req = self.authenticated("PUT", &path, self.http.put(&url).body(payload));
+        let resp = req
             .send()
             .await
             .map_err(|e| GhostError::Network(e.to_string()))?;

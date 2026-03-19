@@ -229,7 +229,7 @@ fn emit_participants(app: &AppHandle, peer_state: &HashMap<u32, PresenceState>, 
 /// Try to decrypt a presence blob and, on success, derive the voice key for that peer.
 async fn process_presence_blob(
     client: &Arc<Mutex<GhostClient>>,
-    server_id: &[u8; 32],
+    _server_id: &[u8; 32],
     channel_id: &[u8; 32],
     blob_b64: &str,
 ) -> Result<(ghost_core::mls::voice::PresenceState, [u8; 32]), String> {
@@ -247,7 +247,7 @@ async fn process_presence_blob(
 /// Seal a presence blob for the local user.
 async fn seal_presence(
     client: &Arc<Mutex<GhostClient>>,
-    server_id: &[u8; 32],
+    _server_id: &[u8; 32],
     channel_id: &[u8; 32],
     muted: bool,
     deafened: bool,
@@ -263,7 +263,7 @@ async fn seal_presence(
 /// Start the audio pipeline and UDP transport after receiving Welcome.
 async fn start_audio(
     client: &Arc<Mutex<GhostClient>>,
-    server_id: &[u8; 32],
+    _server_id: &[u8; 32],
     channel_id: &[u8; 32],
     own_fp: &[u8; 32],
     own_device_vk: &[u8; 32],
@@ -665,7 +665,7 @@ pub async fn run(
                                     let (Some(sid), Some(cid)) = (active_server_id, active_channel_id) else { continue };
                                     let resync_epoch = {
                                         let c = client.lock().await;
-                                        c.voice_epoch(&sid).unwrap_or(0)
+                                        c.voice_epoch(&cid).unwrap_or(0)
                                     };
                                     let mut new_peer_state: HashMap<u32, PresenceState> = HashMap::new();
                                     let mut new_keys: HashMap<u32, crate::audio::PeerVoiceKeys> = HashMap::new();
@@ -698,7 +698,7 @@ pub async fn run(
                                 // Decrypt peer presence blobs and collect voice keys
                                 let current_epoch = {
                                     let c = client.lock().await;
-                                    c.voice_epoch(&p.server_id).unwrap_or(0)
+                                    c.voice_epoch(&p.channel_id).unwrap_or(0)
                                 };
                                 let mut initial_keys: HashMap<u32, crate::audio::PeerVoiceKeys> = HashMap::new();
                                 for peer in &peers {
@@ -748,7 +748,7 @@ pub async fn run(
                                         if let Some(ref session) = audio {
                                             let join_epoch = {
                                                 let c = client.lock().await;
-                                                c.voice_epoch(&sid).unwrap_or(0)
+                                                c.voice_epoch(&cid).unwrap_or(0)
                                             };
                                             if let Ok(mut pk) = session.pipeline.peer_keys.lock() {
                                                 pk.insert(slot_id, crate::audio::PeerVoiceKeys::new(ps.fingerprint, join_epoch, voice_key));

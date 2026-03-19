@@ -79,13 +79,42 @@ struct TwoClientSetup {
     channel_id: [u8; 32],
 }
 
+fn register_identity_in_cache(client: &mut GhostClient, identity: &Identity) {
+    use ghost_wire::idlog::{DeviceInfo, LogState};
+    use std::collections::HashMap;
+    let mut devices = HashMap::new();
+    devices.insert(
+        identity.verifying_key.to_bytes(),
+        DeviceInfo {
+            verifying_key: identity.verifying_key.to_bytes(),
+            label: "test".to_string(),
+            added_at_seq: 1,
+            revoked_at_seq: None,
+        },
+    );
+    let state = LogState {
+        account_fp: identity.fingerprint,
+        master_verifying_key: None,
+        devices,
+        head_seq: 1,
+        head_hash: [0u8; 32],
+    };
+    client.cache_own_identity_log(state);
+}
+
 fn setup_two_clients(sender_seed: [u8; 32], receiver_seed: [u8; 32]) -> TwoClientSetup {
+    let id_sender = Identity::from_seed(sender_seed).unwrap();
+    let id_receiver = Identity::from_seed(receiver_seed).unwrap();
     let mut sender =
         GhostClient::open_in_memory(Identity::from_seed(sender_seed).unwrap(), sender_seed)
             .unwrap();
     let mut receiver =
         GhostClient::open_in_memory(Identity::from_seed(receiver_seed).unwrap(), receiver_seed)
             .unwrap();
+
+    // Register each other's identities for credential validation
+    register_identity_in_cache(&mut sender, &id_receiver);
+    register_identity_in_cache(&mut receiver, &id_sender);
 
     let server_id = sender
         .create_server("test", ServerKind::Server, 1000)
@@ -269,10 +298,16 @@ async fn self_message_not_echoed_as_new() {
 async fn invite_with_real_key_package() {
     let relay_url = common::start_relay().await;
 
+    let id_inviter = Identity::from_seed([0x40; 32]).unwrap();
+    let id_joiner = Identity::from_seed([0x41; 32]).unwrap();
     let mut inviter =
         GhostClient::open_in_memory(Identity::from_seed([0x40; 32]).unwrap(), [0x40; 32]).unwrap();
     let mut joiner =
         GhostClient::open_in_memory(Identity::from_seed([0x41; 32]).unwrap(), [0x41; 32]).unwrap();
+
+    // Register identities for credential validation
+    register_identity_in_cache(&mut inviter, &id_joiner);
+    register_identity_in_cache(&mut joiner, &id_inviter);
 
     // Inviter creates a server
     let server_id = inviter

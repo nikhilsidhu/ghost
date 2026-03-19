@@ -1,11 +1,10 @@
-use openmls::prelude::{BasicCredential, Credential, ProcessedMessageContent, Sender};
+use openmls::prelude::{Credential, ProcessedMessageContent, Sender};
 
 use crate::crypto::{
-    DEFAULT_CHANNEL_TAG, GhostProvider, MessageType, MAILBOX_ID_TAG, MLS_GROUP_ID_TAG,
+    DEFAULT_CHANNEL_TAG, GhostProvider, MessageType, MLS_GROUP_ID_TAG,
     PROTOCOL_VERSION,
 };
 use crate::error::{GhostError, Result};
-use crate::idlog_cache::IdLogCache;
 use crate::mls::group::GhostGroup;
 use crate::storage::{ChannelKind, ServerKind, MemberRole};
 
@@ -162,10 +161,7 @@ pub fn derive_mls_group_id(server_id: &[u8; 32], channel_id: &[u8; 32]) -> [u8; 
 }
 
 pub fn mls_group_mailbox_id(mls_group_id: &[u8]) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(mls_group_id);
-    hasher.update(MAILBOX_ID_TAG);
-    hasher.finalize().into()
+    ghost_wire::mls_group_mailbox_id(mls_group_id)
 }
 
 pub fn derive_default_channel_id(server_id: &[u8; 32]) -> [u8; 32] {
@@ -458,7 +454,7 @@ pub fn decode_mutation(data: &[u8]) -> Result<(u8, u64, String, Vec<u8>)> {
 /// Encode a sync state dump for provision blob.
 /// Wire: [count:2 BE] then for each: [key_len:2 BE][key][ts:8 BE][value_len:2 BE][value]
 /// value_len 0xFFFF = NULL tombstone.
-pub fn encode_sync_state_dump(entries: &[(String, Option<Vec<u8>>, u64)]) -> Vec<u8> {
+pub fn encode_sync_state_dump(entries: &[(String, Option<Vec<u8>>, u64)]) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
     buf.extend_from_slice(&(entries.len() as u16).to_be_bytes());
     for (key, value, ts) in entries {
@@ -468,7 +464,9 @@ pub fn encode_sync_state_dump(entries: &[(String, Option<Vec<u8>>, u64)]) -> Vec
         buf.extend_from_slice(&ts.to_be_bytes());
         match value {
             Some(v) => {
-                assert!(v.len() < 0xFFFF, "sync value too large (0xFFFF reserved for tombstone)");
+                if v.len() >= 0xFFFF {
+                    return Err(GhostError::Format("sync value too large (0xFFFF reserved for tombstone)".into()));
+                }
                 buf.extend_from_slice(&(v.len() as u16).to_be_bytes());
                 buf.extend_from_slice(v);
             }
@@ -477,7 +475,7 @@ pub fn encode_sync_state_dump(entries: &[(String, Option<Vec<u8>>, u64)]) -> Vec
             }
         }
     }
-    buf
+    Ok(buf)
 }
 
 /// Decode a sync state dump from provision blob.
@@ -787,15 +785,10 @@ fn extract_sender_identity(
     credential: &Credential,
     sender: &Sender,
 ) -> Result<([u8; 32], [u8; 32])> {
-    let basic = BasicCredential::try_from(credential.clone())
-        .map_err(|_| GhostError::Mls("sender has non-basic credential".into()))?;
-    let account_fp: [u8; 32] = basic.identity().try_into().map_err(|_| {
-        GhostError::Format("credential identity is not 32 bytes".into())
-    })?;
+    let account_fp = crate::mls::credential::parse_credential(credential)?.account_fp;
 
     let leaf_index = match sender {
         Sender::Member(idx) => idx.u32(),
-        // Relay external proposals don't have identity log entries
         Sender::External(_) => return Err(GhostError::Mls("external sender".into())),
         _ => return Err(GhostError::Mls("unexpected sender type".into())),
     };
@@ -813,55 +806,64 @@ fn extract_sender_identity(
     Ok((account_fp, device_vk))
 }
 
+/// Verify a self-validating credential: blake3(master_vk) == account_fp,
+/// then ed25519_verify(master_vk, delegation_payload, delegation_sig).
 fn validate_device_credential(
-    cache: &IdLogCache,
-    account_fp: &[u8; 32],
+    credential: &Credential,
     device_vk: &[u8; 32],
 ) -> Result<()> {
-    match cache.is_active_device(account_fp, device_vk)? {
-        true => Ok(()),
-        false => Err(GhostError::IdentityLog(format!(
-            "device {} not authorized for account {}",
-            hex::encode(&device_vk[..8]),
-            hex::encode(&account_fp[..8]),
-        ))),
+    let parsed = crate::mls::credential::parse_credential(credential)?;
+
+    // Verify master key matches account fingerprint
+    let computed_fp: [u8; 32] = blake3::hash(&parsed.master_vk).into();
+    if computed_fp != parsed.account_fp {
+        return Err(GhostError::IdentityLog(
+            "master_vk does not match account_fp".into(),
+        ));
     }
+
+    // Verify delegation signature
+    let master_vk = ed25519_dalek::VerifyingKey::from_bytes(&parsed.master_vk)
+        .map_err(|e| GhostError::IdentityLog(format!("invalid master_vk: {e}")))?;
+    let mut msg = Vec::with_capacity(crate::identity::DELEGATION_DOMAIN.len() + 32 + 32 + 8);
+    msg.extend_from_slice(crate::identity::DELEGATION_DOMAIN);
+    msg.extend_from_slice(device_vk);
+    msg.extend_from_slice(&parsed.account_fp);
+    msg.extend_from_slice(&parsed.idlog_seq.to_be_bytes());
+    let sig = ed25519_dalek::Signature::from_bytes(&parsed.delegation_sig);
+    master_vk.verify_strict(&msg, &sig)
+        .map_err(|e| GhostError::IdentityLog(format!("delegation signature invalid: {e}")))?;
+    Ok(())
 }
 
 /// Extract account fingerprint and device key from a leaf node's credential.
 fn extract_leaf_identity(leaf: &openmls::prelude::LeafNode) -> Result<([u8; 32], [u8; 32])> {
-    let basic = BasicCredential::try_from(leaf.credential().clone())
-        .map_err(|_| GhostError::Mls("non-basic credential".into()))?;
-    let account_fp: [u8; 32] = basic.identity().try_into()
-        .map_err(|_| GhostError::Format("credential identity is not 32 bytes".into()))?;
+    let account_fp = crate::mls::credential::parse_credential(leaf.credential())?.account_fp;
     let device_vk: [u8; 32] = leaf.signature_key().as_slice().try_into()
         .map_err(|_| GhostError::Format("signature key is not 32 bytes".into()))?;
     Ok((account_fp, device_vk))
 }
 
-/// Validate that the sender and all added members have authorized device keys.
-/// For application messages, pass staged_commit as None.
+/// Validate sender's self-validating credential (delegation signature).
 pub(crate) fn validate_sender(
     group: &GhostGroup,
     credential: &Credential,
     sender: &Sender,
-    cache: &IdLogCache,
     staged_commit: Option<&openmls::prelude::StagedCommit>,
 ) -> Result<()> {
     match sender {
         Sender::Member(_) => {
-            let (account_fp, device_vk) = extract_sender_identity(group, credential, sender)?;
-            validate_device_credential(cache, &account_fp, &device_vk)?;
+            let (_account_fp, device_vk) = extract_sender_identity(group, credential, sender)?;
+            validate_device_credential(credential, &device_vk)?;
         }
         Sender::NewMemberCommit => {
             let staged = staged_commit
                 .ok_or_else(|| GhostError::Mls("NewMemberCommit without staged commit".into()))?;
             let leaf = staged.update_path_leaf_node()
                 .ok_or_else(|| GhostError::Mls("external commit missing update path".into()))?;
-            let (account_fp, device_vk) = extract_leaf_identity(leaf)?;
-            validate_device_credential(cache, &account_fp, &device_vk)?;
+            let (_account_fp, device_vk) = extract_leaf_identity(leaf)?;
+            validate_device_credential(leaf.credential(), &device_vk)?;
         }
-        // Relay external proposals — no identity log
         Sender::External(_) => {}
         Sender::NewMemberProposal => {}
     }
@@ -870,8 +872,8 @@ pub(crate) fn validate_sender(
     if let Some(staged) = staged_commit {
         for add in staged.add_proposals() {
             let leaf = add.add_proposal().key_package().leaf_node();
-            let (fp, vk) = extract_leaf_identity(leaf)?;
-            validate_device_credential(cache, &fp, &vk)?;
+            let (_fp, vk) = extract_leaf_identity(leaf)?;
+            validate_device_credential(leaf.credential(), &vk)?;
         }
     }
 
@@ -881,12 +883,11 @@ pub(crate) fn validate_sender(
 /// Process an inbound blob that could be an application message or a commit.
 /// Strips the envelope header, then decrypts. App messages are returned;
 /// commits are merged into the group automatically.
-/// All sender credentials are validated against the identity log cache.
+/// Sender credentials are validated via self-validating delegation signatures.
 pub fn open_any(
     group: &mut GhostGroup,
     provider: &GhostProvider,
     blob: &[u8],
-    idlog_cache: &IdLogCache,
 ) -> Result<InboundMessage> {
     ghost_wire::decode_envelope(blob)
         .map_err(|e| GhostError::Format(format!("envelope: {e}")))?;
@@ -897,20 +898,19 @@ pub fn open_any(
 
     match processed.into_content() {
         ProcessedMessageContent::ApplicationMessage(app_msg) => {
-            let mls_basic = BasicCredential::try_from(credential.clone())
-                .map_err(|_| GhostError::Mls("sender has non-basic credential".into()))?;
+            let sender_account_fp = crate::mls::credential::parse_credential(&credential)?.account_fp;
             let msg = ApplicationMessage::from_bytes(&app_msg.into_bytes())?;
-            if msg.sender_fp != mls_basic.identity() {
+            if msg.sender_fp != sender_account_fp {
                 return Err(GhostError::Format(
                     "sender_fp does not match MLS credential".into(),
                 ));
             }
 
-            validate_sender(group, &credential, &sender, idlog_cache, None)?;
+            validate_sender(group, &credential, &sender, None)?;
             Ok(InboundMessage::Application(msg))
         }
         ProcessedMessageContent::StagedCommitMessage(staged_commit) => {
-            validate_sender(group, &credential, &sender, idlog_cache, Some(&staged_commit))?;
+            validate_sender(group, &credential, &sender, Some(&staged_commit))?;
 
             let removed = extract_removed_fps(group, &staged_commit);
             group.merge_staged_commit(provider, *staged_commit)?;
@@ -933,10 +933,9 @@ fn extract_removed_fps(group: &GhostGroup, staged: &openmls::prelude::StagedComm
     let member_map: HashMap<u32, [u8; 32]> = group
         .members()
         .filter_map(|m| {
-            BasicCredential::try_from(m.credential)
+            crate::mls::credential::parse_credential(&m.credential)
                 .ok()
-                .and_then(|bc| <[u8; 32]>::try_from(bc.identity()).ok())
-                .map(|fp| (m.index.u32(), fp))
+                .map(|pc| (m.index.u32(), pc.account_fp))
         })
         .collect();
 
@@ -975,6 +974,7 @@ pub fn seal(
 }
 
 /// Strip envelope header, MLS-decrypt, and deserialize into an ApplicationMessage.
+/// Validates sender credentials via self-validating delegation signatures.
 pub fn open(
     group: &mut GhostGroup,
     provider: &GhostProvider,
@@ -985,18 +985,17 @@ pub fn open(
     let mls_bytes = ghost_wire::envelope_payload(blob);
     let processed = group.process_message_bytes(provider, mls_bytes)?;
 
-    // Extract the MLS-authenticated sender fingerprint before consuming the message
-    let mls_credential = processed.credential().clone();
-    let mls_basic = BasicCredential::try_from(mls_credential)
-        .map_err(|_| GhostError::Mls("sender has non-basic credential".into()))?;
-    let mls_fp = mls_basic.identity();
+    let credential = processed.credential().clone();
+    let sender = processed.sender().clone();
+    let sender_account_fp = crate::mls::credential::parse_credential(&credential)?.account_fp;
 
     match processed.into_content() {
         ProcessedMessageContent::ApplicationMessage(app_msg) => {
             let msg = ApplicationMessage::from_bytes(&app_msg.into_bytes())?;
-            if msg.sender_fp != mls_fp {
+            if msg.sender_fp != sender_account_fp {
                 return Err(GhostError::Format("sender_fp does not match MLS credential".into()));
             }
+            validate_sender(group, &credential, &sender, None)?;
             Ok(msg)
         }
         _ => Err(GhostError::Mls("expected application message".into())),
@@ -1256,7 +1255,8 @@ mod tests {
         .unwrap();
 
         let blob = seal(&mut group_a, &provider_a, &msg).unwrap();
-        let decrypted = open(&mut group_b, &provider_b, &blob).unwrap();
+
+        let decrypted = open(&mut group_b, &provider_b, &blob, ).unwrap();
 
         assert_eq!(decrypted.message_type, MessageType::Text);
         assert_eq!(decrypted.channel_id, test_channel());
@@ -1296,7 +1296,8 @@ mod tests {
         .unwrap();
 
         let blob = seal(&mut group_a, &provider_a, &msg).unwrap();
-        let result = open(&mut group_b, &provider_b, &blob);
+
+        let result = open(&mut group_b, &provider_b, &blob, );
         assert!(result.is_err());
     }
 
@@ -1342,7 +1343,7 @@ mod tests {
             ("read:bb".to_string(), Some(vec![0x02, 0x03]), 200),
             ("order:channels".to_string(), None, 150), // tombstone
         ];
-        let encoded = encode_sync_state_dump(&entries);
+        let encoded = encode_sync_state_dump(&entries).unwrap();
         let decoded = decode_sync_state_dump(&encoded).unwrap();
         assert_eq!(decoded.len(), 3);
         assert_eq!(decoded[0], entries[0]);
@@ -1401,7 +1402,7 @@ mod tests {
 
     #[test]
     fn sync_state_dump_empty() {
-        let encoded = encode_sync_state_dump(&[]);
+        let encoded = encode_sync_state_dump(&[]).unwrap();
         let decoded = decode_sync_state_dump(&encoded).unwrap();
         assert!(decoded.is_empty());
     }
@@ -1422,7 +1423,7 @@ mod tests {
     fn sync_state_dump_decode_truncated_value() {
         // Build a valid entry header then cut off the value
         let entries = vec![("k".to_string(), Some(vec![0xAA; 100]), 1)];
-        let mut encoded = encode_sync_state_dump(&entries);
+        let mut encoded = encode_sync_state_dump(&entries).unwrap();
         encoded.truncate(encoded.len() - 50); // chop value
         assert!(decode_sync_state_dump(&encoded).is_err());
     }
@@ -1571,7 +1572,7 @@ mod tests {
         blob.extend_from_slice(&1u16.to_be_bytes()); // 1 server
         blob.extend_from_slice(&(pp_bytes.len() as u32).to_be_bytes());
         blob.extend_from_slice(&pp_bytes);
-        blob.extend_from_slice(&encode_sync_state_dump(&sync_entries));
+        blob.extend_from_slice(&encode_sync_state_dump(&sync_entries).unwrap());
 
         // Parse it back (same logic as consume_provision)
         assert!(blob.len() >= 34);
@@ -1602,7 +1603,7 @@ mod tests {
         let entries: Vec<_> = (0..200)
             .map(|i| (format!("key:{i}"), Some(vec![i as u8; 10]), i as u64))
             .collect();
-        let encoded = encode_sync_state_dump(&entries);
+        let encoded = encode_sync_state_dump(&entries).unwrap();
         let decoded = decode_sync_state_dump(&encoded).unwrap();
         assert_eq!(decoded.len(), 200);
         assert_eq!(decoded[199].0, "key:199");

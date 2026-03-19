@@ -3,6 +3,9 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 
+/// Maximum tracked keys to prevent memory exhaustion from key spraying.
+const MAX_TRACKED_KEYS: usize = 100_000;
+
 /// Per-key sliding window rate limiter.
 pub struct RateLimiter {
     windows: DashMap<[u8; 32], VecDeque<Instant>>,
@@ -21,6 +24,11 @@ impl RateLimiter {
 
     /// Returns `true` if the request is allowed, `false` if rate-limited.
     pub fn check(&self, key: &[u8; 32]) -> bool {
+        // Reject new keys when the map is full to prevent memory exhaustion
+        if self.windows.len() >= MAX_TRACKED_KEYS && !self.windows.contains_key(key) {
+            return false;
+        }
+
         let now = Instant::now();
         let cutoff = now - self.window;
 

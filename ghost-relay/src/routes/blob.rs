@@ -125,7 +125,7 @@ pub async fn delete_mailbox(
     Path(mailbox_id): Path<String>,
 ) -> Result<StatusCode> {
     let id = decode_mailbox_id(&mailbox_id)?;
-    if !state.is_creator(&id, &auth.account_fp).await {
+    if !state.is_creator_strict(&id, &auth.account_fp).await {
         return Err(crate::error::RelayError::Forbidden(
             "only group creator can delete a mailbox".into(),
         ));

@@ -17,6 +17,17 @@ use thiserror::Error;
 pub const ENVELOPE_VERSION: u8 = 0x01;
 pub const ENVELOPE_HEADER_SIZE: usize = 10;
 
+/// Tag appended to MLS group ID before hashing to derive the mailbox ID.
+pub const MAILBOX_ID_TAG: &[u8] = b"ghost-mailbox-v1";
+
+/// Derive a relay mailbox ID from an MLS group ID.
+pub fn mls_group_mailbox_id(mls_group_id: &[u8]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(mls_group_id);
+    hasher.update(MAILBOX_ID_TAG);
+    hasher.finalize().into()
+}
+
 // WS frame: [seq:8 BE][received_at:8 BE][payload...]
 pub const WS_SEQ_SIZE: usize = 8;
 pub const WS_TIMESTAMP_SIZE: usize = 8;

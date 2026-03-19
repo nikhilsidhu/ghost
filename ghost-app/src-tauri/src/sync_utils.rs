@@ -20,7 +20,7 @@ pub async fn post_sync_message(
     payload: &[u8],
 ) {
     let outbound = {
-        let mut c = client.lock().await;
+        let c = client.lock().await;
         if !c.has_sync_group() { return; }
         let mut inner = Vec::with_capacity(1 + payload.len());
         inner.push(msg_type);
@@ -51,7 +51,11 @@ pub async fn push_sync_snapshot(
             None => return,
         };
         let entries = c.sync_dump().unwrap_or_default();
-        (sk, *c.fingerprint(), encode_sync_state_dump(&entries))
+        let blob = match encode_sync_state_dump(&entries) {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+        (sk, *c.fingerprint(), blob)
     };
 
     let sealed = match sync_seal(&sync_key, &dump_blob) {

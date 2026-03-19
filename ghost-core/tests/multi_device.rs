@@ -12,7 +12,7 @@ use ghost_core::identity::log::{
     create_add_device, create_genesis, create_recovery, create_revoke_device, validate_chain,
     LogEntry,
 };
-use ghost_core::identity::Identity;
+use ghost_core::identity::{compute_delegation_sig, Identity};
 use ghost_core::relay::{RelayClient, RelayEvent};
 use ghost_core::wire::{
     decode_mutation, encode_mutation, encode_sync_state_dump, sync_open,
@@ -50,14 +50,17 @@ async fn recv_blob(
 }
 
 /// Create a GhostClient from Identity::create_account, extracting fields before drop.
-fn make_ghost_client(label: &str) -> (GhostClient, [u8; 32], SigningKey) {
+fn make_ghost_client(label: &str) -> (GhostClient, [u8; 32], SigningKey, SigningKey, [u8; 32]) {
     let acct = Identity::create_account(label).unwrap();
     let fp = acct.identity.fingerprint;
     let sk = acct.identity.signing_key.clone();
     let db_key = acct.db_key;
-    let identity = Identity::from_device(fp, sk.clone(), 1);
+    let master_vk = acct.identity.master_vk;
+    let master_sk = SigningKey::from_bytes(&acct.identity.master_sk.to_bytes());
+    let delegation_sig = acct.identity.delegation_sig;
+    let identity = Identity::from_device(fp, sk.clone(), 1, master_vk, SigningKey::from_bytes(&master_sk.to_bytes()), delegation_sig);
     drop(acct);
-    (GhostClient::open_in_memory(identity, db_key).unwrap(), fp, sk)
+    (GhostClient::open_in_memory(identity, db_key).unwrap(), fp, sk, master_sk, master_vk)
 }
 
 /// Push a full chain to relay and validate it client-side.
@@ -145,7 +148,7 @@ async fn idlog_genesis_add_revoke_full_lifecycle() {
 
 #[test]
 fn sync_set_older_timestamp_rejected() {
-    let (client, _, _) = make_ghost_client("test");
+    let (client, _, _, _, _) = make_ghost_client("test");
 
     // Set at ts=100
     assert!(client.sync_set("read:ch1", &42u64.to_be_bytes(), 100).unwrap());
@@ -161,7 +164,7 @@ fn sync_set_older_timestamp_rejected() {
 
 #[test]
 fn sync_set_newer_timestamp_overwrites() {
-    let (client, _, _) = make_ghost_client("test");
+    let (client, _, _, _, _) = make_ghost_client("test");
 
     client.sync_set("read:ch1", &42u64.to_be_bytes(), 100).unwrap();
     assert!(client.sync_set("read:ch1", &99u64.to_be_bytes(), 200).unwrap());
@@ -173,7 +176,7 @@ fn sync_set_newer_timestamp_overwrites() {
 
 #[test]
 fn sync_remove_older_than_set_is_rejected() {
-    let (client, _, _) = make_ghost_client("test");
+    let (client, _, _, _, _) = make_ghost_client("test");
 
     client.sync_set("read:ch1", &42u64.to_be_bytes(), 100).unwrap();
 
@@ -187,7 +190,7 @@ fn sync_remove_older_than_set_is_rejected() {
 
 #[test]
 fn sync_remove_newer_than_set_creates_tombstone() {
-    let (client, _, _) = make_ghost_client("test");
+    let (client, _, _, _, _) = make_ghost_client("test");
 
     client.sync_set("read:ch1", &42u64.to_be_bytes(), 100).unwrap();
 
@@ -201,7 +204,7 @@ fn sync_remove_newer_than_set_creates_tombstone() {
 
 #[test]
 fn sync_set_cannot_overwrite_newer_tombstone() {
-    let (client, _, _) = make_ghost_client("test");
+    let (client, _, _, _, _) = make_ghost_client("test");
 
     client.sync_set("read:ch1", &1u64.to_be_bytes(), 50).unwrap();
     client.sync_remove("read:ch1", 200).unwrap(); // tombstone at 200
@@ -217,7 +220,7 @@ fn sync_set_cannot_overwrite_newer_tombstone() {
 
 #[test]
 fn sync_import_preserves_newer_local_state() {
-    let (client, _, _) = make_ghost_client("test");
+    let (client, _, _, _, _) = make_ghost_client("test");
 
     // Local state at ts=500
     client.sync_set("read:ch1", &100u64.to_be_bytes(), 500).unwrap();
@@ -243,7 +246,7 @@ fn sync_import_preserves_newer_local_state() {
 
 #[test]
 fn sync_dump_import_between_clients() {
-    let (client_a, _, _) = make_ghost_client("device-a");
+    let (client_a, _, _, _, _) = make_ghost_client("device-a");
 
     client_a
         .sync_set(SYNC_KEY_SERVER_ORDER, b"[\"s1\",\"s2\"]", 100)
@@ -260,7 +263,7 @@ fn sync_dump_import_between_clients() {
     assert_eq!(dump.len(), 3);
 
     // Import into a fresh client
-    let (client_b, _, _) = make_ghost_client("device-b");
+    let (client_b, _, _, _, _) = make_ghost_client("device-b");
     client_b.sync_import(&dump).unwrap();
 
     // Verify identical state
@@ -339,7 +342,7 @@ async fn pairing_offer_response_encrypted_roundtrip() {
 
 #[test]
 fn sync_group_produces_joinable_group_info() {
-    let (mut client_a, fp_a, _) = make_ghost_client("desktop");
+    let (mut client_a, fp_a, _, master_sk_a, master_vk_a) = make_ghost_client("desktop");
     assert!(!client_a.has_sync_group());
     client_a.create_sync_group().unwrap();
 
@@ -347,9 +350,9 @@ fn sync_group_produces_joinable_group_info() {
     let gi = client_a.sync_group_info().unwrap();
     assert!(!gi.is_empty());
 
-    let acct_b = Identity::create_account("phone").unwrap();
-    let identity_b = Identity::from_device(fp_a, acct_b.identity.signing_key.clone(), 2);
-    drop(acct_b);
+    let device_b_key = SigningKey::generate(&mut OsRng);
+    let delegation_sig = compute_delegation_sig(&master_sk_a, device_b_key.verifying_key().as_bytes(), &fp_a, 2);
+    let identity_b = Identity::from_device(fp_a, device_b_key, 2, master_vk_a, SigningKey::from_bytes(&master_sk_a.to_bytes()), delegation_sig);
     let mut client_b = GhostClient::open_in_memory(identity_b, [0x02; 32]).unwrap();
     let (_commit, mailbox_b) = client_b.join_sync_group(&gi).unwrap();
     assert_eq!(mailbox_b, client_a.sync_mailbox_id().unwrap());
@@ -360,17 +363,17 @@ fn sync_group_add_device_via_external_commit() {
     use ghost_wire::idlog::{DeviceInfo, LogState};
     use std::collections::HashMap;
 
-    let (mut client_a, fp_a, sk_a) = make_ghost_client("desktop");
+    let (mut client_a, fp_a, sk_a, master_sk_a, master_vk_a) = make_ghost_client("desktop");
     client_a.create_sync_group().unwrap();
 
     // Export GroupInfo for pairing
     let gi = client_a.sync_group_info().unwrap();
 
     // Device B joins via external commit
-    let acct_b = Identity::create_account("phone").unwrap();
-    let b_vk = acct_b.identity.signing_key.verifying_key().to_bytes();
-    let identity_b = Identity::from_device(fp_a, acct_b.identity.signing_key.clone(), 2);
-    drop(acct_b);
+    let device_b_key = SigningKey::generate(&mut OsRng);
+    let b_vk = device_b_key.verifying_key().to_bytes();
+    let delegation_sig = compute_delegation_sig(&master_sk_a, &b_vk, &fp_a, 2);
+    let identity_b = Identity::from_device(fp_a, device_b_key, 2, master_vk_a, SigningKey::from_bytes(&master_sk_a.to_bytes()), delegation_sig);
     let mut client_b = GhostClient::open_in_memory(identity_b, [0x02; 32]).unwrap();
 
     // Cache identity log so external commit validation passes
@@ -399,15 +402,15 @@ fn sync_mutation_encrypted_decrypted() {
     use ghost_wire::idlog::{DeviceInfo, LogState};
     use std::collections::HashMap;
 
-    let (mut client_a, fp_a, sk_a) = make_ghost_client("desktop");
+    let (mut client_a, fp_a, sk_a, master_sk_a, master_vk_a) = make_ghost_client("desktop");
     client_a.create_sync_group().unwrap();
     let gi = client_a.sync_group_info().unwrap();
 
     // Device B joins
-    let acct_b = Identity::create_account("phone").unwrap();
-    let b_vk = acct_b.identity.signing_key.verifying_key().to_bytes();
-    let identity_b = Identity::from_device(fp_a, acct_b.identity.signing_key.clone(), 2);
-    drop(acct_b);
+    let device_b_key = SigningKey::generate(&mut OsRng);
+    let b_vk = device_b_key.verifying_key().to_bytes();
+    let delegation_sig = compute_delegation_sig(&master_sk_a, &b_vk, &fp_a, 2);
+    let identity_b = Identity::from_device(fp_a, device_b_key, 2, master_vk_a, SigningKey::from_bytes(&master_sk_a.to_bytes()), delegation_sig);
     let mut client_b = GhostClient::open_in_memory(identity_b, [0x02; 32]).unwrap();
 
     // Cache identity log so sync credential validation passes
@@ -418,6 +421,11 @@ fn sync_mutation_encrypted_decrypted() {
     let log_state = LogState { account_fp: fp_a, master_verifying_key: None, devices, head_seq: 2, head_hash: [0u8; 32] };
     client_a.cache_own_identity_log(log_state.clone());
     client_b.cache_own_identity_log(log_state);
+
+    // Both devices share the same sync key (established during pairing)
+    let sync_key = [0x42u8; 32];
+    client_a.set_sync_key(sync_key).unwrap();
+    client_b.set_sync_key(sync_key).unwrap();
 
     let (commit, _) = client_b.join_sync_group(&gi).unwrap();
     client_a.receive_sync(&commit).unwrap();
@@ -448,15 +456,15 @@ fn sync_revocation_prevents_decryption() {
     use ghost_wire::idlog::{DeviceInfo, LogState};
     use std::collections::HashMap;
 
-    let (mut client_a, fp_a, sk_a) = make_ghost_client("desktop");
+    let (mut client_a, fp_a, sk_a, master_sk_a, master_vk_a) = make_ghost_client("desktop");
     client_a.create_sync_group().unwrap();
     let gi = client_a.sync_group_info().unwrap();
 
     // Device B joins
-    let acct_b = Identity::create_account("phone").unwrap();
-    let b_vk = acct_b.identity.signing_key.verifying_key().to_bytes();
-    let identity_b = Identity::from_device(fp_a, acct_b.identity.signing_key.clone(), 2);
-    drop(acct_b);
+    let device_b_key = SigningKey::generate(&mut OsRng);
+    let b_vk = device_b_key.verifying_key().to_bytes();
+    let delegation_sig = compute_delegation_sig(&master_sk_a, &b_vk, &fp_a, 2);
+    let identity_b = Identity::from_device(fp_a, device_b_key, 2, master_vk_a, SigningKey::from_bytes(&master_sk_a.to_bytes()), delegation_sig);
     let mut client_b = GhostClient::open_in_memory(identity_b, [0x02; 32]).unwrap();
 
     // Cache identity log so sync credential validation passes
@@ -468,29 +476,35 @@ fn sync_revocation_prevents_decryption() {
     client_a.cache_own_identity_log(log_state.clone());
     client_b.cache_own_identity_log(log_state);
 
+    let sync_key = [0x42u8; 32];
+    client_a.set_sync_key(sync_key).unwrap();
+    client_b.set_sync_key(sync_key).unwrap();
+
     let (commit, _) = client_b.join_sync_group(&gi).unwrap();
     client_a.receive_sync(&commit).unwrap();
 
     // Device A removes Device B from sync group
-    let removal_commit = client_a.remove_device_from_sync_group(&b_vk).unwrap();
+    let _removal_commit = client_a.remove_device_from_sync_group(&b_vk).unwrap();
     client_a.merge_pending_commit_for_sync().unwrap();
 
-    // Device A sends a post-removal mutation
+    // Device A rotates sync key after removal
+    let new_key = client_a.rotate_sync_key().unwrap();
+    assert_ne!(new_key, sync_key);
+
+    // Device A sends a post-removal mutation (encrypted with new sync key)
     let mutation = encode_mutation(MUTATION_SET, 10000, "read:ch2", &99u64.to_be_bytes());
     let mut payload = Vec::with_capacity(1 + mutation.len());
     payload.push(0x04);
     payload.extend_from_slice(&mutation);
     let outbound = client_a.send_sync(&payload).unwrap();
 
-    // Device B can process the removal commit (already envelope-wrapped)...
-    // But after removal, Device B cannot decrypt the new message
-    let _ = client_b.receive_sync(&removal_commit);
+    // Device B still has old sync key — cannot decrypt
     assert!(client_b.receive_sync(&outbound.blob).is_err());
 }
 
 #[test]
 fn sync_state_survives_dump_import_cycle() {
-    let (client_a, _, _) = make_ghost_client("desktop");
+    let (client_a, _, _, _, _) = make_ghost_client("desktop");
 
     // Set some sync state
     client_a.sync_set("read:ch1", &42u64.to_be_bytes(), 100).unwrap();
@@ -501,7 +515,7 @@ fn sync_state_survives_dump_import_cycle() {
     assert_eq!(dump.len(), 2);
 
     // Import into a fresh client — all state should arrive
-    let (client_b, _, _) = make_ghost_client("phone");
+    let (client_b, _, _, _, _) = make_ghost_client("phone");
     client_b.sync_import(&dump).unwrap();
 
     let (val, ts) = client_b.sync_get("read:ch1").unwrap().unwrap();
@@ -517,7 +531,8 @@ async fn full_pairing_then_sync_exchange() {
     let http = reqwest::Client::new();
 
     // 1. Device A creates account
-    let (_master, device_a, genesis, fp, _seed) = make_account("desktop");
+    let (master, device_a, genesis, fp, _seed) = make_account("desktop");
+    let master_vk = master.verifying_key().to_bytes();
     let fp_hex = hex::encode(fp);
     let (mut relay_a, _) = RelayClient::new(&relay_url);
     relay_a.set_auth(fp, device_a.verifying_key().to_bytes(), device_a.clone());
@@ -528,8 +543,9 @@ async fn full_pairing_then_sync_exchange() {
     relay_a.set_auth(fp, device_a.verifying_key().to_bytes(), device_a.clone());
 
     // 2. Device A creates GhostClient, sync key, and sync MLS group
+    let deleg_a = compute_delegation_sig(&master, device_a.verifying_key().as_bytes(), &fp, 1);
     let mut client_a = GhostClient::open_in_memory(
-        Identity::from_device(fp, device_a.clone(), 1),
+        Identity::from_device(fp, device_a.clone(), 1, master_vk, SigningKey::from_bytes(&master.to_bytes()), deleg_a),
         [0x01; 32],
     )
     .unwrap();
@@ -576,7 +592,7 @@ async fn full_pairing_then_sync_exchange() {
     provision_pt.extend_from_slice(&(group_info.len() as u32).to_be_bytes());
     provision_pt.extend_from_slice(&group_info);
     provision_pt.extend_from_slice(&0u16.to_be_bytes()); // 0 servers
-    provision_pt.extend_from_slice(&encode_sync_state_dump(&sync_dump));
+    provision_pt.extend_from_slice(&encode_sync_state_dump(&sync_dump).unwrap());
     let provision_sealed = sync_seal(&secret, &provision_pt).unwrap();
 
     // put_provision requires auth — sign as device_a
@@ -636,8 +652,9 @@ async fn full_pairing_then_sync_exchange() {
     let recovered_gi = &prov_pt[36..36 + gi_len];
 
     // Device B creates GhostClient, stores sync key, joins sync group
+    let deleg_b = compute_delegation_sig(&master, device_b.verifying_key().as_bytes(), &fp, 2);
     let mut client_b = GhostClient::open_in_memory(
-        Identity::from_device(fp, device_b.clone(), 2),
+        Identity::from_device(fp, device_b.clone(), 2, master_vk, SigningKey::from_bytes(&master.to_bytes()), deleg_b),
         [0x02; 32],
     )
     .unwrap();
@@ -772,7 +789,9 @@ async fn recovery_full_flow() {
     assert!(!final_state.is_active_device(&device2.verifying_key().to_bytes()));
 
     // 7. Recovery device creates GhostClient with sync key + fresh sync group
-    let recovery_identity = Identity::from_device(fp, recovery_device.clone(), 3);
+    let master_vk = recovered_master.verifying_key().to_bytes();
+    let recovery_deleg = compute_delegation_sig(&recovered_master, recovery_device.verifying_key().as_bytes(), &fp, 3);
+    let recovery_identity = Identity::from_device(fp, recovery_device.clone(), 3, master_vk, SigningKey::from_bytes(&recovered_master.to_bytes()), recovery_deleg);
     let mut recovery_client =
         GhostClient::open_in_memory(recovery_identity, [0x99; 32]).unwrap();
     assert!(recovery_client.sync_key().is_none());
