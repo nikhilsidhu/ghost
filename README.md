@@ -108,7 +108,6 @@ cargo test --workspace
 - Metadata is not fully protected. The relay learns mailbox identifiers, traffic timing,
   and message sizes even though it cannot read content.
 - No mobile client.
-- Voice quality and reconnection handling are rough.
 
 ## License
 
