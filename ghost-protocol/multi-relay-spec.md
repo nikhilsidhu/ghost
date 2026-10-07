@@ -284,11 +284,32 @@ Replicated objects (§8) are already on member relays; the device re-writes them
 
 KT discontinuity: clients that stored the old home's checkpoint accept the new home's first checkpoint because the `SetHomeRelay` entry that authorizes the new key is itself in the chain they verified. The window in which an old home could equivocate before the move is the same equivocation risk that exists without re-homing.
 
-### 9.8 Server (group) relay disappears
+### 9.8 Moving a server to another relay
 
-Out of scope for identity; a community dies with its relay unless its creator re-homes the group: new mailboxes on a new relay, GroupInfo upload, a `RelayRef` update distributed inside the group as a metadata control message so members re-dial. Members keep local history. Specified in a later revision.
+A server's MLS groups and mailbox ids do not depend on the relay (`mailbox_id = H(group_id)`), so a server moves by re-establishing the same groups on another relay. Only the server's creator may move it, because only the creator may bootstrap group state on a relay. The target must authenticate the creator: in practice the creator's home (after an account re-home if the old relay was also the home).
 
----
+```
+ServerLocation:
+  [version:1 = 0x01]
+  [server_id:32]
+  [generation:8]            increases with every move; readers keep the highest seen
+  [signer_vk:32]            a device key of the server's creator
+  [ref_len:2][RelayRef]     where the server now lives
+  [signature:64]            by signer_vk over "ghost-server-location-v1:" ‖ all preceding bytes
+```
+
+A reader accepts a ServerLocation only if the signature verifies, `server_id` is the server it holds, `generation` exceeds the last one it accepted, and `signer_vk` is an active device in its cached identity log of the server's creator.
+
+Creator steps:
+
+1. Upload each channel's GroupInfo to the target (creator bootstrap). The target records the group's members, which lets them register there without an invite.
+2. Announce `ServerMoved(ServerLocation)` as a metadata message on the old relay at the current epoch, if the old relay is reachable, and publish the record at the creator's home: `PUT /accounts/{fp}/servers/{server_id}/location` (DeviceAuth; signer must be an active device of `fp`; 409 unless `generation` increases). `GET` on the same path is unauthenticated, because members may not be known to the creator's home.
+3. In each channel group, commit a GroupContextExtensions update naming the target relay as external sender, post it to the target, merge, and re-upload GroupInfo.
+4. Record the server's new relay, resubscribe, refresh mirror grants and the account's sync entry.
+
+Members follow on any of three signals, all carrying the same record: the in-band announcement; a lookup at the creator's home (`flows::server::check_location`), which the application runs at start; or a move link the creator shares out of band (`ghost://move?l=<base64url(ServerLocation)>`), the only path left when the old relay was also the one place creator and member shared. Following registers the account at the target, routes and resubscribes every channel mailbox there from sequence 0 (the target's log starts empty), and records the new relay and generation.
+
+Members that were behind on the old relay recover their epoch from the GroupInfo at the target, as after any gap. History stays on members' devices; the target holds only what is posted after the move.
 
 ## 10. Membership and authentication at a relay
 
@@ -609,6 +630,5 @@ Named per the convention in `.claude/HYBRID_IMPLEMENTATION.md` §J; all run in-p
 
 - OPAQUE for recovery-bundle fetch (replaces rate limiting as the only protection).
 - Removing `master_sk` from devices (audit C1) and populating `RecoveryBundle.master_blob`.
-- Server re-homing (§9.8).
 - Push subscriptions for federation (QUIC binding).
 - Whether registration should allow partial chains for very long logs.
