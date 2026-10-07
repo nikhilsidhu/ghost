@@ -2,8 +2,9 @@
 //!
 //! A server keeps its MLS groups and mailbox ids when it moves; only the relay
 //! holding them changes. Members accept a move only from a `ServerLocation` signed
-//! by an active device of the server's creator, whichever way it reaches them: an
-//! announcement on the old relay, a lookup at the creator's home, or a move link.
+//! by an active device of the server's owner (under its policy), whichever way it
+//! reaches them: an announcement on the old relay, a lookup at the owner's home, or
+//! a move link.
 
 use ghost_wire::server_location::ServerLocation;
 use tokio::sync::Mutex;
@@ -16,8 +17,8 @@ use super::{account, next_generation, sync, SharedClient, SharedRelay};
 
 const MOVE_LINK_PREFIX: &str = "ghost://move?l=";
 
-/// Text a creator shares out of band when the old relay was the only one members
-/// and creator had in common.
+/// Text an owner shares out of band when the old relay was the only one members
+/// and owner had in common.
 pub fn move_link(location: &ServerLocation) -> String {
     format!("{MOVE_LINK_PREFIX}{}", location.encode())
 }
@@ -66,25 +67,32 @@ pub async fn move_server(
     server_id: &[u8; 32],
     target_url: &str,
 ) -> Result<ServerLocation> {
-    let (creator_fp, own_fp, stored_generation, signing_key, channels) = {
+    let (owner_fp, own_fp, stored_generation, signing_key) = {
         let c = client.lock().await;
-        let server = c.store().get_server(server_id)?;
         (
-            server.creator_fp,
+            c.server_owner(server_id)?,
             *c.fingerprint(),
             c.store().server_location_generation(server_id)?,
             c.signing_key_clone(),
-            c.server_channel_mailboxes(server_id),
         )
     };
-    if creator_fp != own_fp {
-        return Err(GhostError::PermissionDenied("only the server's creator can move it".into()));
+    if owner_fp != own_fp {
+        return Err(GhostError::PermissionDenied("only the server's owner can move it".into()));
     }
+    // The owner is admitted to every private channel; it must be in each one to move
+    // its group, or the channel would stay behind on the old relay. A relay that is gone
+    // took the groups this device is not in with it.
+    if let Err(e) = super::channels::join_admitted(client, home, server_id).await {
+        eprintln!("server move: private channels not listed by the old relay: {e}");
+    }
+    let channels = client.lock().await.server_channel_mailboxes(server_id);
 
     let target = standalone_client(home, target_url).await;
     let info = account::register_at(client, &target, None).await?;
 
     // 1. Group state at the target first, so members are listed there and may register.
+    //    The server group goes first: the target admits private channel groups only
+    //    under a server group it holds.
     for (channel_id, mailbox_id) in &channels {
         let group_info = {
             let c = client.lock().await;
@@ -106,12 +114,15 @@ pub async fn move_server(
     home.lock().await.put_server_location(&own_fp, &location).await?;
 
     // 3. The target relay becomes each group's external sender, committed at the target.
-    let staged = {
-        let mut c = client.lock().await;
-        c.stage_server_external_sender(server_id, &info.relay_vk)?
-    };
+    //    One group at a time, server group first: a private channel's commit names the
+    //    server group epoch the target holds.
     let mut seqs = Vec::new();
-    for (channel_id, mailbox_id, commit) in staged {
+    for (channel_id, mailbox_id) in &channels {
+        let (channel_id, mailbox_id) = (*channel_id, *mailbox_id);
+        let commit = {
+            let mut c = client.lock().await;
+            c.stage_external_sender(&channel_id, &info.relay_vk)?
+        };
         let posted = target.lock().await.post_blob(&mailbox_id, commit).await;
         let mut c = client.lock().await;
         match posted {
@@ -145,7 +156,7 @@ pub async fn move_server(
 
 /// Follow a server move announced by `location`. Returns `true` if this device now
 /// uses the new relay, `false` if the record is old or names the current relay.
-/// Refuses records not signed by an active device of the server's creator.
+/// Refuses records not signed by an active device of the server's owner.
 pub async fn follow_move(
     client: &SharedClient,
     home: &SharedRelay,
@@ -154,7 +165,7 @@ pub async fn follow_move(
 ) -> Result<bool> {
     let current_relay = {
         let mut c = client.lock().await;
-        let server = c.store().get_server(server_id)?;
+        let owner_fp = c.server_owner(server_id)?;
         if location.server_id != *server_id {
             return Err(GhostError::Format("move record names a different server".into()));
         }
@@ -164,11 +175,11 @@ pub async fn follow_move(
         location
             .verify_signature()
             .map_err(|e| GhostError::IdentityLog(e.to_string()))?;
-        let creator_log = c.cached_identity_log(&server.creator_fp)?.ok_or_else(|| {
-            GhostError::IdentityLog("the server creator's identity log is not cached; cannot verify the move".into())
+        let owner_log = c.cached_identity_log(&owner_fp)?.ok_or_else(|| {
+            GhostError::IdentityLog("the server owner's identity log is not cached; cannot verify the move".into())
         })?;
-        if !creator_log.is_active_device(&location.signer_vk) {
-            return Err(GhostError::IdentityLog("move record is not signed by an active device of the server's creator".into()));
+        if !owner_log.is_active_device(&location.signer_vk) {
+            return Err(GhostError::IdentityLog("move record is not signed by an active device of the server's owner".into()));
         }
         c.store().server_relay(server_id)?
     };
@@ -203,31 +214,31 @@ pub async fn follow_move(
     Ok(true)
 }
 
-/// Look up a server's location at its creator's home relay and follow it if newer.
+/// Look up a server's location at its owner's home relay and follow it if newer.
 /// For the case where the old relay vanished before announcing anything.
 pub async fn check_location(client: &SharedClient, home: &SharedRelay, server_id: &[u8; 32]) -> Result<bool> {
-    let (creator_fp, creator_home) = {
+    let (owner_fp, owner_home) = {
         let mut c = client.lock().await;
-        let creator_fp = c.store().get_server(server_id)?.creator_fp;
-        if creator_fp == *c.fingerprint() {
+        let owner_fp = c.server_owner(server_id)?;
+        if owner_fp == *c.fingerprint() {
             return Ok(false);
         }
         let home_url = c
-            .cached_identity_log(&creator_fp)?
+            .cached_identity_log(&owner_fp)?
             .and_then(|log| log.home_relay_ref)
             .and_then(|r| r.primary_https_url().map(str::to_string));
-        (creator_fp, home_url)
+        (owner_fp, home_url)
     };
-    let creator_home = creator_home
-        .ok_or_else(|| GhostError::IdentityLog("the server creator's home relay is unknown".into()))?;
-    let (reader, _events) = RelayClient::new(&creator_home);
-    match reader.get_server_location(&creator_fp, server_id).await? {
+    let owner_home = owner_home
+        .ok_or_else(|| GhostError::IdentityLog("the server owner's home relay is unknown".into()))?;
+    let (reader, _events) = RelayClient::new(&owner_home);
+    match reader.get_server_location(&owner_fp, server_id).await? {
         Some(location) => follow_move(client, home, server_id, &location).await,
         None => Ok(false),
     }
 }
 
-/// `check_location` for every server this account did not create. Failures are
+/// `check_location` for every server this account does not own. Failures are
 /// logged per server; returns how many servers moved.
 pub async fn check_all_locations(client: &SharedClient, home: &SharedRelay) -> usize {
     let servers = {
@@ -235,7 +246,12 @@ pub async fn check_all_locations(client: &SharedClient, home: &SharedRelay) -> u
         let own = *c.fingerprint();
         c.store()
             .list_servers()
-            .map(|list| list.into_iter().filter(|s| s.creator_fp != own).map(|s| s.server_id).collect::<Vec<_>>())
+            .map(|list| {
+                list.into_iter()
+                    .map(|s| s.server_id)
+                    .filter(|id| c.server_owner(id).is_ok_and(|owner| owner != own))
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default()
     };
     let mut moved = 0;

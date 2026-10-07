@@ -156,7 +156,7 @@ async fn invite_join_adds_server_for_joiner_and_refreshes_payload() {
     let invite = flows::invite::create(&creator.client, &creator.relay, &server_id, u64::MAX).await.unwrap();
     assert_eq!(invite.relay_url, relay_url);
 
-    let joined = flows::invite::join(&joiner.client, &joiner.relay, &joiner.relay, &invite.token, 2000).await.unwrap();
+    let joined = flows::invite::join(&joiner.client, &joiner.relay, &joiner.relay, &invite.token, &invite.key, 2000).await.unwrap();
     assert_eq!(joined, server_id);
 
     {
@@ -177,7 +177,7 @@ async fn invite_join_adds_server_for_joiner_and_refreshes_payload() {
 async fn invite_join_fails_cleanly_for_unknown_token() {
     let relay_url = common::start_relay().await;
     let joiner = create_account(&relay_url, "joiner").await;
-    let err = flows::invite::join(&joiner.client, &joiner.relay, &joiner.relay, "no-such-token", 2000).await.unwrap_err();
+    let err = flows::invite::join(&joiner.client, &joiner.relay, &joiner.relay, "no-such-token", &[0u8; 32], 2000).await.unwrap_err();
     assert!(matches!(err, GhostError::RelayStatus { status: 404, .. }), "got {err:?}");
     let c = joiner.client.lock().await;
     assert!(c.store().list_servers().unwrap().is_empty());
@@ -195,7 +195,7 @@ async fn member_can_refresh_group_info_only_for_current_state() {
     };
 
     let invite = flows::invite::create(&creator.client, &creator.relay, &server_id, u64::MAX).await.unwrap();
-    flows::invite::join(&joiner.client, &joiner.relay, &joiner.relay, &invite.token, 2000).await.unwrap();
+    flows::invite::join(&joiner.client, &joiner.relay, &joiner.relay, &invite.token, &invite.key, 2000).await.unwrap();
 
     // The joiner's GroupInfo describes the relay's current state, so it is accepted.
     let current = joiner.client.lock().await.export_server_info(&server_id).unwrap();
@@ -219,7 +219,7 @@ async fn receiver_rejects_messages_from_a_device_its_log_shows_revoked() {
     let carol = create_account(&relay_url, "carol").await;
     let server_id = create_server(&alice, "club").await;
     let invite = flows::invite::create(&alice.client, &alice.relay, &server_id, u64::MAX).await.unwrap();
-    flows::invite::join(&carol.client, &carol.relay, &carol.relay, &invite.token, 2000).await.unwrap();
+    flows::invite::join(&carol.client, &carol.relay, &carol.relay, &invite.token, &invite.key, 2000).await.unwrap();
     let (client_b, relay_b, device_b_vk) = pair_second_device(&relay_url, &alice).await;
     let channel_id = derive_default_channel_id(&server_id);
     let mailbox_id = alice.client.lock().await.mailbox_id_for_server(&server_id).unwrap();
@@ -314,4 +314,88 @@ async fn linked_device_rejoins_a_server_with_a_metadata_only_channel() {
     assert!(c.store().get_server(&server_id).is_ok(), "rejoined despite the extra channel");
     let channels = c.store().list_channels(&server_id).unwrap();
     assert_eq!(channels.len(), 2, "the metadata-only channel is kept");
+}
+
+#[tokio::test]
+async fn channels_created_after_the_server_share_its_group() {
+    use ghost_core::client::ReceiveResult;
+    use ghost_core::relay::RelayEvent;
+    use ghost_core::storage::{Channel, ChannelKind};
+    use ghost_core::wire::derive_default_channel_id;
+    use std::time::Duration;
+
+    let relay_url = common::start_relay().await;
+    let creator = create_account(&relay_url, "creator").await;
+    let joiner = create_account(&relay_url, "joiner").await;
+    let server_id = create_server(&creator, "club").await;
+    let (text_id, voice_id) = ([0x71; 32], [0x72; 32]);
+    {
+        let c = creator.client.lock().await;
+        for (channel_id, kind, position) in [(text_id, ChannelKind::Text, 1), (voice_id, ChannelKind::Voice, 2)] {
+            c.store()
+                .insert_channel(&Channel { channel_id, server_id, name: "extra".into(), kind, position })
+                .unwrap();
+        }
+    }
+
+    // Invites work for a server with extra channels, and carry them.
+    let invite = flows::invite::create(&creator.client, &creator.relay, &server_id, u64::MAX).await.unwrap();
+    flows::invite::join(&joiner.client, &joiner.relay, &joiner.relay, &invite.token, &invite.key, 2000).await.unwrap();
+    assert_eq!(joiner.client.lock().await.store().list_channels(&server_id).unwrap().len(), 3);
+
+    // Voice keys exist for the new voice channel and differ from another channel's.
+    {
+        let c = creator.client.lock().await;
+        let fp = *c.fingerprint();
+        let vk = c.verifying_key_bytes();
+        let voice = c.derive_voice_key(&voice_id, &fp, &vk, &[1; 32]).unwrap();
+        let general = c.derive_voice_key(&derive_default_channel_id(&server_id), &fp, &vk, &[1; 32]).unwrap();
+        assert_ne!(voice, general);
+    }
+
+    // The creator catches up on the join, then posts in the new text channel.
+    let mailbox_id = creator.client.lock().await.mailbox_id_for_server(&server_id).unwrap();
+    let default_channel = derive_default_channel_id(&server_id);
+    let (mut reader, mut events) = RelayClient::new(&relay_url);
+    reader.copy_auth_from(&*creator.relay.lock().await);
+    reader.subscribe(mailbox_id, 0);
+    let joiner_fp = joiner.fp;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(event) = events.recv().await {
+            let RelayEvent::Blob(b) = event else { continue };
+            let mut c = creator.client.lock().await;
+            let _ = c.receive_any(&default_channel, &b.payload, Some(b.received_at));
+            if c.mls_member_fingerprints(&server_id).unwrap_or_default().contains(&joiner_fp) {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("creator never saw the joiner");
+    let outbound = {
+        let mut c = creator.client.lock().await;
+        c.send_message(&server_id, &text_id, b"in the new channel".to_vec(), vec![], 5000).unwrap().0
+    };
+    assert_eq!(outbound.mailbox_id, mailbox_id, "public channels use the server's mailbox");
+    creator.relay.lock().await.post_blob(&outbound.mailbox_id, outbound.blob).await.unwrap();
+
+    let (mut joiner_reader, mut joiner_events) = RelayClient::new(&relay_url);
+    joiner_reader.copy_auth_from(&*joiner.relay.lock().await);
+    let since = joiner.client.lock().await.store().get_last_seen_seq(&mailbox_id).unwrap_or(0);
+    joiner_reader.subscribe(mailbox_id, since);
+    let message = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(event) = joiner_events.recv().await {
+            let RelayEvent::Blob(b) = event else { continue };
+            let mut c = joiner.client.lock().await;
+            if let Ok(ReceiveResult::Message(m)) = c.receive_any(&default_channel, &b.payload, Some(b.received_at)) {
+                if m.content == b"in the new channel" {
+                    return m;
+                }
+            }
+        }
+        panic!("event stream ended");
+    })
+    .await
+    .expect("joiner never received the message");
+    assert_eq!(message.channel_id, text_id);
 }

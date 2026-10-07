@@ -16,9 +16,15 @@ use crate::storage::{
 };
 use crate::wire::{
     derive_default_channel_id, mls_group_mailbox_id, open, open_any, seal, sync_server_id,
-    ApplicationMessage, InboundMessage, InviteChannel, InviteMember, InvitePayload, Outbound,
+    ApplicationMessage, CommitChecks, InboundMessage, InviteChannel, InviteMember, InvitePayload, Outbound,
     ProvisionPayload, SyncReceiveResult, SyncServerMeta,
 };
+use ghost_wire::policy::{CommitAad, PolicyError, ServerPolicy, ServerView};
+use ghost_wire::policy_mls;
+
+fn now_millis() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
+}
 
 /// Open an encrypted SQLite connection for MLS state, separate from the app DB.
 fn open_mls_connection(mls_db_key: &[u8; 32], app_db_path: &Path) -> Result<Connection> {
@@ -51,7 +57,38 @@ pub enum ReceiveResult {
     MembersRemoved(Vec<[u8; 32]>),
     /// A proposal was queued (e.g. relay Remove). Creator should commit pending proposals.
     ProposalProcessed,
+    /// This device was removed from a private channel (its access ended); the channel
+    /// is forgotten locally. The server membership is unaffected.
+    ChannelAccessLost([u8; 32]),
     Skipped,
+}
+
+/// A freshly created invite. The relay stores `sealed_payload` under `token`; `key`
+/// opens it and must reach joiners only inside the invite link.
+pub struct NewInvite {
+    pub token: String,
+    pub key: [u8; 32],
+    pub sealed_payload: Vec<u8>,
+}
+
+/// A private channel just created on this device. Its group's GroupInfo goes to the
+/// relay first, which admits the group only from someone who may manage channels;
+/// `announcement` then names the channel inside its group.
+pub struct NewPrivateChannel {
+    pub channel_id: [u8; 32],
+    pub mailbox_id: [u8; 32],
+    pub group_info: Vec<u8>,
+    pub announcement: Outbound,
+}
+
+/// What became of a channel operation received in a metadata message.
+pub enum ChannelOpOutcome {
+    /// Local channel state changed.
+    Applied,
+    /// A newly joined device asked for a private channel's name: send this reply.
+    Reply(Outbound),
+    /// The sender may not do this, or it does not fit where it arrived.
+    Ignored,
 }
 
 /// Session-level orchestration: holds identity, MLS state, and local storage.
@@ -111,7 +148,7 @@ impl GhostClient {
             .ok()
             .flatten();
 
-        Ok(Self {
+        let client = Self {
             identity,
             provider,
             store,
@@ -121,7 +158,14 @@ impl GhostClient {
             sync_group,
             relay_vk: None,
             idlog_cache: IdLogCache::new(),
-        })
+        };
+        // Servers joined before views were recorded start their history here.
+        for server_id in client.channel_server.values().collect::<std::collections::HashSet<_>>() {
+            if let Err(e) = client.record_server_view(server_id) {
+                eprintln!("server view for {}: {e}", hex::encode(&server_id[..8]));
+            }
+        }
+        Ok(client)
     }
 
     pub fn open_in_memory(identity: Identity, db_key: [u8; 32]) -> Result<Self> {
@@ -146,6 +190,116 @@ impl GhostClient {
         self.channel_groups.get(&ch).ok_or_else(|| {
             GhostError::ServerNotLoaded(hex::encode(&server_id[..8]))
         })
+    }
+
+    /// The channel whose MLS group carries traffic for `channel_id`: the channel itself
+    /// when it has its own group (a private channel), otherwise its server's default
+    /// channel, whose group all public channels share. Messages and voice keys keep the
+    /// real channel id, so channels stay distinct inside the shared group.
+    fn group_channel(&self, channel_id: &[u8; 32]) -> [u8; 32] {
+        if self.channel_groups.contains_key(channel_id) {
+            return *channel_id;
+        }
+        match self.store.get_channel(channel_id) {
+            Ok(channel) => derive_default_channel_id(&channel.server_id),
+            Err(_) => *channel_id,
+        }
+    }
+
+    /// A private channel is one with an MLS group of its own besides the server's.
+    pub fn is_private_channel(&self, channel_id: &[u8; 32]) -> bool {
+        self.channel_groups.contains_key(channel_id)
+            && self.channel_server.get(channel_id).is_some_and(|sid| derive_default_channel_id(sid) != *channel_id)
+    }
+
+    /// Authenticated data for a commit to a channel's group. A private channel's
+    /// commits name the server group epoch they were authorized against: the relay
+    /// requires it to be current, and members judge the commit by that epoch's policy.
+    fn commit_aad(&self, channel_id: &[u8; 32]) -> CommitAad {
+        if !self.is_private_channel(channel_id) {
+            return CommitAad::default();
+        }
+        let server_epoch = self
+            .channel_server
+            .get(channel_id)
+            .and_then(|server_id| self.default_group(server_id).ok())
+            .map(GhostGroup::epoch);
+        CommitAad { invite: None, server_epoch }
+    }
+
+    /// The policy governing a server, from its group state.
+    pub fn server_policy(&self, server_id: &[u8; 32]) -> Result<ServerPolicy> {
+        let group = self.default_group(server_id)?;
+        let members: Vec<openmls::prelude::Member> = group.members().collect();
+        policy_mls::server_policy(group.context_extensions(), &members)
+            .map_err(|e| GhostError::Format(format!("server policy: {e}")))
+    }
+
+    /// Whether the server's group carries an explicit policy, rather than the implicit
+    /// one of a group made before roles existed.
+    pub fn server_policy_is_explicit(&self, server_id: &[u8; 32]) -> Result<bool> {
+        Ok(self.default_group(server_id)?.server_policy()?.is_some())
+    }
+
+    /// Mailbox of a server's own group, which its private channels name.
+    pub fn server_mailbox(&self, server_id: &[u8; 32]) -> Result<[u8; 32]> {
+        Ok(mls_group_mailbox_id(self.default_group(server_id)?.group_id()))
+    }
+
+    /// The account that owns a server under its policy.
+    pub fn server_owner(&self, server_id: &[u8; 32]) -> Result<[u8; 32]> {
+        Ok(self.server_policy(server_id)?.owner)
+    }
+
+    /// The server group's view at an epoch of it, against which a private channel
+    /// commit naming that epoch is judged.
+    fn server_view_at(&self, server_mailbox: &[u8; 32], epoch: u64) -> std::result::Result<ServerView, PolicyError> {
+        let denied = |msg: &str| PolicyError::Denied(msg.into());
+        let server_id = self
+            .server_id_for_mailbox(server_mailbox)
+            .ok_or_else(|| denied("the channel names a server this device is not in"))?;
+        let group = self.default_group(&server_id).map_err(|e| PolicyError::Denied(e.to_string()))?;
+        if mls_group_mailbox_id(group.group_id()) != *server_mailbox {
+            return Err(denied("the channel names a mailbox that is not its server's group"));
+        }
+        let current = group.epoch();
+        if epoch > current {
+            return Err(PolicyError::ContextBehind { server_mailbox: *server_mailbox, epoch });
+        }
+        if epoch == current {
+            let members: Vec<openmls::prelude::Member> = group.members().collect();
+            return policy_mls::server_view(group.context_extensions(), &members);
+        }
+        self.store
+            .server_view_at(&server_id, epoch)
+            .map_err(|e| PolicyError::Denied(e.to_string()))?
+            .ok_or_else(|| denied("no record of the server group at that epoch"))
+    }
+
+    /// Record the server group's current view for judging later private channel
+    /// commits. Called after anything that changes the server group's epoch.
+    fn record_server_view(&self, server_id: &[u8; 32]) -> Result<()> {
+        let group = self.default_group(server_id)?;
+        let members: Vec<openmls::prelude::Member> = group.members().collect();
+        let view = policy_mls::server_view(group.context_extensions(), &members)
+            .map_err(|e| GhostError::Format(format!("server policy: {e}")))?;
+        self.store.record_server_view(server_id, group.epoch(), &view)
+    }
+
+    /// Record the server view if `channel_id` is a server's default channel.
+    fn record_if_server_group(&self, channel_id: &[u8; 32]) -> Result<()> {
+        match self.channel_server.get(channel_id) {
+            Some(server_id) if derive_default_channel_id(server_id) == *channel_id => self.record_server_view(server_id),
+            _ => Ok(()),
+        }
+    }
+
+    /// Whether this device holds the server group at or past `epoch`, so private
+    /// channel commits held back for it can be retried.
+    pub fn server_epoch_reached(&self, server_mailbox: &[u8; 32], epoch: u64) -> bool {
+        self.server_id_for_mailbox(server_mailbox)
+            .and_then(|server_id| self.default_group(&server_id).ok())
+            .is_some_and(|group| group.epoch() >= epoch)
     }
 
     /// Get all channel_ids belonging to a server.
@@ -338,6 +492,7 @@ impl GhostClient {
     pub fn receive_sync(&mut self, blob: &[u8]) -> Result<SyncReceiveResult> {
         let cache = &self.idlog_cache;
         let revoked = |fp: &[u8; 32], vk: &[u8; 32]| cache.is_revoked(fp, vk);
+        let no_server = |_: &[u8; 32], _: u64| Err(PolicyError::Denied("the sync group has no server".into()));
         let group = self.sync_group.as_mut()
             .ok_or_else(|| GhostError::Format("no sync group".into()))?;
         let (envelope_type, _epoch) = ghost_wire::decode_envelope(blob)
@@ -367,10 +522,22 @@ impl GhostClient {
                     Ok(processed) => {
                         let credential = processed.credential().clone();
                         let sender = processed.sender().clone();
+                        let aad = processed.aad().to_vec();
                         match processed.into_content() {
                             openmls::prelude::ProcessedMessageContent::StagedCommitMessage(staged) => {
                                 crate::wire::validate_sender(group, &credential, &sender, Some(&staged), &revoked)?;
+                                let checks = CommitChecks {
+                                    revoked: &revoked,
+                                    mailbox: mls_group_mailbox_id(group.group_id()),
+                                    received_at: now_millis(),
+                                    server_at: &no_server,
+                                };
+                                crate::wire::check_policy(group, &sender, &staged, &aad, &checks)?;
                                 group.merge_staged_commit(&self.provider, *staged)?;
+                                Ok(SyncReceiveResult::CommitProcessed)
+                            }
+                            openmls::prelude::ProcessedMessageContent::ProposalMessage(proposal) => {
+                                group.store_pending_proposal(&self.provider, *proposal)?;
                                 Ok(SyncReceiveResult::CommitProcessed)
                             }
                             _ => Ok(SyncReceiveResult::CommitProcessed),
@@ -395,6 +562,7 @@ impl GhostClient {
             &self.provider,
             &self.identity,
             group_info_bytes,
+            &CommitAad::default(),
         )?;
         let mailbox_id = mls_group_mailbox_id(group.group_id());
         self.sync_group = Some(group);
@@ -413,7 +581,7 @@ impl GhostClient {
         if leaf_indices.is_empty() {
             return Err(GhostError::Mls("device not in sync group".into()));
         }
-        group.remove_members(&self.provider, &leaf_indices)
+        group.remove_members(&self.provider, &leaf_indices, &CommitAad::default())
     }
 
     /// Export server metadata for provisioning a sibling device (no role check).
@@ -424,8 +592,11 @@ impl GhostClient {
         let channels = self.store.list_channels(server_id)?;
         let mailbox_id = mls_group_mailbox_id(default_group.group_id());
 
+        // Private channels are found through the relay's discovery and joined with the
+        // server epoch they are authorized against, not provisioned.
         let invite_channels: Vec<InviteChannel> = channels
             .iter()
+            .filter(|c| !self.is_private_channel(&c.channel_id))
             .map(|c| {
                 let gi = self.channel_groups.get(&c.channel_id)
                     .and_then(|g| g.export_group_info(&self.provider).ok())
@@ -455,6 +626,7 @@ impl GhostClient {
             channels: invite_channels,
             mailbox_id,
             relay_ref: self.server_relay_ref(server_id)?,
+            role_names: self.store.list_role_names(server_id)?,
         })
     }
 
@@ -479,6 +651,7 @@ impl GhostClient {
             mailbox_id,
             channels: channels
                 .iter()
+                .filter(|c| !self.is_private_channel(&c.channel_id))
                 .map(|c| InviteChannel {
                     channel_id: c.channel_id,
                     name: c.name.clone(),
@@ -488,6 +661,7 @@ impl GhostClient {
                 })
                 .collect(),
             relay_ref: self.server_relay_ref(server_id)?,
+            role_names: self.store.list_role_names(server_id)?,
         })
     }
 
@@ -495,6 +669,8 @@ impl GhostClient {
     /// `idempotent`: true uses `_if_not_exists` inserts (provision/sync), false uses strict inserts (invite).
     /// Join a server by joining each channel's MLS group.
     /// Returns Vec of (channel_id, commit_bytes, mailbox_id) — one per channel.
+    /// `grant` admits an account that is not yet a member to the server group.
+    #[allow(clippy::too_many_arguments)]
     fn join_server_common(
         &mut self,
         server_id: [u8; 32],
@@ -502,6 +678,8 @@ impl GhostClient {
         kind: ServerKind,
         members: &[InviteMember],
         channels: &[InviteChannel],
+        role_names: &[(u8, String)],
+        grant: Option<&ghost_wire::policy::InviteGrant>,
         timestamp: u64,
         idempotent: bool,
     ) -> Result<Vec<([u8; 32], Vec<u8>, [u8; 32])>> {
@@ -541,13 +719,19 @@ impl GhostClient {
         if idempotent { self.store.insert_member_if_not_exists(&self_member)?; }
         else { self.store.insert_member(&self_member)?; }
 
+        for (role_id, name) in role_names {
+            self.store.set_role_name(&server_id, *role_id, name)?;
+        }
+
         let mut results = Vec::with_capacity(channels.len());
+        let aad = CommitAad { invite: grant.cloned(), server_epoch: None };
         // Channels without GroupInfo have no MLS group: metadata only.
         for ch in channels.iter().filter(|ch| !ch.group_info_bytes.is_empty()) {
             let (ghost_group, commit_bytes) = GhostGroup::join_by_external_commit(
                 &self.provider,
                 &self.identity,
                 &ch.group_info_bytes,
+                &aad,
             )?;
             let mailbox_id = mls_group_mailbox_id(ghost_group.group_id());
             self.channel_groups.insert(ch.channel_id, ghost_group);
@@ -555,6 +739,7 @@ impl GhostClient {
             self.channel_server.insert(ch.channel_id, server_id);
             results.push((ch.channel_id, commit_bytes, mailbox_id));
         }
+        self.record_server_view(&server_id)?;
         Ok(results)
     }
 
@@ -579,7 +764,7 @@ impl GhostClient {
         }
         self.join_server_common(
             payload.server_id, payload.server_name.clone(), payload.kind,
-            &payload.members, &channels, timestamp, true,
+            &payload.members, &channels, &payload.role_names, None, timestamp, true,
         )
     }
 
@@ -598,7 +783,14 @@ impl GhostClient {
         let channel_id = derive_default_channel_id(&server_id);
 
         let ghost_group =
-            GhostGroup::create_with_id(&self.provider, &self.identity, &server_id, &channel_id, self.relay_vk.as_ref())?;
+            GhostGroup::create_with_id(
+                &self.provider,
+                &self.identity,
+                &server_id,
+                &channel_id,
+                self.relay_vk.as_ref(),
+                Some(&crate::mls::group::GroupPolicy::Server(ghost_wire::policy::ServerPolicy::new(self.identity.fingerprint))),
+            )?;
 
         self.store.insert_server(&Server {
             server_id,
@@ -630,34 +822,33 @@ impl GhostClient {
         self.channel_groups.insert(channel_id, ghost_group);
         self.mailbox_map.insert(mailbox_id, channel_id);
         self.channel_server.insert(channel_id, server_id);
+        self.record_server_view(&server_id)?;
         Ok(server_id)
     }
 
-    /// Stage, in every channel group of a server, a commit naming `relay_vk` as the
-    /// group's external sender. Returns (channel_id, mailbox_id, commit) for each; the
-    /// caller posts each commit to the new relay and merges or clears it.
-    pub fn stage_server_external_sender(
-        &mut self,
-        server_id: &[u8; 32],
-        relay_vk: &[u8; 32],
-    ) -> Result<Vec<([u8; 32], [u8; 32], Vec<u8>)>> {
-        let mut staged = Vec::new();
-        for channel_id in self.server_channel_ids(server_id) {
-            let group = self.channel_groups.get_mut(&channel_id).ok_or_else(|| {
-                GhostError::ServerNotLoaded(format!("channel {}", hex::encode(&channel_id[..8])))
-            })?;
-            let commit = group.set_external_sender(&self.provider, relay_vk)?;
-            staged.push((channel_id, mls_group_mailbox_id(group.group_id()), commit));
-        }
-        Ok(staged)
+    /// Stage, in one channel's group, a commit naming `relay_vk` as the group's
+    /// external sender. Returns the commit; the caller posts it to the new relay and
+    /// merges or clears it. A private channel's commit names the server group's
+    /// current epoch, so the server group's own commit must be merged first.
+    pub fn stage_external_sender(&mut self, channel_id: &[u8; 32], relay_vk: &[u8; 32]) -> Result<Vec<u8>> {
+        let aad = self.commit_aad(channel_id);
+        let group = self.channel_groups.get_mut(channel_id).ok_or_else(|| {
+            GhostError::ServerNotLoaded(format!("channel {}", hex::encode(&channel_id[..8])))
+        })?;
+        group.set_external_sender(&self.provider, relay_vk, &aad)
     }
 
-    /// Ids of the server's channels that have an MLS group, with their mailboxes.
+    /// Ids of the server's channels that have an MLS group, with their mailboxes; the
+    /// server's own group comes first, since its private channels are judged by it.
     pub fn server_channel_mailboxes(&self, server_id: &[u8; 32]) -> Vec<([u8; 32], [u8; 32])> {
-        self.server_channel_ids(server_id)
+        let default_channel = derive_default_channel_id(server_id);
+        let mut mailboxes: Vec<([u8; 32], [u8; 32])> = self
+            .server_channel_ids(server_id)
             .into_iter()
             .filter_map(|cid| self.channel_groups.get(&cid).map(|g| (cid, mls_group_mailbox_id(g.group_id()))))
-            .collect()
+            .collect();
+        mailboxes.sort_by_key(|(cid, _)| *cid != default_channel);
+        mailboxes
     }
 
     /// Migrate pre-upgrade groups to include ExternalSendersExtension.
@@ -683,6 +874,7 @@ impl GhostClient {
                 .map(|(cid, _)| *cid)
                 .collect();
             for cid in channel_ids {
+                let aad = self.commit_aad(&cid);
                 let group = match self.channel_groups.get_mut(&cid) {
                     Some(g) => g,
                     None => continue,
@@ -690,7 +882,7 @@ impl GhostClient {
                 if group.has_external_senders() {
                     continue;
                 }
-                if let Ok(commit) = group.add_external_sender_extension(&self.provider, &relay_vk) {
+                if let Ok(commit) = group.add_external_sender_extension(&self.provider, &relay_vk, &aad) {
                     let mailbox_id = mls_group_mailbox_id(group.group_id());
                     results.push((mailbox_id, commit));
                 }
@@ -700,7 +892,7 @@ impl GhostClient {
         // Also migrate sync group
         if let Some(ref mut sync_group) = self.sync_group {
             if !sync_group.has_external_senders() {
-                if let Ok(commit) = sync_group.add_external_sender_extension(&self.provider, &relay_vk) {
+                if let Ok(commit) = sync_group.add_external_sender_extension(&self.provider, &relay_vk, &CommitAad::default()) {
                     let mailbox_id = mls_group_mailbox_id(sync_group.group_id());
                     results.push((mailbox_id, commit));
                 }
@@ -718,7 +910,14 @@ impl GhostClient {
         references: Vec<[u8; 32]>,
         timestamp: u64,
     ) -> Result<(Outbound, [u8; 32])> {
-        let group = self.channel_groups.get_mut(channel_id).ok_or_else(|| {
+        let group_channel = self.group_channel(channel_id);
+        // Never encrypt to someone a private channel no longer admits.
+        if !self.excluded_leaves(&group_channel)?.is_empty() {
+            return Err(GhostError::PermissionDenied(
+                "the channel still holds members who lost access; remove them first".into(),
+            ));
+        }
+        let group = self.channel_groups.get_mut(&group_channel).ok_or_else(|| {
             GhostError::ServerNotLoaded(format!("channel {}", hex::encode(&channel_id[..8])))
         })?;
 
@@ -768,10 +967,16 @@ impl GhostClient {
         server_id: &[u8; 32],
         content: Vec<u8>,
     ) -> Result<Outbound> {
+        self.send_control_in(&derive_default_channel_id(server_id), content)
+    }
+
+    /// Send a control message inside one channel's own group: for a private channel,
+    /// whatever must stay among the members it admits, such as its name.
+    pub fn send_control_in(&mut self, channel_id: &[u8; 32], content: Vec<u8>) -> Result<Outbound> {
         let fingerprint = self.identity.fingerprint;
-        let channel_id = derive_default_channel_id(server_id);
+        let channel_id = *channel_id;
         let group = self.channel_groups.get_mut(&channel_id).ok_or_else(|| {
-            GhostError::ServerNotLoaded(hex::encode(&server_id[..8]))
+            GhostError::ServerNotLoaded(format!("channel {}", hex::encode(&channel_id[..8])))
         })?;
 
         let now = SystemTime::now()
@@ -845,7 +1050,7 @@ impl GhostClient {
             GhostError::ServerNotLoaded(hex::encode(&server_id[..8]))
         })?;
 
-        let (commit_blob, welcome) = group.add_member(&self.provider, key_package)?;
+        let (commit_blob, welcome) = group.add_member(&self.provider, key_package, &CommitAad::default())?;
         let welcome_bytes = welcome
             .to_bytes()
             .map_err(|e| GhostError::Mls(format!("serialize welcome: {e}")))?;
@@ -911,7 +1116,7 @@ impl GhostClient {
         self.channel_groups.insert(channel_id, ghost_group);
         self.mailbox_map.insert(mailbox_id, channel_id);
         self.channel_server.insert(channel_id, *server_id);
-        Ok(())
+        self.record_server_view(server_id)
     }
 
     fn build_invite_payload(
@@ -921,14 +1126,19 @@ impl GhostClient {
         kind: ServerKind,
         members: &[Member],
         channels: &[Channel],
+        grant: &ghost_wire::policy::InviteGrant,
     ) -> Result<InvitePayload> {
+        // Public channels travel as metadata and the default channel carries the server
+        // group's GroupInfo. Private channels never appear in an invite: joiners find the
+        // ones they may enter through the relay's discovery, and others never learn of them.
         let invite_channels: Vec<InviteChannel> = channels
             .iter()
+            .filter(|c| !self.is_private_channel(&c.channel_id))
             .map(|c| {
-                let group = self.channel_groups.get(&c.channel_id).ok_or_else(|| {
-                    GhostError::ServerNotLoaded(format!("channel {}", hex::encode(&c.channel_id[..8])))
-                })?;
-                let gi = group.export_group_info(&self.provider)?;
+                let gi = match self.channel_groups.get(&c.channel_id) {
+                    Some(group) => group.export_group_info(&self.provider)?,
+                    None => Vec::new(),
+                };
                 Ok(InviteChannel {
                     channel_id: c.channel_id,
                     name: c.name.clone(),
@@ -952,55 +1162,75 @@ impl GhostClient {
                 })
                 .collect(),
             channels: invite_channels,
+            role_names: self.store.list_role_names(server_id)?,
+            grant: grant.clone(),
         })
     }
 
-    /// Creator exports an invite payload with per-channel GroupInfo.
-    /// Returns (random_token, serialized_payload).
-    pub fn create_invite(&self, server_id: &[u8; 32]) -> Result<(String, Vec<u8>)> {
-        let member = self.store.get_member(server_id, &self.identity.fingerprint)?;
-        if member.role != MemberRole::Creator {
-            return Err(GhostError::PermissionDenied(
-                "only the creator can create invites".into(),
-            ));
+    /// Create an invite to a server: a grant signed by this device admitting whoever
+    /// holds it until `expires_at`, inside a payload sealed under a fresh key that
+    /// travels only in the invite link, so the relay storing it learns nothing. Needs
+    /// the invite permission; the relay and members check the grant again at the join.
+    pub fn create_invite(&self, server_id: &[u8; 32], expires_at: u64) -> Result<NewInvite> {
+        let own = self.identity.fingerprint;
+        if !self.server_policy(server_id)?.has(&own, ghost_wire::policy::INVITE) {
+            return Err(GhostError::PermissionDenied("creating invites needs the invite permission".into()));
         }
+        let server_mailbox = mls_group_mailbox_id(self.default_group(server_id)?.group_id());
+        let mut nonce = [0u8; 16];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
+        let grant = ghost_wire::policy::InviteGrant::sign(server_mailbox, own, expires_at, nonce, &self.identity.signing_key);
 
-        let meta = self.store.get_server(server_id)?;
-        let members = self.store.list_members(server_id)?;
-        let channels = self.store.list_channels(server_id)?;
-
-        let payload = self.build_invite_payload(server_id, &meta.name, meta.kind, &members, &channels)?;
+        let mut key = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut key);
+        let sealed_payload = self.sealed_invite_payload(server_id, &grant, &key)?;
 
         let mut token_bytes = [0u8; 16];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut token_bytes);
-        let token = hex::encode(token_bytes);
-
-        Ok((token, payload.to_bytes()))
+        Ok(NewInvite { token: hex::encode(token_bytes), key, sealed_payload })
     }
 
-    /// Join a server via an invite payload (external commit).
-    /// Returns (server_id, Vec<(channel_id, commit_bytes, mailbox_id)>).
+    /// Join a server via a sealed invite payload (external commit carrying its grant).
+    /// Returns (server_id, Vec<(channel_id, commit_bytes, mailbox_id)>, grant); the
+    /// grant goes into the payload refreshed for the next joiner.
+    #[allow(clippy::type_complexity)]
     pub fn join_by_invite(
         &mut self,
-        payload_bytes: &[u8],
+        sealed_payload: &[u8],
+        key: &[u8; 32],
         timestamp: u64,
-    ) -> Result<([u8; 32], Vec<([u8; 32], Vec<u8>, [u8; 32])>)> {
-        let payload = InvitePayload::from_bytes(payload_bytes)?;
+    ) -> Result<([u8; 32], Vec<([u8; 32], Vec<u8>, [u8; 32])>, ghost_wire::policy::InviteGrant)> {
+        let opened = crate::crypto::aead::open(key, sealed_payload, crate::wire::INVITE_PAYLOAD_CONTEXT)?;
+        let payload = InvitePayload::from_bytes(&opened)?;
         let channel_results = self.join_server_common(
             payload.server_id, payload.server_name, payload.kind,
-            &payload.members, &payload.channels, timestamp, false,
+            &payload.members, &payload.channels, &payload.role_names, Some(&payload.grant), timestamp, false,
         )?;
-        Ok((payload.server_id, channel_results))
+        Ok((payload.server_id, channel_results, payload.grant))
     }
 
-    /// Re-export an invite payload with fresh GroupInfo (after joining via external commit).
-    pub fn refresh_invite_payload(&self, server_id: &[u8; 32]) -> Result<Vec<u8>> {
+    /// Re-seal an invite payload with fresh GroupInfo and the same grant, for the next
+    /// joiner (after joining via external commit).
+    pub fn refresh_invite_payload(
+        &self,
+        server_id: &[u8; 32],
+        grant: &ghost_wire::policy::InviteGrant,
+        key: &[u8; 32],
+    ) -> Result<Vec<u8>> {
+        self.sealed_invite_payload(server_id, grant, key)
+    }
+
+    fn sealed_invite_payload(
+        &self,
+        server_id: &[u8; 32],
+        grant: &ghost_wire::policy::InviteGrant,
+        key: &[u8; 32],
+    ) -> Result<Vec<u8>> {
         let meta = self.store.get_server(server_id)?;
         let members = self.store.list_members(server_id)?;
         let channels = self.store.list_channels(server_id)?;
-
-        let payload = self.build_invite_payload(server_id, &meta.name, meta.kind, &members, &channels)?;
-        Ok(payload.to_bytes())
+        let payload = self.build_invite_payload(server_id, &meta.name, meta.kind, &members, &channels, grant)?;
+        crate::crypto::aead::seal(key, &payload.to_bytes(), crate::wire::INVITE_PAYLOAD_CONTEXT)
     }
 
     /// Export GroupInfo for a server's default channel so other clients can recover via external commit.
@@ -1026,10 +1256,12 @@ impl GhostClient {
         channel_id: &[u8; 32],
         group_info_bytes: &[u8],
     ) -> Result<(Vec<u8>, [u8; 32])> {
+        let aad = self.commit_aad(channel_id);
         let (ghost_group, commit_bytes) = GhostGroup::join_by_external_commit(
             &self.provider,
             &self.identity,
             group_info_bytes,
+            &aad,
         )?;
 
         let mailbox_id = mls_group_mailbox_id(ghost_group.group_id());
@@ -1042,64 +1274,394 @@ impl GhostClient {
         }
         self.channel_groups.insert(*channel_id, ghost_group);
         self.mailbox_map.insert(mailbox_id, *channel_id);
+        self.record_if_server_group(channel_id)?;
 
         Ok((commit_bytes, mailbox_id))
     }
 
-    /// Creator-only: remove a member from ALL channel MLS groups in the server.
-    /// Returns one Outbound per channel group where the member was found.
+    /// Stage a commit replacing the server's policy: its roles, their assignments, what
+    /// everyone may do, or its owner. Checked here against the current policy so a
+    /// refusal comes early; the relay and every member check it again. Returns the
+    /// commit to post; merge or clear the server group's pending commit afterwards.
+    pub fn stage_server_policy(&mut self, server_id: &[u8; 32], policy: &ServerPolicy) -> Result<Outbound> {
+        use ghost_wire::policy::{authorize_server_commit, CommitSummary, Committer, GrantContext};
+        let current = self.server_policy(server_id)?;
+        let channel_id = derive_default_channel_id(server_id);
+        let group = self.channel_groups.get_mut(&channel_id).ok_or_else(|| {
+            GhostError::ServerNotLoaded(hex::encode(&server_id[..8]))
+        })?;
+        let mailbox_id = mls_group_mailbox_id(group.group_id());
+        let summary = CommitSummary {
+            committer: Committer::Member(self.identity.fingerprint),
+            adds: Vec::new(),
+            removes: Vec::new(),
+            new_server_policy: Some(policy.clone()),
+            new_channel_policy: None,
+        };
+        let no_devices = |_: &[u8; 32], _: &[u8; 32]| false;
+        let ctx = GrantContext { server_mailbox: mailbox_id, now_millis: now_millis(), is_member_device: &no_devices };
+        authorize_server_commit(&current, &summary, &ctx).map_err(|e| GhostError::PermissionDenied(e.to_string()))?;
+
+        let policy = crate::mls::group::GroupPolicy::Server(policy.clone());
+        let blob = group.stage_policy(&self.provider, &policy, &CommitAad::default())?;
+        Ok(Outbound { channel_id, mailbox_id, blob })
+    }
+
+    /// Create a private channel: an MLS group of its own whose ChannelPolicy admits
+    /// `roles` and `accounts` (and always the server's channel managers). Nothing goes
+    /// to the server group, so members it does not admit never learn it exists. Needs
+    /// the manage channels permission, which the relay checks again.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_private_channel(
+        &mut self,
+        server_id: &[u8; 32],
+        name: &str,
+        kind: ChannelKind,
+        position: i32,
+        roles: Vec<u8>,
+        accounts: Vec<[u8; 32]>,
+    ) -> Result<NewPrivateChannel> {
+        use crate::mls::group::GroupPolicy;
+        use ghost_wire::policy::{ChannelPolicy, MANAGE_CHANNELS};
+        let own = self.identity.fingerprint;
+        if !self.server_policy(server_id)?.has(&own, MANAGE_CHANNELS) {
+            return Err(GhostError::PermissionDenied("creating channels needs the manage channels permission".into()));
+        }
+        let server_mailbox = mls_group_mailbox_id(self.default_group(server_id)?.group_id());
+        // The relay hosting the server proposes removals in its channels too.
+        let relay_vk = self.store.server_relay(server_id)?.or(self.relay_vk);
+
+        let mut channel_id = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut channel_id);
+        let policy = ChannelPolicy { server_mailbox, channel_id, roles, accounts };
+        let group = GhostGroup::create_with_id(
+            &self.provider,
+            &self.identity,
+            server_id,
+            &channel_id,
+            relay_vk.as_ref(),
+            Some(&GroupPolicy::Channel(policy)),
+        )?;
+        let group_info = group.export_group_info(&self.provider)?;
+        let mailbox_id = mls_group_mailbox_id(group.group_id());
+
+        self.store.insert_channel(&Channel { channel_id, server_id: *server_id, name: name.to_string(), kind, position })?;
+        self.channel_groups.insert(channel_id, group);
+        self.mailbox_map.insert(mailbox_id, channel_id);
+        self.channel_server.insert(channel_id, *server_id);
+
+        let op = crate::wire::ChannelOpPayload::Create { channel_id, name: name.to_string(), kind, position };
+        let announcement = self.send_control_in(&channel_id, crate::wire::encode_channel_op(&op))?;
+        Ok(NewPrivateChannel { channel_id, mailbox_id, group_info, announcement })
+    }
+
+    /// Join a private channel the relay listed: stage an external commit, then check
+    /// that the group belongs to this server (its id derives from the server id, which
+    /// the relay never learns) and admits this account before letting the commit go.
+    /// Returns (channel_id, mailbox_id, commit). The channel is unnamed until a member
+    /// answers the info request this device sends once the relay accepts the commit;
+    /// if the relay refuses it, call `drop_private_channel`.
+    pub fn join_private_channel(&mut self, server_id: &[u8; 32], group_info: &[u8]) -> Result<([u8; 32], [u8; 32], Vec<u8>)> {
+        let server_epoch = self.default_group(server_id)?.epoch();
+        let aad = CommitAad { invite: None, server_epoch: Some(server_epoch) };
+        let (group, commit) = GhostGroup::join_by_external_commit(&self.provider, &self.identity, group_info, &aad)?;
+
+        let refuse = |group: GhostGroup, provider: &GhostProvider, why: &str| {
+            let _ = group.delete(provider);
+            Err(GhostError::PermissionDenied(format!("not joining listed channel: {why}")))
+        };
+        let Some(policy) = group.channel_policy()? else {
+            return refuse(group, &self.provider, "it is not a private channel");
+        };
+        if group.group_id() != crate::wire::derive_mls_group_id(server_id, &policy.channel_id) {
+            return refuse(group, &self.provider, "its group does not belong to this server");
+        }
+        let server_group = self.default_group(server_id)?;
+        if mls_group_mailbox_id(server_group.group_id()) != policy.server_mailbox {
+            return refuse(group, &self.provider, "it names another server");
+        }
+        let members: Vec<openmls::prelude::Member> = server_group.members().collect();
+        let view = policy_mls::server_view(server_group.context_extensions(), &members)
+            .map_err(|e| GhostError::Format(format!("server policy: {e}")))?;
+        if !policy.admits(&self.identity.fingerprint, &view) {
+            return refuse(group, &self.provider, "its policy does not admit this account");
+        }
+
+        let channel_id = policy.channel_id;
+        let mailbox_id = mls_group_mailbox_id(group.group_id());
+        self.store.insert_channel_if_not_exists(&Channel {
+            channel_id,
+            server_id: *server_id,
+            name: crate::wire::UNNAMED_PRIVATE_CHANNEL.to_string(),
+            kind: ChannelKind::Text,
+            position: 0,
+        })?;
+        self.channel_groups.insert(channel_id, group);
+        self.mailbox_map.insert(mailbox_id, channel_id);
+        self.channel_server.insert(channel_id, *server_id);
+        Ok((channel_id, mailbox_id, commit))
+    }
+
+    /// Answer a newly joined device's request for a private channel's name and kind,
+    /// inside the channel's group. `None` when this device does not know them either.
+    pub fn channel_info_reply(&mut self, channel_id: &[u8; 32]) -> Result<Option<Outbound>> {
+        let channel = self.store.get_channel(channel_id)?;
+        if !self.is_private_channel(channel_id) || channel.name == crate::wire::UNNAMED_PRIVATE_CHANNEL {
+            return Ok(None);
+        }
+        let op = crate::wire::ChannelOpPayload::Create {
+            channel_id: *channel_id,
+            name: channel.name,
+            kind: channel.kind,
+            position: channel.position,
+        };
+        self.send_control_in(channel_id, crate::wire::encode_channel_op(&op)).map(Some)
+    }
+
+    /// Apply a channel operation that `sender` sent in the group of `group_channel`.
+    /// Senders are authenticated by MLS; what they may do comes from the server policy,
+    /// so every member's device reaches the same channel list. Operations inside a
+    /// private channel's group concern only that channel.
+    pub fn apply_channel_op(
+        &mut self,
+        group_channel: &[u8; 32],
+        sender: &[u8; 32],
+        op: crate::wire::ChannelOpPayload,
+    ) -> Result<ChannelOpOutcome> {
+        use crate::wire::ChannelOpPayload;
+        let server_id = *self
+            .channel_server
+            .get(group_channel)
+            .ok_or_else(|| GhostError::ServerNotLoaded(format!("channel {}", hex::encode(&group_channel[..8]))))?;
+        let may_manage = self.server_policy(&server_id)?.has(sender, ghost_wire::policy::MANAGE_CHANNELS);
+
+        if self.is_private_channel(group_channel) {
+            let target = match &op {
+                ChannelOpPayload::Create { channel_id, .. }
+                | ChannelOpPayload::Rename { channel_id, .. }
+                | ChannelOpPayload::Delete { channel_id }
+                | ChannelOpPayload::InfoRequest { channel_id } => *channel_id,
+            };
+            if target != *group_channel {
+                return Ok(ChannelOpOutcome::Ignored);
+            }
+            return match op {
+                ChannelOpPayload::Create { channel_id, name, kind, position } => {
+                    // Any member may tell a device that has no name yet; renaming needs the permission.
+                    let unnamed = self.store.get_channel(&channel_id)?.name == crate::wire::UNNAMED_PRIVATE_CHANNEL;
+                    if !unnamed && !may_manage {
+                        return Ok(ChannelOpOutcome::Ignored);
+                    }
+                    self.store.upsert_channel(&Channel { channel_id, server_id, name, kind, position })?;
+                    Ok(ChannelOpOutcome::Applied)
+                }
+                ChannelOpPayload::Rename { channel_id, name } if may_manage => {
+                    self.store.rename_channel(&channel_id, &name)?;
+                    Ok(ChannelOpOutcome::Applied)
+                }
+                ChannelOpPayload::Delete { channel_id } if may_manage => {
+                    self.drop_private_channel(&channel_id)?;
+                    Ok(ChannelOpOutcome::Applied)
+                }
+                ChannelOpPayload::InfoRequest { channel_id } => Ok(match self.channel_info_reply(&channel_id)? {
+                    Some(reply) => ChannelOpOutcome::Reply(reply),
+                    None => ChannelOpOutcome::Ignored,
+                }),
+                _ => Ok(ChannelOpOutcome::Ignored),
+            };
+        }
+
+        if !may_manage {
+            return Ok(ChannelOpOutcome::Ignored);
+        }
+        match op {
+            ChannelOpPayload::Create { channel_id, name, kind, position } => {
+                self.store.insert_channel_if_not_exists(&Channel { channel_id, server_id, name, kind, position })?;
+            }
+            // Private channels are renamed and deleted only inside their own group.
+            ChannelOpPayload::Rename { channel_id, name } if !self.is_private_channel(&channel_id) => {
+                self.store.rename_channel(&channel_id, &name)?;
+            }
+            ChannelOpPayload::Delete { channel_id } if !self.is_private_channel(&channel_id) => {
+                self.store.delete_channel(&channel_id)?;
+            }
+            _ => return Ok(ChannelOpOutcome::Ignored),
+        }
+        Ok(ChannelOpOutcome::Applied)
+    }
+
+    /// Record a role's display name sent by `sender`, who must be able to manage roles.
+    /// Returns whether it was recorded.
+    pub fn apply_role_name(&mut self, server_id: &[u8; 32], sender: &[u8; 32], role_id: u8, name: &str) -> Result<bool> {
+        if !self.server_policy(server_id)?.has(sender, ghost_wire::policy::MANAGE_ROLES) {
+            return Ok(false);
+        }
+        self.store.set_role_name(server_id, role_id, name)?;
+        Ok(true)
+    }
+
+    /// Name a role: stored here and sent to the server's members in an encrypted
+    /// metadata message. Needs the manage roles permission.
+    pub fn name_role(&mut self, server_id: &[u8; 32], role_id: u8, name: &str) -> Result<Outbound> {
+        if !self.server_policy(server_id)?.has(&self.identity.fingerprint, ghost_wire::policy::MANAGE_ROLES) {
+            return Err(GhostError::PermissionDenied("naming roles needs the manage roles permission".into()));
+        }
+        self.store.set_role_name(server_id, role_id, name)?;
+        self.send_control(server_id, crate::wire::encode_role_name(role_id, name))
+    }
+
+    /// Forget a private channel this device is no longer in (or failed to join).
+    pub fn drop_private_channel(&mut self, channel_id: &[u8; 32]) -> Result<()> {
+        if let Some(group) = self.channel_groups.remove(channel_id) {
+            self.mailbox_map.remove(&mls_group_mailbox_id(group.group_id()));
+            let _ = group.delete(&self.provider);
+        }
+        self.channel_server.remove(channel_id);
+        let _ = self.store.delete_channel(channel_id);
+        Ok(())
+    }
+
+    /// The policy of a private channel, or `None` for a public one.
+    pub fn channel_policy(&self, channel_id: &[u8; 32]) -> Result<Option<ghost_wire::policy::ChannelPolicy>> {
+        match self.channel_groups.get(channel_id) {
+            Some(group) if self.is_private_channel(channel_id) => group.channel_policy(),
+            _ => Ok(None),
+        }
+    }
+
+    /// Stage a commit changing who a private channel admits. Needs the manage channels
+    /// permission; the relay and members check it again and the relay then proposes
+    /// removing whoever it no longer admits.
+    pub fn stage_channel_policy(&mut self, channel_id: &[u8; 32], policy: &ghost_wire::policy::ChannelPolicy) -> Result<Outbound> {
+        let current = self
+            .channel_policy(channel_id)?
+            .ok_or_else(|| GhostError::Format("not a private channel".into()))?;
+        if policy.server_mailbox != current.server_mailbox || policy.channel_id != current.channel_id {
+            return Err(GhostError::PermissionDenied("a channel's server and id are fixed".into()));
+        }
+        let server_id = *self.channel_server.get(channel_id).ok_or_else(|| GhostError::ServerNotLoaded("channel's server".into()))?;
+        if !self.server_policy(&server_id)?.has(&self.identity.fingerprint, ghost_wire::policy::MANAGE_CHANNELS) {
+            return Err(GhostError::PermissionDenied("changing a channel's access needs the manage channels permission".into()));
+        }
+        let aad = self.commit_aad(channel_id);
+        let group = self.channel_groups.get_mut(channel_id).expect("policy read above");
+        let blob = group.stage_policy(&self.provider, &crate::mls::group::GroupPolicy::Channel(policy.clone()), &aad)?;
+        let mailbox_id = mls_group_mailbox_id(group.group_id());
+        Ok(Outbound { channel_id: *channel_id, mailbox_id, blob })
+    }
+
+    /// Leaves of a private channel's group whose accounts its policy no longer admits
+    /// under the server's current state; empty for a public channel.
+    pub fn excluded_leaves(&self, channel_id: &[u8; 32]) -> Result<Vec<LeafNodeIndex>> {
+        let Some(policy) = self.channel_policy(channel_id)? else { return Ok(Vec::new()) };
+        let server_id = self.channel_server.get(channel_id).ok_or_else(|| GhostError::ServerNotLoaded("channel's server".into()))?;
+        let server_group = self.default_group(server_id)?;
+        let server_members: Vec<openmls::prelude::Member> = server_group.members().collect();
+        let view = policy_mls::server_view(server_group.context_extensions(), &server_members)
+            .map_err(|e| GhostError::Format(format!("server policy: {e}")))?;
+        let group = self.channel_groups.get(channel_id).expect("policy read above");
+        let members: Vec<openmls::prelude::Member> = group.members().collect();
+        Ok(policy_mls::excluded_leaves(&policy, &view, &members))
+    }
+
+    /// Stage a commit removing everyone a private channel no longer admits, which must
+    /// happen before anything more is sent there. `None` when nobody is excluded.
+    pub fn remove_excluded(&mut self, channel_id: &[u8; 32]) -> Result<Option<Outbound>> {
+        let excluded = self.excluded_leaves(channel_id)?;
+        if excluded.is_empty() {
+            return Ok(None);
+        }
+        let blob = self.remove_channel_members(channel_id, &excluded)?;
+        let mailbox_id = self.channel_groups.get(channel_id).map(|g| mls_group_mailbox_id(g.group_id())).expect("checked above");
+        Ok(Some(Outbound { channel_id: *channel_id, mailbox_id, blob }))
+    }
+
+    /// Channels whose group still holds this device's leaf without Ghost's policy
+    /// capabilities: groups made before policies existed, which cannot carry one until
+    /// every leaf advertises support.
+    pub fn channels_needing_capability_update(&self) -> Vec<[u8; 32]> {
+        self.channel_groups
+            .iter()
+            .filter(|(_, group)| !group.own_leaf_supports_policy())
+            .map(|(channel_id, _)| *channel_id)
+            .collect()
+    }
+
+    /// Stage a commit updating this device's leaf in a channel's group to advertise
+    /// Ghost's policy capabilities.
+    pub fn stage_capabilities_update(&mut self, channel_id: &[u8; 32]) -> Result<Outbound> {
+        let aad = self.commit_aad(channel_id);
+        let group = self.channel_groups.get_mut(channel_id).ok_or_else(|| {
+            GhostError::ServerNotLoaded(format!("channel {}", hex::encode(&channel_id[..8])))
+        })?;
+        let blob = group.stage_capabilities_update(&self.provider, &aad)?;
+        let mailbox_id = mls_group_mailbox_id(group.group_id());
+        Ok(Outbound { channel_id: *channel_id, mailbox_id, blob })
+    }
+
+    /// Accounts in a server whose leaves cannot carry a policy yet, holding back the
+    /// server's move from the implicit policy to an explicit one.
+    pub fn members_missing_policy_support(&self, server_id: &[u8; 32]) -> Result<Vec<[u8; 32]>> {
+        self.default_group(server_id)?.members_missing_policy_support(&self.provider)
+    }
+
+    /// Servers still under the implicit policy that this account owns and whose every
+    /// leaf now supports policies, so this device may commit the explicit policy.
+    pub fn servers_ready_for_policy(&self) -> Vec<[u8; 32]> {
+        let own = self.identity.fingerprint;
+        let mut ready = Vec::new();
+        for (channel_id, server_id) in &self.channel_server {
+            if derive_default_channel_id(server_id) != *channel_id {
+                continue;
+            }
+            let Some(group) = self.channel_groups.get(channel_id) else { continue };
+            let implicit = group.server_policy().is_ok_and(|p| p.is_none());
+            let owned = self.server_owner(server_id).is_ok_and(|owner| owner == own);
+            let supported = group.members_missing_policy_support(&self.provider).is_ok_and(|m| m.is_empty());
+            if implicit && owned && supported {
+                ready.push(*server_id);
+            }
+        }
+        ready
+    }
+
+    /// Remove a member from the server group: needs the kick permission and a rank above
+    /// the member's. The relay then proposes removing the member from every private
+    /// channel, whose policies admit only server members.
     pub fn kick_member(
         &mut self,
         server_id: &[u8; 32],
         target_fp: &[u8; 32],
-    ) -> Result<Vec<Outbound>> {
+    ) -> Result<Outbound> {
         if target_fp == &self.identity.fingerprint {
             return Err(GhostError::PermissionDenied("cannot kick yourself".into()));
         }
-
-        let member = self.store.get_member(server_id, &self.identity.fingerprint)?;
-        if member.role != MemberRole::Creator {
+        let policy = self.server_policy(server_id)?;
+        let own = self.identity.fingerprint;
+        if !policy.has(&own, ghost_wire::policy::KICK) || !policy.rank(&own).outranks(policy.rank(target_fp)) {
             return Err(GhostError::PermissionDenied(
-                "only the creator can kick members".into(),
+                "kicking this member needs the kick permission and a higher rank".into(),
             ));
         }
 
-        let channel_ids = self.server_channel_ids(server_id);
-        let mut outbound = Vec::new();
-        let mut found_any = false;
-
-        for cid in channel_ids {
-            let group = match self.channel_groups.get_mut(&cid) {
-                Some(g) => g,
-                None => continue,
-            };
-
-            let leaf_indices: Vec<_> = group
-                .members()
-                .filter(|m| {
-                    crate::mls::credential::parse_credential(&m.credential)
-                        .ok()
-                        .map(|pc| pc.account_fp == *target_fp)
-                        .unwrap_or(false)
-                })
-                .map(|m| m.index)
-                .collect();
-
-            if leaf_indices.is_empty() {
-                continue;
-            }
-
-            found_any = true;
-            let commit_blob = group.remove_members(&self.provider, &leaf_indices)?;
-            let mailbox_id = mls_group_mailbox_id(group.group_id());
-            outbound.push(Outbound { channel_id: cid, mailbox_id, blob: commit_blob });
+        let channel_id = derive_default_channel_id(server_id);
+        let group = self.channel_groups.get_mut(&channel_id).ok_or_else(|| {
+            GhostError::ServerNotLoaded(hex::encode(&server_id[..8]))
+        })?;
+        let leaf_indices: Vec<_> = group
+            .members()
+            .filter(|m| {
+                crate::mls::credential::parse_credential(&m.credential)
+                    .is_ok_and(|pc| pc.account_fp == *target_fp)
+            })
+            .map(|m| m.index)
+            .collect();
+        if leaf_indices.is_empty() {
+            return Err(GhostError::Mls("member not found in the server group".into()));
         }
-
-        if !found_any {
-            return Err(GhostError::Mls("member not found in any channel group".into()));
-        }
-
-        Ok(outbound)
+        let blob = group.remove_members(&self.provider, &leaf_indices, &CommitAad::default())?;
+        let mailbox_id = mls_group_mailbox_id(group.group_id());
+        Ok(Outbound { channel_id, mailbox_id, blob })
     }
 
     /// Remove a specific device's leaf from all channel MLS groups by its verifying key.
@@ -1108,6 +1670,7 @@ impl GhostClient {
         let channel_ids: Vec<[u8; 32]> = self.channel_groups.keys().copied().collect();
         let mut outbound = Vec::new();
         for cid in channel_ids {
+            let aad = self.commit_aad(&cid);
             let group = match self.channel_groups.get_mut(&cid) {
                 Some(g) => g,
                 None => continue,
@@ -1120,7 +1683,7 @@ impl GhostClient {
             if leaf_indices.is_empty() {
                 continue;
             }
-            if let Ok(commit_blob) = group.remove_members(&self.provider, &leaf_indices) {
+            if let Ok(commit_blob) = group.remove_members(&self.provider, &leaf_indices, &aad) {
                 let mailbox_id = mls_group_mailbox_id(group.group_id());
                 outbound.push(Outbound { channel_id: cid, mailbox_id, blob: commit_blob });
             }
@@ -1143,10 +1706,11 @@ impl GhostClient {
         channel_id: &[u8; 32],
         members: &[LeafNodeIndex],
     ) -> Result<Vec<u8>> {
+        let aad = self.commit_aad(channel_id);
         let group = self.channel_groups.get_mut(channel_id).ok_or_else(|| {
             GhostError::ServerNotLoaded(format!("channel {}", hex::encode(&channel_id[..8])))
         })?;
-        group.remove_members(&self.provider, members)
+        group.remove_members(&self.provider, members, &aad)
     }
 
     /// Merge a pending commit for a channel's MLS group after the relay accepted it.
@@ -1154,7 +1718,8 @@ impl GhostClient {
         let group = self.channel_groups.get_mut(channel_id).ok_or_else(|| {
             GhostError::ServerNotLoaded(format!("channel {}", hex::encode(&channel_id[..8])))
         })?;
-        group.merge_pending_commit(&self.provider)
+        group.merge_pending_commit(&self.provider)?;
+        self.record_if_server_group(channel_id)
     }
 
     /// Convenience: merge pending commit using server_id (operates on default channel).
@@ -1193,7 +1758,7 @@ impl GhostClient {
 
     /// Get the current MLS epoch for a channel's group.
     pub fn voice_epoch(&self, channel_id: &[u8; 32]) -> Result<u64> {
-        let group = self.channel_groups.get(channel_id).ok_or_else(|| {
+        let group = self.channel_groups.get(&self.group_channel(channel_id)).ok_or_else(|| {
             GhostError::ServerNotLoaded(format!("channel {}", hex::encode(&channel_id[..8])))
         })?;
         Ok(group.epoch())
@@ -1209,7 +1774,7 @@ impl GhostClient {
         device_vk: &[u8; 32],
         voice_salt: &[u8; 32],
     ) -> Result<[u8; 32]> {
-        let group = self.channel_groups.get(channel_id).ok_or_else(|| {
+        let group = self.channel_groups.get(&self.group_channel(channel_id)).ok_or_else(|| {
             GhostError::ServerNotLoaded(format!("channel {}", hex::encode(&channel_id[..8])))
         })?;
         crate::mls::voice::derive_voice_key(group, &self.provider, channel_id, sender_fp, device_vk, voice_salt)
@@ -1221,7 +1786,7 @@ impl GhostClient {
         channel_id: &[u8; 32],
         sender_fp: &[u8; 32],
     ) -> Result<[u8; 32]> {
-        let group = self.channel_groups.get(channel_id).ok_or_else(|| {
+        let group = self.channel_groups.get(&self.group_channel(channel_id)).ok_or_else(|| {
             GhostError::ServerNotLoaded(format!("channel {}", hex::encode(&channel_id[..8])))
         })?;
         crate::mls::voice::derive_presence_key(group, &self.provider, channel_id, sender_fp)
@@ -1254,7 +1819,7 @@ impl GhostClient {
         channel_id: &[u8; 32],
         blob: &[u8],
     ) -> Result<crate::mls::voice::PresenceState> {
-        let group = self.channel_groups.get(channel_id).ok_or_else(|| {
+        let group = self.channel_groups.get(&self.group_channel(channel_id)).ok_or_else(|| {
             GhostError::ServerNotLoaded(format!("channel {}", hex::encode(&channel_id[..8])))
         })?;
         let member_fps = self.mls_member_fingerprints_for_channel(channel_id)?;
@@ -1331,6 +1896,14 @@ impl GhostClient {
             .map(|g| mls_group_mailbox_id(g.group_id()))
     }
 
+    /// Mailbox of the group carrying a channel's traffic: its own for a private
+    /// channel, its server's otherwise.
+    pub fn mailbox_id_for_channel(&self, channel_id: &[u8; 32]) -> Option<[u8; 32]> {
+        self.channel_groups
+            .get(&self.group_channel(channel_id))
+            .map(|g| mls_group_mailbox_id(g.group_id()))
+    }
+
     /// Reverse lookup: find channel_id for a given mailbox_id.
     pub fn channel_id_for_mailbox(&self, mailbox_id: &[u8; 32]) -> Option<[u8; 32]> {
         self.mailbox_map.get(mailbox_id).copied()
@@ -1345,7 +1918,7 @@ impl GhostClient {
 
     /// Extract fingerprints of all MLS group members from a channel's group.
     pub fn mls_member_fingerprints_for_channel(&self, channel_id: &[u8; 32]) -> Result<Vec<[u8; 32]>> {
-        let group = self.channel_groups.get(channel_id).ok_or_else(|| {
+        let group = self.channel_groups.get(&self.group_channel(channel_id)).ok_or_else(|| {
             GhostError::ServerNotLoaded(format!("channel {}", hex::encode(&channel_id[..8])))
         })?;
         let mut fps = Vec::new();
@@ -1387,13 +1960,35 @@ impl GhostClient {
         blob: &[u8],
         received_at: Option<u64>,
     ) -> Result<ReceiveResult> {
-        let cache = &self.idlog_cache;
-        let revoked = |fp: &[u8; 32], vk: &[u8; 32]| cache.is_revoked(fp, vk);
-        let group = self.channel_groups.get_mut(channel_id).ok_or_else(|| {
+        // A commit from before the group's epoch is already applied: this device's own
+        // commit echoed back, or one seen before.
+        let (envelope_type, envelope_epoch) = ghost_wire::decode_envelope(blob)
+            .map_err(|e| GhostError::Format(format!("envelope: {e}")))?;
+        let current_epoch = self.channel_groups.get(channel_id).map(GhostGroup::epoch);
+        if envelope_type == ghost_wire::EnvelopeType::Commit && current_epoch.is_some_and(|e| envelope_epoch < e) {
+            return Ok(ReceiveResult::Skipped);
+        }
+
+        // Out of the map while it is processed, so a private channel's commit can be
+        // judged against its server group's state.
+        let mut group = self.channel_groups.remove(channel_id).ok_or_else(|| {
             GhostError::ServerNotLoaded(format!("channel {}", hex::encode(&channel_id[..8])))
         })?;
+        let opened = {
+            let cache = &self.idlog_cache;
+            let revoked = |fp: &[u8; 32], vk: &[u8; 32]| cache.is_revoked(fp, vk);
+            let server_at = |server_mailbox: &[u8; 32], epoch: u64| self.server_view_at(server_mailbox, epoch);
+            let checks = CommitChecks {
+                revoked: &revoked,
+                mailbox: mls_group_mailbox_id(group.group_id()),
+                received_at: received_at.unwrap_or_else(now_millis),
+                server_at: &server_at,
+            };
+            open_any(&mut group, &self.provider, blob, &checks)
+        };
+        self.channel_groups.insert(*channel_id, group);
 
-        let inbound = match open_any(group, &self.provider, blob, &revoked) {
+        let inbound = match opened {
             Err(GhostError::SelfMessage) => return Ok(ReceiveResult::Skipped),
             other => other?,
         };
@@ -1436,6 +2031,7 @@ impl GhostClient {
                 }
             }
             InboundMessage::Commit { removed } => {
+                self.record_if_server_group(channel_id)?;
                 let group = self.channel_groups.get(channel_id).ok_or_else(|| {
                     GhostError::ServerNotLoaded(format!("channel {}", hex::encode(&channel_id[..8])))
                 })?;
@@ -1445,6 +2041,11 @@ impl GhostClient {
                 if removed.contains(&self.identity.fingerprint) {
                     let own_vk = self.identity.verifying_key.as_bytes();
                     let device_still_in = group.members().any(|m| m.signature_key.as_slice() == own_vk);
+                    // Out of a private channel only: the server membership is unaffected.
+                    if !device_still_in && self.is_private_channel(channel_id) {
+                        self.drop_private_channel(channel_id)?;
+                        return Ok(ReceiveResult::ChannelAccessLost(*channel_id));
+                    }
                     if !device_still_in {
                         let account_still_in = group.members().any(|m| {
                             crate::mls::credential::parse_credential(&m.credential)
@@ -1486,10 +2087,12 @@ impl GhostClient {
         &mut self,
         channel_id: &[u8; 32],
     ) -> Result<Outbound> {
+        let aad = self.commit_aad(channel_id);
+        let excluded = self.excluded_leaves(channel_id)?;
         let group = self.channel_groups.get_mut(channel_id).ok_or_else(|| {
             GhostError::ServerNotLoaded(format!("channel {}", hex::encode(&channel_id[..8])))
         })?;
-        let commit = group.commit_pending_proposals(&self.provider, &self.idlog_cache)?;
+        let commit = group.commit_pending_proposals(&self.provider, &self.idlog_cache, &excluded, &aad)?;
         let mailbox_id = mls_group_mailbox_id(group.group_id());
         Ok(Outbound { channel_id: *channel_id, mailbox_id, blob: commit })
     }
@@ -1689,16 +2292,29 @@ mod tests {
     }
 
     #[test]
-    fn create_invite_requires_creator() {
-        let (c1, c2, server_id) = setup_two_clients();
+    fn create_invite_needs_the_invite_permission() {
+        let (mut c1, mut c2, server_id) = setup_two_clients();
 
-        // c1 (creator) can create invite
-        let result = c1.create_invite(&server_id);
-        assert!(result.is_ok());
+        // Everyone may invite under a new server's policy.
+        assert!(c1.create_invite(&server_id, u64::MAX).is_ok());
+        assert!(c2.create_invite(&server_id, u64::MAX).is_ok());
 
-        // c2 (member) cannot
-        let result = c2.create_invite(&server_id);
-        assert!(matches!(result, Err(GhostError::PermissionDenied(_))));
+        // Once the owner takes the permission away, the member cannot.
+        let mut policy = c1.server_policy(&server_id).unwrap();
+        policy.everyone = 0;
+        let out = c1.stage_server_policy(&server_id, &policy).unwrap();
+        c1.merge_pending_commit_for_server(&server_id).unwrap();
+        c2.receive_any(&out.channel_id, &out.blob, Some(1500)).unwrap();
+        assert!(matches!(c2.create_invite(&server_id, u64::MAX), Err(GhostError::PermissionDenied(_))));
+        assert!(c1.create_invite(&server_id, u64::MAX).is_ok(), "the owner holds every permission");
+    }
+
+    #[test]
+    fn member_cannot_stage_a_policy_change_it_may_not_make() {
+        let (_c1, mut c2, server_id) = setup_two_clients();
+        let mut policy = c2.server_policy(&server_id).unwrap();
+        policy.owner = *c2.fingerprint();
+        assert!(matches!(c2.stage_server_policy(&server_id, &policy), Err(GhostError::PermissionDenied(_))));
     }
 
     #[test]
@@ -1714,10 +2330,10 @@ mod tests {
 
         let server_id = c1.create_server("test", ServerKind::Server, 1000).unwrap();
 
-        let (_token, payload_bytes) = c1.create_invite(&server_id).unwrap();
+        let invite = c1.create_invite(&server_id, u64::MAX).unwrap();
 
-        let (joined_server_id, channel_results) =
-            c2.join_by_invite(&payload_bytes, 2000).unwrap();
+        let (joined_server_id, channel_results, _grant) =
+            c2.join_by_invite(&invite.sealed_payload, &invite.key, 2000).unwrap();
         assert_eq!(joined_server_id, server_id);
 
         // c2 should have the server, channel, and members in their store
@@ -1747,16 +2363,18 @@ mod tests {
         let mut c2 = test_client([0x02; 32]);
 
         let server_id = c1.create_server("test", ServerKind::Server, 1000).unwrap();
-        let (_, payload_bytes) = c1.create_invite(&server_id).unwrap();
+        let invite = c1.create_invite(&server_id, u64::MAX).unwrap();
 
-        c2.join_by_invite(&payload_bytes, 2000).unwrap();
+        let (_, _, grant) = c2.join_by_invite(&invite.sealed_payload, &invite.key, 2000).unwrap();
 
-        let refreshed = c2.refresh_invite_payload(&server_id).unwrap();
-        let payload = InvitePayload::from_bytes(&refreshed).unwrap();
+        let refreshed = c2.refresh_invite_payload(&server_id, &grant, &invite.key).unwrap();
+        let opened = crate::crypto::aead::open(&invite.key, &refreshed, crate::wire::INVITE_PAYLOAD_CONTEXT).unwrap();
+        let payload = InvitePayload::from_bytes(&opened).unwrap();
 
-        // Should include c1 + c2
+        // Should include c1 + c2, and the inviter's grant for the next joiner
         assert_eq!(payload.members.len(), 2);
         assert_eq!(payload.server_name, "test");
         assert!(!payload.channels[0].group_info_bytes.is_empty());
+        assert_eq!(payload.grant, grant);
     }
 }

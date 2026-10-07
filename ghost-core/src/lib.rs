@@ -1,5 +1,6 @@
 pub mod client;
 pub mod crypto;
+pub mod deferred;
 pub mod error;
 pub mod flows;
 pub mod identity;

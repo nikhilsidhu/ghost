@@ -11,6 +11,50 @@ use crate::identity::Identity;
 use crate::wire::derive_mls_group_id;
 
 use super::credential::{credential_from_identity, signer_from_identity};
+use ghost_wire::policy::{ChannelPolicy, CommitAad, ServerPolicy, CHANNEL_POLICY_EXTENSION, SERVER_POLICY_EXTENSION};
+
+/// Extension types every Ghost leaf supports beyond the MLS defaults: a group may
+/// only carry an extension that all its members' leaves advertise.
+pub fn ghost_capabilities() -> Capabilities {
+    Capabilities::new(
+        None,
+        None,
+        Some(&[ExtensionType::Unknown(SERVER_POLICY_EXTENSION), ExtensionType::Unknown(CHANNEL_POLICY_EXTENSION)]),
+        None,
+        None,
+    )
+}
+
+/// The access policy a group is created with.
+pub enum GroupPolicy {
+    Server(ServerPolicy),
+    Channel(ChannelPolicy),
+}
+
+impl GroupPolicy {
+    fn extension_type(&self) -> u16 {
+        match self {
+            Self::Server(_) => SERVER_POLICY_EXTENSION,
+            Self::Channel(_) => CHANNEL_POLICY_EXTENSION,
+        }
+    }
+
+    fn bytes(&self) -> Vec<u8> {
+        match self {
+            Self::Server(p) => p.to_bytes(),
+            Self::Channel(p) => p.to_bytes(),
+        }
+    }
+
+    /// The policy extension plus the required-capabilities entry that makes it valid.
+    fn extensions(&self) -> [Extension; 2] {
+        let ty = self.extension_type();
+        [
+            Extension::RequiredCapabilities(RequiredCapabilitiesExtension::new(&[ExtensionType::Unknown(ty)], &[], &[])),
+            Extension::Unknown(ty, UnknownExtension(self.bytes())),
+        ]
+    }
+}
 
 fn wrap_commit(mls_bytes: &[u8], epoch: u64) -> Vec<u8> {
     let header = ghost_wire::encode_envelope(ghost_wire::EnvelopeType::Commit, epoch);
@@ -56,21 +100,29 @@ pub struct GhostGroup {
 }
 
 impl GhostGroup {
-    /// Build an MlsGroupCreateConfig, optionally adding ExternalSendersExtension.
-    fn build_create_config(relay_vk: Option<&[u8; 32]>) -> Result<MlsGroupCreateConfig> {
+    /// Build an MlsGroupCreateConfig with Ghost's leaf capabilities, optionally adding
+    /// the relay as external sender and an access policy.
+    fn build_create_config(relay_vk: Option<&[u8; 32]>, policy: Option<&GroupPolicy>) -> Result<MlsGroupCreateConfig> {
         let mut builder = MlsGroupCreateConfig::builder()
             .use_ratchet_tree_extension(true)
             .max_past_epochs(1)
-            .wire_format_policy(MIXED_PLAINTEXT_WIRE_FORMAT_POLICY);
+            .wire_format_policy(MIXED_PLAINTEXT_WIRE_FORMAT_POLICY)
+            .capabilities(ghost_capabilities());
 
+        let mut ext_vec = Vec::new();
         if let Some(vk) = relay_vk {
             let external_sender = ExternalSender::new(
                 SignaturePublicKey::from(vk.to_vec()),
                 Credential::new(CredentialType::Basic, b"ghost-relay".to_vec()),
             );
-            let ext = Extension::ExternalSenders(vec![external_sender]);
-            let extensions = Extensions::single(ext)
-                .map_err(|e| GhostError::Mls(format!("external senders extension: {e}")))?;
+            ext_vec.push(Extension::ExternalSenders(vec![external_sender]));
+        }
+        if let Some(policy) = policy {
+            ext_vec.extend(policy.extensions());
+        }
+        if !ext_vec.is_empty() {
+            let extensions = Extensions::from_vec(ext_vec)
+                .map_err(|e| GhostError::Mls(format!("group context extensions: {e}")))?;
             builder = builder.with_group_context_extensions(extensions);
         }
 
@@ -85,7 +137,7 @@ impl GhostGroup {
     ) -> Result<Self> {
         let signer = signer_from_identity(identity);
         let credential = credential_from_identity(identity);
-        let config = Self::build_create_config(relay_vk)?;
+        let config = Self::build_create_config(relay_vk, None)?;
 
         let mls_group = MlsGroup::new(
             provider,
@@ -105,10 +157,11 @@ impl GhostGroup {
         server_id: &[u8; 32],
         channel_id: &[u8; 32],
         relay_vk: Option<&[u8; 32]>,
+        policy: Option<&GroupPolicy>,
     ) -> Result<Self> {
         let signer = signer_from_identity(identity);
         let credential = credential_from_identity(identity);
-        let config = Self::build_create_config(relay_vk)?;
+        let config = Self::build_create_config(relay_vk, policy)?;
 
         let mls_group_id = derive_mls_group_id(server_id, channel_id);
         let mls_group = MlsGroup::new_with_group_id(
@@ -132,7 +185,7 @@ impl GhostGroup {
     ) -> Result<Self> {
         let signer = signer_from_identity(identity);
         let credential = credential_from_identity(identity);
-        let config = Self::build_create_config(relay_vk)?;
+        let config = Self::build_create_config(relay_vk, None)?;
 
         let mls_group = MlsGroup::new_with_group_id(
             provider,
@@ -190,8 +243,10 @@ impl GhostGroup {
         &mut self,
         provider: &GhostProvider,
         key_package: KeyPackage,
+        aad: &CommitAad,
     ) -> Result<(Vec<u8>, MlsMessageOut)> {
         let epoch = self.epoch();
+        self.mls_group.set_aad(aad.to_bytes());
         let bundle = self.mls_group.commit_builder()
             .propose_adds([key_package])
             .load_psks(provider.storage())
@@ -220,8 +275,10 @@ impl GhostGroup {
         &mut self,
         provider: &GhostProvider,
         members: &[LeafNodeIndex],
+        aad: &CommitAad,
     ) -> Result<Vec<u8>> {
         let epoch = self.epoch();
+        self.mls_group.set_aad(aad.to_bytes());
         let bundle = self.mls_group.commit_builder()
             .propose_removals(members.iter().copied())
             .load_psks(provider.storage())
@@ -303,13 +360,15 @@ impl GhostGroup {
     }
 
     /// Commit all queued proposals (e.g. relay-generated Remove proposals).
-    /// External Remove proposals are only included if the target device is
-    /// revoked in the identity log — rejects forged removals from a
-    /// compromised relay key.
+    /// External Remove proposals are only included if the target device is revoked in
+    /// the identity log or its leaf is in `excluded` (a private channel's policy no
+    /// longer admits it), so a compromised relay key cannot remove anyone else.
     pub fn commit_pending_proposals(
         &mut self,
         provider: &GhostProvider,
         idlog_cache: &IdLogCache,
+        excluded: &[LeafNodeIndex],
+        aad: &CommitAad,
     ) -> Result<Vec<u8>> {
         // Build leaf→(account_fp, device_vk) map for Remove target validation
         let member_map: std::collections::HashMap<u32, ([u8; 32], [u8; 32])> = self
@@ -322,6 +381,7 @@ impl GhostGroup {
             .collect();
 
         let epoch = self.epoch();
+        self.mls_group.set_aad(aad.to_bytes());
         let bundle = self.mls_group.commit_builder()
             .load_psks(provider.storage())
             .map_err(|e| GhostError::Mls(format!("load psks: {e}")))?
@@ -332,6 +392,9 @@ impl GhostGroup {
                 // External Remove proposals: only accept if target is revoked
                 if matches!(proposal.sender(), Sender::External(_)) {
                     if let Proposal::Remove(ref remove) = proposal.proposal() {
+                        if excluded.contains(&remove.removed()) {
+                            return true;
+                        }
                         let leaf_idx = remove.removed().u32();
                         if let Some((account_fp, device_vk)) = member_map.get(&leaf_idx) {
                             match idlog_cache.is_active_device(account_fp, device_vk) {
@@ -353,6 +416,14 @@ impl GhostGroup {
             .to_bytes()
             .map_err(|e| GhostError::Mls(format!("serialize pending commit: {e}")))?;
         Ok(wrap_commit(&commit_bytes, epoch))
+    }
+
+    /// Queue a received proposal so the next commit from this device can include it;
+    /// OpenMLS hands processed proposals back without keeping them.
+    pub fn store_pending_proposal(&mut self, provider: &GhostProvider, proposal: QueuedProposal) -> Result<()> {
+        self.mls_group
+            .store_pending_proposal(provider.storage(), proposal)
+            .map_err(|e| GhostError::Mls(format!("queue proposal: {e:?}")))
     }
 
     /// Apply a commit that we received and already validated via process_message.
@@ -416,6 +487,11 @@ impl GhostGroup {
         self.mls_group.group_id().as_slice()
     }
 
+    /// The group's context extensions, where its access policy lives.
+    pub fn context_extensions(&self) -> &Extensions<GroupContext> {
+        self.mls_group.extensions()
+    }
+
     pub fn epoch(&self) -> u64 {
         self.mls_group.epoch().as_u64()
     }
@@ -434,6 +510,124 @@ impl GhostGroup {
             .map_err(|e| GhostError::Mls(format!("serialize group info: {e}")))
     }
 
+    fn policy_bytes(&self, extension_type: u16) -> Option<&[u8]> {
+        self.mls_group.extensions().unknown(extension_type).map(|ext| ext.0.as_slice())
+    }
+
+    /// The server policy this group carries, if any.
+    pub fn server_policy(&self) -> Result<Option<ServerPolicy>> {
+        self.policy_bytes(SERVER_POLICY_EXTENSION)
+            .map(|b| ServerPolicy::from_bytes(b).map_err(|e| GhostError::Format(e.to_string())))
+            .transpose()
+    }
+
+    /// The private channel policy this group carries, if any.
+    pub fn channel_policy(&self) -> Result<Option<ChannelPolicy>> {
+        self.policy_bytes(CHANNEL_POLICY_EXTENSION)
+            .map(|b| ChannelPolicy::from_bytes(b).map_err(|e| GhostError::Format(e.to_string())))
+            .transpose()
+    }
+
+    /// Whether this device's own leaf advertises Ghost's policy extensions.
+    pub fn own_leaf_supports_policy(&self) -> bool {
+        self.mls_group.own_leaf_node().is_some_and(|leaf| {
+            let supported = leaf.capabilities().extensions();
+            [SERVER_POLICY_EXTENSION, CHANNEL_POLICY_EXTENSION]
+                .iter()
+                .all(|ty| supported.contains(&ExtensionType::Unknown(*ty)))
+        })
+    }
+
+    /// Account fingerprints of members whose leaves do not yet advertise the policy
+    /// extensions; a group can carry a policy only once this is empty.
+    pub fn members_missing_policy_support(&self, provider: &GhostProvider) -> Result<Vec<[u8; 32]>> {
+        let group_info = self.export_group_info(provider)?;
+        let msg_in = MlsMessageIn::tls_deserialize_exact(group_info.as_slice())
+            .map_err(|e| GhostError::Mls(format!("group info: {e}")))?;
+        let MlsMessageBodyIn::GroupInfo(vgi) = msg_in.extract() else {
+            return Err(GhostError::Mls("expected GroupInfo".into()));
+        };
+        let tree = vgi
+            .extensions()
+            .ratchet_tree()
+            .ok_or_else(|| GhostError::Mls("group info has no ratchet tree".into()))?
+            .ratchet_tree()
+            .clone();
+        let scratch = openmls_rust_crypto::MemoryStorage::default();
+        let (public, _) = PublicGroup::from_external(provider.crypto(), &scratch, tree, vgi, ProposalStore::new())
+            .map_err(|e| GhostError::Mls(format!("public group: {e}")))?;
+        let mut missing = Vec::new();
+        for member in self.mls_group.members() {
+            let supported = public.leaf(member.index).is_some_and(|leaf| {
+                let ext = leaf.capabilities().extensions();
+                [SERVER_POLICY_EXTENSION, CHANNEL_POLICY_EXTENSION]
+                    .iter()
+                    .all(|ty| ext.contains(&ExtensionType::Unknown(*ty)))
+            });
+            if !supported {
+                if let Ok(parsed) = super::credential::parse_credential(&member.credential) {
+                    if !missing.contains(&parsed.account_fp) {
+                        missing.push(parsed.account_fp);
+                    }
+                }
+            }
+        }
+        Ok(missing)
+    }
+
+    /// Stage a commit updating this device's own leaf to advertise Ghost's capabilities,
+    /// the first step of migrating a group created before policies. Returns the
+    /// envelope-wrapped commit; the caller posts it and merges or clears it.
+    pub fn stage_capabilities_update(&mut self, provider: &GhostProvider, aad: &CommitAad) -> Result<Vec<u8>> {
+        let parameters = LeafNodeParameters::builder().with_capabilities(ghost_capabilities()).build();
+        let epoch = self.epoch();
+        self.mls_group.set_aad(aad.to_bytes());
+        let bundle = self.mls_group.commit_builder()
+            .leaf_node_parameters(parameters)
+            .load_psks(provider.storage())
+            .map_err(|e| GhostError::Mls(format!("load psks: {e}")))?
+            .build(provider.rand(), provider.crypto(), &self.signer, validate_pending_proposal)
+            .map_err(|e| GhostError::Mls(format!("build capabilities update: {e}")))?
+            .stage_commit(provider)
+            .map_err(|e| GhostError::Mls(format!("stage capabilities update: {e}")))?;
+        let commit_bytes = bundle.into_commit()
+            .to_bytes()
+            .map_err(|e| GhostError::Mls(format!("serialize capabilities update: {e}")))?;
+        Ok(wrap_commit(&commit_bytes, epoch))
+    }
+
+    /// Stage a commit setting the group's access policy, keeping every other extension.
+    /// Returns the envelope-wrapped commit; the caller posts it and merges or clears it.
+    pub fn stage_policy(&mut self, provider: &GhostProvider, policy: &GroupPolicy, aad: &CommitAad) -> Result<Vec<u8>> {
+        let ty = policy.extension_type();
+        let mut ext_vec: Vec<Extension> = self
+            .mls_group
+            .extensions()
+            .iter()
+            .filter(|e| !matches!(e, Extension::RequiredCapabilities(_)))
+            .filter(|e| e.extension_type() != ExtensionType::Unknown(ty))
+            .cloned()
+            .collect();
+        ext_vec.extend(policy.extensions());
+        let extensions = Extensions::from_vec(ext_vec)
+            .map_err(|e| GhostError::Mls(format!("build extensions: {e}")))?;
+        let epoch = self.epoch();
+        self.mls_group.set_aad(aad.to_bytes());
+        let bundle = self.mls_group.commit_builder()
+            .propose_group_context_extensions(extensions)
+            .map_err(|e| GhostError::Mls(format!("propose policy: {e}")))?
+            .load_psks(provider.storage())
+            .map_err(|e| GhostError::Mls(format!("load psks: {e}")))?
+            .build(provider.rand(), provider.crypto(), &self.signer, validate_pending_proposal)
+            .map_err(|e| GhostError::Mls(format!("build policy commit: {e}")))?
+            .stage_commit(provider)
+            .map_err(|e| GhostError::Mls(format!("stage policy commit: {e}")))?;
+        let commit_bytes = bundle.into_commit()
+            .to_bytes()
+            .map_err(|e| GhostError::Mls(format!("serialize policy commit: {e}")))?;
+        Ok(wrap_commit(&commit_bytes, epoch))
+    }
+
     /// Check if this group already has ExternalSendersExtension.
     pub fn has_external_senders(&self) -> bool {
         self.mls_group.extensions().external_senders().is_some()
@@ -445,8 +639,9 @@ impl GhostGroup {
         &mut self,
         provider: &GhostProvider,
         relay_vk: &[u8; 32],
+        aad: &CommitAad,
     ) -> Result<Vec<u8>> {
-        self.set_external_sender(provider, relay_vk)
+        self.set_external_sender(provider, relay_vk, aad)
     }
 
     /// Make `relay_vk` the group's only external sender, replacing any previous
@@ -456,6 +651,7 @@ impl GhostGroup {
         &mut self,
         provider: &GhostProvider,
         relay_vk: &[u8; 32],
+        aad: &CommitAad,
     ) -> Result<Vec<u8>> {
         let external_sender = ExternalSender::new(
             SignaturePublicKey::from(relay_vk.to_vec()),
@@ -476,6 +672,7 @@ impl GhostGroup {
             .map_err(|e| GhostError::Mls(format!("build extensions: {e}")))?;
 
         let epoch = self.epoch();
+        self.mls_group.set_aad(aad.to_bytes());
         let bundle = self.mls_group.commit_builder()
             .propose_group_context_extensions(extensions)
             .map_err(|e| GhostError::Mls(format!("propose extensions: {e}")))?
@@ -502,6 +699,7 @@ impl GhostGroup {
         provider: &GhostProvider,
         identity: &Identity,
         group_info_bytes: &[u8],
+        aad: &CommitAad,
     ) -> Result<(Self, Vec<u8>)> {
         let signer = signer_from_identity(identity);
         let credential = credential_from_identity(identity);
@@ -518,10 +716,17 @@ impl GhostGroup {
             .wire_format_policy(MIXED_PLAINTEXT_WIRE_FORMAT_POLICY)
             .use_ratchet_tree_extension(true)
             .build();
+        // The joiner's leaf advertises Ghost's capabilities, so policy-carrying groups accept it.
+        let leaf_parameters = LeafNodeParameters::builder()
+            .with_credential_with_key(credential.clone())
+            .with_capabilities(ghost_capabilities())
+            .build();
         let (mls_group, commit_bundle) = MlsGroup::external_commit_builder()
             .with_config(ext_join_config)
+            .with_aad(aad.to_bytes())
             .build_group(provider, vgi, credential)
             .map_err(|e| GhostError::Mls(format!("build external commit: {e}")))?
+            .leaf_node_parameters(leaf_parameters)
             .load_psks(provider.storage())
             .map_err(|e| GhostError::Mls(format!("load psks: {e}")))?
             .build(provider.rand(), provider.crypto(), &signer, validate_pending_proposal)
@@ -576,7 +781,7 @@ mod tests {
         let kp_b = generate_key_package(&provider_b, &id_b).unwrap();
 
         let (_commit, welcome) = group_a
-            .add_member(&provider_a, kp_b)
+            .add_member(&provider_a, kp_b, &CommitAad::default())
             .unwrap();
 
         let group_b =
@@ -596,7 +801,7 @@ mod tests {
         let mut group_a = GhostGroup::create(&provider_a, &id_a, None).unwrap();
         let kp_b = generate_key_package(&provider_b, &id_b).unwrap();
         let (_commit, welcome) = group_a
-            .add_member(&provider_a, kp_b)
+            .add_member(&provider_a, kp_b, &CommitAad::default())
             .unwrap();
         group_a.merge_pending_commit(&provider_a).unwrap();
         let mut group_b =
@@ -643,7 +848,7 @@ mod tests {
         let group_info_bytes = group_a.export_group_info(&provider_a).unwrap();
 
         let (group_b, commit_bytes) =
-            GhostGroup::join_by_external_commit(&provider_b, &id_b, &group_info_bytes).unwrap();
+            GhostGroup::join_by_external_commit(&provider_b, &id_b, &group_info_bytes, &CommitAad::default()).unwrap();
 
         assert_eq!(group_a.group_id(), group_b.group_id());
         assert!(!commit_bytes.is_empty());
@@ -658,7 +863,7 @@ mod tests {
         let channel_id = derive_default_channel_id(&server_id);
 
         let original = GhostGroup::create_with_id(
-            &provider, &id, &server_id, &channel_id, None,
+            &provider, &id, &server_id, &channel_id, None, None,
         ).unwrap();
         let original_mls_id = original.group_id().to_vec();
 
@@ -680,7 +885,7 @@ mod tests {
 
         let kp_b = generate_key_package(&provider_b, &id_b).unwrap();
         let (_commit, _welcome) = group_a
-            .add_member(&provider_a, kp_b)
+            .add_member(&provider_a, kp_b, &CommitAad::default())
             .unwrap();
         group_a.merge_pending_commit(&provider_a).unwrap();
 
@@ -698,6 +903,7 @@ mod tests {
         let _remove_commit = group_a.remove_members(
             &provider_a,
             &b_leaf,
+            &CommitAad::default(),
         ).unwrap();
         group_a.merge_pending_commit(&provider_a).unwrap();
 
@@ -714,7 +920,7 @@ mod tests {
         assert!(!group.has_external_senders());
 
         let relay_vk = [0xFFu8; 32];
-        let commit = group.add_external_sender_extension(&provider, &relay_vk).unwrap();
+        let commit = group.add_external_sender_extension(&provider, &relay_vk, &CommitAad::default()).unwrap();
         group.merge_pending_commit(&provider).unwrap();
         assert!(!commit.is_empty());
         assert!(group.has_external_senders());
@@ -728,7 +934,7 @@ mod tests {
         let server_id = [0x42u8; 32];
         let channel_id = derive_default_channel_id(&server_id);
 
-        let group = GhostGroup::create_with_id(&provider, &id, &server_id, &channel_id, None).unwrap();
+        let group = GhostGroup::create_with_id(&provider, &id, &server_id, &channel_id, None, None).unwrap();
         assert!(GhostGroup::load(&provider, &id, &server_id, &channel_id).unwrap().is_some());
         group.delete(&provider).unwrap();
         assert!(GhostGroup::load(&provider, &id, &server_id, &channel_id).unwrap().is_none());

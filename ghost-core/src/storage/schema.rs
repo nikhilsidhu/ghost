@@ -143,6 +143,24 @@ pub fn initialize(conn: &Connection) -> Result<()> {
             ref_bytes BLOB NOT NULL,
             last_seen INTEGER NOT NULL
         );
+
+        -- The server group's policy and members from each epoch where they changed,
+        -- against which private channel commits naming that epoch are checked.
+        -- Display names of a server's roles, which the policy in group state identifies
+        -- only by number.
+        CREATE TABLE IF NOT EXISTS role_names (
+            server_id BLOB    NOT NULL REFERENCES servers(server_id) ON DELETE CASCADE,
+            role_id   INTEGER NOT NULL,
+            name      TEXT    NOT NULL,
+            PRIMARY KEY (server_id, role_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS server_views (
+            server_id BLOB    NOT NULL REFERENCES servers(server_id) ON DELETE CASCADE,
+            epoch     INTEGER NOT NULL,
+            view      BLOB    NOT NULL,
+            PRIMARY KEY (server_id, epoch)
+        );
         "
     ))
     .map_err(|e| GhostError::Database(format!("create tables: {e}")))?;

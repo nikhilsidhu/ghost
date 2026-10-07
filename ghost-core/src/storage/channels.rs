@@ -35,6 +35,24 @@ impl GhostStore {
         Ok(())
     }
 
+    /// Insert a channel, or update the name, kind and position of one already stored.
+    pub fn upsert_channel(&self, channel: &Channel) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO channels (channel_id, server_id, name, kind, position) VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(channel_id) DO UPDATE SET name = excluded.name, kind = excluded.kind, position = excluded.position",
+                rusqlite::params![
+                    channel.channel_id.as_slice(),
+                    channel.server_id.as_slice(),
+                    channel.name,
+                    channel.kind.as_str(),
+                    channel.position,
+                ],
+            )
+            .map_err(|e| GhostError::Database(format!("upsert channel: {e}")))?;
+        Ok(())
+    }
+
     pub fn get_channel(&self, channel_id: &[u8; 32]) -> Result<Channel> {
         self.conn
             .query_row(

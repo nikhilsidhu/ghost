@@ -3,11 +3,13 @@ pub mod device_config;
 pub mod idlog_cache;
 pub mod kt_state;
 pub mod servers;
+pub mod server_views;
 pub mod members;
 pub mod messages;
 pub mod read_state;
 pub mod relay_state;
 pub mod relays;
+pub mod role_names;
 pub mod sync_state;
 mod schema;
 

@@ -35,6 +35,11 @@ pub enum GhostError {
     #[error("received own message (relay echo)")]
     SelfMessage,
 
+    /// A private channel commit was authorized at a server group epoch this client
+    /// has not reached; hold the blob until the server group catches up.
+    #[error("server group must reach epoch {epoch} first")]
+    PolicyBehind { server_mailbox: [u8; 32], epoch: u64 },
+
     #[error("identity log: {0}")]
     IdentityLog(String),
 

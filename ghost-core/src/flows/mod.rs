@@ -9,6 +9,7 @@
 //! network round trip.
 
 pub mod account;
+pub mod channels;
 pub mod devices;
 pub mod epoch;
 pub mod idlog;
@@ -17,6 +18,7 @@ pub mod members;
 pub mod pairing;
 pub mod provision;
 pub mod recovery;
+pub mod roles;
 pub mod server;
 pub mod sync;
 
@@ -119,7 +121,7 @@ pub fn server_relay_url(client: &GhostClient, server_id: &[u8; 32]) -> Option<St
 /// Upload the current GroupInfo of the channel that owns `mailbox_id`, so other devices
 /// can join that channel by external commit. Best effort: failures are logged, never
 /// fatal, because the group state is already correct locally.
-pub(crate) async fn publish_server_info(client: &SharedClient, relay: &SharedRelay, mailbox_id: &[u8; 32]) {
+pub async fn publish_server_info(client: &SharedClient, relay: &SharedRelay, mailbox_id: &[u8; 32]) {
     let group_info = {
         let c = client.lock().await;
         let exported = c

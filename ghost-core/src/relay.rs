@@ -523,6 +523,24 @@ impl RelayClient {
             .map_err(|e| GhostError::Network(e.to_string()))
     }
 
+    /// The server's private channels this account may enter, with their GroupInfo.
+    pub async fn get_admitted_channels(&self, server_mailbox: &[u8; 32]) -> Result<ghost_wire::policy::AdmittedChannels> {
+        let path = format!("/servers/{}/channels", URL_SAFE_NO_PAD.encode(server_mailbox));
+        let req = self
+            .http
+            .get(format!("{}{}", self.base_for(server_mailbox), path));
+        let resp = self.authenticated("GET", &path, req)
+            .send()
+            .await
+            .map_err(|e| GhostError::Network(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(status_err("get admitted channels", resp).await);
+        }
+        let body = resp.bytes().await.map_err(|e| GhostError::Network(e.to_string()))?;
+        ghost_wire::policy::AdmittedChannels::from_bytes(&body)
+            .map_err(|e| GhostError::Format(format!("channel listing: {e}")))
+    }
+
     pub async fn put_avatar(
         &self,
         mailbox_id: &[u8; 32],

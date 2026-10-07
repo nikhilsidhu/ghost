@@ -270,6 +270,7 @@ fn payload_from_meta(server_id: [u8; 32], meta: &SyncServerMeta) -> ProvisionPay
         channels: meta.channels.clone(),
         mailbox_id: meta.mailbox_id,
         relay_ref: meta.relay_ref.clone(),
+        role_names: meta.role_names.clone(),
     }
 }
 

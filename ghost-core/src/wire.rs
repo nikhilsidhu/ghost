@@ -7,6 +7,8 @@ use crate::crypto::{
 use crate::error::{GhostError, Result};
 use crate::mls::group::GhostGroup;
 use crate::storage::{ChannelKind, ServerKind, MemberRole};
+use ghost_wire::policy::PolicyError;
+use ghost_wire::policy_mls::{self, GroupFacts, ServerAt};
 use ghost_wire::relay_ref::RelayRef;
 
 const MAX_REFERENCES: usize = 255;
@@ -195,13 +197,33 @@ pub struct InviteChannel {
     pub group_info_bytes: Vec<u8>,
 }
 
+/// What an invite link opens: the server's public face and the grant that admits
+/// the holder. Stored on the relay sealed under a key only the link carries.
 pub struct InvitePayload {
     pub server_id: [u8; 32],
     pub server_name: String,
     pub kind: ServerKind,
     pub members: Vec<InviteMember>,
     pub channels: Vec<InviteChannel>,
+    pub role_names: Vec<(u8, String)>,
+    pub grant: ghost_wire::policy::InviteGrant,
 }
+
+fn write_role_names(buf: &mut Vec<u8>, role_names: &[(u8, String)]) {
+    buf.push(role_names.len() as u8);
+    for (role_id, name) in role_names {
+        buf.push(*role_id);
+        write_string(buf, name);
+    }
+}
+
+fn read_role_names(data: &[u8], pos: &mut usize) -> Result<Vec<(u8, String)>> {
+    let count = read_u8(data, pos)? as usize;
+    (0..count).map(|_| Ok((read_u8(data, pos)?, read_string(data, pos)?))).collect()
+}
+
+/// Names the invite payload in seal and open errors.
+pub const INVITE_PAYLOAD_CONTEXT: &str = "invite payload";
 
 fn write_string(buf: &mut Vec<u8>, s: &str) {
     let bytes = s.as_bytes();
@@ -328,6 +350,10 @@ impl InvitePayload {
             buf.extend_from_slice(&c.group_info_bytes);
         }
 
+        write_role_names(&mut buf, &self.role_names);
+        let grant = self.grant.to_bytes();
+        buf.extend_from_slice(&(grant.len() as u16).to_be_bytes());
+        buf.extend_from_slice(&grant);
         buf
     }
 
@@ -366,6 +392,15 @@ impl InvitePayload {
             });
         }
 
+        let role_names = read_role_names(data, &mut pos)?;
+        let grant_len = read_u16(data, &mut pos)? as usize;
+        if pos + grant_len > data.len() {
+            return Err(GhostError::Format("truncated invite grant".into()));
+        }
+        let grant = ghost_wire::policy::InviteGrant::from_bytes(&data[pos..pos + grant_len])
+            .map_err(|e| GhostError::Format(format!("invite grant: {e}")))?;
+        pos += grant_len;
+
         if pos != data.len() {
             return Err(GhostError::Format(format!(
                 "invite payload: {} trailing bytes",
@@ -373,7 +408,7 @@ impl InvitePayload {
             )));
         }
 
-        Ok(Self { server_id, server_name, kind, members, channels })
+        Ok(Self { server_id, server_name, kind, members, channels, role_names, grant })
     }
 }
 
@@ -546,6 +581,7 @@ pub struct ProvisionPayload {
     pub mailbox_id: [u8; 32],
     /// Relay hosting the server; `None` for the account's home relay.
     pub relay_ref: Option<RelayRef>,
+    pub role_names: Vec<(u8, String)>,
 }
 
 impl ProvisionPayload {
@@ -572,6 +608,7 @@ impl ProvisionPayload {
 
         buf.extend_from_slice(&self.mailbox_id);
         write_relay_ref(&mut buf, self.relay_ref.as_ref());
+        write_role_names(&mut buf, &self.role_names);
         buf
     }
 
@@ -606,6 +643,7 @@ impl ProvisionPayload {
 
         let mailbox_id = read_blob32(data, &mut pos)?;
         let relay_ref = read_relay_ref(data, &mut pos)?;
+        let role_names = read_role_names(data, &mut pos)?;
 
         if pos != data.len() {
             return Err(GhostError::Format(format!(
@@ -614,7 +652,7 @@ impl ProvisionPayload {
             )));
         }
 
-        Ok(Self { server_id, server_name, kind, members, channels, mailbox_id, relay_ref })
+        Ok(Self { server_id, server_name, kind, members, channels, mailbox_id, relay_ref, role_names })
     }
 }
 
@@ -627,8 +665,10 @@ pub struct SyncServerMeta {
     pub mailbox_id: [u8; 32],
     pub channels: Vec<InviteChannel>,
     /// Relay hosting the server; `None` for the account's home relay. Encoded
-    /// last so snapshots written before the field existed still decode.
+    /// after the channels so snapshots written before the field existed still decode.
     pub relay_ref: Option<RelayRef>,
+    /// Encoded last, absent from snapshots written before roles existed.
+    pub role_names: Vec<(u8, String)>,
 }
 
 impl SyncServerMeta {
@@ -645,6 +685,7 @@ impl SyncServerMeta {
             buf.extend_from_slice(&c.position.to_be_bytes());
         }
         write_relay_ref(&mut buf, self.relay_ref.as_ref());
+        write_role_names(&mut buf, &self.role_names);
         buf
     }
 
@@ -665,6 +706,7 @@ impl SyncServerMeta {
             });
         }
         let relay_ref = read_relay_ref(data, &mut pos)?;
+        let role_names = if pos == data.len() { Vec::new() } else { read_role_names(data, &mut pos)? };
         if pos != data.len() {
             return Err(GhostError::Format(format!(
                 "sync server meta: {} trailing bytes",
@@ -672,7 +714,7 @@ impl SyncServerMeta {
             )));
         }
 
-        Ok(Self { server_name, kind, mailbox_id, channels, relay_ref })
+        Ok(Self { server_name, kind, mailbox_id, channels, relay_ref, role_names })
     }
 }
 
@@ -682,11 +724,18 @@ pub enum ChannelOpPayload {
     Create { channel_id: [u8; 32], name: String, kind: ChannelKind, position: i32 },
     Rename { channel_id: [u8; 32], name: String },
     Delete { channel_id: [u8; 32] },
+    /// Sent inside a private channel by a device that just joined it: it cannot read
+    /// anything from before its join, so members answer with `Create`.
+    InfoRequest { channel_id: [u8; 32] },
 }
 
 const CHANNEL_OP_CREATE: u8 = 0x01;
 const CHANNEL_OP_RENAME: u8 = 0x02;
 const CHANNEL_OP_DELETE: u8 = 0x03;
+const CHANNEL_OP_INFO_REQUEST: u8 = 0x04;
+
+/// What a private channel is called until a member tells a newly joined device.
+pub const UNNAMED_PRIVATE_CHANNEL: &str = "private channel";
 
 pub fn encode_channel_op(op: &ChannelOpPayload) -> Vec<u8> {
     let mut buf = Vec::new();
@@ -705,6 +754,10 @@ pub fn encode_channel_op(op: &ChannelOpPayload) -> Vec<u8> {
         }
         ChannelOpPayload::Delete { channel_id } => {
             buf.push(CHANNEL_OP_DELETE);
+            buf.extend_from_slice(channel_id);
+        }
+        ChannelOpPayload::InfoRequest { channel_id } => {
+            buf.push(CHANNEL_OP_INFO_REQUEST);
             buf.extend_from_slice(channel_id);
         }
     }
@@ -731,6 +784,10 @@ pub fn decode_channel_op(data: &[u8]) -> Result<ChannelOpPayload> {
             let channel_id = read_blob32(data, &mut pos)?;
             Ok(ChannelOpPayload::Delete { channel_id })
         }
+        CHANNEL_OP_INFO_REQUEST => {
+            let channel_id = read_blob32(data, &mut pos)?;
+            Ok(ChannelOpPayload::InfoRequest { channel_id })
+        }
         _ => Err(GhostError::Format(format!("unknown channel op: {op:#04x}"))),
     }
 }
@@ -741,6 +798,15 @@ const MEMBER_ANNOUNCE: u8 = 0x10;
 const AVATAR_UPDATE: u8 = 0x11;
 const AVATAR_CLEAR: u8 = 0x12;
 const SERVER_MOVED: u8 = 0x13;
+const ROLE_NAME: u8 = 0x14;
+
+/// A role's display name. Roles live in the server policy, which the relay can read,
+/// so their names travel only in encrypted metadata like this.
+pub fn encode_role_name(role_id: u8, name: &str) -> Vec<u8> {
+    let mut buf = vec![ROLE_NAME, role_id];
+    write_string(&mut buf, name);
+    buf
+}
 
 /// The server's creator announces that the server now lives on another relay.
 pub fn encode_server_moved(location: &ghost_wire::server_location::ServerLocation) -> Vec<u8> {
@@ -772,8 +838,14 @@ pub fn encode_avatar_clear() -> Vec<u8> {
 pub fn decode_metadata(data: &[u8]) -> Result<MetadataPayload> {
     let tag = *data.first().ok_or_else(|| GhostError::Format("empty metadata".into()))?;
     match tag {
-        CHANNEL_OP_CREATE | CHANNEL_OP_RENAME | CHANNEL_OP_DELETE => {
+        CHANNEL_OP_CREATE | CHANNEL_OP_RENAME | CHANNEL_OP_DELETE | CHANNEL_OP_INFO_REQUEST => {
             Ok(MetadataPayload::ChannelOp(decode_channel_op(data)?))
+        }
+        ROLE_NAME => {
+            let mut pos = 1;
+            let role_id = read_u8(data, &mut pos)?;
+            let name = read_string(data, &mut pos)?;
+            Ok(MetadataPayload::RoleName { role_id, name })
         }
         MEMBER_ANNOUNCE => {
             let mut pos = 1;
@@ -799,8 +871,10 @@ pub enum MetadataPayload {
     MemberAnnounce { display_name: String },
     AvatarUpdate { avatar_hash: [u8; 32], avatar_key: [u8; 32] },
     AvatarClear,
-    /// Only meaningful from the server's creator; receivers verify the record.
+    /// Only meaningful from the server's owner; receivers verify the record.
     ServerMoved(ghost_wire::server_location::ServerLocation),
+    /// Only meaningful from a member who may manage roles.
+    RoleName { role_id: u8, name: String },
 }
 
 // --- open_any: handle both app messages and commits from the relay ---
@@ -846,6 +920,40 @@ fn extract_sender_identity(
 /// not revoked: relays and MLS removal stop those, and a device added since the
 /// last refresh must not be rejected.
 pub type RevocationCheck<'a> = &'a dyn Fn(&[u8; 32], &[u8; 32]) -> bool;
+
+/// What a receiver checks a commit against beyond MLS itself, so every member
+/// enforces the rules the relay enforces and a relay cannot slip a forbidden
+/// change past them.
+pub struct CommitChecks<'a> {
+    pub revoked: RevocationCheck<'a>,
+    /// The group's mailbox, which invite grants for it name.
+    pub mailbox: [u8; 32],
+    /// When the relay received the commit, against which invite grants expire.
+    pub received_at: u64,
+    /// The server group's view at a given epoch of it, for private channel commits.
+    pub server_at: ServerAt<'a>,
+}
+
+/// Decide a received commit under the group's policy, as the relay did.
+pub(crate) fn check_policy(
+    group: &GhostGroup,
+    sender: &Sender,
+    staged: &openmls::prelude::StagedCommit,
+    aad: &[u8],
+    checks: &CommitChecks,
+) -> Result<()> {
+    let members: Vec<openmls::prelude::Member> = group.members().collect();
+    let facts = GroupFacts {
+        extensions: group.context_extensions(),
+        members: &members,
+        mailbox: checks.mailbox,
+        now_millis: checks.received_at,
+    };
+    policy_mls::check_commit(sender, staged, aad, &facts, checks.server_at).map_err(|e| match e {
+        PolicyError::ContextBehind { server_mailbox, epoch } => GhostError::PolicyBehind { server_mailbox, epoch },
+        other => GhostError::PermissionDenied(format!("commit refused: {other}")),
+    })
+}
 
 /// Verify a self-validating credential: blake3(master_vk) == account_fp,
 /// then ed25519_verify(master_vk, delegation_payload, delegation_sig), then that
@@ -937,7 +1045,7 @@ pub fn open_any(
     group: &mut GhostGroup,
     provider: &GhostProvider,
     blob: &[u8],
-    revoked: RevocationCheck,
+    checks: &CommitChecks,
 ) -> Result<InboundMessage> {
     ghost_wire::decode_envelope(blob)
         .map_err(|e| GhostError::Format(format!("envelope: {e}")))?;
@@ -945,6 +1053,8 @@ pub fn open_any(
     let processed = group.process_message_bytes(provider, mls_bytes)?;
     let credential = processed.credential().clone();
     let sender = processed.sender().clone();
+    let aad = processed.aad().to_vec();
+    let revoked = checks.revoked;
 
     match processed.into_content() {
         ProcessedMessageContent::ApplicationMessage(app_msg) => {
@@ -961,14 +1071,15 @@ pub fn open_any(
         }
         ProcessedMessageContent::StagedCommitMessage(staged_commit) => {
             validate_sender(group, &credential, &sender, Some(&staged_commit), revoked)?;
+            check_policy(group, &sender, &staged_commit, &aad, checks)?;
 
             let removed = extract_removed_fps(group, &staged_commit);
             group.merge_staged_commit(provider, *staged_commit)?;
             Ok(InboundMessage::Commit { removed })
         }
-        ProcessedMessageContent::ProposalMessage(_proposal) => {
-            // Proposal queued by OpenMLS during process_message_bytes().
-            // The group creator should commit pending proposals to advance the epoch.
+        ProcessedMessageContent::ProposalMessage(proposal) => {
+            // Which proposals a commit may include is decided when committing.
+            group.store_pending_proposal(provider, *proposal)?;
             Ok(InboundMessage::ProposalProcessed)
         }
         ProcessedMessageContent::ExternalJoinProposalMessage(_proposal) => {
@@ -1270,7 +1381,7 @@ mod tests {
         let id = Identity::from_seed([0x01; 32]).unwrap();
         let server_id = [0x42; 32];
         let channel_id = derive_default_channel_id(&server_id);
-        let group = GhostGroup::create_with_id(&provider, &id, &server_id, &channel_id, None).unwrap();
+        let group = GhostGroup::create_with_id(&provider, &id, &server_id, &channel_id, None, None).unwrap();
 
         let expected = derive_mls_group_id(&server_id, &channel_id);
         assert_eq!(group.group_id(), expected);
@@ -1286,9 +1397,9 @@ mod tests {
         let server_id = [0x42; 32];
         let channel_id = derive_default_channel_id(&server_id);
         let mut group_a =
-            GhostGroup::create_with_id(&provider_a, &id_a, &server_id, &channel_id, None).unwrap();
+            GhostGroup::create_with_id(&provider_a, &id_a, &server_id, &channel_id, None, None).unwrap();
         let kp_b = generate_key_package(&provider_b, &id_b).unwrap();
-        let (_commit, welcome) = group_a.add_member(&provider_a, kp_b).unwrap();
+        let (_commit, welcome) = group_a.add_member(&provider_a, kp_b, &ghost_wire::policy::CommitAad::default()).unwrap();
         group_a.merge_pending_commit(&provider_a).unwrap();
         let mut group_b =
             GhostGroup::join(&provider_b, &id_b, &welcome.to_bytes().unwrap()).unwrap();
@@ -1327,9 +1438,9 @@ mod tests {
         let server_id = [0x42; 32];
         let channel_id = derive_default_channel_id(&server_id);
         let mut group_a =
-            GhostGroup::create_with_id(&provider_a, &id_a, &server_id, &channel_id, None).unwrap();
+            GhostGroup::create_with_id(&provider_a, &id_a, &server_id, &channel_id, None, None).unwrap();
         let kp_b = generate_key_package(&provider_b, &id_b).unwrap();
-        let (_commit, welcome) = group_a.add_member(&provider_a, kp_b).unwrap();
+        let (_commit, welcome) = group_a.add_member(&provider_a, kp_b, &ghost_wire::policy::CommitAad::default()).unwrap();
         group_a.merge_pending_commit(&provider_a).unwrap();
         let mut group_b =
             GhostGroup::join(&provider_b, &id_b, &welcome.to_bytes().unwrap()).unwrap();
@@ -1362,9 +1473,9 @@ mod tests {
         let server_id = [0x42; 32];
         let channel_id = derive_default_channel_id(&server_id);
         let mut group_a =
-            GhostGroup::create_with_id(&provider_a, &id_a, &server_id, &channel_id, None).unwrap();
+            GhostGroup::create_with_id(&provider_a, &id_a, &server_id, &channel_id, None, None).unwrap();
         let kp_b = generate_key_package(&provider_b, &id_b).unwrap();
-        let (_commit, welcome) = group_a.add_member(&provider_a, kp_b).unwrap();
+        let (_commit, welcome) = group_a.add_member(&provider_a, kp_b, &ghost_wire::policy::CommitAad::default()).unwrap();
         group_a.merge_pending_commit(&provider_a).unwrap();
         let mut group_b =
             GhostGroup::join(&provider_b, &id_b, &welcome.to_bytes().unwrap()).unwrap();
@@ -1567,6 +1678,7 @@ mod tests {
             ],
             mailbox_id: [0x66; 32],
             relay_ref: Some(RelayRef::https([0x77; 32], "https://relay.example")),
+            role_names: vec![(3, "mods".to_string())],
         };
         let bytes = pp.to_bytes();
         let decoded = ProvisionPayload::from_bytes(&bytes).unwrap();
@@ -1580,6 +1692,7 @@ mod tests {
         assert_eq!(decoded.channels[0].name, "general");
         assert_eq!(decoded.channels[1].name, "voice");
         assert_eq!(decoded.mailbox_id, pp.mailbox_id);
+        assert_eq!(decoded.role_names, pp.role_names);
     }
 
     #[test]
@@ -1592,6 +1705,7 @@ mod tests {
             channels: vec![],
             mailbox_id: [0xEE; 32],
             relay_ref: None,
+            role_names: vec![],
         };
         let bytes = pp.to_bytes();
         let decoded = ProvisionPayload::from_bytes(&bytes).unwrap();
@@ -1610,6 +1724,7 @@ mod tests {
             channels: vec![],
             mailbox_id: [0x22; 32],
             relay_ref: None,
+            role_names: vec![],
         };
         let bytes = pp.to_bytes();
         assert!(ProvisionPayload::from_bytes(&bytes[..bytes.len() - 10]).is_err());
@@ -1625,6 +1740,7 @@ mod tests {
             channels: vec![],
             mailbox_id: [0x22; 32],
             relay_ref: None,
+            role_names: vec![],
         };
         let mut bytes = pp.to_bytes();
         bytes.push(0xFF); // trailing junk
@@ -1650,6 +1766,7 @@ mod tests {
             }],
             mailbox_id: [0x33; 32],
             relay_ref: None,
+            role_names: vec![],
         };
         let sync_entries = vec![
             ("order:servers".to_string(), Some(vec![0x01, 0x02]), 100),
@@ -1722,6 +1839,11 @@ mod tests {
 
     // --- InvitePayload tests ---
 
+    fn test_grant() -> ghost_wire::policy::InviteGrant {
+        let device = ed25519_dalek::SigningKey::from_bytes(&[0x55; 32]);
+        ghost_wire::policy::InviteGrant::sign([0x66; 32], [0x22; 32], 9_000, [0x77; 16], &device)
+    }
+
     #[test]
     fn invite_payload_roundtrip() {
         let payload = InvitePayload {
@@ -1747,6 +1869,8 @@ mod tests {
                 position: 5,
                 group_info_bytes: vec![0xDE, 0xAD, 0xBE, 0xEF],
             }],
+            role_names: vec![(3, "mods".to_string())],
+            grant: test_grant(),
         };
 
         let bytes = payload.to_bytes();
@@ -1764,6 +1888,8 @@ mod tests {
         assert_eq!(decoded.channels[0].name, "general");
         assert_eq!(decoded.channels[0].position, 5);
         assert_eq!(decoded.channels[0].group_info_bytes, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        assert_eq!(decoded.role_names, vec![(3, "mods".to_string())]);
+        assert_eq!(decoded.grant, test_grant());
     }
 
     #[test]
@@ -1774,6 +1900,8 @@ mod tests {
             kind: ServerKind::Server,
             members: vec![],
             channels: vec![],
+            role_names: vec![],
+            grant: test_grant(),
         };
         let bytes = payload.to_bytes();
         assert!(InvitePayload::from_bytes(&bytes[..bytes.len() - 4]).is_err());
@@ -1787,6 +1915,8 @@ mod tests {
             kind: ServerKind::Server,
             members: vec![],
             channels: vec![],
+            role_names: vec![],
+            grant: test_grant(),
         };
         let mut bytes = payload.to_bytes();
         bytes.push(0xFF);
@@ -1837,6 +1967,7 @@ mod tests {
                 },
             ],
             relay_ref: Some(RelayRef::https([0x77; 32], "https://relay.example")),
+            role_names: vec![],
         };
         let bytes = meta.to_bytes();
         let decoded = SyncServerMeta::from_bytes(&bytes).unwrap();
@@ -1860,6 +1991,7 @@ mod tests {
             mailbox_id: [0x11; 32],
             channels: vec![],
             relay_ref: None,
+            role_names: vec![],
         };
         let mut bytes = meta.to_bytes();
         bytes.push(0xFF);
@@ -1874,6 +2006,7 @@ mod tests {
             mailbox_id: [0x22; 32],
             channels: vec![],
             relay_ref: None,
+            role_names: vec![],
         };
         let bytes = meta.to_bytes();
         let decoded = SyncServerMeta::from_bytes(&bytes).unwrap();
@@ -1889,9 +2022,14 @@ mod tests {
             mailbox_id: [0x33; 32],
             channels: vec![],
             relay_ref: None,
+            role_names: vec![],
         };
         let mut bytes = meta.to_bytes();
-        // Old snapshots end before the two-byte relay length.
+        // Snapshots from before roles end after the relay field; older ones end before
+        // its two-byte length.
+        bytes.truncate(bytes.len() - 1);
+        let decoded = SyncServerMeta::from_bytes(&bytes).unwrap();
+        assert!(decoded.role_names.is_empty());
         bytes.truncate(bytes.len() - 2);
         let decoded = SyncServerMeta::from_bytes(&bytes).unwrap();
         assert_eq!(decoded.server_name, "old");

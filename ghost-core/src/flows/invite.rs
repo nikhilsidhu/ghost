@@ -1,4 +1,4 @@
-//! Invite links: creating them as a server creator and joining through them.
+//! Invite links: creating them (with the invite permission) and joining through them.
 
 use ghost_wire::relay_ref::RelayRef;
 
@@ -9,33 +9,36 @@ use super::{account, idlog, publish_server_info, sync, SharedClient, SharedRelay
 
 pub struct CreatedInvite {
     pub token: String,
+    /// Opens the payload stored under `token`; it belongs in the link and nowhere else.
+    pub key: [u8; 32],
     pub relay_url: String,
     /// Identifies the hosting relay by key, so joiners can pin it.
     pub relay_ref: RelayRef,
 }
 
-/// Register an invite token on the relay and upload the invite payload for the first joiner.
+/// Register an invite token on the relay and upload the sealed invite payload for the
+/// first joiner.
 pub async fn create(
     client: &SharedClient,
     relay: &SharedRelay,
     server_id: &[u8; 32],
     expires_at: u64,
 ) -> Result<CreatedInvite> {
-    let (token, payload) = {
+    let invite = {
         let c = client.lock().await;
-        c.create_invite(server_id)?
+        c.create_invite(server_id, expires_at)?
     };
     let r = relay.lock().await;
     let relay_ref = r.get_relay_info().await?.relay_ref;
-    r.register_invite(&token, expires_at).await?;
-    r.put_invite_payload(&token, 0, payload).await?;
-    Ok(CreatedInvite { token, relay_url: r.base_url().to_string(), relay_ref })
+    r.register_invite(&invite.token, expires_at).await?;
+    r.put_invite_payload(&invite.token, 0, invite.sealed_payload).await?;
+    Ok(CreatedInvite { token: invite.token, key: invite.key, relay_url: r.base_url().to_string(), relay_ref })
 }
 
 /// Join a server through an invite token on the relay the link names, which may be
 /// the account's home or any other relay. `relay` is a client for that relay and
 /// `home` for the account's home relay (the same client when they coincide), both
-/// authenticated as this device. Returns the server id.
+/// authenticated as this device; `key` opens the sealed payload. Returns the server id.
 ///
 /// Registers the account at a foreign relay, posts one external commit per channel,
 /// refreshes the invite payload for the next joiner, publishes fresh GroupInfo,
@@ -46,6 +49,7 @@ pub async fn join(
     home: &SharedRelay,
     relay: &SharedRelay,
     token: &str,
+    key: &[u8; 32],
     now: u64,
 ) -> Result<[u8; 32]> {
     let relay_info = account::register_at(client, relay, Some(token)).await?;
@@ -57,9 +61,9 @@ pub async fn join(
             .ok_or_else(|| GhostError::Network("invite has no payload yet".into()))?
     };
 
-    let (server_id, channel_results) = {
+    let (server_id, channel_results, grant) = {
         let mut c = client.lock().await;
-        let joined = c.join_by_invite(&payload_bytes, now)?;
+        let joined = c.join_by_invite(&payload_bytes, key, now)?;
         c.store().set_server_relay(&joined.0, &relay_info.relay_vk)?;
         joined
     };
@@ -83,7 +87,7 @@ pub async fn join(
     // another joiner refreshed first; their payload is at least as fresh as ours.
     let refreshed = {
         let c = client.lock().await;
-        c.refresh_invite_payload(&server_id)?
+        c.refresh_invite_payload(&server_id, &grant, key)?
     };
     {
         let r = relay.lock().await;

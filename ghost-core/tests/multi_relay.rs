@@ -31,8 +31,10 @@ async fn master_client(account: &Account, relay_url: &str) -> RelayClient {
     client
 }
 
-async fn invite_on(account: &Account, server_id: &[u8; 32]) -> String {
-    flows::invite::create(&account.client, &account.relay, server_id, u64::MAX).await.unwrap().token
+/// An invite to the server on the account's relay: (token, key that opens its payload).
+async fn invite_on(account: &Account, server_id: &[u8; 32]) -> (String, [u8; 32]) {
+    let invite = flows::invite::create(&account.client, &account.relay, server_id, u64::MAX).await.unwrap();
+    (invite.token, invite.key)
 }
 
 #[tokio::test]
@@ -56,7 +58,7 @@ async fn accept_p6_sethomerelay_required_at_seq2_for_v2_accounts() {
     // An account whose chain names no home cannot be mirrored, even with a valid invite.
     let host = create_account(&foreign_url, "host").await;
     let server_id = create_server(&host, "club").await;
-    let token = invite_on(&host, &server_id).await;
+    let (token, _key) = invite_on(&host, &server_id).await;
     let legacy = ghost_core::identity::Identity::create_account("legacy").unwrap();
     let legacy_fp = legacy.identity.fingerprint;
     let (legacy_home, _) = RelayClient::new(&home_url);
@@ -87,7 +89,7 @@ async fn accept_p6_account_intro_populates_device_keys_and_allows_deviceauth() {
     let alice = create_account(&home_url, "alice").await;
     let host = create_account(&foreign_url, "host").await;
     let server_id = create_server(&host, "club").await;
-    let token = invite_on(&host, &server_id).await;
+    let (token, _key) = invite_on(&host, &server_id).await;
 
     let foreign = device_client_for(&*alice.relay.lock().await, &foreign_url);
     // Unknown to the foreign relay: authenticated requests are refused.
@@ -115,7 +117,7 @@ async fn accept_p6_anchored_entry_rejected_without_valid_home_checkpoint() {
     let alice = create_account(&home_url, "alice").await;
     let host = create_account(&foreign_url, "host").await;
     let server_id = create_server(&host, "club").await;
-    let token = invite_on(&host, &server_id).await;
+    let (token, _key) = invite_on(&host, &server_id).await;
 
     // Re-sign the SetHomeRelay checkpoint with a key that is not the home's.
     let mut chain = alice.client.lock().await.store().get_cached_anchored_entries(&alice.fp).unwrap();
@@ -135,10 +137,10 @@ async fn accept_p6_join_server_on_foreign_relay_end_to_end() {
     let alice = create_account(&home_url, "alice").await;
     let host = create_account(&foreign_url, "host").await;
     let server_id = create_server(&host, "club").await;
-    let token = invite_on(&host, &server_id).await;
+    let (token, key) = invite_on(&host, &server_id).await;
 
     let foreign = device_client_for(&*alice.relay.lock().await, &foreign_url);
-    let joined = flows::invite::join(&alice.client, &alice.relay, &foreign, &token, 2000).await.unwrap();
+    let joined = flows::invite::join(&alice.client, &alice.relay, &foreign, &token, &key, 2000).await.unwrap();
     assert_eq!(joined, server_id);
 
     // The server is recorded as living on the foreign relay.
@@ -195,10 +197,10 @@ async fn accept_p6_revocation_pushed_to_mirror_closes_sessions_and_emits_removes
     let alice = create_account(&home_url, "alice").await;
     let host = create_account(&foreign_url, "host").await;
     let server_id = create_server(&host, "club").await;
-    let token = invite_on(&host, &server_id).await;
+    let (token, key) = invite_on(&host, &server_id).await;
 
     let foreign = device_client_for(&*alice.relay.lock().await, &foreign_url);
-    flows::invite::join(&alice.client, &alice.relay, &foreign, &token, 2000).await.unwrap();
+    flows::invite::join(&alice.client, &alice.relay, &foreign, &token, &key, 2000).await.unwrap();
 
     // Pairing pushes the new device's AddDevice to the foreign relay.
     let (_client_b, relay_b, device_b_vk) = pair_second_device(&home_url, &alice).await;
@@ -219,9 +221,9 @@ async fn accept_p6_revocation_pushed_to_mirror_closes_sessions_and_emits_removes
 async fn join_foreign_server(alice: &Account, foreign_url: &str) -> ([u8; 32], Arc<Mutex<RelayClient>>, [u8; 32], Account) {
     let host = create_account(foreign_url, "host").await;
     let server_id = create_server(&host, "club").await;
-    let token = invite_on(&host, &server_id).await;
+    let (token, key) = invite_on(&host, &server_id).await;
     let foreign = device_client_for(&*alice.relay.lock().await, foreign_url);
-    flows::invite::join(&alice.client, &alice.relay, &foreign, &token, 2000).await.unwrap();
+    flows::invite::join(&alice.client, &alice.relay, &foreign, &token, &key, 2000).await.unwrap();
     let foreign_vk = foreign.lock().await.get_relay_info().await.unwrap().relay_vk;
     (server_id, foreign, foreign_vk, host)
 }
@@ -535,6 +537,7 @@ async fn accept_p6_revoked_device_cannot_decrypt_after_remaining_devices_commit_
                     Ok(ReceiveResult::DeviceRemoved) => "device removed".into(),
                     Ok(ReceiveResult::MembersRemoved(fps)) => format!("members removed: {}", fps.len()),
                     Ok(ReceiveResult::ProposalProcessed) => "proposal".into(),
+                    Ok(ReceiveResult::ChannelAccessLost(_)) => "channel access lost".into(),
                     Ok(ReceiveResult::Skipped) => "skipped".into(),
                     Err(e) => format!("error: {e}"),
                 }));
@@ -778,8 +781,8 @@ async fn host_server_with_alice(old_url: &str, alice_url: &str) -> HostedServer 
 
     let (alice_app, alice_events) = app_client(&alice, alice_url).await;
     let alice_old_view = Arc::new(Mutex::new(alice_app.lock().await.at(old_url)));
-    let token = invite_on(&host, &server_id).await;
-    flows::invite::join(&alice.client, &alice_app, &alice_old_view, &token, 2000).await.unwrap();
+    let (token, key) = invite_on(&host, &server_id).await;
+    flows::invite::join(&alice.client, &alice_app, &alice_old_view, &token, &key, 2000).await.unwrap();
 
     let (mut reader, mut events) = RelayClient::new(old_url);
     reader.copy_auth_from(&*host.relay.lock().await);
@@ -851,6 +854,38 @@ async fn accept_p6_server_move_followed_through_announcement() {
 }
 
 #[tokio::test]
+async fn server_move_carries_private_channels_to_the_new_relay() {
+    use ghost_core::storage::ChannelKind;
+
+    let old_url = common::start_relay().await;
+    let new_url = common::start_relay().await;
+    let alice_url = common::start_relay().await;
+    let s = host_server_with_alice(&old_url, &alice_url).await;
+    let channel_id = flows::channels::create_private(
+        &s.host.client, &s.host.relay, &s.host.relay, &s.server_id, "staff", ChannelKind::Text, vec![], vec![s.alice.fp],
+    )
+    .await
+    .unwrap();
+
+    let host_home = Arc::new(Mutex::new(s.host.relay.lock().await.at(&new_url)));
+    flows::account::rehome(&s.host.client, &host_home, Some(&s.host.relay)).await.unwrap();
+    flows::server::move_server(&s.host.client, &host_home, &s.server_id, &new_url).await.unwrap();
+
+    // The new relay holds the channel's group under the moved server group: it accepts
+    // the channel's traffic and lists the channel for the members it admits.
+    let outbound = {
+        let mut c = s.host.client.lock().await;
+        c.send_message(&s.server_id, &channel_id, b"still private".to_vec(), vec![], 9000).unwrap().0
+    };
+    host_home.lock().await.post_blob(&outbound.mailbox_id, outbound.blob).await.unwrap();
+    let server_mailbox = s.host.client.lock().await.server_mailbox(&s.server_id).unwrap();
+    let (mut reader, _events) = RelayClient::new(&new_url);
+    reader.copy_auth_from(&*s.host.relay.lock().await);
+    let listing = reader.get_admitted_channels(&server_mailbox).await.unwrap();
+    assert_eq!(listing.0.iter().map(|(mailbox, _)| *mailbox).collect::<Vec<_>>(), vec![outbound.mailbox_id]);
+}
+
+#[tokio::test]
 async fn accept_p6_server_move_found_at_creator_home_after_relay_dies() {
     let (old_url, old_server) = common::start_relay_with_handle().await;
     let new_url = common::start_relay().await;
@@ -904,12 +939,12 @@ async fn accept_p6_server_move_link_followed_when_no_shared_relay_survives() {
 }
 
 #[tokio::test]
-async fn accept_p6_server_move_refuses_records_not_signed_by_the_creator() {
+async fn accept_p6_server_move_refuses_records_not_signed_by_the_owner() {
     let old_url = common::start_relay().await;
     let alice_url = common::start_relay().await;
     let s = host_server_with_alice(&old_url, &alice_url).await;
 
-    // Alice is a member, not the creator: her signature cannot move the server.
+    // Alice is a member, not the owner: her signature cannot move the server.
     let alice_key = s.alice.client.lock().await.signing_key_clone();
     let forged = ghost_wire::server_location::ServerLocation::sign(
         s.server_id,
@@ -918,9 +953,9 @@ async fn accept_p6_server_move_refuses_records_not_signed_by_the_creator() {
         &alice_key,
     );
     let err = flows::server::follow_move(&s.alice.client, &s.alice_app, &s.server_id, &forged).await.unwrap_err();
-    assert!(err.to_string().contains("creator"), "{err}");
+    assert!(err.to_string().contains("owner"), "{err}");
 
-    // Only the creator may move it at all.
+    // Only the owner may move it at all.
     let err = flows::server::move_server(&s.alice.client, &s.alice_app, &s.server_id, &alice_url).await.unwrap_err();
     assert!(matches!(err, GhostError::PermissionDenied(_)), "{err}");
 }
