@@ -19,7 +19,11 @@ use ghost_core::mls::presence::OnlineStatus;
 
 use crate::constants::{DEFAULT_PAGE_SIZE, INVITE_EXPIRY_MS};
 use crate::config::KeybindConfig;
-use crate::dto::{ChannelDto, ConfigDto, DeviceDto, ServerDto, IdentityDto, InviteDto, KeybindConfigDto, MemberDto, MessageDto};
+use crate::dto::{
+    AssignmentDto, ChannelAccessDto, ChannelDto, ConfigDto, DeviceDto, IdentityDto, InviteDto, KeybindConfigDto,
+    MemberDto, MessageDto, PolicyDto, RoleDto, ServerDto, ServerRolesDto,
+};
+use ghost_wire::policy::{ChannelPolicy, Role, ServerPolicy, MANAGE_CHANNELS};
 use crate::presence;
 use crate::state::{AppState, now_millis};
 use crate::voice_task::VoiceCommand;
@@ -27,6 +31,25 @@ use crate::voice_task::VoiceCommand;
 fn parse_id(hex_str: &str) -> Result<[u8; 32], String> {
     let bytes = hex::decode(hex_str).map_err(|e| e.to_string())?;
     bytes.try_into().map_err(|_| "invalid 32-byte id".into())
+}
+
+/// Refuse early, with a clear message, what every member's device would ignore anyway.
+fn require_permission(client: &GhostClient, server_id: &[u8; 32], permission: u32, what: &str) -> Result<(), String> {
+    let policy = client.server_policy(server_id).map_err(|e| e.to_string())?;
+    if policy.has(client.fingerprint(), permission) {
+        Ok(())
+    } else {
+        Err(format!("{what} needs a permission you do not have"))
+    }
+}
+
+/// A client for the relay hosting the server, or `None` when it is the home relay.
+async fn hosting_relay(state: &AppState, server_id: &[u8; 32]) -> Option<tokio::sync::Mutex<RelayClient>> {
+    let url = {
+        let client = state.client.lock().await;
+        flows::server_relay_url(&client, server_id)
+    }?;
+    Some(tokio::sync::Mutex::new(state.relay.lock().await.at(&url)))
 }
 
 /// Abort the running relay task, create a fresh relay client, and swap it into state.
@@ -126,7 +149,7 @@ pub async fn list_servers(state: State<'_, AppState>) -> Result<Vec<ServerDto>, 
     let unread_servers = store.servers_with_unread().map_err(|e| e.to_string())?;
     Ok(servers
         .iter()
-        .map(|s| ServerDto::from_server(s, unread_servers.contains(&s.server_id)))
+        .map(|s| ServerDto::from_server(s, unread_servers.contains(&s.server_id), &client))
         .collect())
 }
 
@@ -141,7 +164,7 @@ async fn create_server_impl(name: &str, kind: ServerKind, state: &AppState) -> R
             .get_server(&server_id)
             .map_err(|e| e.to_string())?;
         let mid = client.mailbox_id_for_server(&server_id);
-        (ServerDto::from_server(&server, false), server_id, mid)
+        (ServerDto::from_server(&server, false, &client), server_id, mid)
     };
 
     if let Some(mid) = mailbox_id {
@@ -193,7 +216,7 @@ pub async fn list_channels(
     let unread_map: std::collections::HashMap<[u8; 32], u32> = unread.into_iter().collect();
     Ok(channels
         .iter()
-        .map(|c| ChannelDto::from_channel(c, unread_map.get(&c.channel_id).copied().unwrap_or(0)))
+        .map(|c| ChannelDto::from_channel(c, unread_map.get(&c.channel_id).copied().unwrap_or(0), client.is_private_channel(&c.channel_id)))
         .collect())
 }
 
@@ -208,7 +231,18 @@ pub async fn list_members(
         .store()
         .list_members(&sid)
         .map_err(|e| e.to_string())?;
-    Ok(members.iter().map(MemberDto::from).collect())
+    let policy = client.server_policy(&sid).ok();
+    Ok(members
+        .iter()
+        .map(|m| {
+            // In rank order, which is the order the policy lists roles in.
+            let roles = policy.as_ref().map_or_else(Vec::new, |p| {
+                let assigned = p.roles_of(&m.fingerprint);
+                p.roles.iter().filter(|r| assigned.contains(&r.id)).map(|r| r.id).collect()
+            });
+            MemberDto::from_member(m, roles)
+        })
+        .collect())
 }
 
 #[tauri::command]
@@ -255,6 +289,11 @@ pub async fn send_message(
     let sid = parse_id(&server_id)?;
     let cid = parse_id(&channel_id)?;
 
+    // A private channel must be rid of members who lost access before anything is sent.
+    flows::channels::remove_excluded(&state.client, &state.relay, &cid)
+        .await
+        .map_err(|e| e.to_string())?;
+
     let (outbound, dto) = {
         let mut client = state.client.lock().await;
         let (outbound, msg_id) = client
@@ -291,6 +330,7 @@ pub async fn create_channel(
 
     let outbound = {
         let mut client = state.client.lock().await;
+        require_permission(&client, &sid, MANAGE_CHANNELS, "creating channels")?;
         let position = client
             .store()
             .list_channels(&sid)
@@ -322,7 +362,7 @@ pub async fn create_channel(
 
     let client = state.client.lock().await;
     let channel = client.store().get_channel(&channel_id).map_err(|e| e.to_string())?;
-    Ok(ChannelDto::from_channel(&channel, 0))
+    Ok(ChannelDto::from_channel(&channel, 0, false))
 }
 
 #[tauri::command]
@@ -337,15 +377,20 @@ pub async fn rename_channel(
         let mut client = state.client.lock().await;
         let channel = client.store().get_channel(&cid).map_err(|e| e.to_string())?;
         let sid = channel.server_id;
+        require_permission(&client, &sid, MANAGE_CHANNELS, "renaming channels")?;
         client
             .store()
             .rename_channel(&cid, &name)
             .map_err(|e| e.to_string())?;
 
-        let op = ChannelOpPayload::Rename { channel_id: cid, name };
-        let out = client
-            .send_control(&sid, encode_channel_op(&op))
-            .map_err(|e| e.to_string())?;
+        // A private channel's name is only ever sent inside its own group.
+        let op = encode_channel_op(&ChannelOpPayload::Rename { channel_id: cid, name });
+        let out = if client.is_private_channel(&cid) {
+            client.send_control_in(&cid, op)
+        } else {
+            client.send_control(&sid, op)
+        }
+        .map_err(|e| e.to_string())?;
         (out, sid)
     };
 
@@ -364,27 +409,161 @@ pub async fn delete_channel(
 ) -> Result<(), String> {
     let cid = parse_id(&channel_id)?;
 
-    let (outbound, sid) = {
+    let (outbound, sid, private_mailbox) = {
         let mut client = state.client.lock().await;
         let channel = client.store().get_channel(&cid).map_err(|e| e.to_string())?;
         let sid = channel.server_id;
-        client
-            .store()
-            .delete_channel(&cid)
-            .map_err(|e| e.to_string())?;
+        require_permission(&client, &sid, MANAGE_CHANNELS, "deleting channels")?;
 
-        let op = ChannelOpPayload::Delete { channel_id: cid };
-        let out = client
-            .send_control(&sid, encode_channel_op(&op))
-            .map_err(|e| e.to_string())?;
-        (out, sid)
+        let op = encode_channel_op(&ChannelOpPayload::Delete { channel_id: cid });
+        if client.is_private_channel(&cid) {
+            // Members drop it on reading this inside its group; then the group goes.
+            let mailbox_id = client.mailbox_id_for_channel(&cid);
+            let out = client.send_control_in(&cid, op).map_err(|e| e.to_string())?;
+            client.drop_private_channel(&cid).map_err(|e| e.to_string())?;
+            (out, sid, mailbox_id)
+        } else {
+            client.store().delete_channel(&cid).map_err(|e| e.to_string())?;
+            (client.send_control(&sid, op).map_err(|e| e.to_string())?, sid, None)
+        }
     };
 
     let relay = state.relay.lock().await;
     let _ = relay.send(&outbound.mailbox_id, outbound.blob).await;
     drop(relay);
+    if let Some(mailbox_id) = private_mailbox {
+        let mut relay = state.relay.lock().await;
+        relay.unsubscribe(&mailbox_id);
+        if let Err(e) = relay.delete_mailbox(&mailbox_id).await {
+            eprintln!("delete private channel mailbox: {e}");
+        }
+    }
 
     flows::sync::server_entry(&state.client, &state.relay, &sid).await;
+    Ok(())
+}
+
+/// Create a private channel admitting the given roles and accounts (and always the
+/// server's channel managers). Members it does not admit never learn it exists.
+#[tauri::command]
+pub async fn create_private_channel(
+    server_id: String,
+    name: String,
+    kind: String,
+    roles: Vec<u8>,
+    accounts: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<ChannelDto, String> {
+    let sid = parse_id(&server_id)?;
+    let kind = match kind.as_str() {
+        "voice" => ChannelKind::Voice,
+        _ => ChannelKind::Text,
+    };
+    let accounts = accounts.iter().map(|a| parse_id(a)).collect::<Result<Vec<_>, _>>()?;
+    let hosting = hosting_relay(&state, &sid).await;
+    let relay = hosting.as_ref().unwrap_or(&state.relay);
+    let channel_id = flows::channels::create_private(&state.client, &state.relay, relay, &sid, &name, kind, roles, accounts)
+        .await
+        .map_err(|e| e.to_string())?;
+    let client = state.client.lock().await;
+    let channel = client.store().get_channel(&channel_id).map_err(|e| e.to_string())?;
+    Ok(ChannelDto::from_channel(&channel, 0, true))
+}
+
+/// Who a private channel admits; `None` for a public channel.
+#[tauri::command]
+pub async fn get_channel_access(channel_id: String, state: State<'_, AppState>) -> Result<Option<ChannelAccessDto>, String> {
+    let cid = parse_id(&channel_id)?;
+    let client = state.client.lock().await;
+    let policy = client.channel_policy(&cid).map_err(|e| e.to_string())?;
+    Ok(policy.map(|p| ChannelAccessDto { roles: p.roles, accounts: p.accounts.iter().map(hex::encode).collect() }))
+}
+
+/// Change whom a private channel admits. Members it no longer admits are removed.
+#[tauri::command]
+pub async fn set_channel_access(channel_id: String, access: ChannelAccessDto, state: State<'_, AppState>) -> Result<(), String> {
+    let cid = parse_id(&channel_id)?;
+    let current = {
+        let client = state.client.lock().await;
+        client.channel_policy(&cid).map_err(|e| e.to_string())?.ok_or("not a private channel")?
+    };
+    let accounts = access.accounts.iter().map(|a| parse_id(a)).collect::<Result<Vec<_>, _>>()?;
+    let policy = ChannelPolicy { roles: access.roles, accounts, ..current };
+    flows::channels::set_policy(&state.client, &state.relay, &cid, &policy)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// A server's roles, assignments and what everyone may do, with role names.
+#[tauri::command]
+pub async fn get_server_roles(server_id: String, state: State<'_, AppState>) -> Result<ServerRolesDto, String> {
+    let sid = parse_id(&server_id)?;
+    let client = state.client.lock().await;
+    let policy = client.server_policy(&sid).map_err(|e| e.to_string())?;
+    let names: std::collections::HashMap<u8, String> =
+        client.store().list_role_names(&sid).map_err(|e| e.to_string())?.into_iter().collect();
+    let explicit = client.server_policy_is_explicit(&sid).map_err(|e| e.to_string())?;
+    let missing = client.members_missing_policy_support(&sid).map_err(|e| e.to_string())?;
+    Ok(ServerRolesDto {
+        my_permissions: policy.permissions(client.fingerprint()),
+        policy: PolicyDto {
+            owner_fp: hex::encode(policy.owner),
+            everyone: policy.everyone,
+            roles: policy
+                .roles
+                .iter()
+                .map(|r| RoleDto { id: r.id, name: names.get(&r.id).cloned().unwrap_or_default(), permissions: r.permissions })
+                .collect(),
+            assignments: policy
+                .assignments
+                .iter()
+                .map(|(account, roles)| AssignmentDto { fingerprint: hex::encode(account), roles: roles.clone() })
+                .collect(),
+        },
+        explicit,
+        members_missing_support: missing.iter().map(hex::encode).collect(),
+    })
+}
+
+/// Replace a server's roles, assignments, everyone permissions or owner, then send the
+/// names of roles that are new or renamed. The relay and every member check the change.
+#[tauri::command]
+pub async fn set_server_roles(server_id: String, policy: PolicyDto, state: State<'_, AppState>) -> Result<(), String> {
+    let sid = parse_id(&server_id)?;
+    let new_policy = ServerPolicy {
+        owner: parse_id(&policy.owner_fp)?,
+        everyone: policy.everyone,
+        roles: policy.roles.iter().map(|r| Role { id: r.id, permissions: r.permissions }).collect(),
+        assignments: policy
+            .assignments
+            .iter()
+            .filter(|a| !a.roles.is_empty())
+            .map(|a| Ok((parse_id(&a.fingerprint)?, a.roles.clone())))
+            .collect::<Result<Vec<_>, String>>()?,
+    };
+    flows::roles::set_server_policy(&state.client, &state.relay, &sid, &new_policy)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let renamed: Vec<(u8, String)> = {
+        let client = state.client.lock().await;
+        let known: std::collections::HashMap<u8, String> =
+            client.store().list_role_names(&sid).map_err(|e| e.to_string())?.into_iter().collect();
+        policy
+            .roles
+            .iter()
+            .filter(|r| known.get(&r.id) != Some(&r.name))
+            .map(|r| (r.id, r.name.clone()))
+            .collect()
+    };
+    for (role_id, name) in renamed {
+        let out = {
+            let mut client = state.client.lock().await;
+            client.name_role(&sid, role_id, &name).map_err(|e| e.to_string())?
+        };
+        let relay = state.relay.lock().await;
+        relay.send(&out.mailbox_id, out.blob).await.map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 
@@ -398,12 +577,12 @@ pub async fn kick_member(
     let sid = parse_id(&server_id)?;
     let fp = parse_id(&fingerprint)?;
 
-    let all_accepted = flows::members::kick(&state.client, &state.relay, &sid, &fp)
+    let accepted = flows::members::kick(&state.client, &state.relay, &sid, &fp)
         .await
         .map_err(|e| e.to_string())?;
     let _ = app.emit("sync", hex::encode(sid));
-    if !all_accepted {
-        return Err("epoch conflict on one or more channels — retry may be needed".into());
+    if !accepted {
+        return Err("the relay rejected the kick (the server changed meanwhile); try again".into());
     }
     Ok(())
 }
@@ -448,7 +627,8 @@ pub async fn create_invite(
     link.query_pairs_mut()
         .append_pair("relay", &created.relay_url)
         .append_pair("r", &created.relay_ref.encode())
-        .append_pair("token", &created.token);
+        .append_pair("token", &created.token)
+        .append_pair("k", &hex::encode(created.key));
 
     Ok(InviteDto { token: created.token, link: link.to_string() })
 }
@@ -481,9 +661,11 @@ pub async fn follow_server_move(link: String, state: State<'_, AppState>) -> Res
 pub async fn join_by_invite(
     relay_url: String,
     token: String,
+    key: String,
     relay_ref: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<ServerDto, String> {
+    let key = parse_id(&key).map_err(|_| "the invite link's key is malformed".to_string())?;
     let configured = state.relay_url.lock().await.clone();
     // A view of the home client: subscriptions on another relay join the same event stream.
     let target = if same_relay(&relay_url, &configured) {
@@ -501,7 +683,7 @@ pub async fn join_by_invite(
         }
     }
 
-    let server_id = flows::invite::join(&state.client, &state.relay, relay, &token, now_millis())
+    let server_id = flows::invite::join(&state.client, &state.relay, relay, &token, &key, now_millis())
         .await
         .map_err(|e| e.to_string())?;
 
@@ -510,7 +692,7 @@ pub async fn join_by_invite(
         .store()
         .get_server(&server_id)
         .map_err(|e| e.to_string())?;
-    Ok(ServerDto::from_server(&server, false))
+    Ok(ServerDto::from_server(&server, false, &client))
 }
 
 #[tauri::command]

@@ -442,8 +442,10 @@ pub async fn run(
                         rand::rngs::OsRng.fill_bytes(&mut voice_salt);
                         active_voice_salt = voice_salt;
 
+                        // Signal on the relay hosting the server; a channel without its own
+                        // mailbox route still resolves there.
                         let request = {
-                            let r = relay.lock().await;
+                            let r = relay.lock().await.at(&relay_url);
                             match r.voice_ws_request(&channel_id_bytes) {
                                 Ok(req) => req,
                                 Err(e) => {

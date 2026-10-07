@@ -3,15 +3,21 @@ import { Portal } from "solid-js/web";
 import { ScrollArea } from "./ui/scroll-area";
 import { Avatar } from "./ui/avatar";
 import type { AvatarStatus } from "./ui/avatar";
-import { identity, members, selectedServerId, selectedServer, onlinePresence } from "../lib/store";
+import { identity, members, selectedServerId, selectedServer, serverRoles, onlinePresence } from "../lib/store";
 import { kickMember } from "../lib/api";
+import { PERMISSIONS } from "../lib/types";
 
 const STATUS_ORDER: Record<string, number> = { online: 0, idle: 1, away: 2 };
 
 export function MemberPanel() {
   const [ctxMenu, setCtxMenu] = createSignal<{ x: number; y: number; fingerprint: string } | null>(null);
 
-  const isCreator = () => identity()?.fingerprint === selectedServer()?.creator_fp;
+  const ownerFp = () => selectedServer()?.owner_fp;
+  const canKick = () => ((selectedServer()?.permissions ?? 0) & PERMISSIONS.kick) !== 0;
+  const roleName = (id: number) => serverRoles()?.policy.roles.find((r) => r.id === id)?.name;
+  /** What to show under a member: owner, else the name of their highest role. */
+  const memberLabel = (fp: string, roles: number[]) =>
+    fp === ownerFp() ? "owner" : roles.length > 0 ? roleName(roles[0]) || "role" : undefined;
   const memberStatus = (fp: string) => onlinePresence().get(fp)?.status as AvatarStatus | undefined;
   const memberStatusMessage = (fp: string) => onlinePresence().get(fp)?.status_message;
 
@@ -26,8 +32,9 @@ export function MemberPanel() {
     });
   };
 
-  const onRightClick = (fingerprint: string, role: string, e: MouseEvent) => {
-    if (!isCreator() || role === "creator") return;
+  // Rank is checked when kicking; the menu only needs the permission.
+  const onRightClick = (fingerprint: string, e: MouseEvent) => {
+    if (!canKick() || fingerprint === ownerFp() || fingerprint === identity()?.fingerprint) return;
     e.preventDefault();
     const menuW = 140, menuH = 40;
     const x = Math.min(e.clientX, window.innerWidth - menuW);
@@ -63,13 +70,18 @@ export function MemberPanel() {
           members — {members().length}
         </span>
       </div>
+      <Show when={serverRoles() && !serverRoles()!.explicit && serverRoles()!.members_missing_support.length > 0}>
+        <div class="px-3 pb-2 text-[11px] text-[var(--neutral-500)] leading-tight">
+          roles are available once {serverRoles()!.members_missing_support.length} member(s) update ghost
+        </div>
+      </Show>
       <ScrollArea class="flex-1">
         <div class="px-2 py-1">
           <For each={sortedMembers()}>
             {(m) => (
               <div
                 class="flex items-center gap-2.5 px-2 py-1.5 rounded-md hover:bg-[var(--hover)]"
-                onContextMenu={(e) => onRightClick(m.fingerprint, m.role, e)}
+                onContextMenu={(e) => onRightClick(m.fingerprint, e)}
               >
                 <Avatar
                   hashKey={m.fingerprint}
@@ -86,8 +98,8 @@ export function MemberPanel() {
                       <div class="text-[11px] text-[var(--neutral-500)] truncate leading-tight">{msg()}</div>
                     )}
                   </Show>
-                  <Show when={!memberStatusMessage(m.fingerprint) && m.role === "creator"}>
-                    <div class="text-[11px] text-[var(--purple-400)] leading-tight">creator</div>
+                  <Show when={!memberStatusMessage(m.fingerprint) && memberLabel(m.fingerprint, m.roles)}>
+                    {(label) => <div class="text-[11px] text-[var(--purple-400)] leading-tight">{label()}</div>}
                   </Show>
                 </div>
               </div>

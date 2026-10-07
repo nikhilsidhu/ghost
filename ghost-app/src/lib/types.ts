@@ -9,8 +9,55 @@ export interface Server {
   name: string;
   kind: "server" | "group" | "dm";
   creator_fp: string;
+  /** Owner under the server's policy, who may do everything. */
+  owner_fp: string;
+  /** This account's permission bits in the server (see PERMISSIONS). */
+  permissions: number;
   created_at: number;
   has_unread: boolean;
+}
+
+/** Permission bits of a server policy; must match ghost-wire's policy module. */
+export const PERMISSIONS = {
+  invite: 1,
+  kick: 2,
+  manageChannels: 4,
+  manageRoles: 8,
+} as const;
+export const ALL_PERMISSIONS = 15;
+
+export interface Role {
+  id: number;
+  name: string;
+  permissions: number;
+}
+
+export interface RoleAssignment {
+  fingerprint: string;
+  roles: number[];
+}
+
+/** A server's policy with role names; roles are listed by rank, highest first. */
+export interface ServerPolicy {
+  owner_fp: string;
+  everyone: number;
+  roles: Role[];
+  assignments: RoleAssignment[];
+}
+
+export interface ServerRoles {
+  policy: ServerPolicy;
+  my_permissions: number;
+  /** False while the server still runs under the implicit policy of an old group. */
+  explicit: boolean;
+  /** Members whose app must update before the server can have roles. */
+  members_missing_support: string[];
+}
+
+/** Who a private channel admits besides the server's channel managers. */
+export interface ChannelAccess {
+  roles: number[];
+  accounts: string[];
 }
 
 export interface Channel {
@@ -20,6 +67,8 @@ export interface Channel {
   kind: "text" | "voice";
   position: number;
   unread_count: number;
+  /** Only members its access list admits can see it. */
+  private: boolean;
 }
 
 export interface Member {
@@ -28,6 +77,8 @@ export interface Member {
   display_name: string;
   role: "creator" | "member";
   joined_at: number;
+  /** Ids of the server roles assigned to this member, highest first. */
+  roles: number[];
 }
 
 export interface Invite {

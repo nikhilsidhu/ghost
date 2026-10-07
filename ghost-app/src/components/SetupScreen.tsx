@@ -49,9 +49,10 @@ export function SetupScreen(props: Props) {
           const url = new URL(input);
           const relay = url.searchParams.get("relay");
           const token = url.searchParams.get("token");
-          if (relay && token) {
+          const key = url.searchParams.get("k");
+          if (relay && token && key) {
             await setRelayUrl(relay);
-            await joinByInvite(relay, token, url.searchParams.get("r"));
+            await joinByInvite(relay, token, key, url.searchParams.get("r"));
             setMode("set-recovery-pass");
             setLoading(false);
             return;

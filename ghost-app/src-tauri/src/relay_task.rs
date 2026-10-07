@@ -1,16 +1,18 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
-use ghost_core::client::{GhostClient, ReceiveResult};
+use ghost_core::client::{ChannelOpOutcome, GhostClient, ReceiveResult};
+use ghost_core::deferred::DeferredBlobs;
+use ghost_core::error::GhostError;
 use ghost_core::crypto::MessageType;
 use ghost_core::mls::presence::OnlineStatus;
 use ghost_core::mls::voice::PresenceState;
-use ghost_core::relay::{RelayClient, RelayEvent};
-use ghost_core::storage::{Channel, Member, MemberRole};
-use ghost_core::wire::{decode_metadata, ChannelOpPayload, MetadataPayload, ProvisionPayload, SyncMessageType, SyncReceiveResult, SyncServerMeta};
+use ghost_core::relay::{IncomingBlob, RelayClient, RelayEvent};
+use ghost_core::storage::{Member, MemberRole};
+use ghost_core::wire::{decode_metadata, derive_default_channel_id, MetadataPayload, ProvisionPayload, SyncMessageType, SyncReceiveResult, SyncServerMeta};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 use tokio::sync::{mpsc, Mutex};
@@ -24,6 +26,21 @@ fn get_json_str<'a>(obj: &'a serde_json::Value, key: &str) -> Option<&'a str> {
 
 fn decode_b64_blob(b64: &str) -> Option<Vec<u8>> {
     B64.decode(b64).ok()
+}
+
+/// Join the private channels of a server that the relay lists for this account, in the
+/// background so the event loop keeps running.
+fn spawn_join_private_channels(client: &Arc<Mutex<GhostClient>>, relay: &Arc<Mutex<RelayClient>>, server_id: [u8; 32], app: &AppHandle) {
+    let (client, relay, app) = (client.clone(), relay.clone(), app.clone());
+    tauri::async_runtime::spawn(async move {
+        match ghost_core::flows::channels::join_admitted(&client, &relay, &server_id).await {
+            Ok(joined) if !joined.is_empty() => {
+                let _ = app.emit("sync", hex::encode(server_id));
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("private channels of {}: {e}", hex::encode(&server_id[..8])),
+        }
+    });
 }
 
 async fn rebroadcast_presence(
@@ -118,6 +135,22 @@ pub async fn run(
         }
     }
 
+    // Bring groups made before policies under one, then join the private channels each
+    // server's relay lists for this account (granted while this device was away).
+    {
+        let (client, relay, app) = (client.clone(), relay.clone(), app.clone());
+        tauri::async_runtime::spawn(async move {
+            ghost_core::flows::roles::migrate(&client, &relay).await;
+            let servers: Vec<[u8; 32]> = {
+                let c = client.lock().await;
+                c.store().list_servers().map(|list| list.into_iter().map(|s| s.server_id).collect()).unwrap_or_default()
+            };
+            for server_id in servers {
+                spawn_join_private_channels(&client, &relay, server_id, &app);
+            }
+        });
+    }
+
     // Per-channel voice members visible to all mailbox subscribers
     let mut voice_members: HashMap<[u8; 32], Vec<PresenceState>> = HashMap::new();
     // Track which channels belong to which mailbox (so snapshots don't clobber other servers)
@@ -132,7 +165,19 @@ pub async fn run(
     let mut consecutive_errors: HashMap<[u8; 32], u32> = HashMap::new();
     const EPOCH_RECOVERY_ERROR_THRESHOLD: u32 = 3;
 
-    while let Some(event) = events.recv().await {
+    // Private channel blobs waiting for the server group to reach the epoch they name,
+    // and those released again for processing.
+    let mut deferred = DeferredBlobs::default();
+    let mut requeued: VecDeque<IncomingBlob> = VecDeque::new();
+
+    loop {
+        let event = match requeued.pop_front() {
+            Some(blob) => RelayEvent::Blob(blob),
+            None => match events.recv().await {
+                Some(event) => event,
+                None => break,
+            },
+        };
         match event {
             RelayEvent::Blob(blob) => {
                 let received_at = blob.received_at;
@@ -163,6 +208,12 @@ pub async fn run(
                     }
                 }
 
+                // Later blobs of a mailbox wait behind one already held back.
+                if deferred.is_waiting(&mailbox_id) {
+                    deferred.queue(blob);
+                    continue;
+                }
+
                 let result = {
                     let mut c = client.lock().await;
                     match (c.channel_id_for_mailbox(&mailbox_id), c.server_id_for_mailbox(&mailbox_id)) {
@@ -171,34 +222,39 @@ pub async fn run(
                     }
                 };
 
+                // A private channel commit authorized at a server epoch this device has
+                // not reached: hold it (and what follows it) until the server group catches up.
+                if let Some((_, _, Err(GhostError::PolicyBehind { server_mailbox, epoch }))) = &result {
+                    let (server_mailbox, epoch) = (*server_mailbox, *epoch);
+                    deferred.hold(blob, server_mailbox, epoch);
+                    continue;
+                }
+
                 // Reset consecutive error counter on any successful receive
                 if matches!(&result, Some((_, _, Ok(_)))) {
                     consecutive_errors.remove(&mailbox_id);
                 }
 
                 match result {
-                    Some((server_id, _channel_id, Ok(ReceiveResult::Message(msg) | ReceiveResult::MessageWithKtWarning(msg)))) if msg.message_type == MessageType::Metadata => {
+                    Some((server_id, group_channel, Ok(ReceiveResult::Message(msg) | ReceiveResult::MessageWithKtWarning(msg)))) if msg.message_type == MessageType::Metadata => {
                         let mut fetch_avatar = None;
                         let mut own_name_changed = false;
                         let mut server_move = None;
+                        let mut info_reply = None;
                         match decode_metadata(&msg.content) {
                             Ok(payload) => {
                                 let mut c = client.lock().await;
                                 match payload {
-                                    MetadataPayload::ChannelOp(ChannelOpPayload::Create { channel_id, name, kind, position }) => {
-                                        let _ = c.store().insert_channel(&Channel {
-                                            channel_id,
-                                            server_id,
-                                            name,
-                                            kind,
-                                            position,
-                                        });
-                                    }
-                                    MetadataPayload::ChannelOp(ChannelOpPayload::Rename { channel_id, name }) => {
-                                        let _ = c.store().rename_channel(&channel_id, &name);
-                                    }
-                                    MetadataPayload::ChannelOp(ChannelOpPayload::Delete { channel_id }) => {
-                                        let _ = c.store().delete_channel(&channel_id);
+                                    // Who may change channels comes from the server policy, checked in core.
+                                    MetadataPayload::ChannelOp(op) => match c.apply_channel_op(&group_channel, &msg.sender_fp, op) {
+                                        Ok(ChannelOpOutcome::Reply(out)) => info_reply = Some(out),
+                                        Ok(_) => {}
+                                        Err(e) => eprintln!("channel op: {e}"),
+                                    },
+                                    MetadataPayload::RoleName { role_id, name } => {
+                                        if let Err(e) = c.apply_role_name(&server_id, &msg.sender_fp, role_id, &name) {
+                                            eprintln!("role name: {e}");
+                                        }
                                     }
                                     MetadataPayload::MemberAnnounce { display_name } => {
                                         let _ = c.store().update_member_name(&server_id, &msg.sender_fp, &display_name);
@@ -219,12 +275,8 @@ pub async fn run(
                                         let _ = app.emit("avatar-cleared", fp_hex);
                                     }
                                     MetadataPayload::ServerMoved(location) => {
-                                        // Only the creator may move a server; the record is verified when followed.
-                                        let from_creator = c
-                                            .store()
-                                            .get_server(&server_id)
-                                            .is_ok_and(|s| s.creator_fp == msg.sender_fp);
-                                        if from_creator {
+                                        // Only the owner may move a server; the record is verified when followed.
+                                        if c.server_owner(&server_id).is_ok_and(|owner| owner == msg.sender_fp) {
                                             server_move = Some(location);
                                         }
                                     }
@@ -232,6 +284,11 @@ pub async fn run(
                                 let _ = c.store().set_last_seen_seq(&mailbox_id, seq);
                             }
                             Err(e) => eprintln!("decode metadata: {e}"),
+                        }
+                        if let Some(out) = info_reply {
+                            if let Err(e) = relay.lock().await.send(&out.mailbox_id, out.blob).await {
+                                eprintln!("channel info reply: {e}");
+                            }
                         }
                         if let Some((sid, fp, hash)) = fetch_avatar {
                             maybe_fetch_avatar(&client, &relay, &app, &data_dir, &sid, &fp, &hash).await;
@@ -254,13 +311,16 @@ pub async fn run(
                         let c = client.lock().await;
                         let _ = c.store().set_last_seen_seq(&mailbox_id, seq);
                     }
-                    Some((server_id, _channel_id, Ok(ReceiveResult::CommitProcessed))) => {
+                    Some((server_id, channel_id, Ok(ReceiveResult::CommitProcessed))) => {
                         let mut new_member_fps = Vec::new();
+                        let server_group = channel_id == derive_default_channel_id(&server_id);
                         {
                             let c = client.lock().await;
                             let _ = c.store().set_last_seen_seq(&mailbox_id, seq);
                             // Discover new members added by this commit (e.g. external join)
-                            if let Ok(mls_fps) = c.mls_member_fingerprints(&server_id) {
+                            if !server_group {
+                                // A private channel's members are a subset of the server's.
+                            } else if let Ok(mls_fps) = c.mls_member_fingerprints(&server_id) {
                                 let stored: HashSet<[u8; 32]> = c.store()
                                     .list_members(&server_id)
                                     .unwrap_or_default()
@@ -280,10 +340,11 @@ pub async fn run(
                                     }
                                 }
                             }
-                            if let Ok(gi) = c.export_server_info(&server_id) {
-                                let r = relay.lock().await;
-                                let _ = r.put_server_info(&mailbox_id, gi).await;
-                            }
+                        }
+                        ghost_core::flows::publish_server_info(&client, &relay, &mailbox_id).await;
+                        // A server commit may have granted access to private channels.
+                        if server_group {
+                            spawn_join_private_channels(&client, &relay, server_id, &app);
                         }
                         // Cache identity logs for gossip enrichment (not required for message processing)
                         for fp in &new_member_fps {
@@ -312,17 +373,17 @@ pub async fn run(
                         drop(c);
                         let _ = app.emit("kicked", hex::encode(server_id));
                     }
-                    Some((server_id, _channel_id, Ok(ReceiveResult::MembersRemoved(removed)))) => {
+                    Some((server_id, channel_id, Ok(ReceiveResult::MembersRemoved(removed)))) => {
                         let c = client.lock().await;
                         let _ = c.store().set_last_seen_seq(&mailbox_id, seq);
-                        for fp in &removed {
-                            let _ = c.store().remove_member(&server_id, fp);
-                        }
-                        if let Ok(gi) = c.export_server_info(&server_id) {
-                            let r = relay.lock().await;
-                            let _ = r.put_server_info(&mailbox_id, gi).await;
+                        // Leaving a private channel does not end server membership.
+                        if channel_id == derive_default_channel_id(&server_id) {
+                            for fp in &removed {
+                                let _ = c.store().remove_member(&server_id, fp);
+                            }
                         }
                         drop(c);
+                        ghost_core::flows::publish_server_info(&client, &relay, &mailbox_id).await;
                         rebroadcast_presence(&client, &relay, &mailbox_id, &presence).await;
                         retry_pending_presence(&app, &client, &server_id, &mut online_members, &mut pending_presence).await;
                         let _ = app.emit("sync", hex::encode(server_id));
@@ -348,11 +409,8 @@ pub async fn run(
                                         Ok(_) => {
                                             let mut c = client.lock().await;
                                             let _ = c.merge_pending_commit_for_channel(&channel_id);
-                                            if let Ok(gi) = c.export_server_info(&server_id) {
-                                                let r = relay.lock().await;
-                                                let _ = r.put_server_info(&mailbox_id, gi).await;
-                                            }
                                             drop(c);
+                                            ghost_core::flows::publish_server_info(&client, &relay, &mailbox_id).await;
                                             rebroadcast_presence(&client, &relay, &mailbox_id, &presence).await;
                                             let _ = app.emit("sync", hex::encode(server_id));
                                         }
@@ -368,6 +426,14 @@ pub async fn run(
                                 }
                             }
                         }
+                    }
+                    Some((server_id, _channel_id, Ok(ReceiveResult::ChannelAccessLost(_)))) => {
+                        // Removed from a private channel; the server membership stands.
+                        let c = client.lock().await;
+                        let _ = c.store().set_last_seen_seq(&mailbox_id, seq);
+                        drop(c);
+                        relay.lock().await.unsubscribe(&mailbox_id);
+                        let _ = app.emit("sync", hex::encode(server_id));
                     }
                     Some((_, _, Ok(ReceiveResult::Skipped))) => {
                         let c = client.lock().await;
@@ -389,6 +455,8 @@ pub async fn run(
                     }
                     None => {}
                 }
+                // A server commit may have released held-back private channel blobs.
+                requeued.extend(deferred.take_ready(&*client.lock().await));
             }
             RelayEvent::Ack(ack) => {
                 if ack.epoch_mismatch {
@@ -467,6 +535,9 @@ async fn handle_sync_application(
             };
             if ghost_core::flows::provision::join_payload_if_unknown(client, relay, &payload, now_ms()).await {
                 let _ = app.emit("sync", "all");
+            } else {
+                // A known server: the other device may have made or entered a private channel.
+                spawn_join_private_channels(client, relay, payload.server_id, app);
             }
         }
         x if x == SyncMessageType::ServerLeft as u8 => {

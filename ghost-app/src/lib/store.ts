@@ -1,8 +1,8 @@
 import { createSignal } from "solid-js";
 import { listen } from "@tauri-apps/api/event";
-import type { Identity, Server, Channel, Member, Message, VoiceState, VoiceParticipants, VoiceSpeaking, VoiceMuteState, VoiceQuality, OnlinePresenceEvent } from "./types";
+import type { Identity, Server, Channel, Member, Message, VoiceState, VoiceParticipants, VoiceSpeaking, VoiceMuteState, VoiceQuality, OnlinePresenceEvent, ServerRoles } from "./types";
 import {
-  getIdentity, listServers, listChannels, listMembers,
+  getIdentity, listServers, listChannels, listMembers, getServerRoles,
   markChannelRead,
   joinVoice, leaveVoice, setVoiceMuted, setVoiceDeafened,
   getConfig,
@@ -32,6 +32,8 @@ const [servers, setServers] = createSignal<Server[]>([]);
 const [selectedServerId, setSelectedServerId] = createSignal<string | null>(null);
 const [channels, setChannels] = createSignal<Channel[]>([]);
 const [members, setMembers] = createSignal<Member[]>([]);
+// Roles of the selected server, for role names and permission checks in the UI
+const [serverRoles, setServerRoles] = createSignal<ServerRoles | null>(null);
 const [selectedChannelId, setSelectedChannelId] = createSignal<string | null>(null);
 const [allChannels, setAllChannels] = createSignal<Channel[]>([]);
 const [allMembers, setAllMembers] = createSignal<Member[]>([]);
@@ -185,10 +187,18 @@ const refreshAllMembers = async () => {
 };
 
 
+const refreshRoles = async () => {
+  const sid = selectedServerId();
+  if (!sid) { setServerRoles(null); return; }
+  const roles = await getServerRoles(sid).catch(() => null);
+  if (selectedServerId() === sid) setServerRoles(roles);
+};
+
 const refreshMembers = async () => {
   const sid = selectedServerId();
   if (!sid) return;
   setMembers(await listMembers(sid));
+  await refreshRoles();
 };
 
 // --- Actions ---
@@ -202,6 +212,7 @@ const selectServer = async (id: string | null) => {
   if (selectedServerId() !== id) return;
   setChannels(ch);
   setMembers(mem);
+  await refreshRoles();
 };
 
 const activateDmView = () => {
@@ -444,7 +455,7 @@ const initialize = async () => {
 };
 
 export {
-  identity, servers, selectedServerId, channels, members,
+  identity, servers, selectedServerId, channels, members, serverRoles, refreshRoles,
   selectedChannelId, allChannels,
   inviteLink, moveLink, showInfo, desiredChannelKind,
   selectedServer, selectedChannelName,

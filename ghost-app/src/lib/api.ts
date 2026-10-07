@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Identity, Server, Channel, Member, Message, Invite, Config, AudioDevices, KeybindConfig, Device } from "./types";
+import type { Identity, Server, Channel, Member, Message, Invite, Config, AudioDevices, KeybindConfig, Device, ServerRoles, ServerPolicy, ChannelAccess } from "./types";
 
 export const getIdentity = () => invoke<Identity>("get_identity");
 
@@ -41,6 +41,24 @@ export const deleteChannel = (channelId: string) =>
 export const kickMember = (serverId: string, fingerprint: string) =>
   invoke<void>("kick_member", { serverId, fingerprint });
 
+/** A channel only the given roles and accounts (and channel managers) can see. */
+export const createPrivateChannel = (serverId: string, name: string, kind: string, roles: number[], accounts: string[]) =>
+  invoke<Channel>("create_private_channel", { serverId, name, kind, roles, accounts });
+
+/** Resolves to null for a public channel. */
+export const getChannelAccess = (channelId: string) =>
+  invoke<ChannelAccess | null>("get_channel_access", { channelId });
+
+export const setChannelAccess = (channelId: string, access: ChannelAccess) =>
+  invoke<void>("set_channel_access", { channelId, access });
+
+export const getServerRoles = (serverId: string) =>
+  invoke<ServerRoles>("get_server_roles", { serverId });
+
+/** Replace roles, assignments, everyone permissions or owner; the relay and members check it. */
+export const setServerRoles = (serverId: string, policy: ServerPolicy) =>
+  invoke<void>("set_server_roles", { serverId, policy });
+
 export const markChannelRead = (channelId: string) =>
   invoke<void>("mark_channel_read", { channelId });
 
@@ -53,9 +71,10 @@ export const moveServer = (serverId: string, relayUrl: string) =>
 /** Follow a move link from a server's creator; resolves true if this device moved. */
 export const followServerMove = (link: string) =>
   invoke<boolean>("follow_server_move", { link });
-/** `relayRef` (the link's `r` parameter) pins the relay's key when present. */
-export const joinByInvite = (relayUrl: string, token: string, relayRef?: string | null) =>
-  invoke<Server>("join_by_invite", { relayUrl, token, relayRef: relayRef ?? null });
+/** `key` (the link's `k` parameter) opens the sealed invite; `relayRef` (its `r`
+ *  parameter) pins the relay's key when present. */
+export const joinByInvite = (relayUrl: string, token: string, key: string, relayRef?: string | null) =>
+  invoke<Server>("join_by_invite", { relayUrl, token, key, relayRef: relayRef ?? null });
 
 export const getConfig = () => invoke<Config>("get_config");
 

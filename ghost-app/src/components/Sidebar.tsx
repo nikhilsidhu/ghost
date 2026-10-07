@@ -605,6 +605,9 @@ function ChannelItem(props: {
     >
       {props.icon}
       <span class="flex-1 truncate">{props.channel.name}</span>
+      <Show when={props.channel.private}>
+        <span class="flex-shrink-0 text-[10px] text-[var(--neutral-500)]" title="private channel">private</span>
+      </Show>
       {/* Fixed-width slot so badge doesn't shift channel name */}
       <span class="flex-shrink-0 w-5 flex items-center justify-end">
         <Show when={props.channel.unread_count > 0 && !props.isSelected}>

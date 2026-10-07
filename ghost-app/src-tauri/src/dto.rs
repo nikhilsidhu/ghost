@@ -1,5 +1,6 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
+use ghost_core::client::GhostClient;
 use ghost_core::identity::Identity;
 use ghost_core::storage::{Channel, ChannelKind, Server, Member, MemberRole, StoredMessage};
 use ghost_core::wire::ApplicationMessage;
@@ -17,6 +18,10 @@ pub struct ServerDto {
     pub name: String,
     pub kind: String,
     pub creator_fp: String,
+    /// Owner under the server's policy, who may do everything.
+    pub owner_fp: String,
+    /// This account's permission bits in the server (see `ghost_wire::policy`).
+    pub permissions: u32,
     pub created_at: u64,
     pub has_unread: bool,
 }
@@ -29,6 +34,8 @@ pub struct ChannelDto {
     pub kind: String,
     pub position: i32,
     pub unread_count: u32,
+    /// Only the members its policy admits can see it.
+    pub private: bool,
 }
 
 #[derive(Serialize)]
@@ -38,6 +45,48 @@ pub struct MemberDto {
     pub display_name: String,
     pub role: String,
     pub joined_at: u64,
+    /// Ids of the server roles assigned to this member, highest first.
+    pub roles: Vec<u8>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct RoleDto {
+    pub id: u8,
+    pub name: String,
+    pub permissions: u32,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct AssignmentDto {
+    pub fingerprint: String,
+    pub roles: Vec<u8>,
+}
+
+/// A server's policy with role names. Roles are listed by rank, highest first.
+#[derive(Serialize, Deserialize)]
+pub struct PolicyDto {
+    pub owner_fp: String,
+    pub everyone: u32,
+    pub roles: Vec<RoleDto>,
+    pub assignments: Vec<AssignmentDto>,
+}
+
+#[derive(Serialize)]
+pub struct ServerRolesDto {
+    pub policy: PolicyDto,
+    pub my_permissions: u32,
+    /// False while the server is still under the implicit policy of a group made
+    /// before roles existed.
+    pub explicit: bool,
+    /// Members whose app must update before the server can have roles.
+    pub members_missing_support: Vec<String>,
+}
+
+/// Who a private channel admits besides the server's channel managers.
+#[derive(Serialize, Deserialize)]
+pub struct ChannelAccessDto {
+    pub roles: Vec<u8>,
+    pub accounts: Vec<String>,
 }
 
 impl From<&Identity> for IdentityDto {
@@ -51,12 +100,16 @@ impl From<&Identity> for IdentityDto {
 }
 
 impl ServerDto {
-    pub fn from_server(s: &Server, has_unread: bool) -> Self {
+    pub fn from_server(s: &Server, has_unread: bool, client: &GhostClient) -> Self {
+        let policy = client.server_policy(&s.server_id).ok();
+        let own = client.fingerprint();
         Self {
             server_id: hex::encode(s.server_id),
             name: s.name.clone(),
             kind: s.kind.as_str().to_string(),
             creator_fp: hex::encode(s.creator_fp),
+            owner_fp: policy.as_ref().map(|p| hex::encode(p.owner)).unwrap_or_default(),
+            permissions: policy.as_ref().map_or(0, |p| p.permissions(own)),
             created_at: s.created_at,
             has_unread,
         }
@@ -64,7 +117,7 @@ impl ServerDto {
 }
 
 impl ChannelDto {
-    pub fn from_channel(c: &Channel, unread_count: u32) -> Self {
+    pub fn from_channel(c: &Channel, unread_count: u32, private: bool) -> Self {
         Self {
             channel_id: hex::encode(c.channel_id),
             server_id: hex::encode(c.server_id),
@@ -76,6 +129,7 @@ impl ChannelDto {
             .to_string(),
             position: c.position,
             unread_count,
+            private,
         }
     }
 }
@@ -154,10 +208,11 @@ pub struct DeviceDto {
     pub is_current: bool,
 }
 
-impl From<&Member> for MemberDto {
-    fn from(m: &Member) -> Self {
+impl MemberDto {
+    pub fn from_member(m: &Member, roles: Vec<u8>) -> Self {
         Self {
-            server_id: hex::encode(m.server_id),            fingerprint: hex::encode(m.fingerprint),
+            server_id: hex::encode(m.server_id),
+            fingerprint: hex::encode(m.fingerprint),
             display_name: m.display_name.clone(),
             role: match m.role {
                 MemberRole::Creator => "creator",
@@ -165,6 +220,7 @@ impl From<&Member> for MemberDto {
             }
             .to_string(),
             joined_at: m.joined_at,
+            roles,
         }
     }
 }
