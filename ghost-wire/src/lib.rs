@@ -4,6 +4,7 @@ pub mod idlog;
 pub mod merkle;
 pub mod recovery_bundle;
 pub mod relay_ref;
+pub mod server_location;
 
 /// Envelope framing for blobs transiting the relay.
 ///
