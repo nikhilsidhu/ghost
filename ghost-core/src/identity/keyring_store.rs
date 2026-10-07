@@ -24,19 +24,55 @@ pub struct StoredDevice {
     pub delegation_sig: [u8; 64],
 }
 
+impl StoredDevice {
+    /// The fixed-size record kept in the OS keyring (hex-encoded) or a device file.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut blob = Vec::with_capacity(DEVICE_BLOB_SIZE);
+        blob.extend_from_slice(&self.fingerprint);
+        blob.extend_from_slice(&self.signing_key.to_bytes());
+        blob.extend_from_slice(&self.db_key);
+        blob.extend_from_slice(&self.mls_db_key);
+        blob.extend_from_slice(&self.idlog_seq.to_be_bytes());
+        blob.extend_from_slice(&self.master_vk);
+        blob.extend_from_slice(&self.master_sk.to_bytes());
+        blob.extend_from_slice(&self.delegation_sig);
+        blob
+    }
+
+    pub fn from_bytes(blob: &[u8]) -> Result<Self> {
+        if blob.len() != DEVICE_BLOB_SIZE {
+            return Err(GhostError::InvalidKey(format!("expected {} bytes, got {}", DEVICE_BLOB_SIZE, blob.len())));
+        }
+        let field = |range: std::ops::Range<usize>| -> [u8; 32] { blob[range].try_into().unwrap() };
+        Ok(StoredDevice {
+            fingerprint: field(0..32),
+            signing_key: SigningKey::from_bytes(&field(32..64)),
+            db_key: field(64..96),
+            mls_db_key: field(96..128),
+            idlog_seq: u64::from_be_bytes(blob[128..136].try_into().unwrap()),
+            master_vk: field(136..168),
+            master_sk: SigningKey::from_bytes(&field(168..200)),
+            delegation_sig: blob[200..264].try_into().unwrap(),
+        })
+    }
+
+    /// The identity this record opens.
+    pub fn identity(&self) -> crate::identity::Identity {
+        crate::identity::Identity::from_device(
+            self.fingerprint,
+            self.signing_key.clone(),
+            self.idlog_seq,
+            self.master_vk,
+            self.master_sk.clone(),
+            self.delegation_sig,
+        )
+    }
+}
+
 /// Store device credentials in OS keyring.
 pub fn store(fingerprint_short: &str, device: &StoredDevice) -> Result<()> {
-    let mut blob = Vec::with_capacity(DEVICE_BLOB_SIZE);
-    blob.extend_from_slice(&device.fingerprint);
-    blob.extend_from_slice(&device.signing_key.to_bytes());
-    blob.extend_from_slice(&device.db_key);
-    blob.extend_from_slice(&device.mls_db_key);
-    blob.extend_from_slice(&device.idlog_seq.to_be_bytes());
-    blob.extend_from_slice(&device.master_vk);
-    blob.extend_from_slice(&device.master_sk.to_bytes());
-    blob.extend_from_slice(&device.delegation_sig);
     let e = entry(fingerprint_short)?;
-    e.set_password(&hex::encode(&blob))?;
+    e.set_password(&hex::encode(device.to_bytes()))?;
     Ok(())
 }
 
@@ -46,31 +82,7 @@ pub fn retrieve(fingerprint_short: &str) -> Result<StoredDevice> {
     let hex_blob = e.get_password()?;
     let blob = hex::decode(&hex_blob)
         .map_err(|e| GhostError::InvalidKey(format!("bad hex in keyring: {e}")))?;
-    if blob.len() != DEVICE_BLOB_SIZE {
-        return Err(GhostError::InvalidKey(format!(
-            "expected {} bytes, got {}",
-            DEVICE_BLOB_SIZE,
-            blob.len()
-        )));
-    }
-    let fingerprint: [u8; 32] = blob[0..32].try_into().unwrap();
-    let sk_bytes: [u8; 32] = blob[32..64].try_into().unwrap();
-    let db_key: [u8; 32] = blob[64..96].try_into().unwrap();
-    let mls_db_key: [u8; 32] = blob[96..128].try_into().unwrap();
-    let idlog_seq = u64::from_be_bytes(blob[128..136].try_into().unwrap());
-    let master_vk: [u8; 32] = blob[136..168].try_into().unwrap();
-    let master_sk_bytes: [u8; 32] = blob[168..200].try_into().unwrap();
-    let delegation_sig: [u8; 64] = blob[200..264].try_into().unwrap();
-    Ok(StoredDevice {
-        fingerprint,
-        signing_key: SigningKey::from_bytes(&sk_bytes),
-        db_key,
-        mls_db_key,
-        idlog_seq,
-        master_vk,
-        master_sk: SigningKey::from_bytes(&master_sk_bytes),
-        delegation_sig,
-    })
+    StoredDevice::from_bytes(&blob)
 }
 
 /// Delete device credentials from OS keyring.
