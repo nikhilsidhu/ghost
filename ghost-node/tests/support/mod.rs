@@ -34,6 +34,15 @@ pub async fn start_relay() -> RunningRelay {
     ghost_relay::server::start(test_config(), Storage::open_in_memory().unwrap(), ([127, 0, 0, 1], 0).into()).await.unwrap()
 }
 
+/// A relay whose voice traffic passes through `forwarder`: it tells clients to send
+/// voice to the forwarder's port, and the forwarder relays to the real one.
+pub async fn start_relay_behind(forwarder: &ghost_media::netem::Forwarder) -> RunningRelay {
+    let config = Config { voice_public_port: Some(forwarder.port()), ..test_config() };
+    let relay = ghost_relay::server::start(config, Storage::open_in_memory().unwrap(), ([127, 0, 0, 1], 0).into()).await.unwrap();
+    forwarder.forward_to(([127, 0, 0, 1], relay.voice_port).into());
+    relay
+}
+
 /// A named device with its own data directory, running its session loop.
 pub struct Peer {
     pub name: &'static str,

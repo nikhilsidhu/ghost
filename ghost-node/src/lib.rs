@@ -1,8 +1,10 @@
 //! A headless Ghost device: an account kept in a data directory, the client's session
-//! loop (`ghost_core::session`, the same loop the desktop app runs), a record of the
-//! events it reports, and the actions a user would take. Tests use it in-process, and
-//! the `ghost-node` binary drives it over stdin and stdout so tests can also run devices
-//! as separate processes and kill them.
+//! and voice loops (`ghost_core::session` and `ghost_core::voice`, the same loops the
+//! desktop app runs), a record of the events they report, and the actions a user would
+//! take. Its voice calls run on synthetic devices: a tone for a microphone and a
+//! recorder for speakers. Tests use it in-process, and the `ghost-node` binary drives
+//! it over stdin and stdout so tests can also run devices as separate processes and
+//! kill them.
 //!
 //! The device key sits in a plain file in the data directory: this is a test tool, not
 //! something to keep a real account in.
@@ -11,6 +13,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use ghost_audio::fake::ToneDevices;
+use ghost_audio::{NoiseSuppressionMode, VoiceAudio};
 use ghost_core::client::GhostClient;
 use ghost_core::error::{GhostError, Result};
 use ghost_core::flows::presence::PresenceInfo;
@@ -20,6 +24,7 @@ use ghost_core::identity::Identity;
 use ghost_core::relay::{RelayClient, RelayEvent};
 use ghost_core::session::{ClientEvent, EventSink, Session, GENESIS_PENDING_FILE};
 use ghost_core::storage::ServerKind;
+use ghost_core::voice::Voice;
 use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::task::JoinHandle;
 
@@ -52,9 +57,14 @@ pub struct Device {
     pub client: Arc<SharedClient>,
     pub relay: Arc<SharedRelay>,
     pub log: Arc<EventLog>,
+    /// The microphone and speakers of its calls.
+    pub tone: Arc<ToneDevices>,
+    pub audio: Arc<VoiceAudio>,
     data_dir: PathBuf,
     events: Option<mpsc::Receiver<RelayEvent>>,
-    task: Option<JoinHandle<()>>,
+    /// The session and voice loops, while started.
+    tasks: Vec<JoinHandle<()>>,
+    voice: Option<Voice>,
 }
 
 fn relay_client(relay_url: &str, device: &StoredDevice) -> (RelayClient, mpsc::Receiver<RelayEvent>) {
@@ -104,13 +114,21 @@ impl Device {
     }
 
     fn assemble(data_dir: &Path, client: GhostClient, relay: RelayClient, events: mpsc::Receiver<RelayEvent>) -> Self {
+        let tone = ToneDevices::new();
+        let audio = Arc::new(VoiceAudio::new(tone.clone()));
+        // A pure tone is not speech, and noise suppression would silence it; loudness
+        // decides what is sent instead.
+        audio.set_noise_suppression(NoiseSuppressionMode::Off);
         Self {
             client: Arc::new(Mutex::new(client)),
             relay: Arc::new(Mutex::new(relay)),
             log: Arc::default(),
+            tone,
+            audio,
             data_dir: data_dir.to_path_buf(),
             events: Some(events),
-            task: None,
+            tasks: Vec::new(),
+            voice: None,
         }
     }
 
@@ -118,7 +136,8 @@ impl Device {
         *self.client.lock().await.fingerprint()
     }
 
-    /// Start the session loop. After `stop`, starts it again on a fresh relay client.
+    /// Start the session and voice loops. After `stop`, starts them again on a fresh
+    /// relay client.
     pub fn start(&mut self) {
         let events = self.events.take().expect("session already running");
         let session = Session {
@@ -129,12 +148,15 @@ impl Device {
             data_dir: self.data_dir.clone(),
             discovery: Arc::default(),
         };
-        self.task = Some(tokio::spawn(session.run(events)));
+        let (voice, voice_loop) = Voice::new(self.client.clone(), self.relay.clone(), self.audio.clone());
+        self.tasks = vec![tokio::spawn(session.run(events)), tokio::spawn(voice_loop.run(self.log.clone()))];
+        self.voice = Some(voice);
     }
 
-    /// Go offline: stop the loop and close every relay connection.
+    /// Go offline: stop the loops (ending any call) and close every relay connection.
     pub async fn stop(&mut self) {
-        if let Some(task) = self.task.take() {
+        self.voice = None;
+        for task in self.tasks.drain(..) {
             task.abort();
             let _ = task.await;
         }
@@ -215,11 +237,16 @@ impl Device {
     pub async fn kick(&self, server_id: &[u8; 32], member: &[u8; 32]) -> Result<bool> {
         flows::members::kick(&self.client, &self.relay, server_id, member).await
     }
+
+    /// This device's voice calls; it must be started.
+    pub fn voice(&self) -> &Voice {
+        self.voice.as_ref().expect("device not started")
+    }
 }
 
 impl Drop for Device {
     fn drop(&mut self) {
-        if let Some(task) = self.task.take() {
+        for task in self.tasks.drain(..) {
             task.abort();
         }
     }

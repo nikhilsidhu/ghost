@@ -3,11 +3,12 @@ name = "ghost-node"
 version = "0.1.0"
 edition = "2021"
 license = "AGPL-3.0"
-description = "A headless Ghost device for tests: the client's session loop driven by commands"
+description = "A headless Ghost device for tests: the client's session and voice loops driven by commands"
 
 [dependencies]
 ghost-core = { path = "../ghost-core" }
 ghost-wire = { path = "../ghost-wire" }
+ghost-audio = { path = "../ghost-audio", features = ["test-util"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util", "sync", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -16,5 +17,6 @@ rand = "0.8"
 
 [dev-dependencies]
 ghost-relay = { path = "../ghost-relay" }
+ghost-media = { path = "../ghost-media", features = ["test-util"] }
 tempfile = "3"
 tokio = { version = "1", features = ["process"] }

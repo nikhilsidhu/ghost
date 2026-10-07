@@ -7,6 +7,7 @@
 use std::path::PathBuf;
 
 use ghost_core::session::{ClientEvent, ServerScope};
+use ghost_core::voice::VoiceEvent;
 use ghost_node::Device;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -28,6 +29,11 @@ enum Command {
     Join { token: String, key: String },
     Say { server: String, channel: String, text: String },
     Kick { server: String, member: String },
+    JoinVoice { server: String, channel: String },
+    LeaveVoice,
+    SetMuted { muted: bool },
+    /// What the synthetic microphone hears: a tone, or silence at amplitude 0.
+    Tone { frequency: f32, amplitude: f32 },
 }
 
 struct Args {
@@ -72,6 +78,17 @@ fn event_json(event: &ClientEvent) -> Value {
         ClientEvent::ServerChanged(ServerScope::All) => json!({ "event": "server_changed", "server": "all" }),
         ClientEvent::Kicked(id) => json!({ "event": "kicked", "server": hex::encode(id) }),
         ClientEvent::RelayConnectivity(connected) => json!({ "event": "relay_connectivity", "connected": connected }),
+        ClientEvent::Voice(VoiceEvent::State(state)) => json!({
+            "event": "voice_state",
+            "connected": state.connected,
+            "channel": state.channel_id.map(hex::encode),
+            "muted": state.muted,
+            "deafened": state.deafened,
+        }),
+        ClientEvent::Voice(VoiceEvent::Participants(everyone)) => {
+            json!({ "event": "voice_participants", "participants": everyone.iter().map(hex::encode).collect::<Vec<_>>() })
+        }
+        ClientEvent::Voice(VoiceEvent::Error(message)) => json!({ "event": "voice_error", "message": message }),
         other => json!({ "event": "other", "debug": format!("{other:?}") }),
     }
 }
@@ -99,6 +116,22 @@ async fn run(device: &Device, command: Command) -> Result<Value, String> {
         Command::Kick { server, member } => {
             let accepted = device.kick(&id32(&server)?, &id32(&member)?).await.map_err(fail)?;
             Ok(json!({ "accepted": accepted }))
+        }
+        Command::JoinVoice { server, channel } => {
+            device.voice().join(id32(&server)?, id32(&channel)?, false, false).await.map_err(fail)?;
+            Ok(json!({}))
+        }
+        Command::LeaveVoice => {
+            device.voice().leave().await.map_err(fail)?;
+            Ok(json!({}))
+        }
+        Command::SetMuted { muted } => {
+            device.voice().set_muted(muted).await.map_err(fail)?;
+            Ok(json!({}))
+        }
+        Command::Tone { frequency, amplitude } => {
+            device.tone.set_tone(frequency, amplitude);
+            Ok(json!({}))
         }
     }
 }
