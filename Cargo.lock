@@ -2295,6 +2295,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "ghost-node"
+version = "0.1.0"
+dependencies = [
+ "ghost-core",
+ "ghost-relay",
+ "ghost-wire",
+ "hex",
+ "rand 0.8.5",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "ghost-relay"
 version = "0.1.0"
 dependencies = [
