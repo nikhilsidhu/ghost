@@ -1,6 +1,9 @@
+pub mod anchor;
 pub mod auth;
 pub mod idlog;
 pub mod merkle;
+pub mod recovery_bundle;
+pub mod relay_ref;
 
 /// Envelope framing for blobs transiting the relay.
 ///
@@ -184,3 +187,6 @@ mod tests {
         assert_eq!(epoch, 0x0102030405060708);
     }
 }
+
+/// Bytes in the generation prefix of a replicated sync snapshot.
+pub const SNAPSHOT_GENERATION_LEN: usize = 8;

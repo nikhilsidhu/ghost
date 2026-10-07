@@ -2,6 +2,8 @@ use ed25519_dalek::{Signature, VerifyingKey};
 use std::collections::HashMap;
 use thiserror::Error;
 
+use crate::relay_ref::RelayRef;
+
 /// Domain separator for identity log signatures.
 pub const IDLOG_SIGN_PREFIX: &[u8] = b"ghost-idlog-v1:";
 
@@ -28,6 +30,8 @@ pub enum EntryType {
     AddDevice = 0x02,
     RevokeDevice = 0x03,
     Recovery = 0x04,
+    /// Names the relay that sequences and anchors this account's log.
+    SetHomeRelay = 0x05,
 }
 
 impl TryFrom<u8> for EntryType {
@@ -38,6 +42,7 @@ impl TryFrom<u8> for EntryType {
             0x02 => Ok(Self::AddDevice),
             0x03 => Ok(Self::RevokeDevice),
             0x04 => Ok(Self::Recovery),
+            0x05 => Ok(Self::SetHomeRelay),
             other => Err(other),
         }
     }
@@ -64,6 +69,11 @@ pub enum EntryBody {
     Recovery {
         device_verifying_key: [u8; 32],
         device_label: String,
+    },
+    SetHomeRelay {
+        relay_vk: [u8; 32],
+        authorizer_key: [u8; 32],
+        relay_ref: RelayRef,
     },
 }
 
@@ -106,6 +116,10 @@ pub struct LogState {
     pub devices: HashMap<[u8; 32], DeviceInfo>,
     pub head_seq: u64,
     pub head_hash: [u8; 32],
+    /// None for a v1 account, whose home is whichever relay holds its genesis.
+    pub home_relay_vk: Option<[u8; 32]>,
+    pub home_relay_ref: Option<RelayRef>,
+    pub home_set_at_seq: u64,
 }
 
 impl LogState {
@@ -116,6 +130,9 @@ impl LogState {
             devices: HashMap::new(),
             head_seq: 0,
             head_hash: [0u8; 32],
+            home_relay_vk: None,
+            home_relay_ref: None,
+            home_set_at_seq: 0,
         }
     }
 
@@ -155,6 +172,13 @@ pub fn encode_body(buf: &mut Vec<u8>, body: &EntryBody) {
             let label = device_label.as_bytes();
             buf.extend_from_slice(&(label.len() as u16).to_be_bytes());
             buf.extend_from_slice(label);
+        }
+        EntryBody::SetHomeRelay { relay_vk, authorizer_key, relay_ref } => {
+            buf.extend_from_slice(relay_vk);
+            buf.extend_from_slice(authorizer_key);
+            let ref_bytes = relay_ref.to_bytes();
+            buf.extend_from_slice(&(ref_bytes.len() as u16).to_be_bytes());
+            buf.extend_from_slice(&ref_bytes);
         }
     }
 }
@@ -319,6 +343,23 @@ pub fn validate_entry(state: &mut LogState, entry: &LogEntry) -> IdlogResult<()>
                 revoked_at_seq: None,
             });
         }
+
+        EntryBody::SetHomeRelay { relay_vk, authorizer_key, relay_ref } => {
+            let master = state.master_verifying_key
+                .ok_or_else(|| IdlogError::Format("idlog: SetHomeRelay before genesis".into()))?;
+
+            if *authorizer_key != master && !state.is_active_device(authorizer_key) {
+                return Err(IdlogError::Format("idlog: unauthorized home relay change".into()));
+            }
+            if relay_ref.relay_vk != *relay_vk {
+                return Err(IdlogError::Format("idlog: relay ref names a different relay".into()));
+            }
+            verify_sig(authorizer_key, entry)?;
+
+            state.home_relay_vk = Some(*relay_vk);
+            state.home_relay_ref = Some(relay_ref.clone());
+            state.home_set_at_seq = entry.seq;
+        }
     }
 
     state.head_seq = entry.seq;
@@ -447,6 +488,16 @@ fn decode_body(entry_type: EntryType, data: &[u8]) -> IdlogResult<EntryBody> {
                 .map_err(|_| err("invalid utf8 in label"))?;
             Ok(EntryBody::Recovery { device_verifying_key, device_label })
         }
+        EntryType::SetHomeRelay => {
+            if data.len() < 66 { return Err(err("set_home_relay too short")); }
+            let relay_vk: [u8; 32] = data[0..32].try_into().unwrap();
+            let authorizer_key: [u8; 32] = data[32..64].try_into().unwrap();
+            let ref_len = u16::from_be_bytes(data[64..66].try_into().unwrap()) as usize;
+            if data.len() != 66 + ref_len { return Err(err("set_home_relay ref length mismatch")); }
+            let relay_ref = RelayRef::from_bytes(&data[66..66 + ref_len])
+                .map_err(|e| IdlogError::Format(format!("idlog body: {e}")))?;
+            Ok(EntryBody::SetHomeRelay { relay_vk, authorizer_key, relay_ref })
+        }
     }
 }
 
@@ -556,6 +607,25 @@ mod tests {
         };
         sign_entry(mk, &mut entry);
         counter_sign(new, &mut entry);
+        entry
+    }
+
+    fn create_set_home_relay(state: &LogState, authorizer: &SigningKey, relay_ref: RelayRef) -> LogEntry {
+        let mut entry = LogEntry {
+            seq: state.head_seq + 1,
+            prev_hash: state.head_hash,
+            account_fp: state.account_fp,
+            entry_type: EntryType::SetHomeRelay,
+            timestamp: 1000 + state.head_seq * 100,
+            body: EntryBody::SetHomeRelay {
+                relay_vk: relay_ref.relay_vk,
+                authorizer_key: authorizer.verifying_key().to_bytes(),
+                relay_ref,
+            },
+            signature: [0u8; 64],
+            counter_signature: None,
+        };
+        sign_entry(authorizer, &mut entry);
         entry
     }
 
@@ -750,6 +820,98 @@ mod tests {
         counter_sign(&recovery_dk, &mut entry);
         let mut state = state;
         assert!(validate_entry(&mut state, &entry).is_err());
+    }
+
+    // ── SetHomeRelay ────────────────────────────────────────────
+
+    #[test]
+    fn set_home_relay_by_device_records_home() {
+        let (mut state, _mk, dk) = build_genesis();
+        assert!(state.home_relay_vk.is_none());
+        let relay_ref = RelayRef::https([0x77; 32], "http://relay-a:7700");
+        let entry = create_set_home_relay(&state, &dk, relay_ref.clone());
+        validate_entry(&mut state, &entry).unwrap();
+        assert_eq!(state.home_relay_vk, Some([0x77; 32]));
+        assert_eq!(state.home_relay_ref, Some(relay_ref));
+        assert_eq!(state.home_set_at_seq, 2);
+    }
+
+    #[test]
+    fn set_home_relay_by_master_key() {
+        let (mut state, mk, _dk) = build_genesis();
+        let entry = create_set_home_relay(&state, &mk, RelayRef::key_only([0x78; 32]));
+        validate_entry(&mut state, &entry).unwrap();
+        assert_eq!(state.home_relay_vk, Some([0x78; 32]));
+    }
+
+    #[test]
+    fn set_home_relay_replaces_previous_home() {
+        let (mut state, _mk, dk) = build_genesis();
+        let first = create_set_home_relay(&state, &dk, RelayRef::https([0x01; 32], "http://a"));
+        validate_entry(&mut state, &first).unwrap();
+        let second = create_set_home_relay(&state, &dk, RelayRef::https([0x02; 32], "http://b"));
+        validate_entry(&mut state, &second).unwrap();
+        assert_eq!(state.home_relay_vk, Some([0x02; 32]));
+        assert_eq!(state.home_set_at_seq, 3);
+    }
+
+    #[test]
+    fn set_home_relay_rejects_unauthorized_signer() {
+        let (mut state, _mk, _dk) = build_genesis();
+        let rogue = random_key();
+        let entry = create_set_home_relay(&state, &rogue, RelayRef::key_only([0x77; 32]));
+        assert!(validate_entry(&mut state, &entry).is_err());
+        assert!(state.home_relay_vk.is_none());
+    }
+
+    #[test]
+    fn set_home_relay_rejects_revoked_authorizer() {
+        let (mut state, _mk, dk) = build_genesis();
+        let dk2 = random_key();
+        let add = create_add_device(&state, &dk, &dk2, "d2");
+        validate_entry(&mut state, &add).unwrap();
+        let revoke = create_revoke_device(&state, &dk, &dk2.verifying_key().to_bytes());
+        validate_entry(&mut state, &revoke).unwrap();
+        let entry = create_set_home_relay(&state, &dk2, RelayRef::key_only([0x77; 32]));
+        assert!(validate_entry(&mut state, &entry).is_err());
+    }
+
+    #[test]
+    fn set_home_relay_rejects_ref_naming_other_relay() {
+        let (mut state, _mk, dk) = build_genesis();
+        let mut entry = create_set_home_relay(&state, &dk, RelayRef::key_only([0x77; 32]));
+        if let EntryBody::SetHomeRelay { relay_vk, .. } = &mut entry.body {
+            *relay_vk = [0x78; 32];
+        }
+        sign_entry(&dk, &mut entry);
+        assert!(validate_entry(&mut state, &entry).is_err());
+    }
+
+    #[test]
+    fn set_home_relay_before_genesis_rejected() {
+        let dk = random_key();
+        let state = LogState::empty([0x33; 32]);
+        let entry = create_set_home_relay(&state, &dk, RelayRef::key_only([0x77; 32]));
+        let mut state = state;
+        assert!(validate_entry(&mut state, &entry).is_err());
+    }
+
+    #[test]
+    fn set_home_relay_roundtrips_wire_format() {
+        let (state, _mk, dk) = build_genesis();
+        let relay_ref = RelayRef::https([0x77; 32], "http://relay-a:7700");
+        let entry = create_set_home_relay(&state, &dk, relay_ref.clone());
+        let decoded = LogEntry::from_bytes(&entry.to_bytes()).unwrap();
+        assert_eq!(decoded.entry_type, EntryType::SetHomeRelay);
+        assert_eq!(entry_hash(&decoded), entry_hash(&entry));
+        match decoded.body {
+            EntryBody::SetHomeRelay { relay_vk, authorizer_key, relay_ref: r } => {
+                assert_eq!(relay_vk, [0x77; 32]);
+                assert_eq!(authorizer_key, dk.verifying_key().to_bytes());
+                assert_eq!(r, relay_ref);
+            }
+            other => panic!("wrong body: {other:?}"),
+        }
     }
 
     // ── Chain integrity ─────────────────────────────────────────

@@ -134,6 +134,7 @@ impl MerkleTree {
 // ── Inclusion proof ─────────────────────────────────────────────────────
 
 /// Proof that a leaf at `leaf_index` is in a tree of `tree_size` leaves.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InclusionProof {
     pub leaf_index: u64,
     pub tree_size: u64,
@@ -382,6 +383,7 @@ fn subproof_from_store(
 // ── Consistency proof ───────────────────────────────────────────────────
 
 /// Proof that an older tree of `old_size` is a prefix of a newer tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConsistencyProof {
     pub old_size: u64,
     pub new_size: u64,
@@ -525,10 +527,39 @@ fn verify_subproof(
 // ── Checkpoint ──────────────────────────────────────────────────────────
 
 const CHECKPOINT_SIGNED_LEN: usize = 4 + 8 + 32 + 8; // magic + size + root + timestamp
-const CHECKPOINT_TOTAL_LEN: usize = CHECKPOINT_SIGNED_LEN + 64; // + Ed25519 signature
+pub const CHECKPOINT_TOTAL_LEN: usize = CHECKPOINT_SIGNED_LEN + 64; // + Ed25519 signature
+
+/// Check that `new` describes a tree that extends the tree `old` describes.
+/// Equal sizes need equal roots and no proof; a larger `new` needs a
+/// consistency proof whose sizes match both checkpoints.
+pub fn verify_extension(
+    old: &Checkpoint,
+    new: &Checkpoint,
+    proof: Option<&ConsistencyProof>,
+) -> Result<(), MerkleError> {
+    if new.tree_size < old.tree_size {
+        return Err(MerkleError::InvalidCheckpoint("tree size went backwards".into()));
+    }
+    if new.tree_size == old.tree_size {
+        return if new.root_hash == old.root_hash {
+            Ok(())
+        } else {
+            Err(MerkleError::InvalidCheckpoint("same tree size with a different root".into()))
+        };
+    }
+    let proof = proof.ok_or(MerkleError::InvalidProof)?;
+    if proof.old_size != old.tree_size || proof.new_size != new.tree_size {
+        return Err(MerkleError::InvalidProof);
+    }
+    if !proof.verify(&old.root_hash, &new.root_hash) {
+        return Err(MerkleError::InvalidProof);
+    }
+    Ok(())
+}
 
 /// Signed tree head. The relay signs a checkpoint after each append;
 /// clients store the latest and verify consistency on updates.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Checkpoint {
     pub tree_size: u64,
     pub root_hash: [u8; 32],
@@ -820,5 +851,28 @@ mod tests {
         let lh = leaf_hash(&data);
         let nh = node_hash(&data, &[0u8; 32]);
         assert_ne!(lh, nh);
+    }
+
+    // ── verify_extension ──
+
+    #[test]
+    fn extension_accepts_matching_proof_and_rejects_mismatches() {
+        let sk = test_signing_key();
+        let leaves = test_leaves(7);
+        let old = Checkpoint::sign(3, compute_root(&leaves[..3]), 1, &sk);
+        let new = Checkpoint::sign(7, compute_root(&leaves), 2, &sk);
+        let proof = ConsistencyProof::generate(3, &leaves);
+        verify_extension(&old, &new, Some(&proof)).unwrap();
+
+        // Missing proof, backwards, and a proof for other sizes all fail.
+        assert!(verify_extension(&old, &new, None).is_err());
+        assert!(verify_extension(&new, &old, Some(&proof)).is_err());
+        let other = ConsistencyProof::generate(2, &leaves);
+        assert!(verify_extension(&old, &new, Some(&other)).is_err());
+
+        // Same size: equal roots pass without a proof, different roots fail.
+        verify_extension(&new, &new, None).unwrap();
+        let forked = Checkpoint::sign(7, [0xEE; 32], 3, &sk);
+        assert!(verify_extension(&new, &forked, None).is_err());
     }
 }
