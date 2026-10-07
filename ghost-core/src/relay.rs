@@ -308,14 +308,24 @@ impl RelayClient {
         subs.routes.insert(mailbox_id, base);
     }
 
-    /// Signed WebSocket upgrade request for a voice channel's signaling socket. The relay
-    /// authenticates the voice socket exactly like the mailbox socket.
-    pub fn voice_ws_request(&self, channel_id: &[u8; 32]) -> Result<tokio_tungstenite::tungstenite::http::Request<()>> {
+    /// Signed WebSocket upgrade request for a voice channel's signaling socket, sent to
+    /// the relay hosting `mailbox_id`: the group carrying the channel's traffic, whose
+    /// members alone may join its voice room.
+    pub fn voice_ws_request(
+        &self,
+        mailbox_id: &[u8; 32],
+        channel_id: &[u8; 32],
+    ) -> Result<tokio_tungstenite::tungstenite::http::Request<()>> {
         let auth = self
             .auth
             .as_ref()
             .ok_or_else(|| GhostError::Network("relay client has no device auth".into()))?;
-        let url = format!("{}/voice/{}", ws_base(&self.base_for(channel_id)), URL_SAFE_NO_PAD.encode(channel_id));
+        let url = format!(
+            "{}/voice/{}/{}",
+            ws_base(&self.base_for(mailbox_id)),
+            URL_SAFE_NO_PAD.encode(mailbox_id),
+            URL_SAFE_NO_PAD.encode(channel_id),
+        );
         Ok(signed_ws_request(&url, auth))
     }
 
@@ -1124,7 +1134,17 @@ async fn ws_task(
                                 let _ = event_tx.send(RelayEvent::Ack(ack)).await;
                             }
                         }
-                        Some(Ok(Message::Close(_))) | None => break,
+                        Some(Ok(Message::Close(frame))) => {
+                            // Removed from the group or revoked: the relay will not serve
+                            // this device again, so reconnecting is pointless.
+                            let code = frame.as_ref().map(|f| u16::from(f.code));
+                            if matches!(code, Some(ghost_wire::WS_CLOSE_REMOVED | ghost_wire::WS_CLOSE_DEVICE_REVOKED)) {
+                                let _ = event_tx.send(RelayEvent::ConnectionState { mailbox_id, connected: false }).await;
+                                return;
+                            }
+                            break;
+                        }
+                        None => break,
                         _ => {}
                     }
                 }
