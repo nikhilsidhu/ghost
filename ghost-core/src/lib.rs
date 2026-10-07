@@ -9,4 +9,5 @@ pub mod mls;
 pub mod relay;
 pub mod session;
 pub mod storage;
+pub mod voice;
 pub mod wire;

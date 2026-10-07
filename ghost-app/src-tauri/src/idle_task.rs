@@ -10,7 +10,7 @@ use tokio::sync::Mutex;
 
 use crate::config::GhostConfig;
 use ghost_core::flows::presence::{self, PresenceInfo};
-use crate::voice_task::VoiceCommand;
+use ghost_core::voice::Voice;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(15);
 const IDLE_THRESHOLD_SECS: u64 = 600; // 10 minutes
@@ -28,7 +28,7 @@ pub async fn run(
     client: Arc<Mutex<GhostClient>>,
     relay: Arc<Mutex<RelayClient>>,
     presence: Arc<Mutex<PresenceInfo>>,
-    voice_cmd: tokio::sync::mpsc::Sender<VoiceCommand>,
+    voice: Voice,
     config: Arc<Mutex<GhostConfig>>,
     config_path: PathBuf,
 ) {
@@ -78,7 +78,7 @@ pub async fn run(
             presence::broadcast(&client, &relay, &info).await;
             let _ = app.emit("idle-transition", "idle");
 
-            let _ = voice_cmd.send(VoiceCommand::SetMuted(true)).await;
+            let _ = voice.set_muted(true).await;
             let _ = app.emit("auto-muted", true);
         } else if idle_secs < HYSTERESIS_SECS && was_idle {
             was_idle = false;

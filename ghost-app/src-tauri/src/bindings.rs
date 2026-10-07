@@ -8,8 +8,10 @@ use std::path::PathBuf;
 use ts_rs::{Config, TS};
 
 use crate::dto::*;
-use crate::relay_task::{OnlinePresenceEvent, OnlinePresenceMemberDto, VoiceChannelMember, VoiceChannelMembersEvent};
-use crate::voice_task::{VoiceMuteStateEvent, VoiceParticipantsEvent, VoiceQualityEvent, VoiceSpeakingEvent, VoiceStateEvent};
+use crate::relay_task::{
+    OnlinePresenceEvent, OnlinePresenceMemberDto, VoiceChannelMember, VoiceChannelMembersEvent, VoiceMuteStateEvent,
+    VoiceParticipantsEvent, VoiceQualityEvent, VoiceSpeakingEvent, VoiceStateEvent,
+};
 
 fn config() -> Config {
     let out_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../src/lib/generated");

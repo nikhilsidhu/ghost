@@ -12,7 +12,7 @@ use ghost_core::relay::RelayClient;
 use ghost_core::storage::{Channel, ChannelKind, ServerKind};
 use ghost_core::wire::{
     encode_avatar_clear, encode_avatar_update, encode_channel_op, encode_member_announce,
-    ChannelOpPayload, SyncMessageType,
+    ChannelOpPayload,
 };
 
 use ghost_core::mls::presence::OnlineStatus;
@@ -26,7 +26,6 @@ use crate::dto::{
 use ghost_wire::policy::{ChannelPolicy, Role, ServerPolicy, MANAGE_CHANNELS};
 use ghost_core::flows::presence;
 use crate::state::{AppState, now_millis};
-use crate::voice_task::VoiceCommand;
 
 fn parse_id(hex_str: &str) -> Result<[u8; 32], String> {
     let bytes = hex::decode(hex_str).map_err(|e| e.to_string())?;
@@ -94,7 +93,8 @@ async fn spawn_relay_task(
         data_dir,
         state.config.clone(),
         state.config_path.clone(),
-        state.voice.cmd_tx.clone(),
+        state.audio.clone(),
+        state.voice.clone(),
     ));
     *state.relay_task_handle.lock().await = Some(jh);
 }
@@ -716,7 +716,7 @@ pub async fn get_config(state: State<'_, AppState>) -> Result<ConfigDto, String>
         noise_suppression: ns.to_string(),
         agc: agc.to_string(),
         input_mode: input_mode.to_string(),
-        vad_threshold: cfg.vad_threshold.unwrap_or(crate::constants::VAD_THRESHOLD),
+        vad_threshold: cfg.vad_threshold(),
         input_gain: cfg.input_gain.unwrap_or(1.0),
         status: status.to_string(),
         status_message: cfg.status_message.clone(),
@@ -911,85 +911,28 @@ pub async fn join_voice(
     deafened: bool,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    // Voice runs on the relay hosting the server, which may not be the home relay.
-    let (fingerprint, hosting_relay_url) = {
-        let client = state.client.lock().await;
-        let server = parse_id(&server_id)?;
-        (hex::encode(client.fingerprint()), flows::server_relay_url(&client, &server))
-    };
-    let default_relay_url = state.relay_url.lock().await.clone();
-    let (relay_url, input_device, output_device, ns_mode, agc_mode, vad_threshold, input_gain, input_mode) = {
+    let (server_id, channel_id) = (parse_id(&server_id)?, parse_id(&channel_id)?);
+    {
         let cfg = state.config.lock().await;
-        let url = hosting_relay_url.unwrap_or_else(|| {
-            cfg.relay_url
-                .as_deref()
-                .filter(|u| !u.is_empty())
-                .map(String::from)
-                .unwrap_or(default_relay_url)
-        });
-        let vad = cfg.vad_threshold.unwrap_or(crate::constants::VAD_THRESHOLD);
-        let gain = cfg.input_gain.unwrap_or(1.0);
-        let mode = if cfg.input_mode.as_deref() == Some("push_to_talk") {
-            crate::audio::INPUT_MODE_PTT
-        } else {
-            crate::audio::INPUT_MODE_VA
-        };
-        (url, cfg.input_device.clone(), cfg.output_device.clone(), cfg.noise_suppression_mode(), cfg.agc_mode(), vad, gain, mode)
-    };
-    // Notify linked devices to leave voice on this channel
-    let channel_id_bytes = parse_id(&channel_id)?;
-    flows::sync::post_message(&state.client, &state.relay, SyncMessageType::VoiceTakeover, &channel_id_bytes).await;
-
-    state
-        .voice
-        .cmd_tx
-        .send(VoiceCommand::Join {
-            server_id,
-            channel_id,
-            relay_url,
-            fingerprint,
-            input_device,
-            output_device,
-            ns_mode: ns_mode as u8,
-            agc_mode: agc_mode as u8,
-            vad_threshold: vad_threshold.to_bits(),
-            input_gain: input_gain.to_bits(),
-            input_mode,
-            muted,
-            deafened,
-        })
-        .await
-        .map_err(|_| "voice task not running".to_string())
+        state.devices.choose(cfg.device_choice());
+        cfg.apply_audio(&state.audio);
+    }
+    state.voice.join(server_id, channel_id, muted, deafened).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn leave_voice(state: State<'_, AppState>) -> Result<(), String> {
-    state
-        .voice
-        .cmd_tx
-        .send(VoiceCommand::Leave)
-        .await
-        .map_err(|_| "voice task not running".to_string())
+    state.voice.leave().await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn set_muted(muted: bool, state: State<'_, AppState>) -> Result<(), String> {
-    state
-        .voice
-        .cmd_tx
-        .send(VoiceCommand::SetMuted(muted))
-        .await
-        .map_err(|_| "voice task not running".to_string())
+    state.voice.set_muted(muted).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn set_deafened(deafened: bool, state: State<'_, AppState>) -> Result<(), String> {
-    state
-        .voice
-        .cmd_tx
-        .send(VoiceCommand::SetDeafened(deafened))
-        .await
-        .map_err(|_| "voice task not running".to_string())
+    state.voice.set_deafened(deafened).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1078,16 +1021,11 @@ pub async fn set_noise_suppression(
 ) -> Result<(), String> {
     use ghost_core::wire::SYNC_KEY_NOISE_SUPPRESSION;
 
-    let ns = match mode.as_str() {
-        "off" => crate::audio::NoiseSuppressionMode::Off,
-        _ => crate::audio::NoiseSuppressionMode::Nnnoiseless,
-    };
     let mut cfg = state.config.lock().await;
     cfg.noise_suppression = Some(mode.clone());
     cfg.save(&state.config_path)?;
     drop(cfg);
-    state.voice.cmd_tx.send(VoiceCommand::SetNoiseSuppression(ns as u8)).await
-        .map_err(|_| "voice task not running".to_string())?;
+    state.audio.set_noise_suppression(ghost_audio::NoiseSuppressionMode::from_config(&mode));
     flows::sync::set_and_push(&state.client, &state.relay, SYNC_KEY_NOISE_SUPPRESSION, mode.as_bytes()).await;
     Ok(())
 }
@@ -1099,16 +1037,11 @@ pub async fn set_agc(
 ) -> Result<(), String> {
     use ghost_core::wire::SYNC_KEY_AGC;
 
-    let agc = match mode.as_str() {
-        "off" => crate::audio::AgcMode::Off,
-        _ => crate::audio::AgcMode::Auto,
-    };
     let mut cfg = state.config.lock().await;
     cfg.agc = Some(mode.clone());
     cfg.save(&state.config_path)?;
     drop(cfg);
-    state.voice.cmd_tx.send(VoiceCommand::SetAgc(agc as u8)).await
-        .map_err(|_| "voice task not running".to_string())?;
+    state.audio.set_agc(ghost_audio::AgcMode::from_config(&mode));
     flows::sync::set_and_push(&state.client, &state.relay, SYNC_KEY_AGC, mode.as_bytes()).await;
     Ok(())
 }
@@ -1120,16 +1053,16 @@ pub async fn set_input_mode(
 ) -> Result<(), String> {
     use ghost_core::wire::SYNC_KEY_INPUT_MODE;
 
-    let mode_u8 = match mode.as_str() {
-        "voice_activity" => crate::audio::INPUT_MODE_VA,
-        "push_to_talk" => crate::audio::INPUT_MODE_PTT,
+    let input_mode = match mode.as_str() {
+        "voice_activity" => ghost_audio::InputMode::VoiceActivity,
+        "push_to_talk" => ghost_audio::InputMode::PushToTalk,
         _ => return Err(format!("unknown input mode: {mode}")),
     };
     let mut cfg = state.config.lock().await;
     cfg.input_mode = Some(mode.clone());
     cfg.save(&state.config_path)?;
     drop(cfg);
-    let _ = state.voice.cmd_tx.send(VoiceCommand::SetInputMode(mode_u8)).await;
+    crate::sync_utils::apply_input_mode(&state.audio, &state.voice, input_mode).await;
     flows::sync::set_and_push(&state.client, &state.relay, SYNC_KEY_INPUT_MODE, mode.as_bytes()).await;
     Ok(())
 }
@@ -1139,12 +1072,8 @@ pub async fn set_ptt_active(
     active: bool,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    state
-        .voice
-        .cmd_tx
-        .send(VoiceCommand::SetPttActive(active))
-        .await
-        .map_err(|_| "voice task not running".to_string())
+    state.audio.set_ptt_active(active);
+    Ok(())
 }
 
 #[tauri::command]
@@ -1156,12 +1085,8 @@ pub async fn set_vad_threshold(
     let mut cfg = state.config.lock().await;
     cfg.vad_threshold = Some(clamped);
     cfg.save(&state.config_path)?;
-    state
-        .voice
-        .cmd_tx
-        .send(VoiceCommand::SetVadThreshold(clamped.to_bits()))
-        .await
-        .map_err(|_| "voice task not running".to_string())
+    state.audio.set_vad_threshold(clamped);
+    Ok(())
 }
 
 #[tauri::command]
@@ -1173,12 +1098,8 @@ pub async fn set_input_gain(
     let mut cfg = state.config.lock().await;
     cfg.input_gain = Some(clamped);
     cfg.save(&state.config_path)?;
-    state
-        .voice
-        .cmd_tx
-        .send(VoiceCommand::SetInputGain(clamped.to_bits()))
-        .await
-        .map_err(|_| "voice task not running".to_string())
+    state.audio.set_input_gain(clamped);
+    Ok(())
 }
 
 #[tauri::command]

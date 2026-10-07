@@ -1,14 +1,10 @@
-use sframe::frame::{EncryptedFrameView, MediaFrameView, MonotonicCounter};
-use sframe::key::{DecryptionKey, EncryptionKey};
-use sframe::CipherSuite;
+//! Voice keys from the MLS group: each sender's frame key (the frames themselves are
+//! sealed in `ghost_media`) and the keys of sealed voice presence.
 
 use crate::crypto::{aead, GhostProvider, VOICE_EXPORT_LABEL, VOICE_PRESENCE_EXPORT_LABEL};
 use crate::error::{GhostError, Result};
 
 use super::group::GhostGroup;
-
-/// SFrame cipher suite for voice frames.
-const VOICE_CIPHER_SUITE: CipherSuite = CipherSuite::AesGcm256Sha512;
 
 fn derive_export_key(
     group: &GhostGroup,
@@ -49,44 +45,6 @@ pub fn derive_voice_key(
         .try_into()
         .map_err(|_| GhostError::Crypto("export key not 32 bytes".into()))?;
     Ok(key)
-}
-
-/// Encrypt a media frame using SFrame (RFC 9605). Codec-agnostic — works for
-/// any encoded media payload (Opus audio, future video codecs, etc.).
-/// Output is an SFrame-framed blob: [sframe_header][ciphertext][auth_tag].
-pub fn encrypt_voice_frame(
-    key: &[u8; 32],
-    sequence: u32,
-    frame: &[u8],
-) -> Result<Vec<u8>> {
-    let enc_key = EncryptionKey::derive_from(VOICE_CIPHER_SUITE, 0u64, key)
-        .map_err(|e| GhostError::Crypto(format!("sframe key derive: {e}")))?;
-    let mut counter = MonotonicCounter::with_start_value(sequence as u64, u64::MAX);
-    let media = MediaFrameView::try_new(&mut counter, frame)
-        .map_err(|e| GhostError::Crypto(format!("sframe counter: {e}")))?;
-    let mut buf = Vec::new();
-    media
-        .encrypt_into(&enc_key, &mut buf)
-        .map_err(|e| GhostError::Crypto(format!("sframe encrypt: {e}")))?;
-    Ok(buf)
-}
-
-/// Decrypt an SFrame-framed media payload. The SFrame header carries the
-/// counter so the sequence is extracted automatically.
-pub fn decrypt_voice_frame(
-    key: &[u8; 32],
-    _sequence: u32,
-    encrypted: &[u8],
-) -> Result<Vec<u8>> {
-    let dec_key = DecryptionKey::derive_from(VOICE_CIPHER_SUITE, 0u64, key)
-        .map_err(|e| GhostError::Crypto(format!("sframe key derive: {e}")))?;
-    let frame = EncryptedFrameView::try_from(encrypted)
-        .map_err(|e| GhostError::Crypto(format!("sframe parse: {e}")))?;
-    let mut buf = Vec::new();
-    frame
-        .decrypt_into(&dec_key, &mut buf)
-        .map_err(|e| GhostError::Crypto(format!("sframe decrypt: {e}")))?;
-    Ok(buf)
 }
 
 // --- Presence blob crypto ---
@@ -173,34 +131,6 @@ pub fn try_open_presence(
 mod tests {
     use super::*;
     use crate::identity::Identity;
-
-    #[test]
-    fn voice_frame_roundtrip() {
-        let key = [0x42u8; 32];
-        let frame = b"fake opus data here";
-        let encrypted = encrypt_voice_frame(&key, 1, frame).unwrap();
-        let decrypted = decrypt_voice_frame(&key, 1, &encrypted).unwrap();
-        assert_eq!(decrypted, frame);
-    }
-
-    #[test]
-    fn tampered_sframe_header_fails() {
-        let key = [0x42u8; 32];
-        let frame = b"opus";
-        let mut encrypted = encrypt_voice_frame(&key, 1, frame).unwrap();
-        // Flip a byte in the SFrame header (authenticated as AAD)
-        encrypted[0] ^= 0xFF;
-        assert!(decrypt_voice_frame(&key, 1, &encrypted).is_err());
-    }
-
-    #[test]
-    fn wrong_key_fails() {
-        let key1 = [0x42u8; 32];
-        let key2 = [0x43u8; 32];
-        let frame = b"opus";
-        let encrypted = encrypt_voice_frame(&key1, 1, frame).unwrap();
-        assert!(decrypt_voice_frame(&key2, 1, &encrypted).is_err());
-    }
 
     #[test]
     fn derive_voice_key_deterministic() {

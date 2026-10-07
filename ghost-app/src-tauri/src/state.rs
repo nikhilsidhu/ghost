@@ -6,9 +6,11 @@ use ghost_core::relay::RelayClient;
 use tokio::sync::Mutex;
 use zeroize::Zeroizing;
 
+use crate::audio::CpalDevices;
 use crate::config::GhostConfig;
+use ghost_audio::VoiceAudio;
 use ghost_core::flows::presence::PresenceInfo;
-use crate::voice_task::VoiceHandle;
+use ghost_core::voice::Voice;
 
 /// Device credentials used to authenticate relay clients. Kept outside GhostClient so a
 /// relay client can be rebuilt without taking the heavy client mutex.
@@ -24,7 +26,11 @@ pub struct AppState {
     pub relay_url: Arc<Mutex<String>>,
     pub config_path: PathBuf,
     pub config: Arc<Mutex<GhostConfig>>,
-    pub voice: VoiceHandle,
+    pub voice: Voice,
+    /// The voice calls' audio, whose settings commands change directly.
+    pub audio: Arc<VoiceAudio>,
+    /// The devices calls use, chosen again at each join.
+    pub devices: Arc<CpalDevices>,
     pub presence: Arc<Mutex<PresenceInfo>>,
     /// The code of the pairing session this device opened; its secret is wiped on drop.
     pub pairing_code: Arc<Mutex<Option<ghost_core::flows::pairing::PairingCode>>>,

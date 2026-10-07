@@ -1,5 +1,6 @@
-//! Runs the core session loop for this app and turns its events into the UI events the
-//! front end listens for. Everything protocol-related happens in `ghost_core::session`.
+//! Runs the core session and voice loops for this app and turns their events into the
+//! UI events the front end listens for. Everything protocol-related happens in
+//! `ghost_core::session` and `ghost_core::voice`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -8,12 +9,55 @@ use ghost_core::client::GhostClient;
 use ghost_core::flows::presence::PresenceInfo;
 use ghost_core::mls::presence::OnlineStatus;
 use ghost_core::relay::{RelayClient, RelayEvent};
+use ghost_audio::VoiceAudio;
 use ghost_core::session::{ClientEvent, EventSink, ServerScope, Session};
+use ghost_core::voice::{Voice, VoiceEvent};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::{mpsc, Mutex};
 
 use crate::dto::MessageDto;
+
+#[derive(Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS), ts(rename = "VoiceState"))]
+pub(crate) struct VoiceStateEvent {
+    connected: bool,
+    server_id: Option<String>,
+    channel_id: Option<String>,
+    muted: bool,
+    deafened: bool,
+    udp_port: Option<u16>,
+}
+
+#[derive(Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS), ts(rename = "VoiceParticipants"))]
+pub(crate) struct VoiceParticipantsEvent {
+    participants: Vec<String>,
+}
+
+#[derive(Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS), ts(rename = "VoiceSpeaking"))]
+pub(crate) struct VoiceSpeakingEvent {
+    fingerprint: String,
+    speaking: bool,
+}
+
+#[derive(Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS), ts(rename = "VoiceMuteState"))]
+pub(crate) struct VoiceMuteStateEvent {
+    fingerprint: String,
+    muted: bool,
+    deafened: bool,
+}
+
+#[derive(Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS), ts(rename = "VoiceQuality"))]
+pub(crate) struct VoiceQualityEvent {
+    packet_loss: f32,
+    jitter_depth: u32,
+    jitter_target: u32,
+    ping_ms: Option<u32>,
+}
 
 #[derive(Serialize, Clone)]
 #[cfg_attr(test, derive(ts_rs::TS), ts(rename = "VoiceChannelMembers"))]
@@ -57,13 +101,62 @@ fn status_str(s: OnlineStatus) -> &'static str {
     }
 }
 
-/// Emits session events to the webview and applies synced settings to this app's
-/// configuration and audio pipeline.
-struct TauriSink {
+/// Emit this device's own voice events to the webview.
+fn emit_voice(app: &AppHandle, event: VoiceEvent) -> tauri::Result<()> {
+    match event {
+        VoiceEvent::State(state) => app.emit(
+            "voice-state",
+            &VoiceStateEvent {
+                connected: state.connected,
+                server_id: state.server_id.map(hex::encode),
+                channel_id: state.channel_id.map(hex::encode),
+                muted: state.muted,
+                deafened: state.deafened,
+                udp_port: state.udp_port,
+            },
+        ),
+        VoiceEvent::Participants(everyone) => {
+            app.emit("voice-participants", &VoiceParticipantsEvent { participants: everyone.iter().map(hex::encode).collect() })
+        }
+        VoiceEvent::Speaking { fingerprint, speaking } => {
+            app.emit("voice-speaking", &VoiceSpeakingEvent { fingerprint: hex::encode(fingerprint), speaking })
+        }
+        VoiceEvent::MuteState { fingerprint, muted, deafened } => {
+            app.emit("voice-mute-state", &VoiceMuteStateEvent { fingerprint: hex::encode(fingerprint), muted, deafened })
+        }
+        VoiceEvent::Quality { quality, ping_ms } => app.emit(
+            "voice-quality",
+            &VoiceQualityEvent {
+                packet_loss: quality.packet_loss_pct,
+                jitter_depth: quality.jitter_depth,
+                jitter_target: quality.jitter_target,
+                ping_ms,
+            },
+        ),
+        VoiceEvent::Error(message) => app.emit("voice-error", message),
+    }
+}
+
+/// Emits session and voice events to the webview and applies synced settings to this
+/// app's configuration and audio.
+pub struct TauriSink {
     app: AppHandle,
     config: Arc<Mutex<crate::config::GhostConfig>>,
     config_path: PathBuf,
-    voice_cmd_tx: mpsc::Sender<crate::voice_task::VoiceCommand>,
+    audio: Arc<VoiceAudio>,
+    voice: Voice,
+}
+
+impl TauriSink {
+    pub fn new(
+        app: AppHandle,
+        config: Arc<Mutex<crate::config::GhostConfig>>,
+        config_path: PathBuf,
+        audio: Arc<VoiceAudio>,
+        voice: Voice,
+    ) -> Self {
+        Self { app, config, config_path, audio, voice }
+    }
 }
 
 impl EventSink for TauriSink {
@@ -105,13 +198,14 @@ impl EventSink for TauriSink {
                 },
             ),
             ClientEvent::SettingsSynced(settings) => {
-                let (app, config, config_path, voice_cmd_tx) =
-                    (app.clone(), self.config.clone(), self.config_path.clone(), self.voice_cmd_tx.clone());
+                let (app, config, config_path, audio, voice) =
+                    (app.clone(), self.config.clone(), self.config_path.clone(), self.audio.clone(), self.voice.clone());
                 tauri::async_runtime::spawn(async move {
-                    crate::sync_utils::apply_synced_settings(&settings, &app, &config, &config_path, &voice_cmd_tx).await;
+                    crate::sync_utils::apply_synced_settings(&settings, &app, &config, &config_path, &audio, &voice).await;
                 });
                 Ok(())
             }
+            ClientEvent::Voice(event) => emit_voice(app, event),
         };
     }
 }
@@ -127,8 +221,9 @@ pub async fn run(
     data_dir: PathBuf,
     config: Arc<Mutex<crate::config::GhostConfig>>,
     config_path: PathBuf,
-    voice_cmd_tx: mpsc::Sender<crate::voice_task::VoiceCommand>,
+    audio: Arc<VoiceAudio>,
+    voice: Voice,
 ) {
-    let sink = Arc::new(TauriSink { app, config, config_path, voice_cmd_tx });
+    let sink = Arc::new(TauriSink::new(app, config, config_path, audio, voice));
     Session { client, relay, presence, sink, data_dir, discovery: Arc::default() }.run(events).await;
 }

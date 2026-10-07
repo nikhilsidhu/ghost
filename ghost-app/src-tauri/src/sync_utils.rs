@@ -7,9 +7,20 @@ use std::sync::Arc;
 
 use ghost_core::flows::presence::PresenceInfo;
 use ghost_core::flows::sync::SyncSettings;
+use ghost_audio::{AgcMode, InputMode, NoiseSuppressionMode, VoiceAudio};
 use ghost_core::mls::presence::OnlineStatus;
+use ghost_core::voice::Voice;
 use tauri::{AppHandle, Emitter};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::Mutex;
+
+/// Switch the input mode. Choosing push to talk drops a standing mute, since the key
+/// now decides when to send.
+pub async fn apply_input_mode(audio: &VoiceAudio, voice: &Voice, mode: InputMode) {
+    audio.set_input_mode(mode);
+    if mode == InputMode::PushToTalk {
+        let _ = voice.unmute_for_push_to_talk().await;
+    }
+}
 
 /// Apply parsed settings to config, saving if anything changed.
 pub fn apply_sync_to_config(settings: &SyncSettings, cfg: &mut crate::config::GhostConfig, path: &Path) {
@@ -59,7 +70,8 @@ pub async fn apply_synced_settings(
     app: &AppHandle,
     config: &Arc<Mutex<crate::config::GhostConfig>>,
     config_path: &Path,
-    voice_cmd_tx: &mpsc::Sender<crate::voice_task::VoiceCommand>,
+    audio: &VoiceAudio,
+    voice: &Voice,
 ) {
     {
         let mut cfg = config.lock().await;
@@ -67,16 +79,13 @@ pub async fn apply_synced_settings(
     }
 
     if let Some(ref mode) = settings.noise_suppression {
-        let ns = crate::audio::NoiseSuppressionMode::from_config(mode) as u8;
-        let _ = voice_cmd_tx.send(crate::voice_task::VoiceCommand::SetNoiseSuppression(ns)).await;
+        audio.set_noise_suppression(NoiseSuppressionMode::from_config(mode));
     }
     if let Some(ref mode) = settings.agc {
-        let agc = crate::audio::AgcMode::from_config(mode) as u8;
-        let _ = voice_cmd_tx.send(crate::voice_task::VoiceCommand::SetAgc(agc)).await;
+        audio.set_agc(AgcMode::from_config(mode));
     }
     if let Some(ref mode) = settings.input_mode {
-        let mode_u8 = if mode == "push_to_talk" { crate::audio::INPUT_MODE_PTT } else { crate::audio::INPUT_MODE_VA };
-        let _ = voice_cmd_tx.send(crate::voice_task::VoiceCommand::SetInputMode(mode_u8)).await;
+        apply_input_mode(audio, voice, InputMode::from_config(mode)).await;
     }
 
     if settings.server_order_changed {

@@ -3,6 +3,7 @@
 
 use crate::flows::sync::SyncSettings;
 use crate::mls::presence::OnlineStatus;
+use crate::voice::VoiceEvent;
 use crate::wire::ApplicationMessage;
 
 /// Which servers an event concerns.
@@ -56,6 +57,8 @@ pub enum ClientEvent {
     /// presence status are already applied; the rest (configuration, audio) is the
     /// runner's to apply.
     SettingsSynced(SyncSettings),
+    /// This device's own voice call (see `voice`).
+    Voice(VoiceEvent),
 }
 
 /// Receives the session's events. Called from the loop, so it must not block.

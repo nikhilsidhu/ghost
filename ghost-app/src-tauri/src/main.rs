@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use tauri::Manager;
 
 mod audio;
@@ -14,26 +16,22 @@ mod relay_task;
 mod setup;
 mod state;
 mod sync_utils;
-mod udp_transport;
-mod voice_task;
 
 #[cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 fn main() {
     let setup::SetupResult {
         state: app_state,
         inbox_rx,
-        voice_cmd_rx,
-        voice_state_tx,
+        voice_loop,
     } = setup::initialize();
     let client = app_state.client.clone();
     let idle_client = app_state.client.clone();
-    let voice_client = app_state.client.clone();
     let relay = app_state.relay.clone();
     let idle_relay = app_state.relay.clone();
-    let voice_relay = app_state.relay.clone();
     let presence = app_state.presence.clone();
     let idle_presence = app_state.presence.clone();
-    let idle_voice_tx = app_state.voice.cmd_tx.clone();
+    let voice = app_state.voice.clone();
+    let audio = app_state.audio.clone();
     let idle_config = app_state.config.clone();
     let idle_config_path = app_state.config_path.clone();
     let relay_task_handle = app_state.relay_task_handle.clone();
@@ -57,7 +55,6 @@ fn main() {
             let handle = app.handle().clone();
             let relay_config = idle_config.clone();
             let relay_config_path = idle_config_path.clone();
-            let relay_voice_tx = idle_voice_tx.clone();
             let relay_task_handle = relay_task_handle.clone();
             let jh = tauri::async_runtime::spawn(relay_task::run(
                 handle.clone(),
@@ -68,22 +65,24 @@ fn main() {
                 data_dir,
                 relay_config,
                 relay_config_path,
-                relay_voice_tx,
+                audio.clone(),
+                voice.clone(),
             ));
             *relay_task_handle.blocking_lock() = Some(jh);
-            tauri::async_runtime::spawn(voice_task::run(
+            let voice_sink = Arc::new(relay_task::TauriSink::new(
                 handle.clone(),
-                voice_client,
-                voice_relay,
-                voice_cmd_rx,
-                voice_state_tx,
+                idle_config.clone(),
+                idle_config_path.clone(),
+                audio,
+                voice.clone(),
             ));
+            tauri::async_runtime::spawn(voice_loop.run(voice_sink));
             tauri::async_runtime::spawn(idle_task::run(
                 handle,
                 idle_client,
                 idle_relay,
                 idle_presence,
-                idle_voice_tx,
+                voice,
                 idle_config,
                 idle_config_path,
             ));

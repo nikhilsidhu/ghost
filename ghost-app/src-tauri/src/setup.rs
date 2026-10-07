@@ -5,15 +5,16 @@ use std::sync::{Arc, RwLock};
 use ghost_core::client::GhostClient;
 use ghost_core::identity::Identity;
 use ghost_core::relay::{RelayClient, RelayEvent};
-use tokio::sync::{mpsc, watch, Mutex};
+use ghost_core::voice::{Voice, VoiceLoop};
+use tokio::sync::{mpsc, Mutex};
 
+use ghost_audio::VoiceAudio;
 use ghost_core::mls::presence::OnlineStatus;
 
+use crate::audio::CpalDevices;
 use crate::config::{self, GhostConfig};
-use crate::constants::VOICE_CMD_CHANNEL_SIZE;
 use ghost_core::flows::presence::PresenceInfo;
 use crate::state::{AppState, AuthMaterial};
-use crate::voice_task::{VoiceCommand, VoiceHandle, VoiceStateEvent};
 
 pub(crate) fn ghost_dir() -> PathBuf {
     match std::env::var("GHOST_DATA_DIR") {
@@ -153,8 +154,8 @@ fn load_or_create_device() -> (Identity, [u8; 32], [u8; 32], Option<[u8; 32]>) {
 pub struct SetupResult {
     pub state: AppState,
     pub inbox_rx: mpsc::Receiver<RelayEvent>,
-    pub voice_cmd_rx: mpsc::Receiver<VoiceCommand>,
-    pub voice_state_tx: watch::Sender<VoiceStateEvent>,
+    /// Serves `state.voice`; spawned once the app can receive its events.
+    pub voice_loop: VoiceLoop,
 }
 
 pub fn initialize() -> SetupResult {
@@ -200,9 +201,6 @@ pub fn initialize() -> SetupResult {
         client.signing_key_clone(),
     );
 
-    let (voice_cmd_tx, voice_cmd_rx) = mpsc::channel(VOICE_CMD_CHANNEL_SIZE);
-    let (voice_state_tx, _voice_state_rx) = watch::channel(VoiceStateEvent::default());
-
     // Check if persisted status message has expired
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -241,15 +239,23 @@ pub fn initialize() -> SetupResult {
         signing_key: client.signing_key_clone(),
     };
 
+    let client = Arc::new(Mutex::new(client));
+    let relay = Arc::new(Mutex::new(relay));
+    let devices = Arc::new(CpalDevices::default());
+    devices.choose(cfg.device_choice());
+    let audio = Arc::new(VoiceAudio::new(devices.clone()));
+    cfg.apply_audio(&audio);
+    let (voice, voice_loop) = Voice::new(client.clone(), relay.clone(), audio.clone());
+
     let state = AppState {
-        client: Arc::new(Mutex::new(client)),
-        relay: Arc::new(Mutex::new(relay)),
+        client,
+        relay,
         relay_url: Arc::new(Mutex::new(relay_url)),
         config_path: cfg_path,
         config: Arc::new(Mutex::new(cfg)),
-        voice: VoiceHandle {
-            cmd_tx: voice_cmd_tx,
-        },
+        voice,
+        audio,
+        devices,
         presence: Arc::new(Mutex::new(initial_presence)),
         pairing_code: Arc::new(Mutex::new(None)),
         recovery_seed: Arc::new(Mutex::new(recovery_seed.map(zeroize::Zeroizing::new))),
@@ -260,7 +266,6 @@ pub fn initialize() -> SetupResult {
     SetupResult {
         state,
         inbox_rx,
-        voice_cmd_rx,
-        voice_state_tx,
+        voice_loop,
     }
 }
