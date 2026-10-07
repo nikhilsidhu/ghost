@@ -67,53 +67,31 @@ pub(crate) fn device_label() -> &'static str {
 /// In debug builds, store device credentials in a file to avoid keychain popups on every recompile.
 #[cfg(debug_assertions)]
 fn load_or_create_device() -> (Identity, [u8; 32], [u8; 32], Option<[u8; 32]>) {
-    use ghost_core::identity::keyring_store::DEVICE_BLOB_SIZE;
+    use ghost_core::identity::keyring_store::StoredDevice;
 
     let path = device_file();
     if let Ok(bytes) = fs::read(&path) {
-        assert_eq!(bytes.len(), DEVICE_BLOB_SIZE, "corrupt device.key");
-        let fingerprint: [u8; 32] = bytes[0..32].try_into().unwrap();
-        let sk_bytes: [u8; 32] = bytes[32..64].try_into().unwrap();
-        let db_key: [u8; 32] = bytes[64..96].try_into().unwrap();
-        let mls_db_key: [u8; 32] = bytes[96..128].try_into().unwrap();
-        let idlog_seq = u64::from_be_bytes(bytes[128..136].try_into().unwrap());
-        let master_vk: [u8; 32] = bytes[136..168].try_into().unwrap();
-        let master_sk_bytes: [u8; 32] = bytes[168..200].try_into().unwrap();
-        let delegation_sig: [u8; 64] = bytes[200..264].try_into().unwrap();
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&sk_bytes);
-        let master_sk = ed25519_dalek::SigningKey::from_bytes(&master_sk_bytes);
-        let identity = Identity::from_device(fingerprint, signing_key, idlog_seq, master_vk, master_sk, delegation_sig);
-        (identity, db_key, mls_db_key, None)
+        let device = StoredDevice::from_bytes(&bytes).expect("corrupt device.key");
+        (device.identity(), device.db_key, device.mls_db_key, None)
     } else {
         let creation = Identity::create_account(device_label())
             .expect("failed to create account");
-        let fingerprint = creation.identity.fingerprint;
-        let sk_bytes = creation.identity.signing_key.to_bytes();
-        let db_key = creation.db_key;
-        let mls_db_key = creation.mls_db_key;
-        let seed = creation.seed;
-        let master_vk = creation.identity.master_vk;
-        let master_sk_bytes = creation.identity.master_sk.to_bytes();
-        let delegation_sig = creation.identity.delegation_sig;
-        let genesis_bytes = creation.genesis_entry.to_bytes();
-        fs::write(genesis_pending_path(), &genesis_bytes)
+        fs::write(genesis_pending_path(), creation.genesis_entry.to_bytes())
             .expect("failed to write genesis.pending");
-        let mut blob = Vec::with_capacity(DEVICE_BLOB_SIZE);
-        blob.extend_from_slice(&fingerprint);
-        blob.extend_from_slice(&sk_bytes);
-        blob.extend_from_slice(&db_key);
-        blob.extend_from_slice(&mls_db_key);
-        blob.extend_from_slice(&1u64.to_be_bytes());
-        blob.extend_from_slice(&master_vk);
-        blob.extend_from_slice(&master_sk_bytes);
-        blob.extend_from_slice(&delegation_sig);
-        fs::write(&path, &blob).expect("failed to write device.key");
+        let device = StoredDevice {
+            fingerprint: creation.identity.fingerprint,
+            signing_key: creation.identity.signing_key.clone(),
+            db_key: creation.db_key,
+            mls_db_key: creation.mls_db_key,
+            idlog_seq: 1,
+            master_vk: creation.identity.master_vk,
+            master_sk: creation.identity.master_sk.clone(),
+            delegation_sig: creation.identity.delegation_sig,
+        };
+        fs::write(&path, device.to_bytes()).expect("failed to write device.key");
+        let seed = creation.seed;
         drop(creation);
-        let identity = Identity::from_device(
-            fingerprint, ed25519_dalek::SigningKey::from_bytes(&sk_bytes), 1,
-            master_vk, ed25519_dalek::SigningKey::from_bytes(&master_sk_bytes), delegation_sig,
-        );
-        (identity, db_key, mls_db_key, Some(seed))
+        (device.identity(), device.db_key, device.mls_db_key, Some(seed))
     }
 }
 

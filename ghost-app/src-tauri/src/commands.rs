@@ -1460,16 +1460,17 @@ fn write_linked_credentials(
     master_sk: &ed25519_dalek::SigningKey,
     delegation_sig: &[u8; 64],
 ) -> Result<(), String> {
-    let mut blob = Vec::with_capacity(ghost_core::identity::keyring_store::DEVICE_BLOB_SIZE);
-    blob.extend_from_slice(account_fp);
-    blob.extend_from_slice(&device_key.to_bytes());
-    blob.extend_from_slice(db_key);
-    blob.extend_from_slice(mls_db_key);
-    blob.extend_from_slice(&idlog_seq.to_be_bytes());
-    blob.extend_from_slice(master_vk);
-    blob.extend_from_slice(&master_sk.to_bytes());
-    blob.extend_from_slice(delegation_sig);
-    std::fs::write(crate::setup::device_file(), &blob)
+    let device = ghost_core::identity::keyring_store::StoredDevice {
+        fingerprint: *account_fp,
+        signing_key: device_key.clone(),
+        db_key: *db_key,
+        mls_db_key: *mls_db_key,
+        idlog_seq,
+        master_vk: *master_vk,
+        master_sk: master_sk.clone(),
+        delegation_sig: *delegation_sig,
+    };
+    std::fs::write(crate::setup::device_file(), device.to_bytes())
         .map_err(|e| format!("write device.key: {e}"))
 }
 
