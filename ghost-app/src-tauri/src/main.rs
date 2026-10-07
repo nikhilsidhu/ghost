@@ -2,6 +2,8 @@ use tauri::Manager;
 
 mod audio;
 mod audio_test;
+#[cfg(test)]
+mod bindings;
 mod commands;
 mod config;
 mod constants;

@@ -1,6 +1,6 @@
 import { createSignal } from "solid-js";
 import { listen } from "@tauri-apps/api/event";
-import type { Identity, Server, Channel, Member, Message, VoiceState, VoiceParticipants, VoiceSpeaking, VoiceMuteState, VoiceQuality, OnlinePresenceEvent, ServerRoles } from "./types";
+import type { Identity, Server, Channel, Member, Message, VoiceState, VoiceParticipants, VoiceSpeaking, VoiceMuteState, VoiceQuality, OnlinePresenceEvent, ServerRoles, VoiceChannelMembers, VoiceChannelMember } from "./types";
 import {
   getIdentity, listServers, listChannels, listMembers, getServerRoles,
   markChannelRead,
@@ -109,7 +109,7 @@ const [voiceMuteStates, setVoiceMuteStates] = createSignal<Map<string, { muted: 
 // Call quality metrics from audio pipeline
 const [voiceQuality, setVoiceQuality] = createSignal<VoiceQuality | null>(null);
 // Per-channel voice members from mailbox WS (visible to all server members)
-const [voiceChannelMembers, setVoiceChannelMembers] = createSignal<Map<string, Array<{ fingerprint: string; muted: boolean; deafened: boolean }>>>(new Map());
+const [voiceChannelMembers, setVoiceChannelMembers] = createSignal<Map<string, VoiceChannelMember[]>>(new Map());
 
 const isInCall = voiceConnected;
 const [isPttMode, setIsPttMode] = createSignal(false);
@@ -359,7 +359,7 @@ const initialize = async () => {
     setVoiceQuality(event.payload);
   });
 
-  listen<{ channel_id: string; members: Array<{ fingerprint: string; muted: boolean; deafened: boolean }> }>("voice-channel-members", (event) => {
+  listen<VoiceChannelMembers>("voice-channel-members", (event) => {
     const { channel_id, members } = event.payload;
     setVoiceChannelMembers(prev => {
       const next = new Map(prev);

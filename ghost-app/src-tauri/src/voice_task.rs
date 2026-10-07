@@ -56,6 +56,7 @@ pub enum VoiceCommand {
 }
 
 #[derive(Clone, Serialize, Default)]
+#[cfg_attr(test, derive(ts_rs::TS), ts(rename = "VoiceState"))]
 pub struct VoiceStateEvent {
     pub connected: bool,
     pub server_id: Option<String>,
@@ -66,17 +67,20 @@ pub struct VoiceStateEvent {
 }
 
 #[derive(Clone, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS), ts(rename = "VoiceParticipants"))]
 pub struct VoiceParticipantsEvent {
     pub participants: Vec<String>,
 }
 
 #[derive(Clone, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS), ts(rename = "VoiceSpeaking"))]
 pub struct VoiceSpeakingEvent {
     pub fingerprint: String,
     pub speaking: bool,
 }
 
 #[derive(Clone, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS), ts(rename = "VoiceMuteState"))]
 pub struct VoiceMuteStateEvent {
     pub fingerprint: String,
     pub muted: bool,
@@ -84,6 +88,7 @@ pub struct VoiceMuteStateEvent {
 }
 
 #[derive(Clone, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS), ts(rename = "VoiceQuality"))]
 pub struct VoiceQualityEvent {
     pub packet_loss: f32,
     pub jitter_depth: u32,

@@ -1043,6 +1043,7 @@ pub async fn list_audio_devices() -> Result<AudioDevicesDto, String> {
 }
 
 #[derive(serde::Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS), ts(rename = "AudioDevices"))]
 pub struct AudioDevicesDto {
     pub inputs: Vec<String>,
     pub outputs: Vec<String>,

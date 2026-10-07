@@ -36,5 +36,9 @@ objc2-app-kit = { version = "0.3", features = ["NSColor", "NSWindow"] }
 objc2-core-foundation = "0.3"
 coreaudio-sys = { version = "0.2", default-features = false, features = ["core_audio"] }
 
+[dev-dependencies]
+# Generates the front end's TypeScript types from the Rust ones (see src/bindings.rs).
+ts-rs = "12"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

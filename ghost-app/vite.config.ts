@@ -1,4 +1,4 @@
-import { defineConfig } from "vite";
+import { defineConfig } from "vitest/config";
 import solid from "vite-plugin-solid";
 import tailwindcss from "@tailwindcss/vite";
 
@@ -17,5 +17,10 @@ export default defineConfig({
     watch: {
       ignored: ["**/src-tauri/**"],
     },
+  },
+  test: {
+    // Tauri's IPC mocks live on `window`.
+    environment: "happy-dom",
+    include: ["src/**/*.test.ts"],
   },
 });

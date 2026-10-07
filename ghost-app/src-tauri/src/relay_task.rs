@@ -16,27 +16,32 @@ use tokio::sync::{mpsc, Mutex};
 use crate::dto::MessageDto;
 
 #[derive(Serialize, Clone)]
-struct VoiceChannelMembersEvent {
+#[cfg_attr(test, derive(ts_rs::TS), ts(rename = "VoiceChannelMembers"))]
+pub(crate) struct VoiceChannelMembersEvent {
     channel_id: String,
     members: Vec<VoiceChannelMember>,
 }
 
 #[derive(Serialize, Clone)]
-struct VoiceChannelMember {
+#[cfg_attr(test, derive(ts_rs::TS), ts(rename = "VoiceChannelMember"))]
+pub(crate) struct VoiceChannelMember {
     fingerprint: String,
     muted: bool,
     deafened: bool,
 }
 
 #[derive(Serialize)]
-struct OnlinePresenceEvent {
+#[cfg_attr(test, derive(ts_rs::TS), ts(rename = "OnlinePresenceEvent"))]
+pub(crate) struct OnlinePresenceEvent {
     server_id: String,
     members: Vec<OnlinePresenceMemberDto>,
 }
 
 #[derive(Serialize)]
-struct OnlinePresenceMemberDto {
+#[cfg_attr(test, derive(ts_rs::TS), ts(rename = "OnlinePresenceMember"))]
+pub(crate) struct OnlinePresenceMemberDto {
     fingerprint: String,
+    #[cfg_attr(test, ts(type = "\"online\" | \"idle\" | \"away\" | \"offline\""))]
     status: String,
     status_message: Option<String>,
     avatar_hash: Option<String>,

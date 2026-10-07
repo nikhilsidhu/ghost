@@ -6,6 +6,7 @@ use ghost_core::storage::{Channel, ChannelKind, Server, Member, MemberRole, Stor
 use ghost_core::wire::ApplicationMessage;
 
 #[derive(Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS), ts(rename = "Identity"))]
 pub struct IdentityDto {
     pub fingerprint: String,
     pub fingerprint_short: String,
@@ -13,9 +14,11 @@ pub struct IdentityDto {
 }
 
 #[derive(Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS), ts(rename = "Server"))]
 pub struct ServerDto {
     pub server_id: String,
     pub name: String,
+    #[cfg_attr(test, ts(type = "\"server\" | \"group\" | \"dm\""))]
     pub kind: String,
     pub creator_fp: String,
     /// Owner under the server's policy, who may do everything.
@@ -27,10 +30,12 @@ pub struct ServerDto {
 }
 
 #[derive(Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS), ts(rename = "Channel"))]
 pub struct ChannelDto {
     pub channel_id: String,
     pub server_id: String,
     pub name: String,
+    #[cfg_attr(test, ts(type = "\"text\" | \"voice\""))]
     pub kind: String,
     pub position: i32,
     pub unread_count: u32,
@@ -39,10 +44,12 @@ pub struct ChannelDto {
 }
 
 #[derive(Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS), ts(rename = "Member"))]
 pub struct MemberDto {
     pub server_id: String,
     pub fingerprint: String,
     pub display_name: String,
+    #[cfg_attr(test, ts(type = "\"creator\" | \"member\""))]
     pub role: String,
     pub joined_at: u64,
     /// Ids of the server roles assigned to this member, highest first.
@@ -50,6 +57,7 @@ pub struct MemberDto {
 }
 
 #[derive(Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS), ts(rename = "Role"))]
 pub struct RoleDto {
     pub id: u8,
     pub name: String,
@@ -57,6 +65,7 @@ pub struct RoleDto {
 }
 
 #[derive(Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS), ts(rename = "RoleAssignment"))]
 pub struct AssignmentDto {
     pub fingerprint: String,
     pub roles: Vec<u8>,
@@ -64,6 +73,7 @@ pub struct AssignmentDto {
 
 /// A server's policy with role names. Roles are listed by rank, highest first.
 #[derive(Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS), ts(rename = "ServerPolicy"))]
 pub struct PolicyDto {
     pub owner_fp: String,
     pub everyone: u32,
@@ -72,6 +82,7 @@ pub struct PolicyDto {
 }
 
 #[derive(Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS), ts(rename = "ServerRoles"))]
 pub struct ServerRolesDto {
     pub policy: PolicyDto,
     pub my_permissions: u32,
@@ -84,6 +95,7 @@ pub struct ServerRolesDto {
 
 /// Who a private channel admits besides the server's channel managers.
 #[derive(Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS), ts(rename = "ChannelAccess"))]
 pub struct ChannelAccessDto {
     pub roles: Vec<u8>,
     pub accounts: Vec<String>,
@@ -135,6 +147,7 @@ impl ChannelDto {
 }
 
 #[derive(Clone, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS), ts(rename = "Message"))]
 pub struct MessageDto {
     pub message_id: String,
     pub channel_id: String,
@@ -174,12 +187,14 @@ impl From<&StoredMessage> for MessageDto {
 }
 
 #[derive(Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS), ts(rename = "Invite"))]
 pub struct InviteDto {
     pub token: String,
     pub link: String,
 }
 
 #[derive(Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS), ts(rename = "Config"))]
 pub struct ConfigDto {
     pub display_name: Option<String>,
     pub relay_url: Option<String>,
@@ -195,11 +210,13 @@ pub struct ConfigDto {
 }
 
 #[derive(Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS), ts(rename = "KeybindConfig"))]
 pub struct KeybindConfigDto {
     pub push_to_talk: Option<String>,
 }
 
 #[derive(Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS), ts(rename = "Device"))]
 pub struct DeviceDto {
     pub device_key: String,
     pub label: String,
