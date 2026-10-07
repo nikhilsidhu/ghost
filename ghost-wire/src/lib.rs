@@ -54,10 +54,7 @@ pub const WS_CLOSE_DEVICE_REVOKED: u16 = 4001;
 /// The account was removed from the group whose mailbox (or voice room) this was.
 pub const WS_CLOSE_REMOVED: u16 = 4002;
 
-// Voice packet: [header_len:2][room_id:32][slot_id:4][flags:1][epoch:8][seq:4][payload_len:2][payload...]
-// Relay reads first 38 bytes (header_len + room_id + slot_id) for routing.
-// room_id and slot_id are relay-assigned at the authenticated voice join (see `voice`).
-// epoch identifies which MLS epoch key encrypted the payload.
+/// Length of the media packet header (see `voice::MediaHeader`).
 pub const VOICE_HEADER_SIZE: usize = 53;
 pub const VOICE_RELAY_PREFIX: usize = 38;
 pub const VOICE_MAX_PACKET: usize = 1500;

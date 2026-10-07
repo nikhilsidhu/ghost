@@ -10,6 +10,7 @@ ed25519-dalek = "2"
 blake3 = "1"
 hex = "0.4"
 base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
 openmls = { version = "0.8", optional = true }
 
 [features]
@@ -18,3 +19,4 @@ mls = ["dep:openmls"]
 
 [dev-dependencies]
 rand = "0.8"
+serde_json = "1"
