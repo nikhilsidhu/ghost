@@ -8,9 +8,16 @@ test in the lowest tier that can reproduce it.
 | Unit | `ghost-wire`, `ghost-core`, `ghost-relay` (`src/**`) | encoding, crypto, policy rules, storage | `cargo test -p <crate> --lib` |
 | Protocol integration | `ghost-core/tests`, `ghost-relay/tests` | flows between clients and an in-process relay | `cargo test -p ghost-core -p ghost-relay` |
 | Scenarios | `ghost-node/tests/scenarios.rs` | the client's real event loop (`ghost_core::session`, the loop the app runs): ordering, retries, recovery, private channels, kicks while offline | `cargo test -p ghost-node --test scenarios` |
+| Voice | `ghost-node/tests/voice.rs` | real calls (`ghost_core::voice`, `ghost-media`, `ghost-audio`, as the app runs them) on synthetic devices: what each caller hears, how late and at what pitch, under loss, jitter, delay spikes and NAT rebinding; group calls with one bad link; mute, push to talk, leaving | `cargo test -p ghost-node --test voice` |
 | Processes | `ghost-node/tests/process.rs` | the shipped relay binary and headless devices as processes: start-up wiring, SIGKILL then restart on the same database and data directory | `cargo test -p ghost-node --test process` |
 | Front end | `ghost-app/src/**/*.test.ts` | store and palette logic against Tauri's mocked IPC, and types generated from the Rust side | `cd ghost-app && npm test && npm run typecheck` |
 | Manual | the checklist below | real audio hardware, OS permission prompts, reboots, upgrades, how it feels | before each release |
+
+In the voice tier each device's microphone plays its own tone and its speakers are
+recorded, so a test checks which 20 ms stretches of playback carried the other caller.
+Voice traffic passes through `ghost_media::netem::Forwarder`, which the relay advertises
+as its voice port (`voice_public_port`), so the clients run unchanged while the forwarder
+drops, delays, reorders and rebinds.
 
 All automated tiers run in CI (`.github/workflows/ci.yml`) on Linux, macOS and Windows,
 plus a check that `ghost-app/src/lib/generated/` matches the Rust types. Regenerate those
@@ -28,8 +35,9 @@ cargo run -p ghost-node -- --data-dir /tmp/node-a --relay http://127.0.0.1:7700 
 ```
 
 It reads JSON commands on stdin (`{"id":1,"cmd":"create_server","name":"club"}`, `invite`,
-`join`, `say`, `kick`) and writes replies and events as JSON lines. Its device key is a
-plain file in the data directory: never use it for a real account.
+`join`, `say`, `kick`, `join_voice`, `leave_voice`, `set_muted`, and `tone` to set what its
+synthetic microphone plays) and writes replies and events as JSON lines. Its device key is
+a plain file in the data directory: never use it for a real account.
 
 ## Release checklist
 
