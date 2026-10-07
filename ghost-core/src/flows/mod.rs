@@ -16,6 +16,7 @@ pub mod idlog;
 pub mod invite;
 pub mod members;
 pub mod pairing;
+pub mod presence;
 pub mod provision;
 pub mod recovery;
 pub mod roles;

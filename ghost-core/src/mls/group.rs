@@ -341,6 +341,8 @@ impl GhostGroup {
                 ProcessMessageError::ValidationError(
                     ValidationError::CannotDecryptOwnMessage,
                 ) => GhostError::SelfMessage,
+                // Our own commit echoed back before we merged it.
+                ProcessMessageError::InvalidCommit(StageCommitError::OwnCommit) => GhostError::SelfMessage,
                 _ => GhostError::Mls(format!("process message: {e}")),
             })
     }
@@ -359,17 +361,19 @@ impl GhostGroup {
         Ok(())
     }
 
-    /// Commit all queued proposals (e.g. relay-generated Remove proposals).
-    /// External Remove proposals are only included if the target device is revoked in
-    /// the identity log or its leaf is in `excluded` (a private channel's policy no
-    /// longer admits it), so a compromised relay key cannot remove anyone else.
+    /// Commit the queued proposals this device may commit (e.g. relay-generated Remove
+    /// proposals). External Remove proposals are only included if the target device is
+    /// revoked in the identity log or its leaf is in `excluded` (a private channel's
+    /// policy no longer admits it), so a compromised relay key cannot remove anyone
+    /// else. A proposal removing this device is left for another member, since a member
+    /// cannot commit its own removal. `None` when nothing is left to commit.
     pub fn commit_pending_proposals(
         &mut self,
         provider: &GhostProvider,
         idlog_cache: &IdLogCache,
         excluded: &[LeafNodeIndex],
         aad: &CommitAad,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<Option<Vec<u8>>> {
         // Build leaf→(account_fp, device_vk) map for Remove target validation
         let member_map: std::collections::HashMap<u32, ([u8; 32], [u8; 32])> = self
             .members()
@@ -379,35 +383,39 @@ impl GhostGroup {
                 Some((m.index.u32(), (fp, vk)))
             })
             .collect();
+        let own_leaf = self.mls_group.own_leaf_index();
+        let committable = |proposal: &QueuedProposal| {
+            if !validate_pending_proposal(proposal) {
+                return false;
+            }
+            if let Proposal::Remove(ref remove) = proposal.proposal() {
+                if remove.removed() == own_leaf {
+                    return false;
+                }
+                // External Remove proposals: only accept if target is revoked or excluded
+                if matches!(proposal.sender(), Sender::External(_)) {
+                    if excluded.contains(&remove.removed()) {
+                        return true;
+                    }
+                    let leaf_idx = remove.removed().u32();
+                    return match member_map.get(&leaf_idx) {
+                        Some((account_fp, device_vk)) => matches!(idlog_cache.is_active_device(account_fp, device_vk), Ok(false)),
+                        None => false, // unknown leaf → reject
+                    };
+                }
+            }
+            true
+        };
+        if !self.mls_group.pending_proposals().any(&committable) {
+            return Ok(None);
+        }
 
         let epoch = self.epoch();
         self.mls_group.set_aad(aad.to_bytes());
         let bundle = self.mls_group.commit_builder()
             .load_psks(provider.storage())
             .map_err(|e| GhostError::Mls(format!("load psks: {e}")))?
-            .build(provider.rand(), provider.crypto(), &self.signer, |proposal: &QueuedProposal| {
-                if !validate_pending_proposal(proposal) {
-                    return false;
-                }
-                // External Remove proposals: only accept if target is revoked
-                if matches!(proposal.sender(), Sender::External(_)) {
-                    if let Proposal::Remove(ref remove) = proposal.proposal() {
-                        if excluded.contains(&remove.removed()) {
-                            return true;
-                        }
-                        let leaf_idx = remove.removed().u32();
-                        if let Some((account_fp, device_vk)) = member_map.get(&leaf_idx) {
-                            match idlog_cache.is_active_device(account_fp, device_vk) {
-                                Ok(false) => {} // revoked → accept
-                                _ => return false, // active or not cached → reject
-                            }
-                        } else {
-                            return false; // unknown leaf → reject
-                        }
-                    }
-                }
-                true
-            })
+            .build(provider.rand(), provider.crypto(), &self.signer, committable)
             .map_err(|e| GhostError::Mls(format!("build pending commit: {e}")))?
             .stage_commit(provider)
             .map_err(|e| GhostError::Mls(format!("stage pending commit: {e}")))?;
@@ -415,7 +423,7 @@ impl GhostGroup {
         let commit_bytes = bundle.into_commit()
             .to_bytes()
             .map_err(|e| GhostError::Mls(format!("serialize pending commit: {e}")))?;
-        Ok(wrap_commit(&commit_bytes, epoch))
+        Ok(Some(wrap_commit(&commit_bytes, epoch)))
     }
 
     /// Queue a received proposal so the next commit from this device can include it;
@@ -424,6 +432,16 @@ impl GhostGroup {
         self.mls_group
             .store_pending_proposal(provider.storage(), proposal)
             .map_err(|e| GhostError::Mls(format!("queue proposal: {e:?}")))
+    }
+
+    /// Whether proposals are queued that another member's leaf, not this device's, is
+    /// the subject of: once this device's view catches up it may be able to commit them.
+    pub fn has_pending_proposals_for_others(&self) -> bool {
+        let own_leaf = self.mls_group.own_leaf_index();
+        self.mls_group.pending_proposals().any(|p| match p.proposal() {
+            Proposal::Remove(remove) => remove.removed() != own_leaf,
+            _ => true,
+        })
     }
 
     /// Apply a commit that we received and already validated via process_message.

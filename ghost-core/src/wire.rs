@@ -17,6 +17,7 @@ const MAX_REFERENCES: usize = 255;
 const FIXED_HEADER_LEN: usize = 1 + 1 + 32 + 32 + 8 + 32 + 32 + 1 + 4;
 
 /// Application-layer message — the plaintext unit before MLS encryption.
+#[derive(Debug, Clone)]
 pub struct ApplicationMessage {
     pub message_type: MessageType,
     pub channel_id: [u8; 32],
@@ -658,7 +659,7 @@ impl ProvisionPayload {
 
 // --- Sync server metadata: lightweight group entry for sync_state (no members) ---
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SyncServerMeta {
     pub server_name: String,
     pub kind: ServerKind,

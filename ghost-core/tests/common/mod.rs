@@ -8,21 +8,21 @@ use ghost_core::flows::pairing::{PairingCode, PairingOffer};
 use ghost_core::identity::Identity;
 use ghost_core::relay::RelayClient;
 use ghost_core::storage::ServerKind;
-use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 
 use ghost_relay::config::Config;
 use ghost_relay::storage::Storage;
-use ghost_relay::{routes, state};
 
+/// An in-process relay that serves until the test process ends (dropping the handle
+/// detaches its tasks without stopping them).
 pub async fn start_relay() -> String {
-    start_relay_with_handle().await.0
+    start_relay_with_handle().await.url()
 }
 
-/// An in-process relay whose server task can be aborted to simulate the relay
-/// disappearing: new connections to its address fail afterwards.
+/// An in-process relay, started exactly as the binary starts it, that a test can stop
+/// to simulate the relay disappearing: new connections to its address fail afterwards.
 #[allow(dead_code)]
-pub async fn start_relay_with_handle() -> (String, tokio::task::JoinHandle<()>) {
+pub async fn start_relay_with_handle() -> ghost_relay::server::RunningRelay {
     let config = Config {
         port: 0,
         max_blob_size: 10 * 1024 * 1024,
@@ -35,13 +35,7 @@ pub async fn start_relay_with_handle() -> (String, tokio::task::JoinHandle<()>) 
         mirror_refresh_secs: 1,
     };
     let storage = Storage::open_in_memory().unwrap();
-    let st = state::new_state(config, storage);
-    tokio::spawn(ghost_relay::federation::run(st.clone()));
-    let app = routes::router(st);
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    (format!("http://127.0.0.1:{port}"), server)
+    ghost_relay::server::start(config, storage, ([127, 0, 0, 1], 0).into()).await.unwrap()
 }
 
 /// Push a genesis identity log entry for a seed-based identity and configure
@@ -103,6 +97,8 @@ pub struct Account {
     pub device_vk: [u8; 32],
     pub client: Shared<GhostClient>,
     pub relay: Shared<RelayClient>,
+    /// What the relay client's subscriptions deliver, for a session loop to consume.
+    pub events: std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<ghost_core::relay::RelayEvent>>>,
 }
 
 #[allow(dead_code)]
@@ -123,7 +119,7 @@ pub async fn create_account(relay_url: &str, label: &str) -> Account {
     );
     let db_key = creation.db_key;
 
-    let (mut relay, _events) = RelayClient::new(relay_url);
+    let (mut relay, events) = RelayClient::new(relay_url);
     relay.put_idlog_entry(&fp, genesis.clone()).await.unwrap();
     relay.set_auth(fp, device_vk, device_sk);
     let relay_vk = relay.get_relay_info().await.unwrap().relay_vk;
@@ -140,7 +136,7 @@ pub async fn create_account(relay_url: &str, label: &str) -> Account {
     let home = flows::account::ensure_home_relay(&client, &relay).await.unwrap();
     assert_eq!(home, relay_vk);
 
-    Account { fp, seed, genesis, device_vk, client, relay }
+    Account { fp, seed, genesis, device_vk, client, relay, events: std::sync::Mutex::new(Some(events)) }
 }
 
 /// Create a server on the account's relay and publish its GroupInfo, as the application does.

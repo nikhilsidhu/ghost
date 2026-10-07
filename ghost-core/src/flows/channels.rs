@@ -34,15 +34,15 @@ pub async fn create_private(
         client.lock().await.drop_private_channel(&created.channel_id)?;
         return Err(e);
     }
-    let seq = {
+    {
         let mut r = relay.lock().await;
         r.add_route(created.mailbox_id);
         r.add_route(created.channel_id);
-        let seq = r.post_blob(&created.announcement.mailbox_id, created.announcement.blob).await?.seq;
-        r.subscribe(created.mailbox_id, seq);
-        seq
-    };
-    client.lock().await.store().set_last_seen_seq(&created.mailbox_id, seq)?;
+        // From the mailbox's start: admitted members are told the moment the group
+        // exists and may join before the announcement lands, and every join counts.
+        r.subscribe(created.mailbox_id, 0);
+        r.post_blob(&created.announcement.mailbox_id, created.announcement.blob).await?;
+    }
     sync::post_server_provisioned(client, home, server_id).await;
     Ok(created.channel_id)
 }

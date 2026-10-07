@@ -121,6 +121,8 @@ pub enum RelayEvent {
     VoiceState { mailbox_id: [u8; 32], json: String },
     Presence { mailbox_id: [u8; 32], json: String },
     ConnectionState { mailbox_id: [u8; 32], connected: bool },
+    /// A private channel of the server at this mailbox newly admits this account.
+    ChannelsChanged { mailbox_id: [u8; 32] },
 }
 
 pub enum WsOutgoing {
@@ -1115,6 +1117,8 @@ async fn ws_task(
                             let s = text.as_str();
                             if s == WS_SIGNAL_GAP {
                                 let _ = event_tx.send(RelayEvent::Gap { mailbox_id }).await;
+                            } else if s == ghost_wire::WS_SIGNAL_CHANNELS {
+                                let _ = event_tx.send(RelayEvent::ChannelsChanged { mailbox_id }).await;
                             } else if s.starts_with("{\"vs") {
                                 let _ = event_tx.send(RelayEvent::VoiceState {
                                     mailbox_id,

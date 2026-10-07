@@ -250,7 +250,7 @@ async fn private_channels_admit_by_role_and_stay_hidden_from_everyone_else() {
     assert!(seen.contains(&"proposal".to_string()), "{seen:?}");
     let refused = owner.client.lock().await.send_message(&server_id, &channel_id, b"secret".to_vec(), vec![], 6000);
     assert!(matches!(refused, Err(GhostError::PermissionDenied(_))), "sent to a channel holding an excluded member");
-    let commit = owner.client.lock().await.commit_pending_proposals(&channel_id).unwrap();
+    let commit = owner.client.lock().await.commit_pending_proposals(&channel_id).unwrap().expect("the relay's removal is committable");
     owner.relay.lock().await.post_blob(&commit.mailbox_id, commit.blob).await.unwrap();
     owner.client.lock().await.merge_pending_commit_for_channel(&channel_id).unwrap();
     let (message, _) = owner.client.lock().await.send_message(&server_id, &channel_id, b"secret".to_vec(), vec![], 6000).unwrap();

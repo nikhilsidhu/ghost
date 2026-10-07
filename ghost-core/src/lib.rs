@@ -7,5 +7,6 @@ pub mod identity;
 pub mod idlog_cache;
 pub mod mls;
 pub mod relay;
+pub mod session;
 pub mod storage;
 pub mod wire;

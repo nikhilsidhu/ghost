@@ -412,7 +412,8 @@ async fn accept_p6_recovery_bundle_replicated_to_all_member_relays_and_rollback_
 
 #[tokio::test]
 async fn accept_p6_recover_with_dead_home_via_import_batch() {
-    let (home_url, home_server) = common::start_relay_with_handle().await;
+    let home_server = common::start_relay_with_handle().await;
+    let home_url = home_server.url();
     let foreign_url = common::start_relay().await;
     let new_home_url = common::start_relay().await;
     let alice = create_account(&home_url, "alice").await;
@@ -425,8 +426,7 @@ async fn accept_p6_recover_with_dead_home_via_import_batch() {
     flows::recovery::set_passphrase(&alice.client, &alice.relay, &alice.seed, passphrase).await.unwrap();
 
     // The home relay disappears, and every device is lost.
-    home_server.abort();
-    let _ = home_server.await;
+    home_server.stop().await;
     let (dead, _) = RelayClient::new(&home_url);
     assert!(dead.get_relay_info().await.is_err(), "home relay is unreachable");
 
@@ -473,7 +473,8 @@ async fn accept_p6_recover_with_dead_home_via_import_batch() {
 
 #[tokio::test]
 async fn accept_p6_revoked_device_cannot_decrypt_after_remaining_devices_commit_while_home_partitioned() {
-    let (home_url, home_server) = common::start_relay_with_handle().await;
+    let home_server = common::start_relay_with_handle().await;
+    let home_url = home_server.url();
     let foreign_url = common::start_relay().await;
     let alice = create_account(&home_url, "alice").await;
     let (server_id, foreign, _foreign_vk, _host) = join_foreign_server(&alice, &foreign_url).await;
@@ -506,8 +507,7 @@ async fn accept_p6_revoked_device_cannot_decrypt_after_remaining_devices_commit_
     }
 
     // The home relay becomes unreachable before the revocation.
-    home_server.abort();
-    let _ = home_server.await;
+    home_server.stop().await;
 
     let outcome = flows::devices::revoke(&alice.client, &alice.relay, &device_b_vk).await.unwrap();
     assert_eq!(outcome, flows::devices::RevokeOutcome::LogPending);
@@ -887,7 +887,8 @@ async fn server_move_carries_private_channels_to_the_new_relay() {
 
 #[tokio::test]
 async fn accept_p6_server_move_found_at_creator_home_after_relay_dies() {
-    let (old_url, old_server) = common::start_relay_with_handle().await;
+    let old_server = common::start_relay_with_handle().await;
+    let old_url = old_server.url();
     let new_url = common::start_relay().await;
     let alice_url = common::start_relay().await;
     let mut s = host_server_with_alice(&old_url, &alice_url).await;
@@ -898,8 +899,7 @@ async fn accept_p6_server_move_found_at_creator_home_after_relay_dies() {
     flows::account::rehome(&s.host.client, &host_home, Some(&s.host.relay)).await.unwrap();
     flows::idlog::cache_member(&s.alice.client, &s.alice_old_view, &s.host.fp).await;
 
-    old_server.abort();
-    let _ = old_server.await;
+    old_server.stop().await;
 
     // The announcement cannot reach anyone; the record at the host's home can.
     flows::server::move_server(&s.host.client, &host_home, &s.server_id, &new_url).await.unwrap();
@@ -913,7 +913,8 @@ async fn accept_p6_server_move_found_at_creator_home_after_relay_dies() {
 
 #[tokio::test]
 async fn accept_p6_server_move_link_followed_when_no_shared_relay_survives() {
-    let (old_url, old_server) = common::start_relay_with_handle().await;
+    let old_server = common::start_relay_with_handle().await;
+    let old_url = old_server.url();
     let new_url = common::start_relay().await;
     let alice_url = common::start_relay().await;
     let mut s = host_server_with_alice(&old_url, &alice_url).await;
@@ -921,8 +922,7 @@ async fn accept_p6_server_move_link_followed_when_no_shared_relay_survives() {
     // The old relay dies before Alice learns anything about the host's new home.
     let host_home = Arc::new(Mutex::new(s.host.relay.lock().await.at(&new_url)));
     flows::account::rehome(&s.host.client, &host_home, Some(&s.host.relay)).await.unwrap();
-    old_server.abort();
-    let _ = old_server.await;
+    old_server.stop().await;
 
     let location = flows::server::move_server(&s.host.client, &host_home, &s.server_id, &new_url).await.unwrap();
     assert!(flows::server::check_location(&s.alice.client, &s.alice_app, &s.server_id).await.is_err());

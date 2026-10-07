@@ -140,7 +140,7 @@ pub async fn post_server_provisioned(client: &SharedClient, relay: &SharedRelay,
 }
 
 /// Settings parsed out of sync state entries, ready for the application to apply.
-#[derive(Default)]
+#[derive(Default, Clone, Debug)]
 pub struct SyncSettings {
     pub display_name: Option<String>,
     pub noise_suppression: Option<String>,

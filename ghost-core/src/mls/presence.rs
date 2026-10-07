@@ -16,6 +16,18 @@ pub enum OnlineStatus {
     Invisible = 3,
 }
 
+impl OnlineStatus {
+    /// The status a user chose, as stored in settings ("online", "away", "invisible").
+    /// Idle is never chosen: it follows inactivity.
+    pub fn from_config(value: &str) -> Self {
+        match value {
+            "away" => Self::Away,
+            "invisible" => Self::Invisible,
+            _ => Self::Online,
+        }
+    }
+}
+
 impl TryFrom<u8> for OnlineStatus {
     type Error = GhostError;
     fn try_from(v: u8) -> Result<Self> {

@@ -1990,6 +1990,13 @@ impl GhostClient {
 
         let inbound = match opened {
             Err(GhostError::SelfMessage) => return Ok(ReceiveResult::Skipped),
+            // Sent at an epoch before this device's (e.g. before it joined): never
+            // readable here, and no sign the group is out of step.
+            Err(GhostError::Mls(_))
+                if envelope_type == ghost_wire::EnvelopeType::Application && current_epoch.is_some_and(|e| envelope_epoch < e) =>
+            {
+                return Ok(ReceiveResult::Skipped);
+            }
             other => other?,
         };
 
@@ -2081,20 +2088,28 @@ impl GhostClient {
         }
     }
 
-    /// Commit any pending proposals for a channel's MLS group.
-    /// Used by the group creator to immediately commit relay-generated Remove proposals.
+    /// Commit the pending proposals of a channel's group that this device may commit
+    /// (relay removals of revoked or excluded devices). `None` when there are none.
     pub fn commit_pending_proposals(
         &mut self,
         channel_id: &[u8; 32],
-    ) -> Result<Outbound> {
+    ) -> Result<Option<Outbound>> {
         let aad = self.commit_aad(channel_id);
         let excluded = self.excluded_leaves(channel_id)?;
         let group = self.channel_groups.get_mut(channel_id).ok_or_else(|| {
             GhostError::ServerNotLoaded(format!("channel {}", hex::encode(&channel_id[..8])))
         })?;
-        let commit = group.commit_pending_proposals(&self.provider, &self.idlog_cache, &excluded, &aad)?;
+        let Some(commit) = group.commit_pending_proposals(&self.provider, &self.idlog_cache, &excluded, &aad)? else {
+            return Ok(None);
+        };
         let mailbox_id = mls_group_mailbox_id(group.group_id());
-        Ok(Outbound { channel_id: *channel_id, mailbox_id, blob: commit })
+        Ok(Some(Outbound { channel_id: *channel_id, mailbox_id, blob: commit }))
+    }
+
+    /// Whether a channel's group holds queued proposals this device may yet commit, once
+    /// its view of the group and server catches up.
+    pub fn awaiting_proposals(&self, channel_id: &[u8; 32]) -> bool {
+        self.channel_groups.get(channel_id).is_some_and(GhostGroup::has_pending_proposals_for_others)
     }
 
     /// Check if this client is the creator of a server.
