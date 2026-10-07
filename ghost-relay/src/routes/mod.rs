@@ -61,7 +61,7 @@ pub fn router(state: AppState) -> Router {
         .route("/recovery/{account_fp}", put(recovery::put).get(recovery::get))
         .route("/sync_state/{account_fp}", put(sync_state::put).get(sync_state::get))
         .route("/ws/{mailbox_id}", get(ws::ws_upgrade))
-        .route("/voice/{channel_id}", get(voice::ws_upgrade))
+        .route("/voice/{mailbox_id}/{channel_id}", get(voice::ws_upgrade))
         .route("/invite", post(invite::register))
         .route(
             "/invite/{token}/join",

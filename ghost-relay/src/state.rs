@@ -133,6 +133,15 @@ impl GroupTable {
     }
 }
 
+/// An account removed from a mailbox's group by the commit at `seq`, the last entry
+/// it may still read there.
+#[derive(Clone, Copy, Debug)]
+pub struct Departure {
+    pub mailbox_id: [u8; 32],
+    pub account_fp: [u8; 32],
+    pub seq: u64,
+}
+
 /// What merging a commit changed beyond the group state itself.
 #[derive(Default)]
 struct CommitEffects {
@@ -158,6 +167,9 @@ pub struct Inner {
     /// Broadcast (account_fp, device_vk) when a device is revoked, so WS
     /// connections belonging to that device can close immediately.
     pub revocation_tx: broadcast::Sender<([u8; 32], [u8; 32])>,
+    /// Broadcast when a commit removes an account from a mailbox's group, so that
+    /// account's live mailbox and voice connections end.
+    pub departure_tx: broadcast::Sender<Departure>,
     pub groups: RwLock<GroupTable>,
     pub relay_crypto: RustCrypto,
     pub relay_vk: [u8; 32],
@@ -197,6 +209,9 @@ impl Inner {
             let appended = match self.storage.append(mailbox_id, et, epoch, data) {
                 Ok((seq, _, epoch_mismatch)) => {
                     self.storage.record_departures(mailbox_id, &effects.departed, seq)?;
+                    for account_fp in &effects.departed {
+                        let _ = self.departure_tx.send(Departure { mailbox_id: *mailbox_id, account_fp: *account_fp, seq });
+                    }
                     (seq, epoch_mismatch)
                 }
                 Err(e) => {
@@ -409,6 +424,12 @@ impl Inner {
             Some(seq) => Ok(Some(seq)),
             None => Err(RelayError::Forbidden("not a member of this mailbox".into())),
         }
+    }
+
+    /// Whether the account is in the mailbox's group as the relay last validated it. Unlike
+    /// `check_membership`, a mailbox without group state admits nobody.
+    pub fn is_group_member(&self, mailbox_id: &[u8; 32], account_fp: &[u8; 32]) -> Result<bool, RelayError> {
+        Ok(self.storage.has_mailbox_members(mailbox_id)? && self.storage.is_mailbox_member(mailbox_id, account_fp)?)
     }
 
     /// Check if account is a member of this mailbox. Skips if no ACL data exists.
@@ -775,6 +796,7 @@ pub type AppState = Arc<Inner>;
 pub fn new_state(config: Config, storage: Storage) -> AppState {
     let (voice_udp_port, voice_udp_port_rx) = watch::channel(0);
     let (revocation_tx, _) = broadcast::channel(16);
+    let (departure_tx, _) = broadcast::channel(64);
     let (relay_vk, relay_sk_bytes) = storage
         .get_or_create_relay_keypair()
         .expect("failed to initialize relay keypair");
@@ -808,6 +830,7 @@ pub fn new_state(config: Config, storage: Storage) -> AppState {
         online_presence: RwLock::new(Vec::new()),
         next_conn_id: AtomicU64::new(1),
         revocation_tx,
+        departure_tx,
         groups: RwLock::new(groups),
         relay_crypto: RustCrypto::default(),
         relay_vk,

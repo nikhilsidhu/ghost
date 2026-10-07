@@ -59,8 +59,8 @@ pub async fn ws_upgrade(
 }
 
 /// `read_limit` is set for an account removed from the group: it gets the entries up
-/// to its removal and the connection ends.
-async fn ws_connection(socket: WebSocket, mailbox_id: [u8; 32], state: AppState, auth: DeviceAuth, read_limit: Option<u64>) {
+/// to its removal and the connection ends. A removal while connected sets it too.
+async fn ws_connection(socket: WebSocket, mailbox_id: [u8; 32], state: AppState, auth: DeviceAuth, mut read_limit: Option<u64>) {
     let (mut sink, mut stream) = socket.split();
     let conn_id = state.next_conn_id.fetch_add(1, Relaxed);
 
@@ -173,6 +173,7 @@ async fn ws_connection(socket: WebSocket, mailbox_id: [u8; 32], state: AppState,
     let mut ping_interval = tokio::time::interval(ping_interval_dur);
     let mut own_seqs: Vec<u64> = Vec::new();
     let mut revoke_rx = state.revocation_tx.subscribe();
+    let mut departure_rx = state.departure_tx.subscribe();
 
     loop {
         tokio::select! {
@@ -213,7 +214,7 @@ async fn ws_connection(socket: WebSocket, mailbox_id: [u8; 32], state: AppState,
                     Ok(entries) => entries,
                     Err(_) => continue,
                 };
-                for entry in &entries {
+                for entry in entries.iter().take_while(|e| read_limit.is_none_or(|last| e.seq <= last)) {
                     last_seen = entry.seq;
                     if let Some(pos) = own_seqs.iter().position(|&s| s == entry.seq) {
                         own_seqs.swap_remove(pos);
@@ -223,6 +224,30 @@ async fn ws_connection(socket: WebSocket, mailbox_id: [u8; 32], state: AppState,
                     if sink.send(Message::binary(frame)).await.is_err() {
                         return;
                     }
+                }
+                if read_limit.is_some_and(|last| last_seen >= last) {
+                    close_removed(&mut sink).await;
+                    break;
+                }
+            }
+            departure = departure_rx.recv() => {
+                match departure {
+                    Ok(d) if d.mailbox_id == mailbox_id && d.account_fp == auth.account_fp => {
+                        // Deliver up to the removing commit, which the seq branch may not
+                        // have reached yet, then close.
+                        read_limit = Some(d.seq);
+                        if last_seen >= d.seq {
+                            close_removed(&mut sink).await;
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        if let Ok(limit) = state.read_limit(&mailbox_id, &auth.account_fp) {
+                            read_limit = limit;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    _ => {}
                 }
             }
             voice_event = voice_rx.recv() => {
@@ -449,6 +474,15 @@ async fn handle_online_presence(
             let _ = mailbox.presence_tx.send((conn_id, broadcast_json.to_string()));
         }
     }
+}
+
+async fn close_removed(sink: &mut futures_util::stream::SplitSink<WebSocket, Message>) {
+    let _ = sink
+        .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+            code: ghost_wire::WS_CLOSE_REMOVED,
+            reason: "removed from the group".into(),
+        })))
+        .await;
 }
 
 fn encode_frame(seq: u64, received_at: u64, payload: &[u8]) -> Vec<u8> {

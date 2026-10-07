@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use crate::auth::DeviceAuth;
 use crate::constants::{MAX_PRESENCE_BLOB_SIZE, PRESENCE_RATE_LIMIT, SPEAKING_RATE_LIMIT};
+use crate::error::RelayError;
 use crate::state::AppState;
 use crate::util::decode_mailbox_id;
 use crate::voice::{Participant, VoiceChannel, VoiceEvent};
@@ -31,7 +32,9 @@ enum ClientMsg {
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ServerMsg {
-    Welcome { slot_id: u32, port: u16, peers: Vec<PeerEntry> },
+    /// `room` goes in every media packet header; `token` keys the bind packets that tie
+    /// the participant's UDP address to `slot_id`.
+    Welcome { slot_id: u32, port: u16, room: String, token: String, peers: Vec<PeerEntry> },
     Joined { slot_id: u32, presence: String },
     Left { slot_id: u32 },
     Presence { slot_id: u32, blob: String },
@@ -45,33 +48,53 @@ struct PeerEntry {
     presence: String,
 }
 
+/// The welcome for an admitted slot: the room's current peers, and what the participant
+/// needs to bind its UDP address.
+fn welcome(state: &AppState, slot_id: u32, room_id: &[u8; 32], token: &[u8; 32], peers: Vec<PeerEntry>) -> ServerMsg {
+    ServerMsg::Welcome {
+        slot_id,
+        port: *state.voice_udp_port_rx.borrow(),
+        room: B64.encode(room_id),
+        token: B64.encode(token),
+        peers,
+    }
+}
+
+/// GET /voice/{mailbox_id}/{channel_id} — join the voice room of a channel within the
+/// group whose mailbox is named: the server's for a public channel, the channel's own
+/// for a private one. Only members of that group may join.
 pub async fn ws_upgrade(
     auth: DeviceAuth,
     State(state): State<AppState>,
-    Path(channel_id): Path<String>,
+    Path((mailbox_id, channel_id)): Path<(String, String)>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    let id = match decode_mailbox_id(&channel_id) {
-        Ok(id) => id,
-        Err(e) => return e.into_response(),
+    let (mailbox_id, channel_id) = match (decode_mailbox_id(&mailbox_id), decode_mailbox_id(&channel_id)) {
+        (Ok(m), Ok(c)) => (m, c),
+        (Err(e), _) | (_, Err(e)) => return e.into_response(),
     };
-    if let Err(e) = state.check_membership(&id, &auth.account_fp) {
-        return e.into_response();
+    match state.is_group_member(&mailbox_id, &auth.account_fp) {
+        Ok(true) => {}
+        Ok(false) => return RelayError::Forbidden("not a member of this channel's group".into()).into_response(),
+        Err(e) => return e.into_response(),
     }
-    ws.on_upgrade(move |socket| voice_connection(socket, id, state, auth))
+    let room_id = ghost_wire::voice::voice_room_id(&mailbox_id, &channel_id);
+    ws.on_upgrade(move |socket| voice_connection(socket, mailbox_id, room_id, state, auth))
 }
 
-async fn voice_connection(socket: WebSocket, channel_id: [u8; 32], state: AppState, auth: DeviceAuth) {
+async fn voice_connection(socket: WebSocket, mailbox_id: [u8; 32], room_id: [u8; 32], state: AppState, auth: DeviceAuth) {
     let (mut sink, mut stream) = socket.split();
     let mut ping_interval = tokio::time::interval(PING_INTERVAL);
     let mut last_pong = Instant::now();
     let mut slot_id: Option<u32> = None;
+    let mut token = [0u8; 32];
     let mut event_rx: Option<tokio::sync::broadcast::Receiver<VoiceEvent>> = None;
 
     // Track which peer slots this connection knows about
     let mut known_slots: HashSet<u32> = HashSet::new();
 
     let mut revoke_rx = state.revocation_tx.subscribe();
+    let mut departure_rx = state.departure_tx.subscribe();
 
     // Rate limiting state
     let mut last_presence_time = Instant::now();
@@ -105,7 +128,7 @@ async fn voice_connection(socket: WebSocket, channel_id: [u8; 32], state: AppSta
                                 let (welcome, rx) = {
                                     let mut channels = state.voice_channels.write().await;
                                     let channel = channels
-                                        .entry(channel_id)
+                                        .entry(room_id)
                                         .or_insert_with(VoiceChannel::new);
 
                                     if channel.participants.len()
@@ -133,10 +156,10 @@ async fn voice_connection(socket: WebSocket, channel_id: [u8; 32], state: AppSta
 
                                     channel.participants.push(Participant {
                                         slot_id: new_slot,
-                                        udp_addr: None,
-                                        last_udp: Instant::now(),
                                         latest_presence: Some(blob.clone()),
                                     });
+                                    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut token);
+                                    state.routing.admit(room_id, new_slot, token);
 
                                     let _ = channel.notify.send(VoiceEvent::Joined {
                                         slot_id: new_slot,
@@ -147,15 +170,7 @@ async fn voice_connection(socket: WebSocket, channel_id: [u8; 32], state: AppSta
                                     });
 
                                     let rx = channel.notify.subscribe();
-                                    let udp_port = *state.voice_udp_port_rx.borrow();
-
-                                    let welcome = ServerMsg::Welcome {
-                                        slot_id: new_slot,
-                                        port: udp_port,
-                                        peers,
-                                    };
-
-                                    (welcome, rx)
+                                    (welcome(&state, new_slot, &room_id, &token, peers), rx)
                                 };
 
                                 // Set connection state after releasing the lock
@@ -200,7 +215,7 @@ async fn voice_connection(socket: WebSocket, channel_id: [u8; 32], state: AppSta
 
                                 {
                                     let mut channels = state.voice_channels.write().await;
-                                    if let Some(channel) = channels.get_mut(&channel_id) {
+                                    if let Some(channel) = channels.get_mut(&room_id) {
                                         if let Some(p) = channel.participants.iter_mut().find(|p| p.slot_id == sid) {
                                             p.latest_presence = Some(blob.clone());
                                         }
@@ -230,7 +245,7 @@ async fn voice_connection(socket: WebSocket, channel_id: [u8; 32], state: AppSta
 
                                 {
                                     let channels = state.voice_channels.read().await;
-                                    if let Some(channel) = channels.get(&channel_id) {
+                                    if let Some(channel) = channels.get(&room_id) {
                                         let _ = channel.notify.send(VoiceEvent::Speaking {
                                             slot_id: sid,
                                             speaking,
@@ -245,7 +260,7 @@ async fn voice_connection(socket: WebSocket, channel_id: [u8; 32], state: AppSta
                                 };
 
                                 let channels = state.voice_channels.read().await;
-                                if let Some(channel) = channels.get(&channel_id) {
+                                if let Some(channel) = channels.get(&room_id) {
                                     let peers: Vec<PeerEntry> = channel
                                         .participants
                                         .iter()
@@ -258,12 +273,7 @@ async fn voice_connection(socket: WebSocket, channel_id: [u8; 32], state: AppSta
                                         })
                                         .collect();
 
-                                    let udp_port = *state.voice_udp_port_rx.borrow();
-                                    let _ = send_json(&mut sink, &ServerMsg::Welcome {
-                                        slot_id: sid,
-                                        port: udp_port,
-                                        peers,
-                                    }).await;
+                                    let _ = send_json(&mut sink, &welcome(&state, sid, &room_id, &token, peers)).await;
                                 }
                             }
                             Err(_) => {
@@ -328,7 +338,7 @@ async fn voice_connection(socket: WebSocket, channel_id: [u8; 32], state: AppSta
                         if let Some(sid) = slot_id {
                             eprintln!("voice ws: slot {sid} lagged {n} events, sending resync");
                             let channels = state.voice_channels.read().await;
-                            if let Some(channel) = channels.get(&channel_id) {
+                            if let Some(channel) = channels.get(&room_id) {
                                 let peers: Vec<PeerEntry> = channel
                                     .participants
                                     .iter()
@@ -344,12 +354,7 @@ async fn voice_connection(socket: WebSocket, channel_id: [u8; 32], state: AppSta
                                 for peer in &peers {
                                     known_slots.insert(peer.slot_id);
                                 }
-                                let udp_port = *state.voice_udp_port_rx.borrow();
-                                let _ = send_json(&mut sink, &ServerMsg::Welcome {
-                                    slot_id: sid,
-                                    port: udp_port,
-                                    peers,
-                                }).await;
+                                let _ = send_json(&mut sink, &welcome(&state, sid, &room_id, &token, peers)).await;
                             }
                         }
                     }
@@ -375,6 +380,22 @@ async fn voice_connection(socket: WebSocket, channel_id: [u8; 32], state: AppSta
                     break;
                 }
             }
+            departure = departure_rx.recv() => {
+                let removed = match departure {
+                    Ok(d) => d.mailbox_id == mailbox_id && d.account_fp == auth.account_fp,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        !state.is_group_member(&mailbox_id, &auth.account_fp).unwrap_or(false)
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                };
+                if removed {
+                    let _ = sink.send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                        code: ghost_wire::WS_CLOSE_REMOVED,
+                        reason: "removed from the group".into(),
+                    }))).await;
+                    break;
+                }
+            }
             _ = ping_interval.tick() => {
                 if last_pong.elapsed() > PONG_TIMEOUT {
                     break;
@@ -390,15 +411,15 @@ async fn voice_connection(socket: WebSocket, channel_id: [u8; 32], state: AppSta
     if let Some(sid) = slot_id {
         {
             let mut channels = state.voice_channels.write().await;
-            if let Some(channel) = channels.get_mut(&channel_id) {
+            if let Some(channel) = channels.get_mut(&room_id) {
                 channel.participants.retain(|p| p.slot_id != sid);
                 let _ = channel.notify.send(VoiceEvent::Left { slot_id: sid });
                 if channel.participants.is_empty() {
-                    channels.remove(&channel_id);
+                    channels.remove(&room_id);
                 }
             }
         }
-        state.routing.remove(&channel_id, &sid);
+        state.routing.remove(&room_id, &sid);
     }
 }
 

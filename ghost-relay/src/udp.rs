@@ -2,30 +2,23 @@ use std::net::SocketAddr;
 
 use tokio::net::UdpSocket;
 
-use ghost_wire::VOICE_MAX_PACKET;
+use ghost_wire::voice::VoiceBind;
+use ghost_wire::{VOICE_HEADER_SIZE, VOICE_MAX_PACKET, VOICE_RELAY_PREFIX};
 use crate::state::AppState;
 
-// Relay reads header_len + channel_id + slot_id for routing.
-// Dispatches on header_len to reject old 73-byte format packets.
-fn parse_header(buf: &[u8]) -> Option<([u8; 32], u32)> {
-    if buf.len() < 38 {
+/// Room and slot of a media packet: `[header_len:2][room_id:32][slot_id:4]...`. Older
+/// header formats and anything shorter are dropped.
+fn parse_media_header(buf: &[u8]) -> Option<([u8; 32], u32)> {
+    if buf.len() < VOICE_RELAY_PREFIX {
         return None;
     }
     let header_len = u16::from_be_bytes(buf[0..2].try_into().ok()?) as usize;
-    if buf.len() < header_len {
+    if header_len != VOICE_HEADER_SIZE || buf.len() < header_len {
         return None;
     }
-    let channel_id: [u8; 32] = buf[2..34].try_into().ok()?;
-    match header_len {
-        // [header_len:2][channel_id:32][slot_id:4][flags:1][epoch:8][seq:4][payload_len:2]...
-        53 => {
-            let slot_id = u32::from_be_bytes(buf[34..38].try_into().ok()?);
-            Some((channel_id, slot_id))
-        }
-        // Old header formats — reject, clients must upgrade
-        45 | 73 => None,
-        _ => None,
-    }
+    let room_id: [u8; 32] = buf[2..34].try_into().ok()?;
+    let slot_id = u32::from_be_bytes(buf[34..38].try_into().ok()?);
+    Some((room_id, slot_id))
 }
 
 pub async fn run(state: AppState) {
@@ -56,20 +49,17 @@ pub async fn run(state: AppState) {
             }
         };
 
-        let (channel_id, slot_id) = match parse_header(&buf[..len]) {
-            Some(h) => h,
-            None => continue,
-        };
-
-        // Register or update the slot's address (cooldown prevents hijacking)
-        if !state.routing.contains(&channel_id, &slot_id) {
-            state.routing.insert(channel_id, slot_id, sender_addr);
-        } else if !state.routing.update_addr(&channel_id, &slot_id, sender_addr) {
-            continue; // Address change rejected (cooldown active)
+        let packet = &buf[..len];
+        if let Some(bind) = VoiceBind::from_bytes(packet) {
+            if !state.routing.bind(&bind, sender_addr) {
+                tracing::debug!("voice bind refused from {sender_addr}");
+            }
+            continue;
         }
 
-        let peers = state.routing.peers(&channel_id, &sender_addr);
-        let packet = &buf[..len];
+        let Some((room_id, slot_id)) = parse_media_header(packet) else { continue };
+        // Only a bound address speaks for its slot; anything else is dropped unread.
+        let Some(peers) = state.routing.forward_targets(&room_id, slot_id, &sender_addr) else { continue };
         for peer in &peers {
             let _ = socket.try_send_to(packet, *peer);
         }

@@ -17,6 +17,7 @@ use openmls_rust_crypto::OpenMlsRustCrypto;
 use openmls_traits::OpenMlsProvider;
 
 use ghost_relay::config::Config;
+use ghost_wire::voice::VoiceBind;
 use ghost_relay::storage::Storage;
 use ghost_relay::{routes, state, udp};
 
@@ -90,6 +91,12 @@ impl TestAuth {
     ) -> tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     > {
+        let (ws, _) = tokio_tungstenite::connect_async(self.ws_request(url)).await.unwrap();
+        ws
+    }
+
+    /// A signed WebSocket upgrade request, for tests that expect the relay to refuse it.
+    fn ws_request(&self, url: &str) -> tokio_tungstenite::tungstenite::http::Request<()> {
         use tokio_tungstenite::tungstenite::http;
 
         let timestamp = std::time::SystemTime::now()
@@ -119,9 +126,7 @@ impl TestAuth {
             .header("x-ghost-signature", hex::encode(signature.to_bytes()))
             .body(())
             .unwrap();
-
-        let (ws, _) = tokio_tungstenite::connect_async(request).await.unwrap();
-        ws
+        request
     }
 }
 
@@ -595,7 +600,7 @@ async fn expired_invite_rejected() {
 // --- Voice tests ---
 
 fn build_voice_packet(
-    channel_id: &[u8; 32],
+    room_id: &[u8; 32],
     slot_id: u32,
     sequence: u32,
     payload: &[u8],
@@ -604,7 +609,7 @@ fn build_voice_packet(
     let epoch: u64 = 0;
     [
         &header_len.to_be_bytes()[..],
-        channel_id,
+        room_id,
         &slot_id.to_be_bytes()[..],
         &[0x00], // flags
         &epoch.to_be_bytes(),
@@ -633,15 +638,35 @@ async fn read_voice_msg(
     .expect("timed out waiting for voice WS message")
 }
 
+/// A group holding only `auth`'s account, published on the relay, whose voice rooms
+/// `auth` may join. Returns the group's mailbox.
+async fn voice_group(base: &str, auth: &TestAuth) -> [u8; 32] {
+    let provider = OpenMlsRustCrypto::default();
+    let identity = MlsTestIdentity::new(&auth.account_fp);
+    let relay_vk = fetch_relay_vk(base).await;
+    let (group, mailbox_id) = create_test_mls_group(&provider, &identity, &relay_vk);
+    let group_info = export_group_info_bytes(&group, &provider, &identity.signer);
+    upload_group_info(base, auth, &mailbox_id, &group_info).await;
+    mailbox_id
+}
+
+fn voice_url(base: &str, mailbox_id: &[u8; 32], channel_id: &[u8; 32]) -> String {
+    let ws_base = base.replace("http://", "ws://");
+    format!("{ws_base}/voice/{}/{}", URL_SAFE_NO_PAD.encode(mailbox_id), URL_SAFE_NO_PAD.encode(channel_id))
+}
+
+/// Room id and bind token from a Welcome.
+fn welcome_binding(msg: &Value) -> ([u8; 32], [u8; 32]) {
+    let decode = |key: &str| -> [u8; 32] { B64.decode(msg[key].as_str().unwrap()).unwrap().try_into().unwrap() };
+    (decode("room"), decode("token"))
+}
+
 #[tokio::test]
 async fn voice_signaling_join_leave() {
     let (base, _) = start_server_with_voice(test_config()).await;
     let auth = TestAuth::generate();
     auth.register(&base).await;
-    let ws_base = base.replace("http://", "ws://");
-    let channel_id = [0x10; 32];
-    let channel_b64 = URL_SAFE_NO_PAD.encode(channel_id);
-    let ws_url = format!("{ws_base}/voice/{channel_b64}");
+    let ws_url = voice_url(&base, &voice_group(&base, &auth).await, &[0x10; 32]);
 
     let presence_a = B64.encode(b"opaque-presence-a");
     let presence_b = B64.encode(b"opaque-presence-b");
@@ -690,59 +715,67 @@ async fn voice_signaling_join_leave() {
     assert_eq!(msg["slot_id"].as_u64().unwrap() as u32, slot_b);
 }
 
+/// Two participants joined to one room with bound UDP sockets: (relay address, room,
+/// (socket, slot, token) for A, the same for B, and the WebSockets keeping them joined).
+struct VoicePair {
+    relay_addr: SocketAddr,
+    room: [u8; 32],
+    a: (UdpSocket, u32, [u8; 32]),
+    b: (UdpSocket, u32, [u8; 32]),
+    _ws: Vec<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>>,
+}
+
+async fn join_voice(ws_url: &str, auth: &TestAuth, presence: &[u8]) -> (
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    u32,
+    [u8; 32],
+    [u8; 32],
+) {
+    let mut ws = auth.ws_connect(ws_url).await;
+    ws.send(Message::Text(
+        serde_json::json!({"type": "join", "presence": B64.encode(presence)}).to_string().into(),
+    )).await.unwrap();
+    let welcome = read_voice_msg(&mut ws).await;
+    assert_eq!(welcome["type"], "welcome");
+    let (room, token) = welcome_binding(&welcome);
+    (ws, welcome["slot_id"].as_u64().unwrap() as u32, room, token)
+}
+
+async fn bound_voice_pair(base: &str, udp_port: u16, auth: &TestAuth, channel_id: [u8; 32]) -> VoicePair {
+    let ws_url = voice_url(base, &voice_group(base, auth).await, &channel_id);
+    let relay_addr: SocketAddr = format!("127.0.0.1:{udp_port}").parse().unwrap();
+    let (mut ws_a, slot_a, room, token_a) = join_voice(&ws_url, auth, b"pa").await;
+    let (ws_b, slot_b, room_b, token_b) = join_voice(&ws_url, auth, b"pb").await;
+    assert_eq!(room, room_b, "one channel, one room");
+    // drain A's "joined" notification for B
+    let _ = tokio::time::timeout(Duration::from_secs(1), read_voice_msg(&mut ws_a)).await;
+
+    let sock_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let sock_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    sock_a.send_to(&VoiceBind::sign(&token_a, room, slot_a, 1).to_bytes(), relay_addr).await.unwrap();
+    sock_b.send_to(&VoiceBind::sign(&token_b, room, slot_b, 1).to_bytes(), relay_addr).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    VoicePair { relay_addr, room, a: (sock_a, slot_a, token_a), b: (sock_b, slot_b, token_b), _ws: vec![ws_a, ws_b] }
+}
+
+async fn received(sock: &UdpSocket, buf: &mut [u8]) -> Option<usize> {
+    tokio::time::timeout(Duration::from_millis(300), sock.recv_from(buf)).await.ok().map(|r| r.unwrap().0)
+}
+
 #[tokio::test]
 async fn voice_udp_forwarding() {
     let (base, udp_port) = start_server_with_voice(test_config()).await;
     let auth = TestAuth::generate();
     auth.register(&base).await;
-    let ws_base = base.replace("http://", "ws://");
-    let channel_id = [0x20; 32];
-    let channel_b64 = URL_SAFE_NO_PAD.encode(channel_id);
-    let ws_url = format!("{ws_base}/voice/{channel_b64}");
-
-    let relay_addr: SocketAddr = format!("127.0.0.1:{udp_port}").parse().unwrap();
-
-    // Both join via signaling — extract slot_ids from Welcome
-    let mut ws_a = auth.ws_connect(&ws_url).await;
-    ws_a.send(Message::Text(
-        serde_json::json!({"type": "join", "presence": B64.encode(b"pa")}).to_string().into(),
-    )).await.unwrap();
-    let msg_a = read_voice_msg(&mut ws_a).await; // welcome
-    let slot_a = msg_a["slot_id"].as_u64().unwrap() as u32;
-
-    let mut ws_b = auth.ws_connect(&ws_url).await;
-    ws_b.send(Message::Text(
-        serde_json::json!({"type": "join", "presence": B64.encode(b"pb")}).to_string().into(),
-    )).await.unwrap();
-    let msg_b = read_voice_msg(&mut ws_b).await; // welcome
-    let slot_b = msg_b["slot_id"].as_u64().unwrap() as u32;
-
-    // drain A's "joined" notification for B
-    let _ = tokio::time::timeout(Duration::from_secs(1), read_voice_msg(&mut ws_a)).await;
-
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    // A sends initial UDP packet to register its address
-    let sock_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let pkt_a = build_voice_packet(&channel_id, slot_a, 1, b"opus-from-a");
-    sock_a.send_to(&pkt_a, relay_addr).await.unwrap();
-
-    // B sends initial UDP packet to register its address
-    let sock_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let pkt_b = build_voice_packet(&channel_id, slot_b, 1, b"opus-from-b");
-    sock_b.send_to(&pkt_b, relay_addr).await.unwrap();
-
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    // Drain any forwarded packets from registration
+    let pair = bound_voice_pair(&base, udp_port, &auth, [0x20; 32]).await;
+    let (sock_a, slot_a, _) = &pair.a;
+    let (sock_b, _, _) = &pair.b;
+    let (relay_addr, room) = (pair.relay_addr, pair.room);
     let mut recv_buf = [0u8; 1500];
-    while tokio::time::timeout(Duration::from_millis(100), sock_a.recv_from(&mut recv_buf))
-        .await
-        .is_ok()
-    {}
 
-    // A sends another packet — B should receive it
-    let pkt_a2 = build_voice_packet(&channel_id, slot_a, 2, b"frame-2");
+    // A sends a packet — B should receive it
+    let pkt_a2 = build_voice_packet(&room, *slot_a, 2, b"frame-2");
     sock_a.send_to(&pkt_a2, relay_addr).await.unwrap();
 
     let (len, _) = tokio::time::timeout(Duration::from_secs(2), sock_b.recv_from(&mut recv_buf))
@@ -752,7 +785,7 @@ async fn voice_udp_forwarding() {
 
     // Verify slot_id and payload
     let recv_slot = u32::from_be_bytes(recv_buf[34..38].try_into().unwrap());
-    assert_eq!(recv_slot, slot_a);
+    assert_eq!(recv_slot, *slot_a);
     let hdr = ghost_wire::VOICE_HEADER_SIZE;
     assert_eq!(&recv_buf[hdr..len], b"frame-2");
 
@@ -762,16 +795,57 @@ async fn voice_udp_forwarding() {
 }
 
 #[tokio::test]
+async fn voice_media_needs_a_bound_address() {
+    let (base, udp_port) = start_server_with_voice(test_config()).await;
+    let auth = TestAuth::generate();
+    auth.register(&base).await;
+    let pair = bound_voice_pair(&base, udp_port, &auth, [0x21; 32]).await;
+    let (_, slot_a, token_a) = &pair.a;
+    let (sock_b, _, _) = &pair.b;
+    let mut buf = [0u8; 1500];
+
+    // An outsider who knows the room and A's slot sends media, then replays A's bind and
+    // forges one: nothing reaches B.
+    let outsider = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    outsider.send_to(&build_voice_packet(&pair.room, *slot_a, 3, b"injected"), pair.relay_addr).await.unwrap();
+    outsider.send_to(&VoiceBind::sign(token_a, pair.room, *slot_a, 1).to_bytes(), pair.relay_addr).await.unwrap();
+    outsider.send_to(&VoiceBind::sign(&[0x66; 32], pair.room, *slot_a, 9).to_bytes(), pair.relay_addr).await.unwrap();
+    outsider.send_to(&build_voice_packet(&pair.room, *slot_a, 4, b"injected"), pair.relay_addr).await.unwrap();
+    assert!(received(sock_b, &mut buf).await.is_none(), "unbound media was forwarded");
+
+    // Nor does the outsider receive B's media.
+    let (sock_b, slot_b, _) = &pair.b;
+    sock_b.send_to(&build_voice_packet(&pair.room, *slot_b, 5, b"secret"), pair.relay_addr).await.unwrap();
+    assert!(received(&outsider, &mut buf).await.is_none(), "an unbound address received media");
+}
+
+#[tokio::test]
+async fn voice_join_needs_membership_of_the_named_group() {
+    let (base, _) = start_server_with_voice(test_config()).await;
+    let member = TestAuth::generate();
+    member.register(&base).await;
+    let outsider = TestAuth::generate();
+    outsider.register(&base).await;
+    let ws_url = voice_url(&base, &voice_group(&base, &member).await, &[0x22; 32]);
+
+    let refused = tokio_tungstenite::connect_async(outsider.ws_request(&ws_url)).await;
+    match refused {
+        Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => assert_eq!(resp.status(), StatusCode::FORBIDDEN),
+        other => panic!("expected 403, got {:?}", other.map(|_| "connected")),
+    }
+    // A mailbox with no group state admits nobody, not even its would-be creator.
+    let unknown = voice_url(&base, &[0x99; 32], &[0x22; 32]);
+    assert!(tokio_tungstenite::connect_async(member.ws_request(&unknown)).await.is_err());
+}
+
+#[tokio::test]
 async fn voice_max_participants() {
     let mut config = test_config();
     config.max_voice_participants = 2;
     let (base, _) = start_server_with_voice(config).await;
     let auth = TestAuth::generate();
     auth.register(&base).await;
-    let ws_base = base.replace("http://", "ws://");
-    let channel_id = [0x30; 32];
-    let channel_b64 = URL_SAFE_NO_PAD.encode(channel_id);
-    let ws_url = format!("{ws_base}/voice/{channel_b64}");
+    let ws_url = voice_url(&base, &voice_group(&base, &auth).await, &[0x30; 32]);
 
     // Fill to capacity
     let mut ws1 = auth.ws_connect(&ws_url).await;
@@ -1743,39 +1817,7 @@ async fn commit_validated_and_acl_updated() {
 
     upload_group_info(&base, &alice, &mailbox_id, &gi).await;
 
-    // Create bob's key package and add him to the group
-    let id_b = MlsTestIdentity::new(&bob.account_fp);
-    let kp_bundle = KeyPackage::builder()
-        .build(
-            Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519,
-            &provider,
-            &id_b.signer,
-            id_b.credential.clone(),
-        )
-        .unwrap();
-
-    let bundle = group.commit_builder()
-        .propose_adds([kp_bundle.key_package().clone()])
-        .load_psks(provider.storage())
-        .unwrap()
-        .build(provider.rand(), provider.crypto(), &id_a.signer, |_| true)
-        .unwrap()
-        .stage_commit(&provider)
-        .unwrap();
-
-    let commit_bytes = bundle.commit()
-        .to_bytes()
-        .unwrap();
-
-    group.merge_pending_commit(&provider).unwrap();
-
-    // Wrap in envelope and POST to relay
-    let commit_envelope = envelope(
-        ghost_wire::EnvelopeType::Commit,
-        0, // epoch 0
-        &commit_bytes,
-    );
-
+    let commit_envelope = add_member_commit(&mut group, &provider, &id_a.signer, &bob.account_fp);
     let client = reqwest::Client::new();
     let url = mailbox_url(&base, &mailbox_id);
     let resp = alice
@@ -1787,6 +1829,107 @@ async fn commit_validated_and_acl_updated() {
 
     // Verify ACL was updated: bob should now be a member
     assert!(st.storage.is_mailbox_member(&mailbox_id, &bob.account_fp).unwrap());
+}
+
+/// What a test commit changes in the group.
+enum Change {
+    Add(Box<KeyPackage>),
+    Remove(Vec<LeafNodeIndex>),
+}
+
+/// A commit adding a fresh device of `account_fp` to `group`, merged locally and wrapped
+/// in an envelope for posting.
+fn add_member_commit(group: &mut MlsGroup, provider: &OpenMlsRustCrypto, signer: &SignatureKeyPair, account_fp: &[u8; 32]) -> Vec<u8> {
+    let joiner = MlsTestIdentity::new(account_fp);
+    let key_package = KeyPackage::builder()
+        .build(Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519, provider, &joiner.signer, joiner.credential.clone())
+        .unwrap();
+    commit_change(group, provider, signer, Change::Add(Box::new(key_package.key_package().clone())))
+}
+
+/// A commit removing every leaf of `account_fp` from `group`, merged locally and wrapped.
+fn remove_member_commit(group: &mut MlsGroup, provider: &OpenMlsRustCrypto, signer: &SignatureKeyPair, account_fp: &[u8; 32]) -> Vec<u8> {
+    let leaves: Vec<LeafNodeIndex> = group
+        .members()
+        .filter(|m| m.credential.serialized_content().starts_with(account_fp))
+        .map(|m| m.index)
+        .collect();
+    commit_change(group, provider, signer, Change::Remove(leaves))
+}
+
+fn commit_change(group: &mut MlsGroup, provider: &OpenMlsRustCrypto, signer: &SignatureKeyPair, change: Change) -> Vec<u8> {
+    let epoch = group.epoch().as_u64();
+    let builder = group.commit_builder();
+    let builder = match change {
+        Change::Add(key_package) => builder.propose_adds([*key_package]),
+        Change::Remove(leaves) => builder.propose_removals(leaves),
+    };
+    let bundle = builder
+        .load_psks(provider.storage())
+        .unwrap()
+        .build(provider.rand(), provider.crypto(), signer, |_| true)
+        .unwrap()
+        .stage_commit(provider)
+        .unwrap();
+    let commit_bytes = bundle.commit().to_bytes().unwrap();
+    group.merge_pending_commit(provider).unwrap();
+    envelope(ghost_wire::EnvelopeType::Commit, epoch, &commit_bytes)
+}
+
+/// The close code a WebSocket ends with, skipping anything sent before.
+async fn close_code(
+    ws: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    saw_binary: &mut bool,
+) -> Option<u16> {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while let Some(Ok(msg)) = ws.next().await {
+            match msg {
+                Message::Close(frame) => return frame.map(|f| f.code.into()),
+                Message::Binary(_) => *saw_binary = true,
+                _ => {}
+            }
+        }
+        None
+    })
+    .await
+    .expect("connection never closed")
+}
+
+#[tokio::test]
+async fn removal_ends_the_members_voice_and_mailbox_connections() {
+    let (base, _) = start_server_with_voice(test_config()).await;
+    let alice = TestAuth::generate();
+    alice.register(&base).await;
+    let bob = TestAuth::generate();
+    bob.register(&base).await;
+
+    let provider = OpenMlsRustCrypto::default();
+    let id_a = MlsTestIdentity::new(&alice.account_fp);
+    let (mut group, mailbox_id) = create_test_mls_group(&provider, &id_a, &fetch_relay_vk(&base).await);
+    upload_group_info(&base, &alice, &mailbox_id, &export_group_info_bytes(&group, &provider, &id_a.signer)).await;
+    let client = reqwest::Client::new();
+    let url = mailbox_url(&base, &mailbox_id);
+    let add = add_member_commit(&mut group, &provider, &id_a.signer, &bob.account_fp);
+    let resp = alice.sign("POST", &url, client.post(&url).body(add)).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Bob is connected to the mailbox and to a voice room of the group.
+    let ws_base = base.replace("http://", "ws://");
+    let mut mailbox_ws = bob.ws_connect(&format!("{ws_base}/ws/{}", URL_SAFE_NO_PAD.encode(mailbox_id))).await;
+    ws_handshake(&mut mailbox_ws, 1).await;
+    consume_vs_snap(&mut mailbox_ws).await;
+    let (mut voice_ws, _, _, _) = join_voice(&voice_url(&base, &mailbox_id, &[0x40; 32]), &bob, b"pb").await;
+
+    let remove = remove_member_commit(&mut group, &provider, &id_a.signer, &bob.account_fp);
+    let resp = alice.sign("POST", &url, client.post(&url).body(remove)).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let mut voice_binary = false;
+    assert_eq!(close_code(&mut voice_ws, &mut voice_binary).await, Some(ghost_wire::WS_CLOSE_REMOVED));
+    // The mailbox delivers the commit that removed Bob, so his device learns of it, then ends.
+    let mut saw_commit = false;
+    assert_eq!(close_code(&mut mailbox_ws, &mut saw_commit).await, Some(ghost_wire::WS_CLOSE_REMOVED));
+    assert!(saw_commit, "the removing commit was not delivered before the close");
 }
 
 // ── Key Transparency integration tests ──────────────────────────
