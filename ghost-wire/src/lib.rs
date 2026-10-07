@@ -2,6 +2,9 @@ pub mod anchor;
 pub mod auth;
 pub mod idlog;
 pub mod merkle;
+pub mod policy;
+#[cfg(feature = "mls")]
+pub mod policy_mls;
 pub mod recovery_bundle;
 pub mod relay_ref;
 pub mod server_location;
