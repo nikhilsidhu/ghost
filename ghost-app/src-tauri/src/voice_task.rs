@@ -142,15 +142,6 @@ impl Drop for AudioSession {
     }
 }
 
-fn ws_url(relay_url: &str, channel_id: &str) -> Result<String, String> {
-    let channel_bytes = hex::decode(channel_id).map_err(|e| format!("bad channel_id: {e}"))?;
-    let channel_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&channel_bytes);
-    let base = relay_url
-        .replacen("http://", "ws://", 1)
-        .replacen("https://", "wss://", 1);
-    Ok(format!("{}/voice/{}", base, channel_b64))
-}
-
 fn relay_host(relay_url: &str) -> Result<String, String> {
     let parsed = url::Url::parse(relay_url).map_err(|e| format!("bad relay url: {e}"))?;
     parsed
@@ -451,11 +442,14 @@ pub async fn run(
                         rand::rngs::OsRng.fill_bytes(&mut voice_salt);
                         active_voice_salt = voice_salt;
 
-                        let url = match ws_url(&relay_url, &channel_id) {
-                            Ok(u) => u,
-                            Err(e) => {
-                                emit_error(&app, &e);
-                                continue;
+                        let request = {
+                            let r = relay.lock().await;
+                            match r.voice_ws_request(&channel_id_bytes) {
+                                Ok(req) => req,
+                                Err(e) => {
+                                    emit_error(&app, &format!("voice ws: {e}"));
+                                    continue;
+                                }
                             }
                         };
 
@@ -470,7 +464,7 @@ pub async fn run(
 
                         let stream = match tokio::time::timeout(
                             WS_CONNECT_TIMEOUT,
-                            tokio_tungstenite::connect_async(&url),
+                            tokio_tungstenite::connect_async(request),
                         ).await {
                             Ok(Ok((stream, _))) => stream,
                             Ok(Err(e)) => {

@@ -158,7 +158,7 @@ const commands: CommandDef[] = [
       const relay = url.searchParams.get("relay");
       const token = url.searchParams.get("token");
       if (!relay || !token) throw new Error("invalid invite link");
-      await joinByInvite(relay, token);
+      await joinByInvite(relay, token, url.searchParams.get("r"));
       await refreshServers();
     },
   },

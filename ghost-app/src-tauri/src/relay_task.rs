@@ -36,49 +36,6 @@ async fn rebroadcast_presence(
     presence::broadcast_presence_to_mailbox(client, relay, mailbox_id, &info).await;
 }
 
-/// Cache a member's identity log with KT proof verification.
-/// Best-effort — failures are logged but don't block processing.
-async fn cache_member_idlog(
-    client: &Arc<Mutex<GhostClient>>,
-    relay: &Arc<Mutex<RelayClient>>,
-    account_fp: &[u8; 32],
-) {
-    let (resp, relay_url) = {
-        let r = relay.lock().await;
-        let resp = match r.get_idlog(account_fp, 0).await {
-            Ok(resp) if !resp.entries.is_empty() => resp,
-            _ => return,
-        };
-        (resp, r.base_url().to_string())
-    };
-
-    let prev_tree_size = {
-        let c = client.lock().await;
-        c.kt_last_tree_size(&relay_url).unwrap_or(0)
-    };
-
-    let consistency = if !resp.checkpoint.is_empty() && prev_tree_size > 0 {
-        let new_ts = ghost_wire::merkle::Checkpoint::from_bytes(&resp.checkpoint)
-            .map(|cp| cp.tree_size)
-            .unwrap_or(0);
-        if new_ts > prev_tree_size {
-            let r = relay.lock().await;
-            r.get_consistency_proof(prev_tree_size, new_ts).await.ok()
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    let mut c = client.lock().await;
-    if let Err(e) = c.cache_identity_log_with_proofs(
-        &relay_url, account_fp, &resp, consistency.as_deref(),
-    ) {
-        eprintln!("cache idlog for {}: {e}", hex::encode(&account_fp[..8]));
-    }
-}
-
 pub async fn run(
     app: AppHandle,
     client: Arc<Mutex<GhostClient>>,
@@ -93,29 +50,19 @@ pub async fn run(
     // Fetch the relay's verifying key so KT checkpoint verification works
     {
         let r = relay.lock().await;
-        match r.get_relay_key().await {
-            Ok(vk) => client.lock().await.set_relay_vk(vk),
-            Err(e) => eprintln!("failed to fetch relay key: {e}"),
+        match r.get_relay_info().await {
+            Ok(info) => client.lock().await.set_relay_vk(info.relay_vk),
+            Err(e) => eprintln!("failed to fetch relay info: {e}"),
         }
     }
 
-    // Subscribe to all existing server mailboxes with persisted last_seen_seq
-    // and the sync MLS group mailbox if it exists
+    // Subscribe to every server mailbox on the relay hosting that server, and to the
+    // sync mailbox on the home relay, resuming from the persisted last_seen_seq.
     let sync_mb = {
         let c = client.lock().await;
-        let mailboxes = c.channel_mailboxes();
         let mut r = relay.lock().await;
-        for (_, mailbox_id) in &mailboxes {
-            let seq = c.store().get_last_seen_seq(mailbox_id).unwrap_or(0);
-            r.subscribe(*mailbox_id, seq);
-        }
-        if let Some(mb) = c.sync_mailbox_id() {
-            let seq = c.store().get_last_seen_seq(&mb).unwrap_or(0);
-            r.subscribe(mb, seq);
-            Some(mb)
-        } else {
-            None
-        }
+        ghost_core::flows::subscribe_known_mailboxes(&c, &mut r);
+        c.sync_mailbox_id()
     };
 
     // Push genesis entry to relay if relay doesn't have it yet.
@@ -140,20 +87,21 @@ pub async fn run(
         }
     }
 
+    // Other relays only register accounts whose log names a home; this also
+    // refreshes the cached copy of our own log. Retried on every start.
+    if let Err(e) = ghost_core::flows::account::ensure_home_relay(&client, &relay).await {
+        eprintln!("failed to record home relay in identity log: {e}");
+    }
+
     // Cache identity logs for gossip (kt_head_hash) and remove-proposal validation.
     // No longer required for message processing — credentials are self-validating.
     {
-        let own_fp = {
-            let c = client.lock().await;
-            *c.fingerprint()
-        };
-        cache_member_idlog(&client, &relay, &own_fp).await;
         let member_fps = {
             let c = client.lock().await;
             c.all_member_fingerprints()
         };
         for fp in &member_fps {
-            cache_member_idlog(&client, &relay, fp).await;
+            ghost_core::flows::idlog::cache_member(&client, &relay, fp).await;
         }
     }
 
@@ -308,7 +256,7 @@ pub async fn run(
                         }
                         // Cache identity logs for gossip enrichment (not required for message processing)
                         for fp in &new_member_fps {
-                            cache_member_idlog(&client, &relay, fp).await;
+                            ghost_core::flows::idlog::cache_member(&client, &relay, fp).await;
                         }
                         rebroadcast_presence(&client, &relay, &mailbox_id, &presence).await;
                         retry_pending_presence(&app, &client, &server_id, &mut online_members, &mut pending_presence).await;
@@ -321,8 +269,16 @@ pub async fn run(
                         let key = format!("{}{}", SYNC_KEY_SERVER_PREFIX, hex::encode(server_id));
                         let _ = c.sync_remove(&key, now_ms());
                         drop(c);
-                        crate::sync_utils::post_sync_message(&client, &relay, SyncMessageType::ServerLeft as u8, &server_id).await;
-                        crate::sync_utils::push_sync_snapshot(&client, &relay).await;
+                        ghost_core::flows::sync::post_message(&client, &relay, SyncMessageType::ServerLeft, &server_id).await;
+                        ghost_core::flows::sync::push_snapshot(&client, &relay).await;
+                        let _ = app.emit("kicked", hex::encode(server_id));
+                    }
+                    Some((server_id, _channel_id, Ok(ReceiveResult::DeviceRemoved))) => {
+                        // This device was revoked; the account's other devices are still
+                        // members, so nothing goes to the sync group. Only the UI updates.
+                        let c = client.lock().await;
+                        let _ = c.store().set_last_seen_seq(&mailbox_id, seq);
+                        drop(c);
                         let _ = app.emit("kicked", hex::encode(server_id));
                     }
                     Some((server_id, _channel_id, Ok(ReceiveResult::MembersRemoved(removed)))) => {
@@ -470,7 +426,7 @@ async fn handle_sync_application(
 
     match msg_type {
         x if x == SyncMessageType::ServerProvisioned as u8 => {
-            // ServerProvisioned — join via external commit
+            // Another device joined or created a server: join it on the relay hosting it.
             let payload = match ProvisionPayload::from_bytes(body) {
                 Ok(p) => p,
                 Err(e) => {
@@ -478,102 +434,9 @@ async fn handle_sync_application(
                     return;
                 }
             };
-
-            // Fetch fresh GroupInfo and join with retry
-            let mut joined = false;
-            for _ in 0..3 {
-                let gi_bytes = {
-                    let r = relay.lock().await;
-                    match r.get_server_info(&payload.mailbox_id).await {
-                        Ok(gi) => gi,
-                        Err(_) => break,
-                    }
-                };
-
-                let result = {
-                    let mut c = client.lock().await;
-                    c.join_from_provision(&payload, &gi_bytes, now_ms())
-                };
-
-                match result {
-                    Ok(channel_results) => {
-                        // Post commits for each channel, subscribe to each mailbox
-                        let mut default_mailbox_id = payload.mailbox_id;
-                        let mut _default_commit_seq = 0u64;
-                        for (_ch_id, commit, mailbox_id) in &channel_results {
-                            let commit_seq = {
-                                let r = relay.lock().await;
-                                match r.post_blob(mailbox_id, commit.clone()).await {
-                                    Ok(res) => res.seq,
-                                    Err(e) => {
-                                        eprintln!("sync: failed to post commit: {e}");
-                                        continue;
-                                    }
-                                }
-                            };
-                            {
-                                let c = client.lock().await;
-                                let _ = c.store().set_last_seen_seq(mailbox_id, commit_seq);
-                                drop(c);
-                                let mut r = relay.lock().await;
-                                r.subscribe(*mailbox_id, commit_seq);
-                            }
-                            // Track default channel's mailbox for announce
-                            if channel_results.len() == 1 || _ch_id == &ghost_core::wire::derive_default_channel_id(&payload.server_id) {
-                                default_mailbox_id = *mailbox_id;
-                                _default_commit_seq = commit_seq;
-                            }
-                        }
-
-                        // Upload fresh GroupInfo
-                        {
-                            let c = client.lock().await;
-                            if let Ok(gi) = c.export_server_info(&payload.server_id) {
-                                let r = relay.lock().await;
-                                let _ = r.put_server_info(&default_mailbox_id, gi).await;
-                            }
-                        }
-
-                        // Send member announce
-                        let announce = {
-                            let mut c = client.lock().await;
-                            let name = c.identity().display_name.clone();
-                            c.send_control(
-                                &payload.server_id,
-                                ghost_core::wire::encode_member_announce(&name),
-                            )
-                        };
-                        if let Ok(outbound) = announce {
-                            let r = relay.lock().await;
-                            let _ = r.send(&outbound.mailbox_id, outbound.blob).await;
-                        }
-
-                        // Write server entry to sync_state
-                        {
-                            use ghost_core::wire::SYNC_KEY_SERVER_PREFIX;
-                            let c = client.lock().await;
-                            if let Ok(meta) = c.export_server_meta(&payload.server_id) {
-                                let key = format!("{}{}", SYNC_KEY_SERVER_PREFIX, hex::encode(payload.server_id));
-                                let _ = c.sync_set(&key, &meta.to_bytes(), now_ms());
-                            }
-                        }
-
-                        joined = true;
-                        break;
-                    }
-                    Err(e) => {
-                        eprintln!("sync: join attempt failed for {}: {e}", hex::encode(&payload.server_id[..8]));
-                        continue;
-                    }
-                }
+            if ghost_core::flows::provision::join_payload_if_unknown(client, relay, &payload, now_ms()).await {
+                let _ = app.emit("sync", "all");
             }
-
-            if !joined {
-                eprintln!("sync: failed to join server {} after retries", hex::encode(&payload.server_id[..8]));
-                return;
-            }
-
-            let _ = app.emit("sync", "all");
         }
         x if x == SyncMessageType::ServerLeft as u8 => {
             // ServerLeft — remove local state, unsubscribe
@@ -602,7 +465,7 @@ async fn handle_sync_application(
             }
 
             // No sync broadcast — this IS the broadcast from the other device
-            crate::sync_utils::push_sync_snapshot(&client, &relay).await;
+            ghost_core::flows::sync::push_snapshot(&client, &relay).await;
             let _ = app.emit("kicked", hex::encode(server_id));
         }
         x if x == SyncMessageType::VoiceTakeover as u8 => {
@@ -639,7 +502,7 @@ async fn handle_sync_application(
             } else {
                 vec![(key, None, ts)]
             };
-            let settings = crate::sync_utils::parse_sync_entries(&entry);
+            let settings = ghost_core::flows::sync::parse_entries(&entry);
             crate::sync_utils::apply_sync_side_effects(
                 &settings, app, client, relay, config, config_path, presence, voice_cmd_tx,
             ).await;
@@ -675,7 +538,7 @@ async fn fetch_and_merge_sync_state(
     presence: &Arc<Mutex<PresenceInfo>>,
     voice_cmd_tx: &mpsc::Sender<crate::voice_task::VoiceCommand>,
 ) {
-    use ghost_core::wire::{decode_sync_state_dump, encode_sync_state_dump, sync_open, sync_seal};
+    use ghost_core::wire::{decode_sync_state_dump, sync_open};
 
     let (sync_key, account_fp) = {
         let c = client.lock().await;
@@ -689,24 +552,10 @@ async fn fetch_and_merge_sync_state(
     };
 
     let sealed = match get_result {
-        Ok(Some(data)) => data,
+        Ok(Some((_generation, data))) => data,
         Ok(None) => {
             // No snapshot yet — push our local state as the initial one
-            let dump_blob = {
-                let c = client.lock().await;
-                let entries = c.sync_dump().unwrap_or_default();
-                match encode_sync_state_dump(&entries) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        eprintln!("encode_sync_state_dump failed: {e}");
-                        return;
-                    }
-                }
-            };
-            if let Ok(s) = sync_seal(&sync_key, &dump_blob) {
-                let r = relay.lock().await;
-                let _ = r.put_sync_state(&account_fp, s).await;
-            }
+            ghost_core::flows::sync::push_snapshot(client, relay).await;
             return;
         }
         Err(e) => {
@@ -736,7 +585,7 @@ async fn fetch_and_merge_sync_state(
         c.sync_import(&entries).unwrap_or_default();
     }
 
-    let settings = crate::sync_utils::parse_sync_entries(&entries);
+    let settings = ghost_core::flows::sync::parse_entries(&entries);
     crate::sync_utils::apply_sync_side_effects(
         &settings, app, client, relay, config, config_path, presence, voice_cmd_tx,
     ).await;
@@ -746,21 +595,7 @@ async fn fetch_and_merge_sync_state(
     }
 
     // PUT our merged state back
-    let merged_blob = {
-        let c = client.lock().await;
-        let merged = c.sync_dump().unwrap_or_default();
-        match encode_sync_state_dump(&merged) {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("encode_sync_state_dump failed: {e}");
-                return;
-            }
-        }
-    };
-    if let Ok(s) = sync_seal(&sync_key, &merged_blob) {
-        let r = relay.lock().await;
-        let _ = r.put_sync_state(&account_fp, s).await;
-    }
+    ghost_core::flows::sync::push_snapshot(client, relay).await;
 }
 
 /// Join a server from its relay-stored GroupInfo if we don't already have it locally.
@@ -772,98 +607,9 @@ async fn join_server_if_unknown(
     server_id: [u8; 32],
     meta: &SyncServerMeta,
 ) {
-    use ghost_core::wire::SYNC_KEY_SERVER_PREFIX;
-
-    {
-        let c = client.lock().await;
-        if c.store().get_server(&server_id).is_ok() {
-            return; // already joined
-        }
+    if ghost_core::flows::provision::join_if_unknown(client, relay, server_id, meta, now_ms()).await {
+        let _ = app.emit("sync", hex::encode(server_id));
     }
-
-    let gi_bytes = {
-        let r = relay.lock().await;
-        match r.get_server_info(&meta.mailbox_id).await {
-            Ok(gi) => gi,
-            Err(e) => {
-                eprintln!("sync: join_server_if_unknown: get_server_info failed for {}: {e}",
-                    hex::encode(&server_id[..8]));
-                return;
-            }
-        }
-    };
-
-    let payload = ProvisionPayload {
-        server_id,
-        server_name: meta.server_name.clone(),
-        kind: meta.kind,
-        members: vec![],
-        channels: meta.channels.clone(),
-        mailbox_id: meta.mailbox_id,
-    };
-
-    let channel_results = {
-        let mut c = client.lock().await;
-        match c.join_from_provision(&payload, &gi_bytes, now_ms()) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("sync: join_server_if_unknown: join_from_provision failed for {}: {e}",
-                    hex::encode(&server_id[..8]));
-                return;
-            }
-        }
-    };
-
-    let mut default_mailbox_id = meta.mailbox_id;
-    for (_ch_id, commit, mailbox_id) in &channel_results {
-        let commit_seq = {
-            let r = relay.lock().await;
-            match r.post_blob(mailbox_id, commit.clone()).await {
-                Ok(res) => res.seq,
-                Err(e) => { eprintln!("sync: join_server_if_unknown: post commit failed: {e}"); continue; }
-            }
-        };
-        {
-            let c = client.lock().await;
-            let _ = c.store().set_last_seen_seq(mailbox_id, commit_seq);
-            drop(c);
-            let mut r = relay.lock().await;
-            r.subscribe(*mailbox_id, commit_seq);
-        }
-        if channel_results.len() == 1
-            || _ch_id == &ghost_core::wire::derive_default_channel_id(&server_id)
-        {
-            default_mailbox_id = *mailbox_id;
-        }
-    }
-
-    {
-        let c = client.lock().await;
-        if let Ok(gi) = c.export_server_info(&server_id) {
-            let r = relay.lock().await;
-            let _ = r.put_server_info(&default_mailbox_id, gi).await;
-        }
-    }
-
-    let announce = {
-        let mut c = client.lock().await;
-        let name = c.identity().display_name.clone();
-        c.send_control(&server_id, ghost_core::wire::encode_member_announce(&name))
-    };
-    if let Ok(outbound) = announce {
-        let r = relay.lock().await;
-        let _ = r.send(&outbound.mailbox_id, outbound.blob).await;
-    }
-
-    {
-        let c = client.lock().await;
-        if let Ok(meta_out) = c.export_server_meta(&server_id) {
-            let key = format!("{}{}", SYNC_KEY_SERVER_PREFIX, hex::encode(server_id));
-            let _ = c.sync_set(&key, &meta_out.to_bytes(), now_ms());
-        }
-    }
-
-    let _ = app.emit("sync", hex::encode(server_id));
 }
 
 async fn handle_gap(
@@ -877,21 +623,18 @@ async fn handle_gap(
         cid
     };
 
-    match crate::commands::recover_epoch(client, relay, &channel_id, mailbox_id, "gap recovery").await {
+    match ghost_core::flows::epoch::recover(client, relay, &channel_id, mailbox_id, "gap recovery").await {
         Ok(true) => {}
         Ok(false) => eprintln!("gap recovery: failed after attempts"),
-        Err(e) => {
-            if e.contains("404") {
-                eprintln!("gap recovery: relay has no server_info, resetting last_seen");
-                let c = client.lock().await;
-                let _ = c.store().set_last_seen_seq(mailbox_id, 0);
-                drop(c);
-                let mut r = relay.lock().await;
-                r.subscribe(*mailbox_id, 0);
-            } else {
-                eprintln!("{e}");
-            }
+        Err(ghost_core::error::GhostError::RelayStatus { status: 404, .. }) => {
+            eprintln!("gap recovery: relay has no server_info, resetting last_seen");
+            let c = client.lock().await;
+            let _ = c.store().set_last_seen_seq(mailbox_id, 0);
+            drop(c);
+            let mut r = relay.lock().await;
+            r.subscribe(*mailbox_id, 0);
         }
+        Err(e) => eprintln!("gap recovery: {e}"),
     }
 }
 

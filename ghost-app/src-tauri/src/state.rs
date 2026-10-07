@@ -10,8 +10,8 @@ use crate::config::GhostConfig;
 use crate::presence::PresenceInfo;
 use crate::voice_task::VoiceHandle;
 
-/// Device credentials for request signing. Stored separately from GhostClient
-/// so sign_request can read without contending on the heavy client mutex.
+/// Device credentials used to authenticate relay clients. Kept outside GhostClient so a
+/// relay client can be rebuilt without taking the heavy client mutex.
 pub struct AuthMaterial {
     pub account_fp: [u8; 32],
     pub device_vk: [u8; 32],
@@ -22,17 +22,17 @@ pub struct AppState {
     pub client: Arc<Mutex<GhostClient>>,
     pub relay: Arc<Mutex<RelayClient>>,
     pub relay_url: Arc<Mutex<String>>,
-    pub http: reqwest::Client,
     pub config_path: PathBuf,
     pub config: Arc<Mutex<GhostConfig>>,
     pub voice: VoiceHandle,
     pub presence: Arc<Mutex<PresenceInfo>>,
-    pub pairing_secret: Arc<Mutex<Option<Zeroizing<[u8; 32]>>>>,
+    /// The code of the pairing session this device opened; its secret is wiped on drop.
+    pub pairing_code: Arc<Mutex<Option<ghost_core::flows::pairing::PairingCode>>>,
     /// Holds the account seed between creation and recovery passphrase setup (or skip).
     pub recovery_seed: Arc<Mutex<Option<Zeroizing<[u8; 32]>>>>,
     /// Handle for the running relay task — used to abort it before hot-swap.
     pub relay_task_handle: Arc<Mutex<Option<tauri::async_runtime::JoinHandle<()>>>>,
-    /// Device auth material for request signing — avoids locking client on every HTTP request.
+    /// Device auth material for building relay clients during hot-swaps.
     pub auth: Arc<RwLock<AuthMaterial>>,
 }
 

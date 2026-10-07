@@ -51,7 +51,7 @@ export function SetupScreen(props: Props) {
           const token = url.searchParams.get("token");
           if (relay && token) {
             await setRelayUrl(relay);
-            await joinByInvite(relay, token);
+            await joinByInvite(relay, token, url.searchParams.get("r"));
             setMode("set-recovery-pass");
             setLoading(false);
             return;

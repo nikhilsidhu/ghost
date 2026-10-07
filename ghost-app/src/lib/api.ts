@@ -47,8 +47,9 @@ export const markChannelRead = (channelId: string) =>
 export const createInvite = (serverId: string) =>
   invoke<Invite>("create_invite", { serverId });
 
-export const joinByInvite = (relayUrl: string, token: string) =>
-  invoke<Server>("join_by_invite", { relayUrl, token });
+/** `relayRef` (the link's `r` parameter) pins the relay's key when present. */
+export const joinByInvite = (relayUrl: string, token: string, relayRef?: string | null) =>
+  invoke<Server>("join_by_invite", { relayUrl, token, relayRef: relayRef ?? null });
 
 export const getConfig = () => invoke<Config>("get_config");
 
@@ -121,8 +122,9 @@ export const getCachedAvatar = (fingerprintHex: string) =>
 
 // Devices
 export const getDevices = () => invoke<Device[]>("get_devices");
+/** Resolves false when the home relay was unreachable and the revocation must be retried. */
 export const revokeDevice = (deviceKeyHex: string) =>
-  invoke<void>("revoke_device", { deviceKeyHex });
+  invoke<boolean>("revoke_device", { deviceKeyHex });
 export const startPairing = () => invoke<string>("start_pairing");
 export const checkPairing = () => invoke<string | null>("check_pairing");
 export const cancelPairing = () => invoke<void>("cancel_pairing");

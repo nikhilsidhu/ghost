@@ -107,9 +107,12 @@ export default function DevicesSettings() {
       if (revokeLoading()) return;
       setRevokeLoading(true);
       try {
-        await revokeDevice(key);
+        const complete = await revokeDevice(key);
         setRevoking(null);
         await load();
+        if (!complete) {
+          setError("Device removed from all servers, but the home relay is unreachable. Revoke again once it is back to finish.");
+        }
       } catch (e) {
         setError(String(e));
       } finally {

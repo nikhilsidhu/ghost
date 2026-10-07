@@ -1,149 +1,32 @@
 use base64::Engine;
+use ed25519_dalek::SigningKey;
 use rand::RngCore;
 use tauri::{Emitter, State};
 
+use ghost_core::client::GhostClient;
+use ghost_core::flows;
+use ghost_core::flows::pairing::{PairingCode, PairingOffer};
+use ghost_core::flows::recovery::RecoveryCode;
+use ghost_core::flows::sync::SyncSettings;
+use ghost_core::relay::RelayClient;
 use ghost_core::storage::{Channel, ChannelKind, ServerKind};
-use ghost_core::wire::{encode_avatar_clear, encode_avatar_update, encode_channel_op, encode_member_announce, ChannelOpPayload};
+use ghost_core::wire::{
+    encode_avatar_clear, encode_avatar_update, encode_channel_op, encode_member_announce,
+    ChannelOpPayload, SyncMessageType,
+};
 
 use ghost_core::mls::presence::OnlineStatus;
 
-use crate::constants::{DEFAULT_PAGE_SIZE, INVITE_EXPIRY_MS, SEQ_HEADER};
+use crate::constants::{DEFAULT_PAGE_SIZE, INVITE_EXPIRY_MS};
 use crate::config::KeybindConfig;
 use crate::dto::{ChannelDto, ConfigDto, DeviceDto, ServerDto, IdentityDto, InviteDto, KeybindConfigDto, MemberDto, MessageDto};
 use crate::presence;
 use crate::state::{AppState, now_millis};
 use crate::voice_task::VoiceCommand;
 
-#[derive(serde::Deserialize)]
-struct IdLogEntry {
-    payload: String,
-}
-
 fn parse_id(hex_str: &str) -> Result<[u8; 32], String> {
     let bytes = hex::decode(hex_str).map_err(|e| e.to_string())?;
     bytes.try_into().map_err(|_| "invalid 32-byte id".into())
-}
-
-/// Sign an HTTP request with the device's cached auth credentials.
-fn sign_request(state: &AppState, method: &str, path: &str, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-    let auth = state.auth.read().unwrap();
-    let h = ghost_wire::auth::sign_request_headers(method, path, &auth.account_fp, &auth.device_vk, &auth.signing_key, None);
-    drop(auth);
-    req.header("X-Ghost-Account", &h.account)
-        .header("X-Ghost-Device", &h.device)
-        .header("X-Ghost-Timestamp", &h.timestamp)
-        .header("X-Ghost-Signature", &h.signature)
-}
-
-/// Post a sync message to all linked devices. No-op if sync key is not set (single device).
-async fn post_sync_message(state: &AppState, msg_type: u8, payload: &[u8]) {
-    crate::sync_utils::post_sync_message(&state.client, &state.relay, msg_type, payload).await;
-}
-
-async fn push_sync_snapshot(state: &AppState) {
-    crate::sync_utils::push_sync_snapshot(&state.client, &state.relay).await;
-}
-
-/// Write a server's metadata to sync_state and push to linked devices + relay snapshot.
-async fn sync_server_entry(state: &AppState, server_id: &[u8; 32]) {
-    use ghost_core::wire::{encode_mutation, MUTATION_SET, SyncMessageType, SYNC_KEY_SERVER_PREFIX};
-
-    let (key, value, ts) = {
-        let client = state.client.lock().await;
-        let meta = match client.export_server_meta(server_id) {
-            Ok(m) => m,
-            Err(_) => return,
-        };
-        let key = format!("{}{}", SYNC_KEY_SERVER_PREFIX, hex::encode(server_id));
-        let value = meta.to_bytes();
-        let ts = now_millis();
-        let _ = client.sync_set(&key, &value, ts);
-        (key, value, ts)
-    };
-    post_sync_message(state, SyncMessageType::MutationSync as u8, &encode_mutation(MUTATION_SET, ts, &key, &value)).await;
-    push_sync_snapshot(state).await;
-}
-
-/// Write a key-value entry to sync state, broadcast to linked devices, and push snapshot.
-async fn sync_set_and_push(state: &AppState, key: &str, value: &[u8]) {
-    use ghost_core::wire::{encode_mutation, MUTATION_SET, SyncMessageType};
-    let ts = now_millis();
-    {
-        let client = state.client.lock().await;
-        let _ = client.sync_set(key, value, ts);
-    }
-    post_sync_message(state, SyncMessageType::MutationSync as u8, &encode_mutation(MUTATION_SET, ts, key, value)).await;
-    push_sync_snapshot(state).await;
-}
-
-/// Best-effort: fetch and cache an identity log, logging errors but not failing.
-async fn cache_member_idlog_from_state(state: &AppState, account_fp: &[u8; 32]) {
-    if let Err(e) = fetch_and_verify_idlog(state, account_fp).await {
-        eprintln!("cache idlog for {}: {e}", hex::encode(&account_fp[..8]));
-    }
-}
-
-/// Fetch an identity log from the relay, verify KT proofs (inclusion + consistency),
-/// and cache the validated result. Returns the validated LogState.
-async fn fetch_and_verify_idlog(
-    state: &AppState,
-    account_fp: &[u8; 32],
-) -> Result<ghost_wire::idlog::LogState, String> {
-    let resp = {
-        let relay = state.relay.lock().await;
-        relay.get_idlog(account_fp, 0).await.map_err(|e| e.to_string())?
-    };
-
-    if resp.entries.is_empty() {
-        return Err("identity log is empty".into());
-    }
-
-    let relay_url = state.relay_url.lock().await.clone();
-
-    // Fetch consistency proof if we have a previous checkpoint
-    let consistency = if !resp.checkpoint.is_empty() {
-        let prev_tree_size = {
-            let client = state.client.lock().await;
-            client.kt_last_tree_size(&relay_url).unwrap_or(0)
-        };
-        if prev_tree_size > 0 {
-            let new_tree_size = ghost_wire::merkle::Checkpoint::from_bytes(&resp.checkpoint)
-                .map(|cp| cp.tree_size)
-                .unwrap_or(0);
-            if new_tree_size > prev_tree_size {
-                let relay = state.relay.lock().await;
-                Some(relay.get_consistency_proof(prev_tree_size, new_tree_size)
-                    .await.map_err(|e| e.to_string())?)
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    // Verify proofs, validate chain, and cache
-    let mut client = state.client.lock().await;
-    client.cache_identity_log_with_proofs(
-        &relay_url,
-        account_fp,
-        &resp,
-        consistency.as_deref(),
-    ).map_err(|e| e.to_string())
-}
-
-/// Remove a sync state entry, broadcast to linked devices, and push snapshot.
-async fn sync_remove_and_push(state: &AppState, key: &str) {
-    use ghost_core::wire::{encode_mutation, MUTATION_REMOVE, SyncMessageType};
-    let ts = now_millis();
-    {
-        let client = state.client.lock().await;
-        let _ = client.sync_remove(key, ts);
-    }
-    post_sync_message(state, SyncMessageType::MutationSync as u8, &encode_mutation(MUTATION_REMOVE, ts, key, &[])).await;
-    push_sync_snapshot(state).await;
 }
 
 /// Abort the running relay task, create a fresh relay client, and swap it into state.
@@ -154,7 +37,7 @@ async fn replace_relay(
     if let Some(handle) = state.relay_task_handle.lock().await.take() {
         handle.abort();
     }
-    let (mut new_relay, inbox_rx) = ghost_core::relay::RelayClient::new(relay_url);
+    let (mut new_relay, inbox_rx) = RelayClient::new(relay_url);
     {
         let auth = state.auth.read().unwrap();
         new_relay.set_auth(auth.account_fp, auth.device_vk, auth.signing_key.clone());
@@ -193,58 +76,41 @@ async fn spawn_relay_task(
     *state.relay_task_handle.lock().await = Some(jh);
 }
 
-const MAX_EPOCH_RECOVERY_ATTEMPTS: usize = 3;
-const MAX_REJOIN_ATTEMPTS: usize = 3;
+/// Replace the running identity after linking or recovery: install the new client,
+/// refresh the auth material relay clients are built from, and rebuild the relay client.
+async fn install_identity(
+    state: &AppState,
+    new_client: GhostClient,
+    relay_url: &str,
+) -> tokio::sync::mpsc::Receiver<ghost_core::relay::RelayEvent> {
+    {
+        let mut auth = state.auth.write().unwrap();
+        auth.account_fp = *new_client.fingerprint();
+        auth.device_vk = new_client.verifying_key_bytes();
+        auth.signing_key = new_client.signing_key_clone();
+    }
+    *state.client.lock().await = new_client;
+    replace_relay(state, relay_url).await
+}
+
+/// Persist settings restored from a sync snapshot into config, and optionally presence.
+async fn apply_restored_settings(state: &AppState, settings: &SyncSettings, update_presence: bool) {
+    let mut cfg = state.config.lock().await;
+    crate::sync_utils::apply_sync_to_config(settings, &mut cfg, &state.config_path);
+    if update_presence {
+        let mut p = state.presence.lock().await;
+        crate::sync_utils::apply_config_to_presence(&cfg, &mut p);
+    }
+}
+
+fn same_relay(a: &str, b: &str) -> bool {
+    a.trim_end_matches('/') == b.trim_end_matches('/')
+}
+
 const PAIRING_POLL_ATTEMPTS: usize = 90;
 const PAIRING_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 const MAX_PROVISION_FETCH_ATTEMPTS: usize = 5;
-
-/// Recover from an epoch conflict via external commit. Returns true on success.
-pub(crate) async fn recover_epoch(
-    client: &std::sync::Arc<tokio::sync::Mutex<ghost_core::client::GhostClient>>,
-    relay: &std::sync::Arc<tokio::sync::Mutex<ghost_core::relay::RelayClient>>,
-    channel_id: &[u8; 32],
-    mailbox_id: &[u8; 32],
-    label: &str,
-) -> Result<bool, String> {
-    for attempt in 0..MAX_EPOCH_RECOVERY_ATTEMPTS {
-        let server_info = {
-            let r = relay.lock().await;
-            match r.get_server_info(mailbox_id).await {
-                Ok(gi) => gi,
-                Err(e) => return Err(format!("{label}: fetch GroupInfo: {e}")),
-            }
-        };
-        let commit = {
-            let mut c = client.lock().await;
-            match c.recover_via_external_commit(channel_id, &server_info) {
-                Ok((commit, _)) => commit,
-                Err(e) => {
-                    eprintln!("{label}: external commit failed (attempt {attempt}): {e}");
-                    continue;
-                }
-            }
-        };
-        let all_ok = match relay.lock().await.post_blob(mailbox_id, commit).await {
-            Ok(_) => true,
-            Err(e) => {
-                eprintln!("{label}: relay rejected commit (attempt {attempt}): {e}");
-                false
-            }
-        };
-        if all_ok {
-            let c = client.lock().await;
-            if let Some(sid) = c.server_id_for_mailbox(mailbox_id) {
-                if let Ok(gi) = c.export_server_info(&sid) {
-                    let r = relay.lock().await;
-                    let _ = r.put_server_info(mailbox_id, gi).await;
-                }
-            }
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
+const PROVISION_FETCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 #[tauri::command]
 pub async fn get_identity(state: State<'_, AppState>) -> Result<IdentityDto, String> {
@@ -299,15 +165,8 @@ async fn create_server_impl(name: &str, kind: ServerKind, state: &AppState) -> R
         relay.subscribe(mid, 0);
     }
 
-    {
-        let client = state.client.lock().await;
-        if let Ok(payload) = client.export_provision_payload(&server_id) {
-            drop(client);
-            post_sync_message(state, ghost_core::wire::SyncMessageType::ServerProvisioned as u8, &payload.to_bytes()).await;
-        }
-    }
-
-    sync_server_entry(state, &server_id).await;
+    flows::sync::post_server_provisioned(&state.client, &state.relay, &server_id).await;
+    flows::sync::server_entry(&state.client, &state.relay, &server_id).await;
     Ok(server_dto)
 }
 
@@ -354,15 +213,8 @@ pub async fn list_members(
 
 #[tauri::command]
 pub async fn save_server_order(order: Vec<String>, state: State<'_, AppState>) -> Result<(), String> {
-    use ghost_core::wire::{encode_mutation, MUTATION_SET, SyncMessageType, SYNC_KEY_SERVER_ORDER};
-    let ts = now_millis();
     let value = serde_json::to_vec(&order).map_err(|e| e.to_string())?;
-    {
-        let client = state.client.lock().await;
-        let _ = client.sync_set(SYNC_KEY_SERVER_ORDER, &value, ts);
-    }
-    post_sync_message(&state, SyncMessageType::MutationSync as u8, &encode_mutation(MUTATION_SET, ts, SYNC_KEY_SERVER_ORDER, &value)).await;
-    push_sync_snapshot(&state).await;
+    flows::sync::set_and_push(&state.client, &state.relay, ghost_core::wire::SYNC_KEY_SERVER_ORDER, &value).await;
     Ok(())
 }
 
@@ -466,7 +318,7 @@ pub async fn create_channel(
     let _ = relay.send(&outbound.mailbox_id, outbound.blob).await;
     drop(relay);
 
-    sync_server_entry(&state, &sid).await;
+    flows::sync::server_entry(&state.client, &state.relay, &sid).await;
 
     let client = state.client.lock().await;
     let channel = client.store().get_channel(&channel_id).map_err(|e| e.to_string())?;
@@ -501,7 +353,7 @@ pub async fn rename_channel(
     let _ = relay.send(&outbound.mailbox_id, outbound.blob).await;
     drop(relay);
 
-    sync_server_entry(&state, &sid).await;
+    flows::sync::server_entry(&state.client, &state.relay, &sid).await;
     Ok(())
 }
 
@@ -532,7 +384,7 @@ pub async fn delete_channel(
     let _ = relay.send(&outbound.mailbox_id, outbound.blob).await;
     drop(relay);
 
-    sync_server_entry(&state, &sid).await;
+    flows::sync::server_entry(&state.client, &state.relay, &sid).await;
     Ok(())
 }
 
@@ -546,49 +398,13 @@ pub async fn kick_member(
     let sid = parse_id(&server_id)?;
     let fp = parse_id(&fingerprint)?;
 
-    let outbounds = {
-        let mut client = state.client.lock().await;
-        client.kick_member(&sid, &fp).map_err(|e| e.to_string())?
-    };
-
-    // Post commits via HTTP for each channel group the member was in
-    let mut all_ok = true;
-    for out in &outbounds {
-        let post_result = {
-            let relay = state.relay.lock().await;
-            relay.post_blob(&out.mailbox_id, out.blob.clone()).await
-        };
-        match post_result {
-            Ok(_) => {
-                let mut client = state.client.lock().await;
-                let _ = client.merge_pending_commit_for_channel(&out.channel_id);
-            }
-            Err(e) => {
-                eprintln!("kick: relay rejected commit for channel {}: {e}", hex::encode(&out.channel_id[..8]));
-                let mut client = state.client.lock().await;
-                let _ = client.clear_pending_commit_for_channel(&out.channel_id);
-                all_ok = false;
-            }
-        }
-    }
-    // Remove member from store even on partial success — successful channels
-    // already advanced their epoch and locked out the member
-    {
-        let client = state.client.lock().await;
-        let _ = client.store().remove_member(&sid, &fp);
-        if let Ok(gi) = client.export_server_info(&sid) {
-            if let Some(mb) = client.mailbox_id_for_server(&sid) {
-                let relay = state.relay.lock().await;
-                let _ = relay.put_server_info(&mb, gi).await;
-            }
-        }
-        drop(client);
-        let _ = app.emit("sync", hex::encode(sid));
-    }
-    if !all_ok {
+    let all_accepted = flows::members::kick(&state.client, &state.relay, &sid, &fp)
+        .await
+        .map_err(|e| e.to_string())?;
+    let _ = app.emit("sync", hex::encode(sid));
+    if !all_accepted {
         return Err("epoch conflict on one or more channels — retry may be needed".into());
     }
-
     Ok(())
 }
 
@@ -597,17 +413,14 @@ pub async fn mark_channel_read(
     channel_id: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    use ghost_core::wire::{encode_mutation, MUTATION_SET, SyncMessageType, SYNC_KEY_READ_PREFIX};
     let cid = parse_id(&channel_id)?;
     let ts = now_millis();
-    let key = format!("{SYNC_KEY_READ_PREFIX}{channel_id}");
+    let key = format!("{}{}", ghost_core::wire::SYNC_KEY_READ_PREFIX, channel_id);
     {
         let client = state.client.lock().await;
         client.store().mark_channel_read(&cid, ts).map_err(|e| e.to_string())?;
-        let _ = client.sync_set(&key, &ts.to_be_bytes(), ts);
     }
-    post_sync_message(&state, SyncMessageType::MutationSync as u8, &encode_mutation(MUTATION_SET, ts, &key, &ts.to_be_bytes())).await;
-    push_sync_snapshot(&state).await;
+    flows::sync::set_and_push(&state.client, &state.relay, &key, &ts.to_be_bytes()).await;
     Ok(())
 }
 
@@ -617,179 +430,59 @@ pub async fn create_invite(
     state: State<'_, AppState>,
 ) -> Result<InviteDto, String> {
     let sid = parse_id(&server_id)?;
-
-    let relay_url = state.relay_url.lock().await.clone();
-
-    let (token, payload_bytes) = {
+    // Invite tokens live on the relay hosting the server, which joiners will contact.
+    let hosting_url = {
         let client = state.client.lock().await;
-        client.create_invite(&sid).map_err(|e| e.to_string())?
+        flows::server_relay_url(&client, &sid)
     };
-
-    let expires_at = now_millis() + INVITE_EXPIRY_MS;
-    let reg_path = "/invite";
-    sign_request(&state, "POST", reg_path, state.http
-        .post(format!("{}{}", relay_url, reg_path))
-        .json(&serde_json::json!({ "token": token, "expires_at": expires_at })))
-        .send()
+    let hosting = match hosting_url {
+        Some(url) => Some(tokio::sync::Mutex::new(state.relay.lock().await.at(&url))),
+        None => None,
+    };
+    let relay = hosting.as_ref().unwrap_or(&state.relay);
+    let created = flows::invite::create(&state.client, relay, &sid, now_millis() + INVITE_EXPIRY_MS)
         .await
-        .map_err(|e| format!("register invite: {e}"))?
-        .error_for_status()
-        .map_err(|e| format!("register invite: {e}"))?;
-
-    let join_path = format!("/invite/{}/join", token);
-    sign_request(&state, "POST", &join_path, state.http
-        .post(format!("{}{}", relay_url, join_path))
-        .header(SEQ_HEADER, "0")
-        .body(payload_bytes))
-        .send()
-        .await
-        .map_err(|e| format!("upload invite payload: {e}"))?
-        .error_for_status()
-        .map_err(|e| format!("upload invite payload: {e}"))?;
+        .map_err(|e| e.to_string())?;
 
     let mut link = url::Url::parse("ghost://join").expect("valid base URL");
     link.query_pairs_mut()
-        .append_pair("relay", &relay_url)
-        .append_pair("token", &token);
-    let link = link.to_string();
+        .append_pair("relay", &created.relay_url)
+        .append_pair("r", &created.relay_ref.encode())
+        .append_pair("token", &created.token);
 
-    Ok(InviteDto { token, link })
+    Ok(InviteDto { token: created.token, link: link.to_string() })
 }
 
+/// Join a server through an invite. The server may live on the home relay or any
+/// other; `relay_ref`, when the link carries one, pins the relay's key so a link
+/// pointing at the wrong relay fails instead of joining it.
 #[tauri::command]
 pub async fn join_by_invite(
     relay_url: String,
     token: String,
+    relay_ref: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<ServerDto, String> {
-    let response = state
-        .http
-        .get(format!("{}/invite/{}/join", relay_url, token))
-        .send()
-        .await
-        .map_err(|e| format!("fetch invite: {e}"))?
-        .error_for_status()
-        .map_err(|e| format!("fetch invite: {e}"))?;
-
-    let seq: u64 = response
-        .headers()
-        .get(SEQ_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    let payload_bytes = response
-        .bytes()
-        .await
-        .map_err(|e| format!("read invite body: {e}"))?;
-
-    let (server_id, channel_results) = {
-        let mut client = state.client.lock().await;
-        client
-            .join_by_invite(&payload_bytes, now_millis())
-            .map_err(|e| e.to_string())?
+    let configured = state.relay_url.lock().await.clone();
+    // A view of the home client: subscriptions on another relay join the same event stream.
+    let target = if same_relay(&relay_url, &configured) {
+        None
+    } else {
+        Some(tokio::sync::Mutex::new(state.relay.lock().await.at(&relay_url)))
     };
+    let relay = target.as_ref().unwrap_or(&state.relay);
 
-    // Broadcast the external commit for each channel group
-    #[derive(serde::Deserialize)]
-    struct PostBlobResp { seq: u64 }
-    // Use the first (default) channel's mailbox for subscribe and announce
-    let default_mailbox_id = channel_results.first()
-        .map(|(_, _, mb)| *mb)
-        .ok_or_else(|| "no channel groups created".to_string())?;
-    let mut last_commit_seq = 0u64;
-    for (_ch_id, commit, mailbox_id) in &channel_results {
-        let mailbox_b64 =
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mailbox_id);
-        let box_path = format!("/box/{}", mailbox_b64);
-        let resp = sign_request(&state, "POST", &box_path, state.http
-            .post(format!("{}{}", relay_url, box_path))
-            .body(commit.clone()))
-            .send()
-            .await
-            .map_err(|e| format!("broadcast commit: {e}"))?
-            .error_for_status()
-            .map_err(|e| format!("broadcast commit: {e}"))?;
-        let commit_seq = resp.json::<PostBlobResp>().await
-            .map(|r| r.seq).unwrap_or(0);
-        if *mailbox_id == default_mailbox_id {
-            last_commit_seq = commit_seq;
+    if let Some(encoded) = relay_ref {
+        let expected = ghost_wire::relay_ref::RelayRef::decode(&encoded).map_err(|e| e.to_string())?;
+        let actual = relay.lock().await.get_relay_info().await.map_err(|e| e.to_string())?;
+        if actual.relay_vk != expected.relay_vk {
+            return Err(format!("the relay at {relay_url} is not the relay this invite was issued by"));
         }
     }
 
-    // Refresh the invite payload with fresh GroupInfo for the next joiner
-    let updated_payload = {
-        let client = state.client.lock().await;
-        client
-            .refresh_invite_payload(&server_id)
-            .map_err(|e| e.to_string())?
-    };
-
-    let refresh_path = format!("/invite/{}/join", token);
-    let resp = sign_request(&state, "POST", &refresh_path, state.http
-        .post(format!("{}{}", relay_url, refresh_path))
-        .header(SEQ_HEADER, seq.to_string())
-        .body(updated_payload))
-        .send()
+    let server_id = flows::invite::join(&state.client, &state.relay, relay, &token, now_millis())
         .await
-        .map_err(|e| format!("refresh invite: {e}"))?;
-
-    if !resp.status().is_success() && resp.status() != reqwest::StatusCode::CONFLICT {
-        return Err(format!("refresh invite: HTTP {}", resp.status()));
-    }
-
-    // Upload fresh GroupInfo so other members can recover via external commit
-    {
-        let client = state.client.lock().await;
-        for (_ch_id, _commit, mailbox_id) in &channel_results {
-            if let Ok(gi) = client.export_server_info(&server_id) {
-                let relay = state.relay.lock().await;
-                let _ = relay.put_server_info(mailbox_id, gi).await;
-            }
-        }
-    }
-
-    // Subscribe from the commit seq so we don't replay stale messages
-    let announce = {
-        let mut client = state.client.lock().await;
-        let _ = client.store().set_last_seen_seq(&default_mailbox_id, last_commit_seq);
-        let name = client.identity().display_name.clone();
-        match client.send_control(&server_id, encode_member_announce(&name)) {
-            Ok(out) => Some(out),
-            Err(e) => {
-                eprintln!("send_control failed: {e}");
-                None
-            }
-        }
-    };
-    {
-        let mut relay = state.relay.lock().await;
-        relay.subscribe(default_mailbox_id, last_commit_seq);
-        if let Some(outbound) = announce {
-            let _ = relay.send(&outbound.mailbox_id, outbound.blob).await;
-        }
-    }
-
-    // Cache identity logs for all group members so credential validation works
-    {
-        let member_fps = {
-            let c = state.client.lock().await;
-            c.all_member_fingerprints()
-        };
-        for fp in &member_fps {
-            cache_member_idlog_from_state(&state, fp).await;
-        }
-    }
-
-    // Notify linked devices
-    {
-        let client = state.client.lock().await;
-        if let Ok(payload) = client.export_provision_payload(&server_id) {
-            drop(client);
-            post_sync_message(&state, ghost_core::wire::SyncMessageType::ServerProvisioned as u8, &payload.to_bytes()).await;
-        }
-    }
-
-    sync_server_entry(&state, &server_id).await;
+        .map_err(|e| e.to_string())?;
 
     let client = state.client.lock().await;
     let server = client
@@ -858,7 +551,7 @@ pub async fn set_display_name(
     }
     drop(relay);
 
-    sync_set_and_push(&state, SYNC_KEY_DISPLAY_NAME, name.as_bytes()).await;
+    flows::sync::set_and_push(&state.client, &state.relay, SYNC_KEY_DISPLAY_NAME, name.as_bytes()).await;
     let _ = app.emit("display-name-sync", ());
     Ok(())
 }
@@ -1015,19 +708,22 @@ pub async fn join_voice(
     deafened: bool,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let fingerprint = {
+    // Voice runs on the relay hosting the server, which may not be the home relay.
+    let (fingerprint, hosting_relay_url) = {
         let client = state.client.lock().await;
-        hex::encode(client.fingerprint())
+        let server = parse_id(&server_id)?;
+        (hex::encode(client.fingerprint()), flows::server_relay_url(&client, &server))
     };
     let default_relay_url = state.relay_url.lock().await.clone();
     let (relay_url, input_device, output_device, ns_mode, agc_mode, vad_threshold, input_gain, input_mode) = {
         let cfg = state.config.lock().await;
-        let url = cfg
-            .relay_url
-            .as_deref()
-            .filter(|u| !u.is_empty())
-            .map(String::from)
-            .unwrap_or(default_relay_url);
+        let url = hosting_relay_url.unwrap_or_else(|| {
+            cfg.relay_url
+                .as_deref()
+                .filter(|u| !u.is_empty())
+                .map(String::from)
+                .unwrap_or(default_relay_url)
+        });
         let vad = cfg.vad_threshold.unwrap_or(crate::constants::VAD_THRESHOLD);
         let gain = cfg.input_gain.unwrap_or(1.0);
         let mode = if cfg.input_mode.as_deref() == Some("push_to_talk") {
@@ -1039,7 +735,7 @@ pub async fn join_voice(
     };
     // Notify linked devices to leave voice on this channel
     let channel_id_bytes = parse_id(&channel_id)?;
-    post_sync_message(&state, ghost_core::wire::SyncMessageType::VoiceTakeover as u8, &channel_id_bytes).await;
+    flows::sync::post_message(&state.client, &state.relay, SyncMessageType::VoiceTakeover, &channel_id_bytes).await;
 
     state
         .voice
@@ -1188,7 +884,7 @@ pub async fn set_noise_suppression(
     drop(cfg);
     state.voice.cmd_tx.send(VoiceCommand::SetNoiseSuppression(ns as u8)).await
         .map_err(|_| "voice task not running".to_string())?;
-    sync_set_and_push(&state, SYNC_KEY_NOISE_SUPPRESSION, mode.as_bytes()).await;
+    flows::sync::set_and_push(&state.client, &state.relay, SYNC_KEY_NOISE_SUPPRESSION, mode.as_bytes()).await;
     Ok(())
 }
 
@@ -1209,7 +905,7 @@ pub async fn set_agc(
     drop(cfg);
     state.voice.cmd_tx.send(VoiceCommand::SetAgc(agc as u8)).await
         .map_err(|_| "voice task not running".to_string())?;
-    sync_set_and_push(&state, SYNC_KEY_AGC, mode.as_bytes()).await;
+    flows::sync::set_and_push(&state.client, &state.relay, SYNC_KEY_AGC, mode.as_bytes()).await;
     Ok(())
 }
 
@@ -1230,7 +926,7 @@ pub async fn set_input_mode(
     cfg.save(&state.config_path)?;
     drop(cfg);
     let _ = state.voice.cmd_tx.send(VoiceCommand::SetInputMode(mode_u8)).await;
-    sync_set_and_push(&state, SYNC_KEY_INPUT_MODE, mode.as_bytes()).await;
+    flows::sync::set_and_push(&state.client, &state.relay, SYNC_KEY_INPUT_MODE, mode.as_bytes()).await;
     Ok(())
 }
 
@@ -1327,7 +1023,7 @@ pub async fn set_status(status: String, state: State<'_, AppState>) -> Result<()
         cfg.status = Some(status.clone());
         let _ = cfg.save(&state.config_path);
         drop(cfg);
-        sync_set_and_push(&state, SYNC_KEY_STATUS, status.as_bytes()).await;
+        flows::sync::set_and_push(&state.client, &state.relay, SYNC_KEY_STATUS, status.as_bytes()).await;
     }
     Ok(())
 }
@@ -1354,9 +1050,9 @@ pub async fn set_status_message(
     drop(cfg);
 
     if let Some(ref msg) = message {
-        sync_set_and_push(&state, SYNC_KEY_STATUS_MESSAGE, msg.as_bytes()).await;
+        flows::sync::set_and_push(&state.client, &state.relay, SYNC_KEY_STATUS_MESSAGE, msg.as_bytes()).await;
     } else {
-        sync_remove_and_push(&state, SYNC_KEY_STATUS_MESSAGE).await;
+        flows::sync::remove_and_push(&state.client, &state.relay, SYNC_KEY_STATUS_MESSAGE).await;
     }
     Ok(())
 }
@@ -1365,11 +1061,13 @@ pub async fn set_status_message(
 
 #[tauri::command]
 pub async fn get_devices(state: State<'_, AppState>) -> Result<Vec<DeviceDto>, String> {
-    let (account_fp, own_device_vk) = {
+    let own_device_vk = {
         let client = state.client.lock().await;
-        (*client.fingerprint(), client.identity().verifying_key.to_bytes())
+        client.identity().verifying_key.to_bytes()
     };
-    let log_state = fetch_and_verify_idlog(&state, &account_fp).await?;
+    let log_state = flows::devices::list(&state.client, &state.relay)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(log_state
         .devices
         .values()
@@ -1383,882 +1081,169 @@ pub async fn get_devices(state: State<'_, AppState>) -> Result<Vec<DeviceDto>, S
         .collect())
 }
 
+/// Revoke a device. Returns false when the device is out of every group but the home
+/// relay was unreachable, so the identity log entry still has to be retried.
 #[tauri::command]
 pub async fn revoke_device(
     device_key_hex: String,
     state: State<'_, AppState>,
-) -> Result<(), String> {
-    use ghost_core::identity::log::create_revoke_device;
-
+) -> Result<bool, String> {
     let target_key = parse_id(&device_key_hex)?;
-
-    let (account_fp, signing_key_bytes, own_device_vk) = {
-        let client = state.client.lock().await;
-        (
-            *client.fingerprint(),
-            client.identity().signing_key.to_bytes(),
-            client.identity().verifying_key.to_bytes(),
-        )
-    };
-    if target_key == own_device_vk {
-        return Err("cannot revoke current device".into());
-    }
-    let device_signing_key = ed25519_dalek::SigningKey::from_bytes(&signing_key_bytes);
-
-    let log_state = fetch_and_verify_idlog(&state, &account_fp).await?;
-
-    let revoke_entry = create_revoke_device(&log_state, &device_signing_key, &target_key);
-    let payload = revoke_entry.to_bytes();
-
-    {
-        let relay = state.relay.lock().await;
-        relay.put_idlog_entry(&account_fp, payload).await.map_err(|e| e.to_string())?;
-    }
-
-    // Remove from sync MLS group (forward secrecy — revoked device can't decrypt future sync)
-    let sync_removal = {
-        let mut client = state.client.lock().await;
-        if client.has_sync_group() {
-            let mb = client.sync_mailbox_id();
-            match client.remove_device_from_sync_group(&target_key) {
-                Ok(blob) => mb.map(|m| (m, blob)),
-                Err(e) => {
-                    eprintln!("revoke: failed to remove from sync group: {e}");
-                    None
-                }
-            }
-        } else {
-            None
-        }
-    };
-    if let Some((sync_mb, commit_blob)) = sync_removal {
-        let post_result = {
-            let relay = state.relay.lock().await;
-            relay.post_blob(&sync_mb, commit_blob).await
-        };
-        let sync_removal_ok = match post_result {
-            Ok(_) => {
-                let mut client = state.client.lock().await;
-                let _ = client.merge_pending_commit_for_sync();
-                true
-            }
-            Err(e) => {
-                eprintln!("revoke: sync group POST failed: {e}");
-                let mut client = state.client.lock().await;
-                let _ = client.clear_pending_commit_for_sync();
-                false
-            }
-        };
-
-        // Rotate sync key: send the new key encrypted with the OLD key, then store it.
-        // Order matters — send_sync uses sync_seal(current key), so we must send before storing.
-        if sync_removal_ok {
-            let new_key = {
-                let mut k = [0u8; 32];
-                rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut k);
-                k
-            };
-            crate::sync_utils::post_sync_message(
-                &state.client,
-                &state.relay,
-                ghost_core::wire::SyncMessageType::SyncKeyRotate as u8,
-                &new_key,
-            ).await;
-            {
-                let c = state.client.lock().await;
-                let _ = c.set_sync_key(new_key);
-            }
-            crate::sync_utils::push_sync_snapshot(&state.client, &state.relay).await;
-        }
-    }
-
-    // Remove leaves via HTTP so we detect epoch conflicts
-    let outbound = {
-        let mut client = state.client.lock().await;
-        client.revoke_device_leaves(&target_key)
-    };
-    for out in outbound {
-        let post_result = {
-            let relay = state.relay.lock().await;
-            relay.post_blob(&out.mailbox_id, out.blob).await
-        };
-        match post_result {
-            Ok(_) => {
-                let mut client = state.client.lock().await;
-                let _ = client.merge_pending_commit_for_channel(&out.channel_id);
-                if let Some(sid) = client.server_id_for_mailbox(&out.mailbox_id) {
-                    if let Ok(gi) = client.export_server_info(&sid) {
-                        let relay = state.relay.lock().await;
-                        let _ = relay.put_server_info(&out.mailbox_id, gi).await;
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("revoke: relay rejected commit for channel {}: {e}, retrying", hex::encode(&out.channel_id[..8]));
-                {
-                    let mut client = state.client.lock().await;
-                    let _ = client.clear_pending_commit_for_channel(&out.channel_id);
-                }
-
-                // Retry: recover epoch then re-create and post removal commit
-                match recover_epoch(&state.client, &state.relay, &out.channel_id, &out.mailbox_id, "revoke-retry").await {
-                    Ok(true) => {
-                        let retry_blob = {
-                            let mut client = state.client.lock().await;
-                            let leaf_indices: Vec<_> = client.find_device_leaves(&out.channel_id, &target_key);
-                            if leaf_indices.is_empty() {
-                                continue;
-                            }
-                            match client.remove_channel_members(&out.channel_id, &leaf_indices) {
-                                Ok(blob) => blob,
-                                Err(e) => {
-                                    eprintln!("revoke: retry remove_members failed: {e}");
-                                    continue;
-                                }
-                            }
-                        };
-                        let post_result = {
-                            let relay = state.relay.lock().await;
-                            relay.post_blob(&out.mailbox_id, retry_blob).await
-                        };
-                        match post_result {
-                            Ok(_) => {
-                                let mut client = state.client.lock().await;
-                                let _ = client.merge_pending_commit_for_channel(&out.channel_id);
-                                if let Some(sid) = client.server_id_for_mailbox(&out.mailbox_id) {
-                                    if let Ok(gi) = client.export_server_info(&sid) {
-                                        let relay = state.relay.lock().await;
-                                        let _ = relay.put_server_info(&out.mailbox_id, gi).await;
-                                    }
-                                }
-                            }
-                            Err(e2) => {
-                                eprintln!("revoke: retry also failed for channel {}: {e2}", hex::encode(&out.channel_id[..8]));
-                                let mut client = state.client.lock().await;
-                                let _ = client.clear_pending_commit_for_channel(&out.channel_id);
-                            }
-                        }
-                    }
-                    Ok(false) | Err(_) => {
-                        eprintln!("revoke: epoch recovery failed for channel {}", hex::encode(&out.channel_id[..8]));
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(())
+    let outcome = flows::devices::revoke(&state.client, &state.relay, &target_key)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(outcome == flows::devices::RevokeOutcome::Complete)
 }
 
 // ── Device pairing ──────────────────────────────────────────────────
 
-fn pairing_seal(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, String> {
-    use aes_gcm::aead::{Aead, AeadCore, OsRng};
-    use aes_gcm::{Aes256Gcm, KeyInit};
-    let cipher = Aes256Gcm::new(key.into());
-    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
-    let ct = cipher.encrypt(&nonce, plaintext)
-        .map_err(|e| format!("pairing seal: {e}"))?;
-    let mut blob = Vec::with_capacity(12 + ct.len());
-    blob.extend_from_slice(&nonce);
-    blob.extend_from_slice(&ct);
-    Ok(blob)
-}
-
-fn pairing_open(key: &[u8; 32], blob: &[u8]) -> Result<Vec<u8>, String> {
-    use aes_gcm::aead::Aead;
-    use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
-    if blob.len() < 12 {
-        return Err("pairing blob too short".into());
-    }
-    let nonce = Nonce::from_slice(&blob[..12]);
-    let cipher = Aes256Gcm::new(key.into());
-    cipher.decrypt(nonce, &blob[12..])
-        .map_err(|e| format!("pairing open: {e}"))
-}
-
-/// Join a single server via external commit with retries.
-/// Posts commits via HTTP (relay WS may not be connected yet), subscribes, uploads
-/// GroupInfo, and announces membership. Returns true on success.
-async fn rejoin_server(
-    state: &AppState,
-    relay_url: &str,
-    payload: &ghost_core::wire::ProvisionPayload,
-    now: u64,
-    label: &str,
-) -> bool {
-    let mailbox_b64 = base64::Engine::encode(
-        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
-        &payload.mailbox_id,
-    );
-
-    for _ in 0..MAX_REJOIN_ATTEMPTS {
-        let si_path = format!("/box/{}/server_info", mailbox_b64);
-        let gi_resp = sign_request(state, "GET", &si_path, state.http
-            .get(format!("{}{}", relay_url, si_path)))
-            .send()
-            .await;
-        let gi_bytes = match gi_resp {
-            Ok(r) if r.status().is_success() => match r.bytes().await {
-                Ok(b) => b,
-                Err(_) => continue,
-            },
-            Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => break,
-            Ok(r) if r.status().is_server_error() => continue,
-            Ok(_) => break,
-            Err(_) => continue,
-        };
-
-        let result = {
-            let mut client = state.client.lock().await;
-            client.join_from_provision(payload, &gi_bytes, now)
-        };
-
-        match result {
-            Ok(channel_results) => {
-                // Post commits for all channel groups
-                let mut _last_commit_seq = 0u64;
-                for (_ch_id, commit, mailbox_id) in &channel_results {
-                    let box_b64 = base64::Engine::encode(
-                        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
-                        mailbox_id,
-                    );
-                    let box_path = format!("/box/{}", box_b64);
-                    let resp = sign_request(state, "POST", &box_path, state.http
-                        .post(format!("{}{}", relay_url, box_path))
-                        .body(commit.clone()))
-                        .send()
-                        .await;
-                    let commit_seq = match resp {
-                        Ok(r) if r.status().is_success() => {
-                            r.json::<serde_json::Value>().await
-                                .ok()
-                                .and_then(|v| v["seq"].as_u64())
-                                .unwrap_or(0)
-                        }
-                        Ok(r) => {
-                            eprintln!("{label}: relay rejected commit (status {})", r.status());
-                            continue;
-                        }
-                        Err(e) => {
-                            eprintln!("{label}: failed to post commit: {e}");
-                            continue;
-                        }
-                    };
-                    {
-                        let client = state.client.lock().await;
-                        let _ = client.store().set_last_seen_seq(mailbox_id, commit_seq);
-                    }
-                    {
-                        let mut relay = state.relay.lock().await;
-                        relay.subscribe(*mailbox_id, commit_seq);
-                    }
-                    _last_commit_seq = commit_seq;
-                }
-
-                // Upload GroupInfo so future joiners see the updated epoch
-                {
-                    let client = state.client.lock().await;
-                    if let Ok(gi) = client.export_server_info(&payload.server_id) {
-                        drop(client);
-                        let si_put_path = format!("/box/{}/server_info", mailbox_b64);
-                        let _ = sign_request(state, "PUT", &si_put_path, state.http
-                            .put(format!("{}{}", relay_url, si_put_path))
-                            .body(gi))
-                            .send()
-                            .await;
-                    }
-                }
-
-                let announce_result = {
-                    let mut client = state.client.lock().await;
-                    let name = client.identity().display_name.clone();
-                    client.send_control(
-                        &payload.server_id,
-                        ghost_core::wire::encode_member_announce(&name),
-                    )
-                };
-                if let Ok(outbound) = announce_result {
-                    let ann_path = format!("/box/{}", mailbox_b64);
-                    let _ = sign_request(state, "POST", &ann_path, state.http
-                        .post(format!("{}{}", relay_url, ann_path))
-                        .body(outbound.blob))
-                        .send()
-                        .await;
-                }
-
-                // Cache identity logs for all group members (warm the AS cache)
-                let member_fps = {
-                    let client = state.client.lock().await;
-                    client.mls_member_fingerprints(&payload.server_id).unwrap_or_default()
-                };
-                for fp in &member_fps {
-                    let _ = fetch_and_verify_idlog(state, fp).await;
-                }
-
-                return true;
-            }
-            Err(e) => {
-                eprintln!("{label}: join attempt failed for {}: {e}", hex::encode(&payload.server_id[..8]));
-                continue;
-            }
-        }
-    }
-
-    eprintln!("{label}: failed to join server {} after retries", hex::encode(&payload.server_id[..8]));
-    false
-}
-
-/// Parse and join all servers from a provision blob.
-async fn consume_provision(
-    state: &AppState,
-    relay_url: &str,
-    plaintext: &[u8],
-) -> Result<(), String> {
-    use ghost_core::wire::ProvisionPayload;
-
-    // Parse: [sync_key:32][gi_len:u32][group_info][count:u16][len:u32 + payload]...[sync_dump]
-    if plaintext.len() < 38 {
-        return Err("provision blob too short".into());
-    }
-
-    let sync_key: [u8; 32] = plaintext[..32].try_into().unwrap();
-    let gi_len = u32::from_be_bytes(plaintext[32..36].try_into().unwrap()) as usize;
-    if plaintext.len() < 36 + gi_len + 2 {
-        return Err("provision blob truncated (group info)".into());
-    }
-    let gi_bytes = &plaintext[36..36 + gi_len];
-    let count = u16::from_be_bytes(plaintext[36 + gi_len..38 + gi_len].try_into().unwrap()) as usize;
-
-    let mut pos = 38 + gi_len;
-    let mut payloads = Vec::with_capacity(count);
-    for _ in 0..count {
-        if pos + 4 > plaintext.len() {
-            return Err("provision blob truncated".into());
-        }
-        let len = u32::from_be_bytes(plaintext[pos..pos + 4].try_into().unwrap()) as usize;
-        pos += 4;
-        if pos + len > plaintext.len() {
-            return Err("provision payload truncated".into());
-        }
-        payloads.push(&plaintext[pos..pos + len]);
-        pos += len;
-    }
-
-    // Store sync_key (used for durable snapshot encryption)
-    {
-        let client = state.client.lock().await;
-        client.set_sync_key(sync_key).map_err(|e| e.to_string())?;
-    }
-
-    // Join sync MLS group via external commit
-    let (sync_commit, sync_mb) = {
-        let mut client = state.client.lock().await;
-        client.join_sync_group(gi_bytes).map_err(|e| format!("join sync group: {e}"))?
-    };
-    let sync_commit_seq = {
-        let relay = state.relay.lock().await;
-        match relay.post_blob(&sync_mb, sync_commit).await {
-            Ok(res) => res.seq,
-            Err(e) => {
-                eprintln!("provision: failed to post sync group commit: {e}");
-                0
-            }
-        }
-    };
-
-    // Subscribe from the commit seq so we don't replay old-epoch messages
-    {
-        let client = state.client.lock().await;
-        let _ = client.store().set_last_seen_seq(&sync_mb, sync_commit_seq);
-        let mut relay = state.relay.lock().await;
-        relay.subscribe(sync_mb, sync_commit_seq);
-    }
-
-    let now = now_millis();
-
-    for payload_bytes in payloads {
-        let payload = ProvisionPayload::from_bytes(payload_bytes).map_err(|e| e.to_string())?;
-        if rejoin_server(state, relay_url, &payload, now, "provision").await {
-            sync_server_entry(state, &payload.server_id).await;
-        }
-    }
-
-    // Import sync state if present
-    if pos < plaintext.len() {
-        if let Ok(sync_entries) = ghost_core::wire::decode_sync_state_dump(&plaintext[pos..]) {
-            let settings = crate::sync_utils::parse_sync_entries(&sync_entries);
-            let client = state.client.lock().await;
-            let _ = client.sync_import(&sync_entries);
-            for (cid, read_ts) in &settings.read_marks {
-                let _ = client.store().mark_channel_read(cid, *read_ts);
-            }
-            drop(client);
-            let mut cfg = state.config.lock().await;
-            crate::sync_utils::apply_sync_to_config(&settings, &mut cfg, &state.config_path);
-        }
-    }
-
-    Ok(())
-}
-
-/// Start pairing: generate secret, post offer, return pairing code.
+/// Start pairing: post a sealed offer and return the code the new device scans.
 #[tauri::command]
 pub async fn start_pairing(state: State<'_, AppState>) -> Result<String, String> {
-    let mut secret = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut secret);
-
     let relay_url = state.relay_url.lock().await.clone();
-
-    // Offer payload: JSON with account config the new device needs
     let (display_name, status_message) = {
         let cfg = state.config.lock().await;
         (cfg.display_name.clone().unwrap_or_default(), cfg.status_message.clone())
     };
-    let avatar_hash_hex = {
+    let avatar_hash = {
         let p = state.presence.lock().await;
         p.avatar_hash.map(hex::encode)
     };
-    let offer_json = serde_json::json!({
-        "relay_url": relay_url,
-        "display_name": display_name,
-        "avatar_hash": avatar_hash_hex,
-        "status_message": status_message,
-    });
-    let offer_plaintext = serde_json::to_vec(&offer_json).map_err(|e| e.to_string())?;
-    let offer_blob = pairing_seal(&secret, &offer_plaintext)?;
+    let offer = PairingOffer { relay_url, display_name, avatar_hash, status_message };
 
-    let account_fp = {
-        let client = state.client.lock().await;
-        *client.fingerprint()
-    };
-
-    let relay = state.relay.lock().await;
-    relay.post_pairing_offer(&account_fp, offer_blob)
+    let code = flows::pairing::start(&state.client, &state.relay, &offer)
         .await
         .map_err(|e| e.to_string())?;
-
-    let code = format!(
-        "{}#{}#{}",
-        relay_url,
-        hex::encode(account_fp),
-        hex::encode(secret),
-    );
-    *state.pairing_secret.lock().await = Some(zeroize::Zeroizing::new(secret));
-    Ok(code)
+    let encoded = code.encode();
+    *state.pairing_code.lock().await = Some(code);
+    Ok(encoded)
 }
 
-/// Poll for pairing response. Returns the new device label if complete, None if still waiting.
+/// Poll for the new device's response. Returns its label once linked, `None` while waiting.
 #[tauri::command]
 pub async fn check_pairing(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<Option<String>, String> {
-    use ghost_core::identity::log::create_add_device;
-
-    let secret = {
-        let guard = state.pairing_secret.lock().await;
-        match guard.as_deref() {
-            Some(s) => *s,
-            None => return Err("no active pairing session".into()),
-        }
-    };
-
-    let account_fp = {
-        let client = state.client.lock().await;
-        *client.fingerprint()
-    };
-
-    let response_blob = {
-        let relay = state.relay.lock().await;
-        relay.get_pairing_response(&account_fp)
-            .await
-            .map_err(|e| e.to_string())?
-    };
-
-    let response_blob = match response_blob {
-        Some(b) => b,
-        None => return Ok(None),
-    };
-
-    // Decrypt response: [signing_key:32][label_bytes...]
-    let plaintext = pairing_open(&secret, &response_blob)?;
-    if plaintext.len() < 33 {
-        return Err("pairing response too short".into());
-    }
-    let new_sk_bytes: [u8; 32] = plaintext[..32].try_into().unwrap();
-    let new_device_label = String::from_utf8(plaintext[32..].to_vec())
-        .map_err(|_| "invalid label in pairing response")?;
-
-    let new_device_key = ed25519_dalek::SigningKey::from_bytes(&new_sk_bytes);
-
-    // Fetch current identity log with KT proof verification
-    let log_state = match fetch_and_verify_idlog(&state, &account_fp).await {
-        Ok(ls) => ls,
-        Err(_) => {
-            // Identity log may be empty if relay was restarted — re-push genesis
-            let genesis_path = state.config_path.parent()
-                .unwrap_or(&state.config_path)
-                .join("genesis.pending");
-            if let Ok(payload) = std::fs::read(&genesis_path) {
-                let relay = state.relay.lock().await;
-                relay.put_idlog_entry(&account_fp, payload).await
-                    .map_err(|e| format!("re-push genesis: {e}"))?;
-            } else {
-                return Err("identity log empty on relay and no local genesis available".into());
-            }
-            fetch_and_verify_idlog(&state, &account_fp).await?
-        }
-    };
-
-    // Build provision blob BEFORE pushing AddDevice — device B starts
-    // fetching provision as soon as it sees AddDevice in the identity log.
-    let provision_blob = {
-        let mut client = state.client.lock().await;
-
-        let sync_key = client.sync_key()
-            .ok_or_else(|| "sync_key not set — account may not be initialized".to_string())?;
-
-        // Create sync group on first pairing if it doesn't exist yet
-        if !client.has_sync_group() {
-            client.create_sync_group()
-                .map_err(|e| format!("create sync group: {e}"))?;
-        }
-
-        let gi_bytes = client.sync_group_info()
-            .map_err(|e| format!("sync group info: {e}"))?;
-
-        // Export each server's metadata
-        let server_mailboxes = client.server_mailboxes();
-        let mut payloads: Vec<Vec<u8>> = Vec::new();
-        for (sid, _) in &server_mailboxes {
-            if let Ok(pp) = client.export_provision_payload(sid) {
-                payloads.push(pp.to_bytes());
-            }
-        }
-
-        // Compute delegation for the new device
-        let new_device_idlog_seq = log_state.head_seq + 1;
-        let prov_master_vk = client.identity().master_vk;
-        let prov_master_sk_bytes = client.identity().master_sk.to_bytes();
-        let prov_delegation_sig = ghost_core::identity::compute_delegation_sig(
-            &client.identity().master_sk,
-            new_device_key.verifying_key().as_bytes(),
-            &account_fp,
-            new_device_idlog_seq,
-        );
-
-        // Serialize: [master_sk:32][master_vk:32][delegation_sig:64][sync_key:32][gi_len:u32]...
-        let mut provision_pt = Vec::new();
-        provision_pt.extend_from_slice(&prov_master_sk_bytes);
-        provision_pt.extend_from_slice(&prov_master_vk);
-        provision_pt.extend_from_slice(&prov_delegation_sig);
-        provision_pt.extend_from_slice(&sync_key);
-        provision_pt.extend_from_slice(&(gi_bytes.len() as u32).to_be_bytes());
-        provision_pt.extend_from_slice(&gi_bytes);
-        provision_pt.extend_from_slice(&(payloads.len() as u16).to_be_bytes());
-        for p in &payloads {
-            provision_pt.extend_from_slice(&(p.len() as u32).to_be_bytes());
-            provision_pt.extend_from_slice(p);
-        }
-
-        // Append sync_state dump
-        let sync_entries = client.sync_dump().unwrap_or_default();
-        provision_pt.extend_from_slice(&ghost_core::wire::encode_sync_state_dump(&sync_entries)
-            .map_err(|e| e.to_string())?);
-
-        pairing_seal(&secret, &provision_pt)?
-    };
-
-    // PUT provision to relay first
-    let relay_url = state.relay_url.lock().await.clone();
-    let fp_hex = hex::encode(account_fp);
-    let prov_path = format!("/pair/{}/provision", fp_hex);
-    sign_request(&state, "PUT", &prov_path, state.http
-        .put(format!("{}{}", relay_url, prov_path))
-        .body(provision_blob))
-        .send()
+    let code = state
+        .pairing_code
+        .lock()
         .await
-        .map_err(|e| format!("put provision: {e}"))?
-        .error_for_status()
-        .map_err(|e| format!("put provision: {e}"))?;
+        .clone()
+        .ok_or_else(|| "no active pairing session".to_string())?;
 
-    // Create AddDevice entry (dual-signed) and push AFTER provision is uploaded
-    let authorizer_key = {
-        let client = state.client.lock().await;
-        ed25519_dalek::SigningKey::from_bytes(&client.identity().signing_key.to_bytes())
-    };
-    let add_entry = create_add_device(&log_state, &authorizer_key, &new_device_key, &new_device_label);
-    let payload = add_entry.to_bytes();
+    // genesis.pending lets the flow re-push the account's genesis if the relay lost its log.
+    let genesis = std::fs::read(crate::setup::genesis_pending_path()).ok();
+    // Pairing runs on the home relay, so it is also the rendezvous.
+    let linked = flows::pairing::check(&state.client, &state.relay, &state.relay, &code, genesis.as_deref())
+        .await
+        .map_err(|e| e.to_string())?;
+    let Some(label) = linked else { return Ok(None) };
 
-    {
-        let relay = state.relay.lock().await;
-        relay.put_idlog_entry(&account_fp, payload).await.map_err(|e| e.to_string())?;
-    }
-
-    // Restart relay task so the sync mailbox is captured in its event loop.
-    // The relay task starts before pairing, so sync_mb = None in the current loop.
-    // Restarting ensures the new loop sees sync_mailbox_id() = Some(...) and can
-    // process incoming sync messages (including Device B's external commit).
+    // Restart the relay task so the sync mailbox created during pairing is part of its loop.
     let relay_url = state.relay_url.lock().await.clone();
     let new_inbox_rx = replace_relay(&state, &relay_url).await;
-
-    // Zeroizing wrapper handles cleanup on drop
-    *state.pairing_secret.lock().await = None;
-
+    *state.pairing_code.lock().await = None;
     spawn_relay_task(app, &state, new_inbox_rx).await;
 
-    Ok(Some(new_device_label))
+    Ok(Some(label))
 }
 
 /// Cancel an active pairing session.
 #[tauri::command]
 pub async fn cancel_pairing(state: State<'_, AppState>) -> Result<(), String> {
-    *state.pairing_secret.lock().await = None;
+    *state.pairing_code.lock().await = None;
     Ok(())
 }
 
 // ── Join as new device ──────────────────────────────────────────────
 
-/// New-device side of pairing: parse code, fetch offer, post response, wait for
-/// confirmation, write credentials, hot-swap identity in place.
+/// New-device side of pairing: fetch the offer, hand over a fresh device key, wait for the
+/// identity log to list it, fetch the provision, then replace the local identity in place.
 #[tauri::command]
 pub async fn join_as_new_device(
     pairing_code: String,
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
-    use ghost_core::identity::log::{LogEntry, validate_chain};
-
-    // 1. Parse pairing code: relay_url#account_fp_hex#secret_hex
-    let parts: Vec<&str> = pairing_code.splitn(3, '#').collect();
-    if parts.len() != 3 {
-        return Err("invalid pairing code".into());
-    }
-    let relay_url = parts[0];
-    let account_fp_hex = parts[1];
-    let secret_hex = parts[2];
-
-    let account_fp: [u8; 32] = hex::decode(account_fp_hex)
-        .map_err(|e| format!("bad fingerprint: {e}"))?
-        .try_into()
-        .map_err(|_| "fingerprint must be 32 bytes")?;
-    let secret: [u8; 32] = hex::decode(secret_hex)
-        .map_err(|e| format!("bad secret: {e}"))?
-        .try_into()
-        .map_err(|_| "secret must be 32 bytes")?;
+    let code = PairingCode::parse(&pairing_code).map_err(|e| e.to_string())?;
 
     let _ = app.emit("link-status", "connecting to relay…");
+    // The new device has no identity on this relay yet, so the client is unauthenticated.
+    let (guest_relay, _unused_events) = RelayClient::new(&code.relay_url);
+    let offer = flows::pairing::fetch_offer(&guest_relay, &code).await.map_err(|e| e.to_string())?;
 
-    // 2. Fetch and decrypt the offer to get account config
-    let offer_blob = state
-        .http
-        .get(format!("{}/pair/{}", relay_url, account_fp_hex))
-        .send()
-        .await
-        .map_err(|e| format!("fetch offer: {e}"))?
-        .error_for_status()
-        .map_err(|e| format!("fetch offer: {e}"))?
-        .bytes()
-        .await
-        .map_err(|e| format!("read offer: {e}"))?;
-    let offer_pt = pairing_open(&secret, &offer_blob)?;
-    let offer: serde_json::Value = serde_json::from_slice(&offer_pt)
-        .map_err(|e| format!("parse offer: {e}"))?;
-    let display_name = offer["display_name"].as_str().unwrap_or("");
-    let offer_avatar_hash: Option<[u8; 32]> = offer["avatar_hash"]
-        .as_str()
-        .and_then(|h| hex::decode(h).ok())
-        .and_then(|b| b.try_into().ok());
-    let offer_status_message = offer["status_message"].as_str().map(String::from);
-
-    // 3. Generate new device key
-    let device_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-    let device_vk_bytes = device_key.verifying_key().to_bytes();
+    let device_key = SigningKey::generate(&mut rand::rngs::OsRng);
+    let device_vk = device_key.verifying_key().to_bytes();
     let label = crate::setup::device_label();
 
     let _ = app.emit("link-status", "sending device key…");
-
-    // 4. Encrypt and post response: [signing_key:32][label_bytes]
-    let mut response_pt = Vec::with_capacity(32 + label.len());
-    response_pt.extend_from_slice(&device_key.to_bytes());
-    response_pt.extend_from_slice(label.as_bytes());
-    let response_blob = pairing_seal(&secret, &response_pt)?;
-
-    state
-        .http
-        .post(format!("{}/pair/{}/respond", relay_url, account_fp_hex))
-        .body(response_blob)
-        .send()
-        .await
-        .map_err(|e| format!("post pairing response: {e}"))?
-        .error_for_status()
-        .map_err(|e| format!("post pairing response: {e}"))?;
+    flows::pairing::respond(&guest_relay, &code, &device_key, label).await.map_err(|e| e.to_string())?;
 
     let _ = app.emit("link-status", "waiting for other device…");
+    let log_state = flows::pairing::wait_for_device(
+        &guest_relay, &code.account_fp, &device_key, PAIRING_POLL_ATTEMPTS, PAIRING_POLL_INTERVAL,
+    ).await.map_err(|e| e.to_string())?;
 
-    // 5. Poll identity log until our device key appears
-    for _ in 0..PAIRING_POLL_ATTEMPTS {
-        tokio::time::sleep(PAIRING_POLL_INTERVAL).await;
+    let _ = app.emit("link-status", "syncing account…");
+    let blob = flows::pairing::fetch_provision(
+        &guest_relay, &code, MAX_PROVISION_FETCH_ATTEMPTS, PROVISION_FETCH_INTERVAL,
+    ).await.map_err(|e| e.to_string())?;
 
-        let resp = state
-            .http
-            .get(format!("{}/idlog/{}", relay_url, account_fp_hex))
-            .send()
-            .await
-            .map_err(|e| format!("fetch idlog: {e}"))?;
-        if !resp.status().is_success() {
-            continue;
+    // The pairing code may name any relay the account uses; the identity log names the home.
+    let home_url = log_state
+        .home_relay_ref
+        .as_ref()
+        .and_then(|r| r.primary_https_url())
+        .unwrap_or(&code.relay_url)
+        .to_string();
+
+    // From here on the steps are irreversible: credentials written, old databases removed.
+    let mut db_key = [0u8; 32];
+    let mut mls_db_key = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut db_key);
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut mls_db_key);
+    let idlog_seq = log_state.devices.get(&device_vk).map(|d| d.added_at_seq).unwrap_or(0);
+    write_linked_credentials(
+        &code.account_fp,
+        &device_key,
+        &db_key,
+        &mls_db_key,
+        idlog_seq,
+        &blob.master_vk,
+        &SigningKey::from_bytes(&blob.master_sk),
+        &blob.delegation_sig,
+    )?;
+    crate::setup::wipe_local_databases();
+
+    {
+        let mut cfg = state.config.lock().await;
+        if !offer.display_name.is_empty() {
+            cfg.display_name = Some(offer.display_name.clone());
         }
-
-        #[derive(serde::Deserialize)]
-        struct IdLogResponseEntry {
-            payload: String,
+        cfg.relay_url = Some(home_url.clone());
+        if let Some(ref sm) = offer.status_message {
+            cfg.status_message = Some(sm.clone());
         }
-        #[derive(serde::Deserialize)]
-        struct IdLogResponseBody {
-            entries: Vec<IdLogResponseEntry>,
-        }
-        let body: IdLogResponseBody = resp.json().await.map_err(|e| format!("parse idlog: {e}"))?;
-        let parsed: std::result::Result<Vec<LogEntry>, _> = body.entries
-            .iter()
-            .map(|e| {
-                let bytes = base64::Engine::decode(
-                    &base64::engine::general_purpose::STANDARD,
-                    &e.payload,
-                )
-                .map_err(|e| format!("base64: {e}"))?;
-                LogEntry::from_bytes(&bytes).map_err(|e| e.to_string())
-            })
-            .collect();
-
-        match &parsed {
-            Err(e) => eprintln!("pairing: idlog parse failed: {e}"),
-            Ok(entries) => {
-                match validate_chain(entries) {
-                    Err(e) => eprintln!("pairing: chain validation failed: {e}"),
-                    _ => {}
-                }
-            }
-        }
-        if let Ok(log_entries) = parsed {
-            if let Ok(log_state) = validate_chain(&log_entries) {
-                eprintln!("pairing: idlog has {} entries, {} devices, looking for {}",
-                    log_entries.len(), log_state.devices.len(), hex::encode(&device_vk_bytes[..8]));
-                if log_state.devices.contains_key(&device_vk_bytes) {
-                    let _ = app.emit("link-status", "syncing account…");
-
-                    // 6. Write credentials to disk/keyring for next launch
-                    let mut db_key = [0u8; 32];
-                    let mut mls_db_key = [0u8; 32];
-                    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut db_key);
-                    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut mls_db_key);
-
-                    let idlog_seq = log_state.devices.get(&device_vk_bytes)
-                        .map(|d| d.added_at_seq).unwrap_or(0);
-
-                    // Fetch provision blob to get master key material
-                    let provision_url = format!("{}/pair/{}/provision", relay_url, account_fp_hex);
-                    let mut raw_provision = None;
-                    for attempt in 0..MAX_PROVISION_FETCH_ATTEMPTS {
-                        if attempt > 0 {
-                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                        }
-                        match state.http.get(&provision_url).send().await {
-                            Ok(resp) if resp.status().is_success() => {
-                                match resp.bytes().await {
-                                    Ok(enc_blob) => match pairing_open(&secret, &enc_blob) {
-                                        Ok(pt) => { raw_provision = Some(pt); break; }
-                                        Err(e) => eprintln!("provision decrypt: {e}"),
-                                    }
-                                    Err(e) => eprintln!("provision read: {e}"),
-                                }
-                            }
-                            Ok(resp) => eprintln!("provision fetch: {}", resp.status()),
-                            Err(e) => eprintln!("provision fetch: {e}"),
-                        }
-                    }
-
-                    // Extract master key material from provision blob header
-                    let raw_provision = raw_provision
-                        .ok_or_else(|| "failed to fetch provision blob".to_string())?;
-                    if raw_provision.len() < 128 {
-                        return Err("provision blob too short for master key material".into());
-                    }
-                    let prov_master_sk_bytes: [u8; 32] = raw_provision[..32].try_into().unwrap();
-                    let prov_master_vk: [u8; 32] = raw_provision[32..64].try_into().unwrap();
-                    let prov_delegation_sig: [u8; 64] = raw_provision[64..128].try_into().unwrap();
-                    let prov_master_sk = ed25519_dalek::SigningKey::from_bytes(&prov_master_sk_bytes);
-
-                    write_linked_credentials(
-                        &account_fp,
-                        &device_key,
-                        &db_key,
-                        &mls_db_key,
-                        idlog_seq,
-                        &prov_master_vk,
-                        &prov_master_sk,
-                        &prov_delegation_sig,
-                    )?;
-
-                    // 7. Delete old DB files
-                    crate::setup::wipe_local_databases();
-
-                    // 8. Save config + set presence from offer
-                    let relay_url_owned = relay_url.to_string();
-                    {
-                        let mut cfg = state.config.lock().await;
-                        if !display_name.is_empty() {
-                            cfg.display_name = Some(display_name.to_string());
-                        }
-                        cfg.relay_url = Some(relay_url_owned.clone());
-                        if let Some(ref sm) = offer_status_message {
-                            cfg.status_message = Some(sm.clone());
-                        }
-                        cfg.save(&state.config_path)?;
-                    }
-                    {
-                        let mut p = state.presence.lock().await;
-                        p.avatar_hash = offer_avatar_hash;
-                    }
-
-                    // 9. Hot-swap: open new client with linked identity
-                    let new_identity = ghost_core::identity::Identity::from_device(
-                        account_fp,
-                        ed25519_dalek::SigningKey::from_bytes(&device_key.to_bytes()),
-                        idlog_seq,
-                        prov_master_vk,
-                        ed25519_dalek::SigningKey::from_bytes(&prov_master_sk_bytes),
-                        prov_delegation_sig,
-                    );
-                    let mut new_client = ghost_core::client::GhostClient::open(
-                        new_identity, db_key, mls_db_key, &crate::setup::db_path(),
-                    ).map_err(|e| format!("open new client: {e}"))?;
-                    if !display_name.is_empty() {
-                        new_client.set_display_name(display_name.to_string());
-                    }
-                    {
-                        let mut auth = state.auth.write().unwrap();
-                        auth.account_fp = *new_client.fingerprint();
-                        auth.device_vk = new_client.verifying_key_bytes();
-                        auth.signing_key = new_client.signing_key_clone();
-                    }
-                    *state.client.lock().await = new_client;
-
-                    // 10. Replace relay
-                    let new_inbox_rx = replace_relay(&state, &relay_url_owned).await;
-
-                    // 10b. Consume provision blob (skip 128-byte master key header)
-                    consume_provision(&state, relay_url, &raw_provision[128..]).await
-                        .map_err(|e| format!("provision sync failed: {e}"))?;
-
-                    // 11. Spawn relay task (subscribes to sync mailbox automatically)
-                    spawn_relay_task(app.clone(), &state, new_inbox_rx).await;
-
-                    return Ok(relay_url_owned);
-                }
-            }
-        }
+        cfg.save(&state.config_path)?;
+    }
+    {
+        let mut p = state.presence.lock().await;
+        p.avatar_hash = offer.avatar_hash_bytes();
     }
 
-    Err("timed out waiting for device to be added".into())
+    let identity = flows::pairing::linked_identity(code.account_fp, device_key, &log_state, &blob);
+    let mut new_client = GhostClient::open(identity, db_key, mls_db_key, &crate::setup::db_path())
+        .map_err(|e| format!("open new client: {e}"))?;
+    if !offer.display_name.is_empty() {
+        new_client.set_display_name(offer.display_name.clone());
+    }
+    let new_inbox_rx = install_identity(&state, new_client, &home_url).await;
+
+    let settings = flows::provision::consume(&state.client, &state.relay, &blob, now_millis())
+        .await
+        .map_err(|e| format!("provision sync failed: {e}"))?;
+    apply_restored_settings(&state, &settings, false).await;
+
+    spawn_relay_task(app, &state, new_inbox_rx).await;
+    Ok(home_url)
 }
 
 #[cfg(debug_assertions)]
@@ -2322,46 +1307,18 @@ pub async fn set_recovery_passphrase(
     passphrase: String,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
-    use ghost_core::identity::export::export_recovery_blob;
-
-    if passphrase.chars().count() < 12 {
-        return Err("passphrase must be at least 12 characters".into());
-    }
-
     let seed = state.recovery_seed.lock().await
         .take()
         .ok_or("recovery seed no longer available — already used or session expired")?;
 
-    let sync_key = {
-        let client = state.client.lock().await;
-        client.sync_key().ok_or("sync_key not set")?
-    };
-
-    let blob = match export_recovery_blob(&*seed, &sync_key, &passphrase) {
-        Ok(b) => b,
+    match flows::recovery::set_passphrase(&state.client, &state.relay, &seed, &passphrase).await {
+        Ok(code) => Ok(code.encode()),
         Err(e) => {
-            // Put seed back so user can retry
+            // Put the seed back so the user can retry
             *state.recovery_seed.lock().await = Some(seed);
-            return Err(e.to_string());
+            Err(e.to_string())
         }
-    };
-
-    let account_fp = {
-        let client = state.client.lock().await;
-        *client.fingerprint()
-    };
-    if let Err(e) = {
-        let relay = state.relay.lock().await;
-        relay.put_recovery_blob(&account_fp, blob).await
-    } {
-        // Put seed back so user can retry
-        *state.recovery_seed.lock().await = Some(seed);
-        return Err(e.to_string());
     }
-    // seed dropped here — Zeroizing handles cleanup
-
-    let relay_url = state.relay_url.lock().await.clone();
-    Ok(format!("{}#{}", relay_url, hex::encode(account_fp)))
 }
 
 #[tauri::command]
@@ -2377,7 +1334,7 @@ pub async fn get_recovery_code(state: State<'_, AppState>) -> Result<String, Str
         *client.fingerprint()
     };
     let relay_url = state.relay_url.lock().await.clone();
-    Ok(format!("{}#{}", relay_url, hex::encode(account_fp)))
+    Ok(RecoveryCode { relay_url, account_fp }.encode())
 }
 
 #[tauri::command]
@@ -2386,150 +1343,16 @@ pub async fn change_recovery_passphrase(
     new_passphrase: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    use ghost_core::identity::export::{import_recovery_blob, export_recovery_blob};
-
-    if new_passphrase.chars().count() < 12 {
-        return Err("new passphrase must be at least 12 characters".into());
-    }
-
-    let account_fp = {
-        let client = state.client.lock().await;
-        *client.fingerprint()
-    };
-
-    let blob = {
-        let relay = state.relay.lock().await;
-        relay.get_recovery_blob(&account_fp).await.map_err(|e| e.to_string())?
-            .ok_or("no recovery blob found")?
-    };
-
-    let recovered = import_recovery_blob(&blob, &current_passphrase).map_err(|e| e.to_string())?;
-    // If v1 blob (no sync_key), grab current sync_key for v2 re-export
-    let sync_key = match recovered.sync_key {
-        Some(k) => k,
-        None => {
-            let client = state.client.lock().await;
-            client.sync_key().ok_or("sync_key not set")?
-        }
-    };
-    let new_blob = export_recovery_blob(&recovered.seed, &sync_key, &new_passphrase)
-        .map_err(|e| e.to_string())?;
-    drop(recovered);
-
-    {
-        let relay = state.relay.lock().await;
-        relay.put_recovery_blob(&account_fp, new_blob).await.map_err(|e| e.to_string())?;
-    }
-    Ok(())
+    flows::recovery::change_passphrase(&state.client, &state.relay, &current_passphrase, &new_passphrase)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn has_recovery_blob(state: State<'_, AppState>) -> Result<bool, String> {
-    let account_fp = {
-        let client = state.client.lock().await;
-        *client.fingerprint()
-    };
-    let relay = state.relay.lock().await;
-    let blob = relay.get_recovery_blob(&account_fp).await.map_err(|e| e.to_string())?;
-    Ok(blob.is_some())
-}
-
-/// Fetch identity log from relay and validate the hash chain.
-async fn fetch_and_validate_idlog(
-    http: &reqwest::Client,
-    relay_url: &str,
-    fp_hex: &str,
-) -> Result<(Vec<ghost_core::identity::log::LogEntry>, ghost_core::identity::log::LogState), String> {
-    use ghost_core::identity::log::{LogEntry, validate_chain};
-
-    let entries: Vec<IdLogEntry> = http
-        .get(format!("{}/idlog/{}", relay_url, fp_hex))
-        .send().await.map_err(|e| format!("fetch idlog: {e}"))?
-        .error_for_status().map_err(|e| format!("fetch idlog: {e}"))?
-        .json().await.map_err(|e| format!("parse idlog: {e}"))?;
-
-    let log_entries: Vec<LogEntry> = entries.iter().map(|e| {
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(&e.payload).map_err(|e| format!("base64: {e}"))?;
-        LogEntry::from_bytes(&bytes).map_err(|e| e.to_string())
-    }).collect::<Result<Vec<_>, _>>()?;
-
-    let log_state = validate_chain(&log_entries).map_err(|e| e.to_string())?;
-    Ok((log_entries, log_state))
-}
-
-/// Rejoin all servers listed in sync state via external commits.
-async fn rejoin_servers_from_sync(
-    state: &AppState,
-    relay_url: &str,
-    server_entries: &[([u8; 32], ghost_core::wire::SyncServerMeta)],
-    now: u64,
-) {
-    for (server_id, meta) in server_entries {
-        let payload = ghost_core::wire::ProvisionPayload {
-            server_id: *server_id,
-            server_name: meta.server_name.clone(),
-            kind: meta.kind,
-            members: Vec::new(),
-            channels: meta.channels.clone(),
-            mailbox_id: meta.mailbox_id,
-        };
-        rejoin_server(state, relay_url, &payload, now, "recovery").await;
-    }
-}
-
-/// Remove revoked device leaves from all MLS groups, with deferred merge.
-async fn revoke_old_device_leaves(
-    state: &AppState,
-    relay_url: &str,
-    revoked_keys: &[[u8; 32]],
-) {
-    for revoked_vk in revoked_keys {
-        let outbound = {
-            let mut client = state.client.lock().await;
-            client.revoke_device_leaves(revoked_vk)
-        };
-        for out in outbound {
-            let mailbox_b64 = base64::Engine::encode(
-                &base64::engine::general_purpose::URL_SAFE_NO_PAD,
-                &out.mailbox_id,
-            );
-            let box_path = format!("/box/{}", mailbox_b64);
-            let post_result = sign_request(state, "POST", &box_path, state.http
-                .post(format!("{}{}", relay_url, box_path))
-                .body(out.blob))
-                .send()
-                .await;
-            match post_result {
-                Ok(r) if r.status().is_success() => {
-                    let mut client = state.client.lock().await;
-                    let _ = client.merge_pending_commit_for_channel(&out.channel_id);
-                    let sid = client.server_id_for_mailbox(&out.mailbox_id);
-                    if let Some(sid) = sid {
-                        if let Ok(gi) = client.export_server_info(&sid) {
-                            drop(client);
-                            let si_path = format!("/box/{}/server_info", mailbox_b64);
-                            let _ = sign_request(state, "PUT", &si_path, state.http
-                                .put(format!("{}{}", relay_url, si_path))
-                                .body(gi))
-                                .send()
-                                .await;
-                        }
-                    }
-                }
-                Ok(r) => {
-                    eprintln!("recovery: relay rejected revocation commit ({})", r.status());
-                    let mut client = state.client.lock().await;
-                    let _ = client.clear_pending_commit_for_channel(&out.channel_id);
-                }
-                Err(e) => {
-                    eprintln!("recovery: failed to post revocation commit: {e}");
-                    let mut client = state.client.lock().await;
-                    let _ = client.clear_pending_commit_for_channel(&out.channel_id);
-                }
-            }
-        }
-    }
+    flows::recovery::has_blob(&state.client, &state.relay)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -2540,222 +1363,60 @@ pub async fn recover_account(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
-    use ghost_core::identity::export::{import_recovery_blob, export_recovery_blob};
-    use ghost_core::identity::log::create_recovery;
-    use ghost_core::crypto::keys::derive_ed25519_seed;
-    use ghost_core::wire::{SyncServerMeta,
-        decode_sync_state_dump, encode_sync_state_dump, sync_open, sync_seal};
-
-    if new_passphrase.chars().count() < 12 {
-        return Err("new passphrase must be at least 12 characters".into());
+    if new_passphrase.chars().count() < flows::recovery::MIN_PASSPHRASE_CHARS {
+        return Err(format!("new passphrase must be at least {} characters", flows::recovery::MIN_PASSPHRASE_CHARS));
     }
+    let code = RecoveryCode::parse(&recovery_code).map_err(|e| e.to_string())?;
 
-    // 1. Parse recovery code: relay_url#fp_hex
-    let parts: Vec<&str> = recovery_code.splitn(2, '#').collect();
-    if parts.len() != 2 {
-        return Err("invalid recovery code".into());
-    }
-    let relay_url = parts[0];
-    let fp_hex = parts[1];
+    // No local identity for this account yet, so the relay client is unauthenticated.
+    let (guest_relay, _unused_events) = RelayClient::new(&code.relay_url);
+    let material = flows::recovery::begin(&guest_relay, code.account_fp, &passphrase, crate::setup::device_label())
+        .await
+        .map_err(|e| e.to_string())?;
 
-    let account_fp: [u8; 32] = hex::decode(fp_hex)
-        .map_err(|e| format!("bad fingerprint: {e}"))?
-        .try_into()
-        .map_err(|_| "fingerprint must be 32 bytes")?;
-
-    // 2. Fetch and decrypt recovery blob
-    let blob_bytes = state.http
-        .get(format!("{}/recovery/{}", relay_url, fp_hex))
-        .send().await.map_err(|e| format!("fetch recovery blob: {e}"))?
-        .error_for_status().map_err(|e| format!("fetch recovery blob: {e}"))?
-        .bytes().await.map_err(|e| format!("read recovery blob: {e}"))?;
-
-    let recovered = import_recovery_blob(&blob_bytes, &passphrase).map_err(|e| e.to_string())?;
-    let seed = zeroize::Zeroizing::new(recovered.seed);
-
-    // 3. Derive master key and verify fingerprint
-    let mut ed_bytes = derive_ed25519_seed(&seed).map_err(|e| e.to_string())?;
-    let master_key = ed25519_dalek::SigningKey::from_bytes(&ed_bytes);
-    zeroize::Zeroize::zeroize(&mut ed_bytes);
-    let expected_fp: [u8; 32] = blake3::hash(master_key.verifying_key().as_bytes()).into();
-    if expected_fp != account_fp {
-        let mut mk_bytes = master_key.to_bytes();
-        drop(master_key);
-        zeroize::Zeroize::zeroize(&mut mk_bytes);
-        return Err("recovery blob does not match this account".into());
-    }
-
-    // 4. Fetch and validate identity log
-    let (_log_entries, log_state) = fetch_and_validate_idlog(&state.http, relay_url, fp_hex).await?;
-
-    // 5. Generate new device key + Recovery entry
-    let new_device_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-    let label = crate::setup::device_label();
-    let recovery_entry = create_recovery(&log_state, &master_key, &new_device_key, label);
-    let entry_bytes = recovery_entry.to_bytes();
-    // Keep master_key alive — needed for delegation sig below
-
-    // 6. Push Recovery entry to relay
-    state.http
-        .put(format!("{}/idlog/{}", relay_url, fp_hex))
-        .body(entry_bytes)
-        .send().await.map_err(|e| format!("push recovery entry: {e}"))?
-        .error_for_status().map_err(|e| format!("push recovery entry: {e}"))?;
-
-    // 7. Write credentials for new device
+    // From here on the steps are irreversible: credentials written, old databases removed.
     let mut db_key = [0u8; 32];
     let mut mls_db_key = [0u8; 32];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut db_key);
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut mls_db_key);
-
-    let recovery_seq = log_state.head_seq + 1;
-    let rec_master_vk: [u8; 32] = master_key.verifying_key().to_bytes();
-    let rec_delegation_sig = ghost_core::identity::compute_delegation_sig(
-        &master_key, new_device_key.verifying_key().as_bytes(), &account_fp, recovery_seq,
-    );
     write_linked_credentials(
-        &account_fp, &new_device_key, &db_key, &mls_db_key, recovery_seq,
-        &rec_master_vk, &master_key, &rec_delegation_sig,
+        &code.account_fp,
+        material.device_key(),
+        &db_key,
+        &mls_db_key,
+        material.recovery_seq,
+        &material.master_key().verifying_key().to_bytes(),
+        material.master_key(),
+        &material.delegation_sig(),
     )?;
-
-    // 8. Delete old DB files
     crate::setup::wipe_local_databases();
 
-    // 9. Set sync_key: from v2 blob or generate random for v1
-    let sync_key = match recovered.sync_key {
-        Some(k) => k,
-        None => {
-            let mut k = [0u8; 32];
-            rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut k);
-            k
-        }
-    };
+    // v1 blobs carry no sync key; start a fresh one.
+    let sync_key = material.sync_key.unwrap_or_else(|| {
+        let mut k = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut k);
+        k
+    });
 
-    // 10. Hot-swap client
-    let master_vk: [u8; 32] = master_key.verifying_key().to_bytes();
-    let delegation_sig = ghost_core::identity::compute_delegation_sig(
-        &master_key, new_device_key.verifying_key().as_bytes(), &account_fp, recovery_seq,
-    );
-    let new_identity = ghost_core::identity::Identity::from_device(
-        account_fp,
-        ed25519_dalek::SigningKey::from_bytes(&new_device_key.to_bytes()),
-        recovery_seq,
-        master_vk,
-        master_key,
-        delegation_sig,
-    );
-    let mut new_client = ghost_core::client::GhostClient::open(
-        new_identity, db_key, mls_db_key, &crate::setup::db_path(),
-    ).map_err(|e| format!("open new client: {e}"))?;
+    let mut new_client = GhostClient::open(material.identity(), db_key, mls_db_key, &crate::setup::db_path())
+        .map_err(|e| format!("open new client: {e}"))?;
     new_client.set_sync_key(sync_key).map_err(|e| e.to_string())?;
     new_client.create_sync_group().map_err(|e| format!("create sync group: {e}"))?;
-    {
-        let mut auth = state.auth.write().unwrap();
-        auth.account_fp = *new_client.fingerprint();
-        auth.device_vk = new_client.verifying_key_bytes();
-        auth.signing_key = new_client.signing_key_clone();
-    }
-    *state.client.lock().await = new_client;
-
-    // 11. Replace relay + save URL in config
-    let relay_url_owned = relay_url.to_string();
-    let new_inbox_rx = replace_relay(&state, &relay_url_owned).await;
+    let new_inbox_rx = install_identity(&state, new_client, &code.relay_url).await;
     {
         let mut cfg = state.config.lock().await;
-        cfg.relay_url = Some(relay_url_owned.clone());
+        cfg.relay_url = Some(code.relay_url.clone());
         let _ = cfg.save(&state.config_path);
     }
 
-    // 12. Fetch and apply sync_state (settings + group list)
-    let mut server_entries: Vec<([u8; 32], SyncServerMeta)> = Vec::new();
+    let settings = flows::recovery::finish(&state.client, &state.relay, &material, sync_key, &new_passphrase)
+        .await
+        .map_err(|e| e.to_string())?;
+    apply_restored_settings(&state, &settings, true).await;
 
-    if recovered.sync_key.is_some() {
-        let entries = async {
-            let ss_path = format!("/sync_state/{}", fp_hex);
-            let resp = sign_request(&state, "GET", &ss_path, state.http
-                .get(format!("{}{}", relay_url, ss_path)))
-                .send().await.map_err(|e| format!("fetch: {e}"))?;
-            if !resp.status().is_success() {
-                return Err(format!("HTTP {}", resp.status()));
-            }
-            let sealed = resp.bytes().await.map_err(|e| format!("body: {e}"))?;
-            let dump_bytes = sync_open(&sync_key, &sealed).map_err(|e| format!("decrypt: {e}"))?;
-            decode_sync_state_dump(&dump_bytes).map_err(|e| format!("decode: {e}"))
-        }.await;
-
-        if let Ok(entries) = entries {
-            let mut settings = crate::sync_utils::parse_sync_entries(&entries);
-            server_entries = std::mem::take(&mut settings.server_entries);
-
-            // Import into client (separate lock scope)
-            {
-                let mut client = state.client.lock().await;
-                let _ = client.sync_import(&entries);
-                if let Some(ref name) = settings.display_name {
-                    client.set_display_name(name.clone());
-                }
-            }
-
-            // Apply settings to config (separate lock scope)
-            {
-                let mut cfg = state.config.lock().await;
-                crate::sync_utils::apply_sync_to_config(&settings, &mut cfg, &state.config_path);
-
-                // Apply to presence
-                let mut p = state.presence.lock().await;
-                if let Some(ref status) = cfg.status {
-                    p.status = match status.as_str() {
-                        "away" => ghost_core::mls::presence::OnlineStatus::Away,
-                        "invisible" => ghost_core::mls::presence::OnlineStatus::Invisible,
-                        _ => ghost_core::mls::presence::OnlineStatus::Online,
-                    };
-                }
-                p.status_message = cfg.status_message.clone();
-            }
-        } else if let Err(e) = entries {
-            eprintln!("recovery: sync_state failed: {e}");
-        }
-    }
-
-    // 13. Rejoin groups from sync_state
-    rejoin_servers_from_sync(&state, relay_url, &server_entries, now_millis()).await;
-
-    // 13b. Remove old device leaves from groups.
-    // log_state is from BEFORE the Recovery entry — all devices that were active
-    // at that point are now revoked by the Recovery entry we just pushed.
-    let revoked_keys: Vec<[u8; 32]> = log_state.devices.values()
-        .filter(|d| d.is_active())
-        .map(|d| d.verifying_key)
-        .collect();
-    revoke_old_device_leaves(&state, relay_url, &revoked_keys).await;
-
-    // 14. Clear old account's recovery seed if present
     *state.recovery_seed.lock().await = None;
-
-    // 15. Re-upload recovery blob with new passphrase (never re-use the old one)
-    let new_blob = export_recovery_blob(&*seed, &sync_key, &new_passphrase).map_err(|e| e.to_string())?;
-    drop(seed);
-    {
-        let relay = state.relay.lock().await;
-        relay.put_recovery_blob(&account_fp, new_blob).await.map_err(|e| e.to_string())?;
-    }
-
-    // 16. Push merged sync_state back to relay
-    {
-        let client = state.client.lock().await;
-        let merged = client.sync_dump().unwrap_or_default();
-        if let Ok(dump_blob) = encode_sync_state_dump(&merged) {
-            if let Ok(sealed) = sync_seal(&sync_key, &dump_blob) {
-                let relay = state.relay.lock().await;
-                let _ = relay.put_sync_state(&account_fp, sealed).await;
-            }
-        }
-    }
-
-    // 17. Spawn relay task (subscribes to sync mailbox automatically)
     spawn_relay_task(app, &state, new_inbox_rx).await;
-
-    Ok(relay_url_owned)
+    Ok(code.relay_url)
 }
 
 #[tauri::command]
