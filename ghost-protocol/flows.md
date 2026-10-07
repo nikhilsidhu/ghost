@@ -484,14 +484,15 @@ Identical to Create Server except `ServerKind::Dm` and default channel named "me
 ### Join Voice
 
 1. **[sync]** Send `VoiceTakeover` to linked devices (tells them to leave this channel)
-2. **[voice]** Build voice WebSocket URL: `ws://.../voice/{channel_b64}`
+2. **[voice]** Build voice WebSocket URL for the group carrying the channel: `ws://.../voice/{mailbox_b64}/{channel_b64}`
 3. **[core]** Derive presence encryption key from MLS export secret, seal presence blob (AES-256-GCM)
-4. **[voice]** Connect WebSocket (10s timeout), send `Join { presence }`
-5. **[relay]** Allocate slot, broadcast `Joined` + `Presence` to existing peers
-6. **[relay]** Send `Welcome` with slot_id, UDP port, peer list
+4. **[voice]** Connect WebSocket (10s timeout), send `Join { presence }`; the relay refuses accounts not in that group
+5. **[relay]** Allocate slot and bind token, broadcast `Joined` + `Presence` to existing peers
+6. **[relay]** Send `Welcome` with slot_id, UDP port, room id, bind token, peer list
 7. **[voice]** Decrypt each peer's presence blob (trial decryption with all member keys)
 8. **[core]** Derive voice encryption key for each peer via MLS export secret
-9. **[voice]** Build `AudioPipeline`: open devices, create Opus encoder, nnnoiseless denoiser, jitter buffers, spawn UDP send/recv tasks
+9. **[voice]** Build `AudioPipeline`: open devices, create Opus encoder, nnnoiseless denoiser, jitter buffers, spawn UDP send/recv tasks and the bind task (binds at 0/200/600/1500 ms, then every 5 s)
+9a. **[relay]** Verify each bind's MAC and counter, bind the sender's address to the slot; forward media only between bound addresses
 10. **[voice]** Broadcast voice state to server mailbox for sidebar visibility
 11. **[app]** Emit `voice-state`, `voice-participants`, `voice-mute-state` events
 

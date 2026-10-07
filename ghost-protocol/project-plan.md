@@ -119,7 +119,7 @@ Open source, self-hosted, encrypted group chat with voice. No accounts, no serve
 ### Visible to relay host
 - IP addresses, mailbox activity, timing, blob sizes
 - Voice: who is in a call and when (relay forwards their streams)
-- Voice UDP header metadata (channel_id, relay-assigned slot ID) visible on wire — content is encrypted
+- Voice UDP header metadata (relay-assigned room and slot IDs) visible on wire — content is encrypted
 - Message and voice content is never accessible regardless of who runs the relay
 
 ### Device security
@@ -189,20 +189,20 @@ DELETE /invites/:id            → cancel invite
 ### Voice Relay
 
 ```
-WebSocket /voice/{channel_id}  → signaling (join/leave/speaking/mute state)
+WebSocket /voice/{mailbox_id}/{channel_id}  → signaling (join/leave/speaking/mute state)
 Raw UDP on GHOST_VOICE_PORT    → encrypted audio packet forwarding
 ```
 
 Voice signaling flow:
-1. Client opens WebSocket to `/voice/{channel_id}`, sends `Join` with an encrypted presence blob
-2. Relay assigns a `slot_id` and responds with `Assigned { slot_id, port }`
-3. Client opens UDP socket to relay at the assigned port
-4. Client sends encrypted Opus frames prefixed with `slot_id`; relay copies to all other participants
+1. Client opens WebSocket to `/voice/{mailbox_id}/{channel_id}` (members of that group only), sends `Join` with an encrypted presence blob
+2. Relay assigns a `slot_id` and responds with `Welcome { slot_id, port, room, token, peers }`
+3. Client opens UDP socket to relay at the assigned port and binds it to the slot with token-keyed bind packets
+4. Client sends encrypted Opus frames headed by `room` and `slot_id`; relay copies them only between bound addresses
 5. Participants exchange encrypted presence blobs over the voice WebSocket for key derivation
 6. On leave: client sends `Leave`, relay removes from routing table
 
-Voice packet format (45-byte header defined in ghost-wire):
-`[header_len:2][channel_id:32][slot_id:4][flags:1][seq:4][payload_len:2] + encrypted Opus payload`
+Voice packet format (53-byte header defined in ghost-wire):
+`[header_len:2][room_id:32][slot_id:4][flags:1][epoch:8][seq:4][payload_len:2] + encrypted Opus payload`
 
 The relay reads the first 38 bytes for routing. The slot_id is relay-assigned, keeping sender fingerprints out of the plaintext header.
 
@@ -549,7 +549,7 @@ Deliverable: `ghost-protocol/spec.md`
 ## Future Considerations
 
 - **QUIC transport** — unify WebSocket + UDP onto a single port. Deferred — current setup is simpler to self-host.
-- **UDP header encryption** — channel_id and slot_id are plaintext in the voice header. Encrypting with a session key would hide routing metadata from the wire.
+- **UDP header encryption** — room_id and slot_id are plaintext in the voice header. Encrypting with a session key would hide routing metadata from the wire.
 - **Plugin system (WASM)** — sandboxed hot-loadable plugins. Deferred — built-in integrations cover current needs.
 - **Relay admin panel** — web UI for managing relay config, bots, monitoring health.
 - **Deployment aids** — relay setup wizard, cloud marketplace images.

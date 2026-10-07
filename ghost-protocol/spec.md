@@ -496,7 +496,7 @@ Expired or used → HTTP 410.
 
 ### 12.1 Signaling
 
-WebSocket at `/voice/{channel_id_b64}`. JSON text frames:
+WebSocket at `/voice/{mailbox_id_b64}/{channel_id_b64}`, device-authenticated. `mailbox_id` names the group carrying the channel: the server's for a public channel, the channel's own for a private one. Only accounts in that group as the relay last validated it may connect. The relay derives the room as `blake3::derive_key("ghost voice room v1", mailbox_id ‖ channel_id)`, so rooms of different groups never meet. JSON text frames:
 
 **Client → Relay:**
 - **Join** — encrypted presence blob (contains fingerprint, mute/deafen state, display name)
@@ -504,13 +504,25 @@ WebSocket at `/voice/{channel_id_b64}`. JSON text frames:
 - **Presence** — updated presence blob (mute/deafen changes)
 
 **Relay → Client:**
-- **Assigned** — relay assigns `slot_id` (small integer) and UDP port
-- **Welcome** — existing participants' presence blobs (sent on join)
+- **Welcome** — the participant's `slot_id`, the UDP port, the `room` id for media headers, a fresh 32-byte `token` for binding its UDP address, and existing participants' presence blobs (sent on join)
 - **Joined** — new participant's slot_id and presence blob
 - **Left** — participant's slot_id
 - **Speaking** — slot_id and speaking state (from VAD/PTT)
 
 Presence blobs are encrypted with per-sender AES-256-GCM keys derived from the MLS group's shared secret. The relay cannot read them. Receivers trial-decrypt with each known sender's key to identify who sent it.
+
+When a commit removes an account from the group, the relay closes that account's voice connections with code 4002, and its mailbox connections after delivering the removing commit.
+
+### 12.1.2 Binding a UDP Address
+
+The relay forwards media only between addresses bound to a slot, so knowing a room or slot id is not enough to send into a room or receive from it (the model of ICE binding after signaling).
+
+```
+[header_len:2 = 78][room_id:32][slot_id:4][counter:8][mac:32]
+mac = blake3 keyed with the Welcome token over "ghost-voice-bind-v1" ‖ room_id ‖ slot_id ‖ counter
+```
+
+The relay accepts a bind only if the MAC verifies under the slot's token and the counter exceeds every earlier one, and then binds the sending address to the slot. A captured bind therefore cannot be replayed to steal a slot, and a participant whose address changes simply binds again. Clients send binds right after Welcome (at 0, 200, 600 and 1500 ms) and then every 5 seconds.
 
 ### 12.1.1 Voice State Broadcast
 
@@ -531,19 +543,20 @@ All voice traffic goes through the relay SFU regardless of participant count. Th
 
 ### 12.3 Audio Packet Format (SFU)
 
-UDP packets, 45-byte header:
+UDP packets, 53-byte header:
 
 ```
-[header_len:2][channel_id:32][slot_id:4][flags:1][seq:4][payload_len:2][payload...]
+[header_len:2][room_id:32][slot_id:4][flags:1][epoch:8][seq:4][payload_len:2][payload...]
 ```
 
 **Relay-readable prefix (first 38 bytes):**
-- `header_len` — u16, total header size (always 45)
-- `channel_id` — 32 bytes, identifies the voice channel
+- `header_len` — u16, total header size (always 53)
+- `room_id` — 32 bytes, the room from Welcome
 - `slot_id` — u32, relay-assigned per connection (not a fingerprint)
 
 **Remainder of header:**
 - `flags` — u8 (reserved)
+- `epoch` — u64, the MLS epoch whose key encrypted the payload
 - `seq` — u32, monotonically increasing sequence number
 - `payload_len` — u16, length of encrypted payload
 
@@ -552,7 +565,7 @@ UDP packets, 45-byte header:
 
 Nonce derived from `seq` zero-padded to 12 bytes (§7.3), not transmitted. Receiver maps `slot_id` to a sender fingerprint (learned from the voice WS presence exchange) and selects the decryption key.
 
-The relay reads only `channel_id` and `slot_id` for routing. Sender fingerprints never appear in the plaintext UDP header.
+The relay reads only `room_id` and `slot_id` for routing. Sender fingerprints never appear in the plaintext UDP header.
 
 ### 12.4 Audio Parameters
 
@@ -568,9 +581,9 @@ The relay reads only `channel_id` and `slot_id` for routing. Sender fingerprints
 
 ### 12.5 SFU Behavior
 
-1. Receive packet
-2. Read `channel_id` → look up routing table
-3. Copy to all endpoints except sender
+1. Receive packet; a bind packet (header_len 78) updates the slot's address and stops here
+2. Read `room_id` and `slot_id`; drop the packet unless it comes from the address bound to that slot
+3. Copy to every other bound address in the room
 4. No buffering, reordering, mixing, transcoding, or decryption
 
 Routing table maintained by signaling WebSocket.
