@@ -3,9 +3,9 @@ import { Dynamic } from "solid-js/web";
 import "../lib/commands";
 import {
   selectedServer, selectedChannelId,
-  inviteLink, showInfo, settingsOpen, settingsCategory,
+  inviteLink, moveLink, showInfo, settingsOpen, settingsCategory,
   initialize,
-  setInviteLink, setShowInfo, dmViewActive,
+  setInviteLink, setMoveLink, setShowInfo, dmViewActive,
 } from "../lib/store";
 import { sections } from "../lib/settings-registry";
 import { slideDuration } from "../lib/constants";
@@ -125,6 +125,12 @@ export function Layout() {
       </div>
       <CommandPalette />
       <InviteDialog link={inviteLink()} onClose={() => setInviteLink(null)} />
+      <InviteDialog
+        link={moveLink()}
+        onClose={() => setMoveLink(null)}
+        title="Server Move Link"
+        note="Members follow the move automatically while the old relay is up; share this with anyone who cannot reach it."
+      />
       <ShortcutOverlay shortcuts={overlayShortcuts} forceOpen={showInfo()} onClose={() => setShowInfo(false)} />
     </div>
   );

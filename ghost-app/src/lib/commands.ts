@@ -2,11 +2,11 @@ import {
   servers, selectedServerId, channels, allChannels,
   desiredChannelKind, contacts,
   selectServer, selectChannel, selectDm, refreshServers, refreshChannels, refreshAllMembers,
-  updateIdentity, setInviteLink, setShowInfo, setDesiredChannelKind,
+  updateIdentity, setInviteLink, setMoveLink, setShowInfo, setDesiredChannelKind,
 } from "./store";
 import {
   createServer, createDm, createChannel, renameChannel, deleteChannel,
-  createInvite, joinByInvite, setDisplayName,
+  createInvite, joinByInvite, setDisplayName, moveServer, followServerMove,
 } from "./api";
 import { registerCommand, registerProvider, triggerCommand } from "./registry";
 import type { CommandDef, SearchProvider } from "./registry";
@@ -159,6 +159,27 @@ const commands: CommandDef[] = [
       const token = url.searchParams.get("token");
       if (!relay || !token) throw new Error("invalid invite link");
       await joinByInvite(relay, token, url.searchParams.get("r"));
+      await refreshServers();
+    },
+  },
+  {
+    id: "move-server",
+    command: "move server",
+    args: [
+      { name: "server", placeholder: "server", complete: serverCompleter, defaultValue: () => selectedServerId() },
+      { name: "relay", placeholder: "new relay url" },
+    ],
+    execute: async (args) => {
+      setMoveLink(await moveServer(args.server, args.relay));
+      await refreshServers();
+    },
+  },
+  {
+    id: "follow-move",
+    command: "follow server move",
+    args: [{ name: "link", placeholder: "paste move link" }],
+    execute: async (args) => {
+      await followServerMove(args.link);
       await refreshServers();
     },
   },

@@ -93,6 +93,19 @@ pub async fn run(
         eprintln!("failed to record home relay in identity log: {e}");
     }
 
+    // Servers whose relay went away before announcing a move can be found through
+    // their creators' home relays.
+    {
+        let client = client.clone();
+        let relay = relay.clone();
+        tauri::async_runtime::spawn(async move {
+            let moved = ghost_core::flows::server::check_all_locations(&client, &relay).await;
+            if moved > 0 {
+                eprintln!("{moved} servers moved while this device was away");
+            }
+        });
+    }
+
     // Cache identity logs for gossip (kt_head_hash) and remove-proposal validation.
     // No longer required for message processing — credentials are self-validating.
     {
@@ -167,6 +180,7 @@ pub async fn run(
                     Some((server_id, _channel_id, Ok(ReceiveResult::Message(msg) | ReceiveResult::MessageWithKtWarning(msg)))) if msg.message_type == MessageType::Metadata => {
                         let mut fetch_avatar = None;
                         let mut own_name_changed = false;
+                        let mut server_move = None;
                         match decode_metadata(&msg.content) {
                             Ok(payload) => {
                                 let mut c = client.lock().await;
@@ -204,6 +218,16 @@ pub async fn run(
                                         let _ = std::fs::remove_file(data_dir.join("avatars").join(format!("{}.hash", fp_hex)));
                                         let _ = app.emit("avatar-cleared", fp_hex);
                                     }
+                                    MetadataPayload::ServerMoved(location) => {
+                                        // Only the creator may move a server; the record is verified when followed.
+                                        let from_creator = c
+                                            .store()
+                                            .get_server(&server_id)
+                                            .is_ok_and(|s| s.creator_fp == msg.sender_fp);
+                                        if from_creator {
+                                            server_move = Some(location);
+                                        }
+                                    }
                                 }
                                 let _ = c.store().set_last_seen_seq(&mailbox_id, seq);
                             }
@@ -211,6 +235,13 @@ pub async fn run(
                         }
                         if let Some((sid, fp, hash)) = fetch_avatar {
                             maybe_fetch_avatar(&client, &relay, &app, &data_dir, &sid, &fp, &hash).await;
+                        }
+                        if let Some(location) = server_move {
+                            match ghost_core::flows::server::follow_move(&client, &relay, &server_id, &location).await {
+                                Ok(true) => eprintln!("server {} moved to another relay", hex::encode(&server_id[..8])),
+                                Ok(false) => {}
+                                Err(e) => eprintln!("server move not followed: {e}"),
+                            }
                         }
                         if own_name_changed {
                             let _ = app.emit("display-name-sync", ());

@@ -107,6 +107,8 @@ fn main() {
             commands::mark_channel_read,
             commands::create_invite,
             commands::join_by_invite,
+            commands::move_server,
+            commands::follow_server_move,
             commands::get_config,
             commands::set_display_name,
             commands::set_relay_url,

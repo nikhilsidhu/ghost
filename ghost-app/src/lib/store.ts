@@ -39,6 +39,8 @@ const [allMembers, setAllMembers] = createSignal<Member[]>([]);
 // --- UI ---
 
 const [inviteLink, setInviteLink] = createSignal<string | null>(null);
+/** Link a server's creator shares after moving it to another relay. */
+const [moveLink, setMoveLink] = createSignal<string | null>(null);
 const [showInfo, setShowInfo] = createSignal(false);
 const [desiredChannelKind, setDesiredChannelKind] = createSignal<string>("text");
 const [settingsOpen, setSettingsOpen] = createSignal(false);
@@ -444,13 +446,13 @@ const initialize = async () => {
 export {
   identity, servers, selectedServerId, channels, members,
   selectedChannelId, allChannels,
-  inviteLink, showInfo, desiredChannelKind,
+  inviteLink, moveLink, showInfo, desiredChannelKind,
   selectedServer, selectedChannelName,
   dmViewActive, dms, serverList, contacts,
   selectServer, selectChannel, selectDm, activateDmView,
   updateIdentity, initialize,
   refreshServers, refreshChannels, refreshAllChannels, refreshAllMembers,
-  setInviteLink, setShowInfo, setDesiredChannelKind,
+  setInviteLink, setMoveLink, setShowInfo, setDesiredChannelKind,
   settingsOpen, settingsCategory, setSettingsCategory, toggleSettings,
   profileOpen, setProfileOpen, toggleProfile, relayConnected, onlinePresence,
   INVISIBLE, ownStatus, setOwnStatus, ownStatusMessage, setOwnStatusMessage, selectedExpiry, setSelectedExpiry, expiresAt, setExpiresAt, rebuildPresence, autoMuted, setAutoMuted,

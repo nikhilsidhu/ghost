@@ -453,6 +453,27 @@ pub async fn create_invite(
     Ok(InviteDto { token: created.token, link: link.to_string() })
 }
 
+/// Move a server this account created to the relay at `relay_url` (normally this
+/// account's home). Returns a move link to share with members who cannot reach the
+/// old relay any more.
+#[tauri::command]
+pub async fn move_server(server_id: String, relay_url: String, state: State<'_, AppState>) -> Result<String, String> {
+    let sid = parse_id(&server_id)?;
+    let location = flows::server::move_server(&state.client, &state.relay, &sid, &relay_url)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(flows::server::move_link(&location))
+}
+
+/// Follow a server move from a link the server's creator shared.
+#[tauri::command]
+pub async fn follow_server_move(link: String, state: State<'_, AppState>) -> Result<bool, String> {
+    let location = flows::server::parse_move_link(&link).map_err(|e| e.to_string())?;
+    flows::server::follow_move(&state.client, &state.relay, &location.server_id, &location)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// Join a server through an invite. The server may live on the home relay or any
 /// other; `relay_ref`, when the link carries one, pins the relay's key so a link
 /// pointing at the wrong relay fails instead of joining it.

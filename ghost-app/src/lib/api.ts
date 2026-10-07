@@ -47,6 +47,12 @@ export const markChannelRead = (channelId: string) =>
 export const createInvite = (serverId: string) =>
   invoke<Invite>("create_invite", { serverId });
 
+/** Move a server you created to another relay; resolves to a move link for members. */
+export const moveServer = (serverId: string, relayUrl: string) =>
+  invoke<string>("move_server", { serverId, relayUrl });
+/** Follow a move link from a server's creator; resolves true if this device moved. */
+export const followServerMove = (link: string) =>
+  invoke<boolean>("follow_server_move", { link });
 /** `relayRef` (the link's `r` parameter) pins the relay's key when present. */
 export const joinByInvite = (relayUrl: string, token: string, relayRef?: string | null) =>
   invoke<Server>("join_by_invite", { relayUrl, token, relayRef: relayRef ?? null });

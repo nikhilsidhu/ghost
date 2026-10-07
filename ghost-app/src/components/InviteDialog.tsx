@@ -6,6 +6,9 @@ import { Button } from "./ui/button";
 interface Props {
   link: string | null;
   onClose: () => void;
+  /** Defaults describe an invite; a server move link passes its own. */
+  title?: string;
+  note?: string;
 }
 
 function QrCode(props: { data: string; size: number }) {
@@ -43,7 +46,7 @@ export function InviteDialog(props: Props) {
   return (
     <Dialog open={!!props.link} onOpenChange={(v) => { if (!v) props.onClose(); }}>
       <DialogContent class="max-w-xs p-6">
-        <DialogTitle>Invite Link</DialogTitle>
+        <DialogTitle>{props.title ?? "Invite Link"}</DialogTitle>
 
         <div class="flex flex-col items-center gap-4">
           <Show when={props.link}>
@@ -67,7 +70,7 @@ export function InviteDialog(props: Props) {
           </div>
 
           <p class="text-xs" style={{ color: "var(--neutral-500)" }}>
-            Expires in 7 days
+            {props.note ?? "Expires in 7 days"}
           </p>
         </div>
       </DialogContent>
