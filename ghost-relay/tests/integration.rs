@@ -2028,3 +2028,36 @@ async fn kt_consistency_proof_valid() {
 
     assert!(proof.verify(&old_root, &new_checkpoint.root_hash));
 }
+
+#[tokio::test]
+async fn server_location_requires_an_active_device_signature_and_increasing_generation() {
+    use ghost_wire::relay_ref::RelayRef;
+    use ghost_wire::server_location::ServerLocation;
+
+    let base = start_server(test_config()).await;
+    let alice = TestAuth::generate();
+    alice.register(&base).await;
+    let client = reqwest::Client::new();
+    let server_id = [0x5E; 32];
+    let url = format!("{base}/accounts/{}/servers/{}/location", hex::encode(alice.account_fp), hex::encode(server_id));
+    let put = |body: Vec<u8>| alice.sign("PUT", &url, client.put(&url).body(body));
+
+    // Signed by Alice's device: stored and readable without credentials.
+    let first = ServerLocation::sign(server_id, 1, RelayRef::https([0x11; 32], "https://new.example"), &alice.device_key);
+    assert_eq!(put(first.to_bytes()).send().await.unwrap().status(), StatusCode::NO_CONTENT);
+    let resp = client.get(&url).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.bytes().await.unwrap().as_ref(), first.to_bytes().as_slice());
+
+    // Replaying the same generation is refused.
+    assert_eq!(put(first.to_bytes()).send().await.unwrap().status(), StatusCode::CONFLICT);
+
+    // A record signed by a key that is not one of Alice's devices is refused.
+    let stranger = SigningKey::generate(&mut OsRng);
+    let forged = ServerLocation::sign(server_id, 2, RelayRef::https([0x22; 32], "https://evil.example"), &stranger);
+    assert_eq!(put(forged.to_bytes()).send().await.unwrap().status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    // Unknown servers have no location.
+    let other = format!("{base}/accounts/{}/servers/{}/location", hex::encode(alice.account_fp), hex::encode([0x5F; 32]));
+    assert_eq!(client.get(&other).send().await.unwrap().status(), StatusCode::NOT_FOUND);
+}

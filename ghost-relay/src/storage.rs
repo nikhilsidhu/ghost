@@ -228,6 +228,15 @@ impl Storage {
                  PRIMARY KEY (account_fp, token)
              ) WITHOUT ROWID;
 
+             CREATE TABLE IF NOT EXISTS server_locations (
+                 account_fp BLOB NOT NULL,
+                 server_id  BLOB NOT NULL,
+                 generation INTEGER NOT NULL,
+                 data       BLOB NOT NULL,
+                 updated_at INTEGER NOT NULL,
+                 PRIMARY KEY (account_fp, server_id)
+             ) WITHOUT ROWID;
+
              CREATE TABLE IF NOT EXISTS mirror_grants (
                  account_fp BLOB NOT NULL,
                  relay_vk   BLOB NOT NULL,
@@ -306,6 +315,20 @@ impl Storage {
 
     pub fn conn(&self) -> &Mutex<Connection> {
         &self.conn
+    }
+
+    /// Raise a mailbox's commit epoch to `epoch`, never lowering it. Group state
+    /// established from GroupInfo (a new group, or one moved here from another relay)
+    /// sets the epoch the next commit must carry.
+    pub fn raise_mailbox_epoch(&self, mailbox_id: &[u8; 32], epoch: u64) -> Result<(), RelayError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO mailbox_state (mailbox_id, current_epoch, next_seq) VALUES (?1, ?2, 1)
+             ON CONFLICT (mailbox_id) DO UPDATE SET current_epoch = MAX(current_epoch, ?2)",
+            params![mailbox_id.as_slice(), epoch as i64],
+        )
+        .map_err(|e| RelayError::Storage(e.to_string()))?;
+        Ok(())
     }
 
     /// Store a blob, enforcing epoch ordering for commits.
@@ -1234,6 +1257,61 @@ impl Storage {
 
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|e| RelayError::Storage(e.to_string()))
+    }
+
+    /// Store where a server created by this account now lives, unless the stored
+    /// record has an equal or newer generation.
+    pub fn put_server_location(
+        &self,
+        account_fp: &[u8; 32],
+        server_id: &[u8; 32],
+        generation: u64,
+        data: &[u8],
+    ) -> Result<(), RelayError> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction().map_err(|e| RelayError::Storage(e.to_string()))?;
+        let stored: Option<i64> = tx
+            .query_row(
+                "SELECT generation FROM server_locations WHERE account_fp = ?1 AND server_id = ?2",
+                params![account_fp.as_slice(), server_id.as_slice()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| RelayError::Storage(e.to_string()))?;
+        if stored.is_some_and(|g| generation <= g as u64) {
+            return Err(RelayError::Conflict);
+        }
+        tx.execute(
+            "INSERT INTO server_locations (account_fp, server_id, generation, data, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT (account_fp, server_id) DO UPDATE SET generation = ?3, data = ?4, updated_at = ?5",
+            params![account_fp.as_slice(), server_id.as_slice(), generation as i64, data, now_millis() as i64],
+        )
+        .map_err(|e| RelayError::Storage(e.to_string()))?;
+        tx.commit().map_err(|e| RelayError::Storage(e.to_string()))
+    }
+
+    pub fn get_server_location(&self, account_fp: &[u8; 32], server_id: &[u8; 32]) -> Result<Option<Vec<u8>>, RelayError> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT data FROM server_locations WHERE account_fp = ?1 AND server_id = ?2",
+            params![account_fp.as_slice(), server_id.as_slice()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| RelayError::Storage(e.to_string()))
+    }
+
+    /// Whether the account belongs to a group this relay holds state for, which
+    /// a group creator established by uploading the group's GroupInfo here.
+    pub fn is_listed_member(&self, account_fp: &[u8; 32]) -> Result<bool, RelayError> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM mailbox_members WHERE account_fp = ?1)",
+            params![account_fp.as_slice()],
+            |row| row.get(0),
+        )
+        .map_err(|e| RelayError::Storage(e.to_string()))
     }
 
     /// Replace the set of relays the account allows to pull its log from here.

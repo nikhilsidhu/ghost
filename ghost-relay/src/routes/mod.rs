@@ -21,11 +21,15 @@ use crate::error::{RelayError, Result};
 use crate::state::AppState;
 
 pub(crate) fn decode_account_fp(hex: &str) -> Result<[u8; 32]> {
-    let bytes = hex::decode(hex)
-        .map_err(|_| RelayError::BadRequest("invalid hex account fingerprint".into()))?;
+    decode_id32(hex, "account fingerprint")
+}
+
+/// Decode a hex path segment holding a 32-byte id; `what` names it in errors.
+pub(crate) fn decode_id32(hex: &str, what: &str) -> Result<[u8; 32]> {
+    let bytes = hex::decode(hex).map_err(|_| RelayError::BadRequest(format!("invalid hex {what}")))?;
     bytes
         .try_into()
-        .map_err(|_| RelayError::BadRequest("account fingerprint must be 32 bytes".into()))
+        .map_err(|_| RelayError::BadRequest(format!("{what} must be 32 bytes")))
 }
 
 pub fn router(state: AppState) -> Router {
@@ -36,6 +40,10 @@ pub fn router(state: AppState) -> Router {
         .route("/accounts/{account_fp}", get(accounts::get))
         .route("/accounts/{account_fp}/import", post(accounts::import))
         .route("/accounts/{account_fp}/mirrors", put(accounts::put_mirrors))
+        .route(
+            "/accounts/{account_fp}/servers/{server_id}/location",
+            put(accounts::put_server_location).get(accounts::get_server_location),
+        )
         .route("/box/{mailbox_id}", post(blob::post_blob).get(blob::get_blobs).delete(blob::delete_mailbox))
         .route("/box/{mailbox_id}/server_info", put(server_info::put).get(server_info::get))
         .route("/box/{mailbox_id}/avatar/{fingerprint}", put(avatar::put).get(avatar::get).delete(avatar::delete))

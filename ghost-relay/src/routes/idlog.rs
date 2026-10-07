@@ -73,9 +73,9 @@ pub struct AnchoredQuery {
 ///
 /// The batch authenticates itself: every entry is signed by an account key and
 /// anchored by the home, so the sender needs no credentials. An unknown account
-/// is admitted only with a valid invite for a server here, which also lets its
-/// devices authenticate until the invite expires so they can post their first
-/// commits.
+/// is admitted only with a valid invite for a server here (which also lets its
+/// devices authenticate until the invite expires, so they can post their first
+/// commits) or when a group here lists it as a member.
 pub async fn put_anchored(
     State(state): State<AppState>,
     Path(account_fp_hex): Path<String>,
@@ -92,9 +92,12 @@ pub async fn put_anchored(
         return Err(RelayError::PayloadTooLarge);
     }
 
+    // Unknown accounts need an invite, unless a group here already lists them as
+    // members (its creator moved the group here and uploaded its state).
     let known = state.storage.get_account(&account_fp)?.is_some();
+    let listed = !known && state.storage.is_listed_member(&account_fp)?;
     let mut guest_until = None;
-    if !known {
+    if !known && !listed {
         let token = query.invite.ok_or_else(|| {
             RelayError::Forbidden("unknown account; an invite token is required".into())
         })?;

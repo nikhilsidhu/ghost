@@ -553,6 +553,9 @@ impl Inner {
         self.storage.set_mailbox_group_id(mailbox_id, &group_id_bytes)?;
         let members = extract_member_fps(&pg);
         self.storage.update_mailbox_members(mailbox_id, &members)?;
+        // The next commit must be at the group's epoch, even if this relay never saw
+        // the earlier ones (the group moved here).
+        self.storage.raise_mailbox_epoch(mailbox_id, new_epoch)?;
         groups.insert(*mailbox_id, (pg, creator_fp));
         Ok(())
     }
