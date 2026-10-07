@@ -44,6 +44,10 @@ pub const WS_FRAME_HEADER_SIZE: usize = WS_SEQ_SIZE + WS_TIMESTAMP_SIZE;
 // WS text signals
 pub const WS_SIGNAL_GAP: &str = "gap";
 pub const WS_SIGNAL_EPOCH_MISMATCH: &str = "epoch_mismatch";
+/// Sent on a server mailbox connection when a private channel of that server newly
+/// admits the connected account (created, or its access changed), so the device runs
+/// discovery. Only admitted accounts receive it, so others learn nothing.
+pub const WS_SIGNAL_CHANNELS: &str = "channels";
 
 // WS close codes (4000-4999 = application-defined)
 pub const WS_CLOSE_DEVICE_REVOKED: u16 = 4001;
