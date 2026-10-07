@@ -27,6 +27,7 @@ pub async fn start_relay_with_handle() -> ghost_relay::server::RunningRelay {
         port: 0,
         max_blob_size: 10 * 1024 * 1024,
         voice_port: 0,
+        voice_public_port: None,
         max_voice_participants: 25,
         db_path: None,
         log_retention_hours: 72,

@@ -56,7 +56,6 @@ pub const WS_CLOSE_REMOVED: u16 = 4002;
 
 /// Length of the media packet header (see `voice::MediaHeader`).
 pub const VOICE_HEADER_SIZE: usize = 53;
-pub const VOICE_RELAY_PREFIX: usize = 38;
 pub const VOICE_MAX_PACKET: usize = 1500;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

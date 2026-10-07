@@ -4,6 +4,9 @@ pub struct Config {
     pub port: u16,
     pub max_blob_size: usize,
     pub voice_port: u16,
+    /// UDP port clients are told to send voice to, when it differs from `voice_port`
+    /// (the relay sits behind a port mapping or a forwarder).
+    pub voice_public_port: Option<u16>,
     pub max_voice_participants: usize,
     pub db_path: Option<String>,
     pub log_retention_hours: u64,
@@ -20,6 +23,7 @@ impl Config {
             port: parse_env("GHOST_PORT", DEFAULT_PORT),
             max_blob_size: parse_env("GHOST_MAX_BLOB_SIZE", DEFAULT_MAX_BLOB_SIZE),
             voice_port: parse_env("GHOST_VOICE_PORT", DEFAULT_VOICE_PORT),
+            voice_public_port: std::env::var("GHOST_VOICE_PUBLIC_PORT").ok().and_then(|v| v.parse().ok()),
             max_voice_participants: parse_env(
                 "GHOST_MAX_VOICE_PARTICIPANTS",
                 DEFAULT_MAX_VOICE_PARTICIPANTS,

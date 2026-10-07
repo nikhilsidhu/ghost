@@ -6,7 +6,7 @@ use axum::response::{IntoResponse, Response};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
-use serde::{Deserialize, Serialize};
+use ghost_wire::voice::{ClientMsg, PeerEntry, ServerMsg};
 use std::time::{Duration, Instant};
 
 use crate::auth::DeviceAuth;
@@ -19,41 +19,12 @@ use crate::voice::{Participant, VoiceChannel, VoiceEvent};
 const PING_INTERVAL: Duration = Duration::from_secs(30);
 const PONG_TIMEOUT: Duration = Duration::from_secs(60);
 
-#[derive(Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum ClientMsg {
-    Join { presence: String },
-    Leave,
-    Presence { blob: String },
-    Speaking { speaking: bool },
-    Resync,
-}
-
-#[derive(Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum ServerMsg {
-    /// `room` goes in every media packet header; `token` keys the bind packets that tie
-    /// the participant's UDP address to `slot_id`.
-    Welcome { slot_id: u32, port: u16, room: String, token: String, peers: Vec<PeerEntry> },
-    Joined { slot_id: u32, presence: String },
-    Left { slot_id: u32 },
-    Presence { slot_id: u32, blob: String },
-    Speaking { slot_id: u32, speaking: bool },
-    Error { message: String },
-}
-
-#[derive(Serialize)]
-struct PeerEntry {
-    slot_id: u32,
-    presence: String,
-}
-
 /// The welcome for an admitted slot: the room's current peers, and what the participant
 /// needs to bind its UDP address.
 fn welcome(state: &AppState, slot_id: u32, room_id: &[u8; 32], token: &[u8; 32], peers: Vec<PeerEntry>) -> ServerMsg {
     ServerMsg::Welcome {
         slot_id,
-        port: *state.voice_udp_port_rx.borrow(),
+        port: state.config.voice_public_port.unwrap_or(*state.voice_udp_port_rx.borrow()),
         room: B64.encode(room_id),
         token: B64.encode(token),
         peers,

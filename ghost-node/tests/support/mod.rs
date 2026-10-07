@@ -19,6 +19,7 @@ pub fn test_config() -> Config {
         port: 0,
         max_blob_size: 10 * 1024 * 1024,
         voice_port: 0,
+        voice_public_port: None,
         max_voice_participants: 25,
         db_path: None,
         log_retention_hours: 72,

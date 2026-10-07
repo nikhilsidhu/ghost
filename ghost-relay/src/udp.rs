@@ -2,24 +2,9 @@ use std::net::SocketAddr;
 
 use tokio::net::UdpSocket;
 
-use ghost_wire::voice::VoiceBind;
-use ghost_wire::{VOICE_HEADER_SIZE, VOICE_MAX_PACKET, VOICE_RELAY_PREFIX};
+use ghost_wire::voice::{MediaHeader, VoiceBind};
+use ghost_wire::VOICE_MAX_PACKET;
 use crate::state::AppState;
-
-/// Room and slot of a media packet: `[header_len:2][room_id:32][slot_id:4]...`. Older
-/// header formats and anything shorter are dropped.
-fn parse_media_header(buf: &[u8]) -> Option<([u8; 32], u32)> {
-    if buf.len() < VOICE_RELAY_PREFIX {
-        return None;
-    }
-    let header_len = u16::from_be_bytes(buf[0..2].try_into().ok()?) as usize;
-    if header_len != VOICE_HEADER_SIZE || buf.len() < header_len {
-        return None;
-    }
-    let room_id: [u8; 32] = buf[2..34].try_into().ok()?;
-    let slot_id = u32::from_be_bytes(buf[34..38].try_into().ok()?);
-    Some((room_id, slot_id))
-}
 
 pub async fn run(state: AppState) {
     let port = state.config.voice_port;
@@ -57,9 +42,10 @@ pub async fn run(state: AppState) {
             continue;
         }
 
-        let Some((room_id, slot_id)) = parse_media_header(packet) else { continue };
+        // Other header formats and truncated packets are dropped.
+        let Some((header, _)) = MediaHeader::parse(packet) else { continue };
         // Only a bound address speaks for its slot; anything else is dropped unread.
-        let Some(peers) = state.routing.forward_targets(&room_id, slot_id, &sender_addr) else { continue };
+        let Some(peers) = state.routing.forward_targets(&header.room_id, header.slot_id, &sender_addr) else { continue };
         for peer in &peers {
             let _ = socket.try_send_to(packet, *peer);
         }

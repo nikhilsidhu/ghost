@@ -159,6 +159,7 @@ fn test_config() -> Config {
         port: 0,
         max_blob_size: 1024,
         voice_port: 0,
+        voice_public_port: None,
         max_voice_participants: 25,
         db_path: None,
         log_retention_hours: 72,
@@ -732,6 +733,21 @@ async fn join_voice(ws_url: &str, auth: &TestAuth, presence: &[u8]) -> (
     assert_eq!(welcome["type"], "welcome");
     let (room, token) = welcome_binding(&welcome);
     (ws, welcome["slot_id"].as_u64().unwrap() as u32, room, token)
+}
+
+#[tokio::test]
+async fn voice_welcome_names_the_public_port_when_configured() {
+    let (base, udp_port) = start_server_with_voice(Config { voice_public_port: Some(40_123), ..test_config() }).await;
+    let auth = TestAuth::generate();
+    auth.register(&base).await;
+    let ws_url = voice_url(&base, &voice_group(&base, &auth).await, &[0x11; 32]);
+    let mut ws = auth.ws_connect(&ws_url).await;
+    ws.send(Message::Text(serde_json::json!({"type": "join", "presence": B64.encode(b"p")}).to_string().into()))
+        .await
+        .unwrap();
+    let welcome = read_voice_msg(&mut ws).await;
+    assert_eq!(welcome["port"], 40_123);
+    assert_ne!(udp_port, 40_123, "the relay still binds its own port");
 }
 
 async fn bound_voice_pair(base: &str, udp_port: u16, auth: &TestAuth, channel_id: [u8; 32]) -> VoicePair {
