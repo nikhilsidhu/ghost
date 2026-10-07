@@ -112,6 +112,15 @@ impl GroupTable {
         policy_mls::server_policy(pg.group_context().extensions(), &members).ok().map(|policy| policy.owner)
     }
 
+    /// The server mailbox a private channel group belongs to, and the accounts its
+    /// policy admits now.
+    pub fn admitted_accounts(&self, channel_mailbox: &[u8; 32]) -> Option<([u8; 32], Vec<[u8; 32]>)> {
+        let channel = channel_policy_of(self.groups.get(channel_mailbox)?)?;
+        let view = self.server_view(&channel.server_mailbox).ok()?;
+        let admitted = view.members.iter().filter(|account| channel.admits(account, &view)).copied().collect();
+        Some((channel.server_mailbox, admitted))
+    }
+
     /// Leaves to propose removing after a commit to `mailbox_id`: in that group if it
     /// is a private channel, or in each of its private channels if it is a server group.
     pub fn channel_exclusions(&self, mailbox_id: &[u8; 32]) -> Vec<([u8; 32], Vec<LeafNodeIndex>)> {
@@ -149,6 +158,9 @@ struct CommitEffects {
     exclusions: Vec<([u8; 32], Vec<LeafNodeIndex>)>,
     /// Accounts the commit removed from the group entirely.
     departed: Vec<[u8; 32]>,
+    /// A private channel group whose policy the commit changed, so whom it admits may
+    /// have grown.
+    channel_policy_changed: Option<[u8; 32]>,
 }
 
 pub struct Inner {
@@ -240,6 +252,9 @@ impl Inner {
         if let Some(mut groups) = locked_groups {
             for (channel_mailbox, leaves) in effects.exclusions {
                 self.propose_removals_locked(&mut groups, &channel_mailbox, &leaves).await;
+            }
+            if let Some(channel_mailbox) = effects.channel_policy_changed {
+                self.signal_admitted(&groups, &channel_mailbox).await;
             }
         }
         Ok((seq, epoch_mismatch))
@@ -353,6 +368,7 @@ impl Inner {
                 }
                 self.authorize_commit(groups, mailbox_id, &sender, &staged_commit, &aad)?;
 
+                let policy_before = groups.get(mailbox_id).and_then(channel_policy_of);
                 let pg = groups.get_mut(mailbox_id).expect("looked up above");
                 let before = extract_member_fps(pg);
                 let mls_storage = MlsPublicStorage::new(self.storage.conn());
@@ -363,7 +379,9 @@ impl Inner {
                 self.storage.update_mailbox_members(mailbox_id, &members)?;
                 let mut departed: Vec<[u8; 32]> = before.into_iter().filter(|fp| !members.contains(fp)).collect();
                 departed.dedup();
-                return Ok(CommitEffects { exclusions: groups.channel_exclusions(mailbox_id), departed });
+                let policy_after = groups.get(mailbox_id).and_then(channel_policy_of);
+                let channel_policy_changed = (policy_before.is_some() && policy_before != policy_after).then_some(*mailbox_id);
+                return Ok(CommitEffects { exclusions: groups.channel_exclusions(mailbox_id), departed, channel_policy_changed });
             }
             ProcessedMessageContent::ProposalMessage(proposal) => *proposal,
             ProcessedMessageContent::ExternalJoinProposalMessage(proposal) => *proposal,
@@ -538,6 +556,19 @@ impl Inner {
         }
     }
 
+    /// Tell the accounts a private channel admits, on their connections to its server's
+    /// mailbox, to look for channels: it was just created or its access changed. Nobody
+    /// else is told, so the channel stays hidden from them.
+    async fn signal_admitted(&self, groups: &GroupTable, channel_mailbox: &[u8; 32]) {
+        let Some((server_mailbox, admitted)) = groups.admitted_accounts(channel_mailbox) else { return };
+        let map = self.mailboxes.read().await;
+        if let Some(mailbox) = map.get(&server_mailbox) {
+            for account in admitted {
+                let _ = mailbox.channels_tx.send(account);
+            }
+        }
+    }
+
     /// Propose removing leaves from a group as its external sender, skipping leaves a
     /// queued proposal already removes. Each proposal is queued in the public group and
     /// appended to the mailbox; a failed append evicts the group so it re-initializes
@@ -697,6 +728,7 @@ impl Inner {
         let policies = policy_mls::policies(candidate.group_context().extensions())
             .map_err(|e| RelayError::Forbidden(format!("group policy: {e}")))?;
         let mut groups = self.groups.write().await;
+        let is_channel = matches!(policies, (None, Some(_)));
         match policies {
             (Some(_), Some(_)) => {
                 return Err(RelayError::Forbidden("a group carries a server or a channel policy, not both".into()));
@@ -729,6 +761,9 @@ impl Inner {
         // the earlier ones (the group moved here).
         self.storage.raise_mailbox_epoch(mailbox_id, new_epoch)?;
         groups.insert(*mailbox_id, pg);
+        if is_channel {
+            self.signal_admitted(&groups, mailbox_id).await;
+        }
         Ok(())
     }
 

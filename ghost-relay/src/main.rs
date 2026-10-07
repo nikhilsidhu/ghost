@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 
 use tracing_subscriber::EnvFilter;
 
-use ghost_relay::{config, federation, routes, state, storage, udp, worker};
+use ghost_relay::{config, server, storage};
 
 #[tokio::main]
 async fn main() {
@@ -22,16 +22,8 @@ async fn main() {
             storage::Storage::open_in_memory().expect("failed to open storage")
         }
     };
-    let state = state::new_state(config, storage);
-
-    tokio::spawn(worker::run(state.clone()));
-    tokio::spawn(federation::run(state.clone()));
-    tokio::spawn(udp::run(state.clone()));
-
-    let app = routes::router(state);
-
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    tracing::info!("relay listening on {addr}");
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    let relay = server::start(config, storage, addr).await.expect("failed to start relay");
+    tracing::info!("relay listening on {}", relay.addr);
+    relay.serve_forever().await;
 }

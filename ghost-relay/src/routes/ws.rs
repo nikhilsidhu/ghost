@@ -8,7 +8,7 @@ use serde::Deserialize;
 use std::sync::atomic::Ordering::Relaxed;
 use std::time::Duration;
 
-use ghost_wire::{WS_FRAME_HEADER_SIZE, WS_SIGNAL_EPOCH_MISMATCH, WS_SIGNAL_GAP};
+use ghost_wire::{WS_FRAME_HEADER_SIZE, WS_SIGNAL_CHANNELS, WS_SIGNAL_EPOCH_MISMATCH, WS_SIGNAL_GAP};
 
 use crate::auth::DeviceAuth;
 use crate::constants::{MAX_PRESENCE_BLOB_SIZE, WS_MAX_FANOUT_BATCH, WS_PING_INTERVAL_SECS};
@@ -65,10 +65,10 @@ async fn ws_connection(socket: WebSocket, mailbox_id: [u8; 32], state: AppState,
     let conn_id = state.next_conn_id.fetch_add(1, Relaxed);
 
     // Subscribe before handshake so we don't miss blobs during replay
-    let (mut seq_rx, mut voice_rx, mut presence_rx) = {
+    let (mut seq_rx, mut voice_rx, mut presence_rx, mut channels_rx) = {
         let mut map = state.mailboxes.write().await;
         let mailbox = map.entry(mailbox_id).or_insert_with(Mailbox::new);
-        (mailbox.seq_tx.subscribe(), mailbox.voice_tx.subscribe(), mailbox.presence_tx.subscribe())
+        (mailbox.seq_tx.subscribe(), mailbox.voice_tx.subscribe(), mailbox.presence_tx.subscribe(), mailbox.channels_tx.subscribe())
     };
 
     // Handshake: first binary frame is 8-byte BE last_seen_seq
@@ -259,6 +259,17 @@ async fn ws_connection(socket: WebSocket, mailbox_id: [u8; 32], state: AppState,
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     _ => {} // own message or lagged
+                }
+            }
+            admitted = channels_rx.recv() => {
+                match admitted {
+                    Ok(account_fp) if account_fp == auth.account_fp => {
+                        if sink.send(Message::text(WS_SIGNAL_CHANNELS)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    _ => {}
                 }
             }
             presence_event = presence_rx.recv() => {

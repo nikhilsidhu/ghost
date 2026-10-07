@@ -8,7 +8,7 @@ use futures_util::{SinkExt, StreamExt};
 use rand::rngs::OsRng;
 use reqwest::StatusCode;
 use serde_json::Value;
-use tokio::net::{TcpListener, UdpSocket};
+use tokio::net::UdpSocket;
 use tokio_tungstenite::tungstenite::Message;
 
 use openmls::prelude::*;
@@ -19,7 +19,7 @@ use openmls_traits::OpenMlsProvider;
 use ghost_relay::config::Config;
 use ghost_wire::voice::VoiceBind;
 use ghost_relay::storage::Storage;
-use ghost_relay::{routes, state, udp};
+use ghost_relay::{server, state};
 
 // ── Test auth helpers ─────────────────────────────────────────────
 
@@ -136,29 +136,22 @@ async fn start_server(config: Config) -> String {
     start_server_with_state(config).await.0
 }
 
-async fn start_server_with_state(config: Config) -> (String, state::AppState) {
+/// A relay started exactly as the binary starts it; it serves until the test ends.
+async fn start_running(config: Config) -> server::RunningRelay {
     let storage = Storage::open_in_memory().unwrap();
-    let st = state::new_state(config, storage);
-    let app = routes::router(st.clone());
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    (format!("http://127.0.0.1:{port}"), st)
+    server::start(config, storage, ([127, 0, 0, 1], 0).into()).await.unwrap()
 }
 
-/// Starts relay with UDP voice loop. Returns (http_base_url, udp_port).
+async fn start_server_with_state(config: Config) -> (String, state::AppState) {
+    let relay = start_running(config).await;
+    (relay.url(), relay.state.clone())
+}
+
+/// Returns (http_base_url, udp_port).
 async fn start_server_with_voice(config: Config) -> (String, u16) {
-    let storage = Storage::open_in_memory().unwrap();
-    let st = state::new_state(config, storage);
-    let mut voice_rx = st.voice_udp_port_rx.clone();
-    tokio::spawn(udp::run(st.clone()));
-    let app = routes::router(st);
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    voice_rx.changed().await.unwrap();
-    let udp_port = *voice_rx.borrow();
-    (format!("http://127.0.0.1:{port}"), udp_port)
+    let relay = start_running(config).await;
+    assert_ne!(relay.voice_port, 0, "voice UDP socket did not bind");
+    (relay.url(), relay.voice_port)
 }
 
 fn test_config() -> Config {
