@@ -107,7 +107,8 @@ enum ClientMsg {
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ServerMsg {
-    Welcome { slot_id: u32, port: u16, peers: Vec<PeerEntry> },
+    /// `room` goes in our media packet headers; `token` keys the binds of our UDP address.
+    Welcome { slot_id: u32, port: u16, room: String, token: String, peers: Vec<PeerEntry> },
     Joined { slot_id: u32, presence: String },
     Left { slot_id: u32 },
     Presence { slot_id: u32, blob: String },
@@ -133,13 +134,20 @@ struct AudioSession {
     own_fp: [u8; 32],
     udp_send_task: JoinHandle<()>,
     udp_recv_task: JoinHandle<()>,
+    bind_task: JoinHandle<()>,
 }
 
 impl Drop for AudioSession {
     fn drop(&mut self) {
         self.udp_send_task.abort();
         self.udp_recv_task.abort();
+        self.bind_task.abort();
     }
+}
+
+/// Decode a 32-byte value the relay sent in base64.
+fn decode_b64_32(value: &str) -> Option<[u8; 32]> {
+    B64.decode(value).ok()?.try_into().ok()
 }
 
 fn relay_host(relay_url: &str) -> Result<String, String> {
@@ -251,7 +259,9 @@ async fn seal_presence(
     Ok(B64.encode(&blob))
 }
 
-/// Start the audio pipeline and UDP transport after receiving Welcome.
+/// Start the audio pipeline and UDP transport after receiving Welcome. `room_id` and
+/// `bind_token` come from the Welcome: the relay forwards our media only once a bind
+/// keyed with the token has tied our UDP address to `own_slot_id`.
 async fn start_audio(
     client: &Arc<Mutex<GhostClient>>,
     _server_id: &[u8; 32],
@@ -260,6 +270,8 @@ async fn start_audio(
     own_device_vk: &[u8; 32],
     own_voice_salt: &[u8; 32],
     own_slot_id: u32,
+    room_id: [u8; 32],
+    bind_token: [u8; 32],
     relay_url: &str,
     port: u16,
     peer_keys: HashMap<u32, crate::audio::PeerVoiceKeys>,
@@ -277,7 +289,7 @@ async fn start_audio(
     };
 
     let mut pipeline = AudioPipeline::start(
-        own_slot_id, own_key, own_epoch, *channel_id, peer_keys,
+        own_slot_id, own_key, own_epoch, room_id, peer_keys,
         input_device, output_device,
     )?;
     pipeline.controls.muted.store(voice_state.muted, Ordering::Relaxed);
@@ -286,11 +298,26 @@ async fn start_audio(
     let host = relay_host(relay_url)?;
     let transport = Arc::new(UdpTransport::connect(&host, port).await?);
 
-    // Registration packet so relay learns our UDP address before we transmit audio
-    let reg_pkt = crate::audio::build_packet(channel_id, own_slot_id, own_epoch, 0, &[]);
-    if let Err(e) = transport.socket.send(&reg_pkt).await {
-        eprintln!("voice udp registration send: {e}");
-    }
+    // Bind our UDP address to our slot, quickly at first, then periodically. Each bind
+    // carries a higher counter, so the relay accepts it even after our address changes.
+    let transport_bind = transport.clone();
+    let bind_task = tokio::spawn(async move {
+        let schedule = crate::constants::VOICE_BIND_RETRY_DELAYS_MS
+            .windows(2)
+            .map(|pair| std::time::Duration::from_millis(pair[1] - pair[0]));
+        let delays = std::iter::once(std::time::Duration::ZERO)
+            .chain(schedule)
+            .chain(std::iter::repeat(crate::constants::VOICE_BIND_INTERVAL));
+        let mut counter: u64 = 0;
+        for delay in delays {
+            tokio::time::sleep(delay).await;
+            counter += 1;
+            let bind = ghost_wire::voice::VoiceBind::sign(&bind_token, room_id, own_slot_id, counter);
+            if let Err(e) = transport_bind.socket.send(&bind.to_bytes()).await {
+                eprintln!("voice udp bind send: {e}");
+            }
+        }
+    });
 
     let mut outbound_rx = pipeline
         .outbound_rx
@@ -316,6 +343,7 @@ async fn start_audio(
         own_fp: *own_fp,
         udp_send_task,
         udp_recv_task,
+        bind_task,
     })
 }
 
@@ -442,11 +470,15 @@ pub async fn run(
                         rand::rngs::OsRng.fill_bytes(&mut voice_salt);
                         active_voice_salt = voice_salt;
 
-                        // Signal on the relay hosting the server; a channel without its own
-                        // mailbox route still resolves there.
+                        // The voice room belongs to the group carrying the channel (the
+                        // server's, or a private channel's own), on the relay hosting it.
+                        let Some(mailbox_id) = client.lock().await.mailbox_id_for_channel(&channel_id_bytes) else {
+                            emit_error(&app, "voice: channel has no group");
+                            continue;
+                        };
                         let request = {
                             let r = relay.lock().await.at(&relay_url);
-                            match r.voice_ws_request(&channel_id_bytes) {
+                            match r.voice_ws_request(&mailbox_id, &channel_id_bytes) {
                                 Ok(req) => req,
                                 Err(e) => {
                                     emit_error(&app, &format!("voice ws: {e}"));
@@ -654,7 +686,7 @@ pub async fn run(
                 if let Message::Text(text) = msg {
                     match serde_json::from_str::<ServerMsg>(text.as_str()) {
                         Ok(server_msg) => match server_msg {
-                            ServerMsg::Welcome { slot_id, port, peers } => {
+                            ServerMsg::Welcome { slot_id, port, room, token, peers } => {
                                 let Some(p) = pending.take() else {
                                     // Resync: relay pushed fresh state after broadcast lag
                                     let Some(ref session) = audio else { continue };
@@ -720,9 +752,13 @@ pub async fn run(
                                     });
                                 }
 
+                                let (Some(room_id), Some(bind_token)) = (decode_b64_32(&room), decode_b64_32(&token)) else {
+                                    emit_error(&app, "voice: relay sent a malformed welcome");
+                                    continue;
+                                };
                                 match start_audio(
                                     &client, &p.server_id, &p.channel_id, &p.own_fp, &p.own_device_vk,
-                                    &p.voice_salt, slot_id, &p.relay_url, port, initial_keys, &state,
+                                    &p.voice_salt, slot_id, room_id, bind_token, &p.relay_url, port, initial_keys, &state,
                                     p.input_device.clone(), p.output_device.clone(),
                                 ).await {
                                     Ok(session) => {

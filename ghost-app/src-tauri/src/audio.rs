@@ -335,8 +335,9 @@ impl Agc {
     }
 }
 
+/// A media packet for the room and slot the relay assigned at our voice join.
 pub fn build_packet(
-    channel_id: &[u8; 32],
+    room_id: &[u8; 32],
     slot_id: u32,
     epoch: u64,
     sequence: u32,
@@ -344,7 +345,7 @@ pub fn build_packet(
 ) -> Vec<u8> {
     let mut pkt = Vec::with_capacity(VOICE_HEADER_SIZE + payload.len());
     pkt.extend_from_slice(&(VOICE_HEADER_SIZE as u16).to_be_bytes());
-    pkt.extend_from_slice(channel_id);
+    pkt.extend_from_slice(room_id);
     pkt.extend_from_slice(&slot_id.to_be_bytes());
     pkt.push(0x00); // flags
     pkt.extend_from_slice(&epoch.to_be_bytes());
@@ -354,7 +355,7 @@ pub fn build_packet(
     pkt
 }
 
-/// Returns (channel_id, slot_id, epoch, sequence, payload_len, header_len).
+/// Returns (room_id, slot_id, epoch, sequence, payload_len, header_len).
 /// Payload starts at buf[header_len..header_len + payload_len].
 pub fn parse_header(buf: &[u8]) -> Option<([u8; 32], u32, u64, u32, usize, usize)> {
     if buf.len() < VOICE_HEADER_SIZE {
@@ -364,7 +365,7 @@ pub fn parse_header(buf: &[u8]) -> Option<([u8; 32], u32, u64, u32, usize, usize
     if header_len < VOICE_HEADER_SIZE || buf.len() < header_len {
         return None;
     }
-    let channel_id: [u8; 32] = buf[2..34].try_into().ok()?;
+    let room_id: [u8; 32] = buf[2..34].try_into().ok()?;
     let slot_id = u32::from_be_bytes(buf[34..38].try_into().ok()?);
     // flags at byte 38
     let epoch = u64::from_be_bytes(buf[39..47].try_into().ok()?);
@@ -373,7 +374,7 @@ pub fn parse_header(buf: &[u8]) -> Option<([u8; 32], u32, u64, u32, usize, usize
     if buf.len() < header_len + payload_len {
         return None;
     }
-    Some((channel_id, slot_id, epoch, sequence, payload_len, header_len))
+    Some((room_id, slot_id, epoch, sequence, payload_len, header_len))
 }
 
 struct SampleRateConverter {
@@ -429,7 +430,7 @@ impl AudioPipeline {
         own_slot_id: u32,
         own_key: [u8; 32],
         own_epoch: u64,
-        channel_id: [u8; 32],
+        room_id: [u8; 32],
         peer_keys: HashMap<u32, PeerVoiceKeys>,
         input_device_name: Option<String>,
         output_device_name: Option<String>,
@@ -453,7 +454,7 @@ impl AudioPipeline {
                     own_slot_id,
                     own_key,
                     own_epoch,
-                    channel_id,
+                    room_id,
                     peer_keys_clone,
                     input_device_name,
                     output_device_name,
@@ -751,7 +752,7 @@ fn run_audio_thread(
     own_slot_id: u32,
     own_key: [u8; 32],
     own_epoch: u64,
-    channel_id: [u8; 32],
+    room_id: [u8; 32],
     peer_keys: Arc<Mutex<HashMap<u32, PeerVoiceKeys>>>,
     input_device_name: Option<String>,
     output_device_name: Option<String>,
@@ -920,7 +921,7 @@ fn run_audio_thread(
                 // Always encode to keep Opus encoder state warm
                 if let Ok(len) = encoder.encode_float(&frame_48k, &mut encode_buf) {
                     if let Ok(encrypted) = encrypt_voice_frame(&own_key, sequence, &encode_buf[..len]) {
-                        let pkt = build_packet(&channel_id, own_slot_id, own_epoch, sequence, &encrypted);
+                        let pkt = build_packet(&room_id, own_slot_id, own_epoch, sequence, &encrypted);
                         sequence = sequence.wrapping_add(1);
 
                         if speaking {
@@ -939,7 +940,7 @@ fn run_audio_thread(
                                 // Speech end: send silence frames for clean decoder reset
                                 for _ in 0..SILENCE_FRAME_COUNT {
                                     if let Ok(enc) = encrypt_voice_frame(&own_key, sequence, &OPUS_SILENCE) {
-                                        let spkt = build_packet(&channel_id, own_slot_id, own_epoch, sequence, &enc);
+                                        let spkt = build_packet(&room_id, own_slot_id, own_epoch, sequence, &enc);
                                         let _ = outbound_tx.try_send(spkt);
                                         sequence = sequence.wrapping_add(1);
                                         diag_frames_sent += 1;
@@ -962,7 +963,7 @@ fn run_audio_thread(
                 if was_speaking {
                     for _ in 0..SILENCE_FRAME_COUNT {
                         if let Ok(enc) = encrypt_voice_frame(&own_key, sequence, &OPUS_SILENCE) {
-                            let spkt = build_packet(&channel_id, own_slot_id, own_epoch, sequence, &enc);
+                            let spkt = build_packet(&room_id, own_slot_id, own_epoch, sequence, &enc);
                             let _ = outbound_tx.try_send(spkt);
                             sequence = sequence.wrapping_add(1);
                             diag_frames_sent += 1;

@@ -15,6 +15,12 @@ pub const OPUS_EXPECTED_LOSS_PCT: i32 = 5;
 // Voice packet header — re-exported from ghost-wire
 pub use ghost_wire::{VOICE_HEADER_SIZE, VOICE_MAX_PACKET};
 
+// Bind packets tie our UDP address to our voice slot. The first few go out quickly so
+// a lost one costs little audio; the rest keep the binding current if our address
+// changes (new network, NAT rebinding).
+pub const VOICE_BIND_RETRY_DELAYS_MS: [u64; 4] = [0, 200, 600, 1500];
+pub const VOICE_BIND_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
 // Volume normalizer
 pub const AGC_TARGET_RMS: f32 = 0.1;
 pub const AGC_MAX_GAIN: f32 = 3.0;
