@@ -7,7 +7,7 @@ use tokio::sync::Mutex;
 use zeroize::Zeroizing;
 
 use crate::config::GhostConfig;
-use crate::presence::PresenceInfo;
+use ghost_core::flows::presence::PresenceInfo;
 use crate::voice_task::VoiceHandle;
 
 /// Device credentials used to authenticate relay clients. Kept outside GhostClient so a

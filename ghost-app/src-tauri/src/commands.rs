@@ -24,7 +24,7 @@ use crate::dto::{
     MemberDto, MessageDto, PolicyDto, RoleDto, ServerDto, ServerRolesDto,
 };
 use ghost_wire::policy::{ChannelPolicy, Role, ServerPolicy, MANAGE_CHANNELS};
-use crate::presence;
+use ghost_core::flows::presence;
 use crate::state::{AppState, now_millis};
 use crate::voice_task::VoiceCommand;
 
@@ -818,7 +818,7 @@ pub async fn upload_avatar(
         p.avatar_hash = Some(avatar_hash);
         let info = p.clone();
         drop(p);
-        presence::broadcast_presence(&state.client, &state.relay, &info).await;
+        presence::broadcast(&state.client, &state.relay, &info).await;
     }
 
     Ok(())
@@ -861,7 +861,7 @@ pub async fn clear_avatar(
         p.avatar_hash = None;
         let info = p.clone();
         drop(p);
-        presence::broadcast_presence(&state.client, &state.relay, &info).await;
+        presence::broadcast(&state.client, &state.relay, &info).await;
     }
 
     Ok(())
@@ -1220,7 +1220,7 @@ pub async fn set_status(status: String, state: State<'_, AppState>) -> Result<()
         p.status = os;
         p.clone()
     };
-    presence::broadcast_presence(&state.client, &state.relay, &info).await;
+    presence::broadcast(&state.client, &state.relay, &info).await;
     if os != OnlineStatus::Idle {
         let mut cfg = state.config.lock().await;
         cfg.status = Some(status.clone());
@@ -1245,7 +1245,7 @@ pub async fn set_status_message(
         p.status_expiry = expiry;
         p.clone()
     };
-    presence::broadcast_presence(&state.client, &state.relay, &info).await;
+    presence::broadcast(&state.client, &state.relay, &info).await;
     let mut cfg = state.config.lock().await;
     cfg.status_message = message.clone();
     cfg.status_expiry = expiry;

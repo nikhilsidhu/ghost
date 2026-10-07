@@ -9,7 +9,7 @@ use tauri::{AppHandle, Emitter};
 use tokio::sync::Mutex;
 
 use crate::config::GhostConfig;
-use crate::presence::{self, PresenceInfo};
+use ghost_core::flows::presence::{self, PresenceInfo};
 use crate::voice_task::VoiceCommand;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(15);
@@ -46,7 +46,7 @@ pub async fn run(
                     p.status_expiry = None;
                     let info = p.clone();
                     drop(p);
-                    presence::broadcast_presence(&client, &relay, &info).await;
+                    presence::broadcast(&client, &relay, &info).await;
                     let mut cfg = config.lock().await;
                     cfg.status_message = None;
                     cfg.status_expiry = None;
@@ -75,7 +75,7 @@ pub async fn run(
                 p.status = OnlineStatus::Idle;
                 p.clone()
             };
-            presence::broadcast_presence(&client, &relay, &info).await;
+            presence::broadcast(&client, &relay, &info).await;
             let _ = app.emit("idle-transition", "idle");
 
             let _ = voice_cmd.send(VoiceCommand::SetMuted(true)).await;
@@ -92,7 +92,7 @@ pub async fn run(
                 p.status = OnlineStatus::Online;
                 p.clone()
             };
-            presence::broadcast_presence(&client, &relay, &info).await;
+            presence::broadcast(&client, &relay, &info).await;
             let _ = app.emit("idle-transition", "online");
         }
     }

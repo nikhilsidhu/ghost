@@ -8,7 +8,6 @@ mod constants;
 mod device_watcher;
 mod dto;
 mod idle_task;
-mod presence;
 mod relay_task;
 mod setup;
 mod state;

@@ -11,7 +11,7 @@ use ghost_core::mls::presence::OnlineStatus;
 
 use crate::config::{self, GhostConfig};
 use crate::constants::VOICE_CMD_CHANNEL_SIZE;
-use crate::presence::PresenceInfo;
+use ghost_core::flows::presence::PresenceInfo;
 use crate::state::{AppState, AuthMaterial};
 use crate::voice_task::{VoiceCommand, VoiceHandle, VoiceStateEvent};
 
