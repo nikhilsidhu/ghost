@@ -14,6 +14,7 @@ use ghost_wire::anchor::{decode_sequence, encode_sequence, AnchoredEntry, Import
 use ghost_wire::merkle::Checkpoint;
 use ghost_wire::recovery_bundle::RecoveryBundle;
 use ghost_wire::relay_ref::RelayRef;
+use ghost_wire::server_location::ServerLocation;
 use ghost_wire::{
     SNAPSHOT_GENERATION_LEN, WS_FRAME_HEADER_SIZE, WS_SEQ_SIZE, WS_SIGNAL_EPOCH_MISMATCH, WS_SIGNAL_GAP,
 };
@@ -664,6 +665,41 @@ impl RelayClient {
             return Err(status_err("put mirror grants", resp).await);
         }
         Ok(())
+    }
+
+    /// Publish where a server this account created now lives (at the account's home).
+    pub async fn put_server_location(&self, account_fp: &[u8; 32], location: &ServerLocation) -> Result<()> {
+        let path = format!("/accounts/{}/servers/{}/location", hex::encode(account_fp), hex::encode(location.server_id));
+        let req = self.http.put(format!("{}{}", self.base_url, path)).body(location.to_bytes());
+        let resp = self.authenticated("PUT", &path, req)
+            .send()
+            .await
+            .map_err(|e| GhostError::Network(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(status_err("put server location", resp).await);
+        }
+        Ok(())
+    }
+
+    /// Where the creator `account_fp` says its server lives; `None` if it never moved it.
+    pub async fn get_server_location(&self, account_fp: &[u8; 32], server_id: &[u8; 32]) -> Result<Option<ServerLocation>> {
+        let url = format!(
+            "{}/accounts/{}/servers/{}/location",
+            self.base_url,
+            hex::encode(account_fp),
+            hex::encode(server_id)
+        );
+        let resp = self.http.get(url).send().await.map_err(|e| GhostError::Network(e.to_string()))?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            return Err(status_err("get server location", resp).await);
+        }
+        let bytes = resp.bytes().await.map_err(|e| GhostError::Network(e.to_string()))?;
+        ServerLocation::from_bytes(&bytes)
+            .map(Some)
+            .map_err(|e| GhostError::Network(e.to_string()))
     }
 
     /// Where this relay believes the account is homed.

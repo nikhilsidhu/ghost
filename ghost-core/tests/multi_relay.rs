@@ -716,3 +716,211 @@ async fn accept_p6_identity_log_reads_require_authorization() {
         .unwrap();
     assert_eq!(pull(&some_relay).await, reqwest::StatusCode::OK);
 }
+
+// ── Server moves ──────────────────────────────────────────────────────
+
+/// A device's own relay client with a readable event stream, as the application holds it.
+async fn app_client(account: &Account, home_url: &str) -> (Arc<Mutex<RelayClient>>, tokio::sync::mpsc::Receiver<RelayEvent>) {
+    let (mut client, events) = RelayClient::new(home_url);
+    client.copy_auth_from(&*account.relay.lock().await);
+    (Arc::new(Mutex::new(client)), events)
+}
+
+/// Feed a device's events to its client until `pick` returns a value.
+async fn receive_until<T>(
+    client: &Arc<Mutex<ghost_core::client::GhostClient>>,
+    events: &mut tokio::sync::mpsc::Receiver<RelayEvent>,
+    channel_id: &[u8; 32],
+    mut pick: impl FnMut(ReceiveResult) -> Option<T>,
+) -> Option<T> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(event) = events.recv().await {
+            let RelayEvent::Blob(b) = event else { continue };
+            let result = client.lock().await.receive_any(channel_id, &b.payload, Some(b.received_at));
+            if let Some(value) = result.ok().and_then(&mut pick) {
+                return Some(value);
+            }
+        }
+        None
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+fn text(content: &'static [u8]) -> impl FnMut(ReceiveResult) -> Option<()> {
+    move |r| match r {
+        ReceiveResult::Message(m) | ReceiveResult::MessageWithKtWarning(m) if m.content == content => Some(()),
+        _ => None,
+    }
+}
+
+/// Host creates a server on `old_url`; Alice (home `alice_url`) joins it through her
+/// app client; the host's device catches up on her join, as its live connection would.
+struct HostedServer {
+    host: Account,
+    alice: Account,
+    server_id: [u8; 32],
+    channel_id: [u8; 32],
+    alice_app: Arc<Mutex<RelayClient>>,
+    alice_events: tokio::sync::mpsc::Receiver<RelayEvent>,
+    alice_old_view: Arc<Mutex<RelayClient>>,
+}
+
+async fn host_server_with_alice(old_url: &str, alice_url: &str) -> HostedServer {
+    let host = create_account(old_url, "host").await;
+    let alice = create_account(alice_url, "alice").await;
+    let server_id = create_server(&host, "club").await;
+    let channel_id = derive_default_channel_id(&server_id);
+    let mailbox_id = host.client.lock().await.mailbox_id_for_server(&server_id).unwrap();
+    // The host's application is subscribed to its server, which routes it to this relay.
+    host.relay.lock().await.subscribe(mailbox_id, 0);
+
+    let (alice_app, alice_events) = app_client(&alice, alice_url).await;
+    let alice_old_view = Arc::new(Mutex::new(alice_app.lock().await.at(old_url)));
+    let token = invite_on(&host, &server_id).await;
+    flows::invite::join(&alice.client, &alice_app, &alice_old_view, &token, 2000).await.unwrap();
+
+    let (mut reader, mut events) = RelayClient::new(old_url);
+    reader.copy_auth_from(&*host.relay.lock().await);
+    reader.subscribe(mailbox_id, 0);
+    let alice_fp = alice.fp;
+    let caught_up = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(event) = events.recv().await {
+            let RelayEvent::Blob(b) = event else { continue };
+            let mut c = host.client.lock().await;
+            let _ = c.receive_any(&channel_id, &b.payload, Some(b.received_at));
+            let _ = c.store().set_last_seen_seq(&mailbox_id, b.seq);
+            if c.mls_member_fingerprints(&server_id).unwrap_or_default().contains(&alice_fp) {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(caught_up.is_ok(), "host never saw Alice join");
+    HostedServer { host, alice, server_id, channel_id, alice_app, alice_events, alice_old_view }
+}
+
+async fn relay_vk_at(url: &str) -> [u8; 32] {
+    RelayClient::new(url).0.get_relay_info().await.unwrap().relay_vk
+}
+
+async fn host_sends(s: &HostedServer, home: &Arc<Mutex<RelayClient>>, content: &[u8]) {
+    let outbound = {
+        let mut c = s.host.client.lock().await;
+        c.send_message(&s.server_id, &s.channel_id, content.to_vec(), vec![], 9000).unwrap().0
+    };
+    home.lock().await.post_blob(&outbound.mailbox_id, outbound.blob).await.unwrap();
+}
+
+#[tokio::test]
+async fn accept_p6_server_move_followed_through_announcement() {
+    let old_url = common::start_relay().await;
+    let new_url = common::start_relay().await;
+    let alice_url = common::start_relay().await;
+    let mut s = host_server_with_alice(&old_url, &alice_url).await;
+
+    // The host's account moves to the new relay, then the server follows it.
+    let host_home = Arc::new(Mutex::new(s.host.relay.lock().await.at(&new_url)));
+    flows::account::rehome(&s.host.client, &host_home, Some(&s.host.relay)).await.unwrap();
+    let location = flows::server::move_server(&s.host.client, &host_home, &s.server_id, &new_url).await.unwrap();
+
+    // Alice's live connection delivers the announcement; following it moves her.
+    let announced = receive_until(&s.alice.client, &mut s.alice_events, &s.channel_id, |r| match r {
+        ReceiveResult::Message(m) | ReceiveResult::MessageWithKtWarning(m) if m.message_type == MessageType::Metadata => {
+            match ghost_core::wire::decode_metadata(&m.content) {
+                Ok(ghost_core::wire::MetadataPayload::ServerMoved(location)) => Some(location),
+                _ => None,
+            }
+        }
+        _ => None,
+    })
+    .await
+    .expect("Alice never received the move announcement");
+    assert_eq!(announced, location);
+    assert!(flows::server::follow_move(&s.alice.client, &s.alice_app, &s.server_id, &announced).await.unwrap());
+    let new_vk = relay_vk_at(&new_url).await;
+    assert_eq!(s.alice.client.lock().await.store().server_relay(&s.server_id).unwrap(), Some(new_vk));
+
+    // Messages now flow through the new relay; a repeated announcement changes nothing.
+    host_sends(&s, &host_home, b"after the move").await;
+    receive_until(&s.alice.client, &mut s.alice_events, &s.channel_id, text(b"after the move"))
+        .await
+        .expect("Alice never received a message through the new relay");
+    assert!(!flows::server::follow_move(&s.alice.client, &s.alice_app, &s.server_id, &announced).await.unwrap());
+}
+
+#[tokio::test]
+async fn accept_p6_server_move_found_at_creator_home_after_relay_dies() {
+    let (old_url, old_server) = common::start_relay_with_handle().await;
+    let new_url = common::start_relay().await;
+    let alice_url = common::start_relay().await;
+    let mut s = host_server_with_alice(&old_url, &alice_url).await;
+
+    // While the old relay is still up, the host re-homes its account and Alice's
+    // device refreshes the host's log there, learning the new home.
+    let host_home = Arc::new(Mutex::new(s.host.relay.lock().await.at(&new_url)));
+    flows::account::rehome(&s.host.client, &host_home, Some(&s.host.relay)).await.unwrap();
+    flows::idlog::cache_member(&s.alice.client, &s.alice_old_view, &s.host.fp).await;
+
+    old_server.abort();
+    let _ = old_server.await;
+
+    // The announcement cannot reach anyone; the record at the host's home can.
+    flows::server::move_server(&s.host.client, &host_home, &s.server_id, &new_url).await.unwrap();
+    assert!(flows::server::check_location(&s.alice.client, &s.alice_app, &s.server_id).await.unwrap());
+
+    host_sends(&s, &host_home, b"we survived").await;
+    receive_until(&s.alice.client, &mut s.alice_events, &s.channel_id, text(b"we survived"))
+        .await
+        .expect("Alice never received a message after the relay died");
+}
+
+#[tokio::test]
+async fn accept_p6_server_move_link_followed_when_no_shared_relay_survives() {
+    let (old_url, old_server) = common::start_relay_with_handle().await;
+    let new_url = common::start_relay().await;
+    let alice_url = common::start_relay().await;
+    let mut s = host_server_with_alice(&old_url, &alice_url).await;
+
+    // The old relay dies before Alice learns anything about the host's new home.
+    let host_home = Arc::new(Mutex::new(s.host.relay.lock().await.at(&new_url)));
+    flows::account::rehome(&s.host.client, &host_home, Some(&s.host.relay)).await.unwrap();
+    old_server.abort();
+    let _ = old_server.await;
+
+    let location = flows::server::move_server(&s.host.client, &host_home, &s.server_id, &new_url).await.unwrap();
+    assert!(flows::server::check_location(&s.alice.client, &s.alice_app, &s.server_id).await.is_err());
+
+    // The link carries the same signed record, verified against the host's cached log.
+    let link = flows::server::move_link(&location);
+    let parsed = flows::server::parse_move_link(&link).unwrap();
+    assert!(flows::server::follow_move(&s.alice.client, &s.alice_app, &s.server_id, &parsed).await.unwrap());
+
+    host_sends(&s, &host_home, b"found you").await;
+    receive_until(&s.alice.client, &mut s.alice_events, &s.channel_id, text(b"found you"))
+        .await
+        .expect("Alice never received a message after following the link");
+}
+
+#[tokio::test]
+async fn accept_p6_server_move_refuses_records_not_signed_by_the_creator() {
+    let old_url = common::start_relay().await;
+    let alice_url = common::start_relay().await;
+    let s = host_server_with_alice(&old_url, &alice_url).await;
+
+    // Alice is a member, not the creator: her signature cannot move the server.
+    let alice_key = s.alice.client.lock().await.signing_key_clone();
+    let forged = ghost_wire::server_location::ServerLocation::sign(
+        s.server_id,
+        99,
+        ghost_wire::relay_ref::RelayRef::https([0x66; 32], "https://evil.example"),
+        &alice_key,
+    );
+    let err = flows::server::follow_move(&s.alice.client, &s.alice_app, &s.server_id, &forged).await.unwrap_err();
+    assert!(err.to_string().contains("creator"), "{err}");
+
+    // Only the creator may move it at all.
+    let err = flows::server::move_server(&s.alice.client, &s.alice_app, &s.server_id, &alice_url).await.unwrap_err();
+    assert!(matches!(err, GhostError::PermissionDenied(_)), "{err}");
+}

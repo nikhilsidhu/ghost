@@ -232,6 +232,15 @@ impl GhostClient {
         self.store.set_kt_state(relay_vk, head.tree_size, &head.root_hash, &head.to_bytes())
     }
 
+    /// The cached identity log state for an account, loading it from the local
+    /// database when it is not in memory yet. `None` if this device never cached it.
+    pub fn cached_identity_log(&mut self, account_fp: &[u8; 32]) -> Result<Option<ghost_wire::idlog::LogState>> {
+        if let Some(state) = self.idlog_cache.get(account_fp) {
+            return Ok(Some(state.clone()));
+        }
+        Ok(self.idlog_cache.load_from_store(&self.store, account_fp)?.cloned())
+    }
+
     /// Insert a pre-validated LogState directly (e.g. for our own account).
     pub fn cache_own_identity_log(&mut self, state: ghost_wire::idlog::LogState) {
         self.idlog_cache.insert(state);
@@ -533,7 +542,8 @@ impl GhostClient {
         else { self.store.insert_member(&self_member)?; }
 
         let mut results = Vec::with_capacity(channels.len());
-        for ch in channels {
+        // Channels without GroupInfo have no MLS group: metadata only.
+        for ch in channels.iter().filter(|ch| !ch.group_info_bytes.is_empty()) {
             let (ghost_group, commit_bytes) = GhostGroup::join_by_external_commit(
                 &self.provider,
                 &self.identity,
@@ -553,18 +563,19 @@ impl GhostClient {
     pub fn join_from_provision(
         &mut self,
         payload: &ProvisionPayload,
-        group_info_bytes: &[u8],
+        group_infos: &HashMap<[u8; 32], Vec<u8>>,
         timestamp: u64,
     ) -> Result<Vec<([u8; 32], Vec<u8>, [u8; 32])>> {
-        // Provision payloads carry channel metadata but the GroupInfo comes
-        // separately (fetched from the relay's server_info endpoint).
-        // Inject it into the default channel's group_info_bytes.
-        let mut channels = payload.channels.clone();
+        // Provision payloads carry channel metadata only; each channel's GroupInfo comes
+        // from that channel's mailbox on the relay. Channels without one have no MLS group
+        // and are stored as metadata; the default channel must have one.
         let default_ch = derive_default_channel_id(&payload.server_id);
+        if !group_infos.contains_key(&default_ch) {
+            return Err(GhostError::Mls("no GroupInfo for the server's default channel".into()));
+        }
+        let mut channels = payload.channels.clone();
         for ch in &mut channels {
-            if ch.channel_id == default_ch {
-                ch.group_info_bytes = group_info_bytes.to_vec();
-            }
+            ch.group_info_bytes = group_infos.get(&ch.channel_id).cloned().unwrap_or_default();
         }
         self.join_server_common(
             payload.server_id, payload.server_name.clone(), payload.kind,
@@ -620,6 +631,33 @@ impl GhostClient {
         self.mailbox_map.insert(mailbox_id, channel_id);
         self.channel_server.insert(channel_id, server_id);
         Ok(server_id)
+    }
+
+    /// Stage, in every channel group of a server, a commit naming `relay_vk` as the
+    /// group's external sender. Returns (channel_id, mailbox_id, commit) for each; the
+    /// caller posts each commit to the new relay and merges or clears it.
+    pub fn stage_server_external_sender(
+        &mut self,
+        server_id: &[u8; 32],
+        relay_vk: &[u8; 32],
+    ) -> Result<Vec<([u8; 32], [u8; 32], Vec<u8>)>> {
+        let mut staged = Vec::new();
+        for channel_id in self.server_channel_ids(server_id) {
+            let group = self.channel_groups.get_mut(&channel_id).ok_or_else(|| {
+                GhostError::ServerNotLoaded(format!("channel {}", hex::encode(&channel_id[..8])))
+            })?;
+            let commit = group.set_external_sender(&self.provider, relay_vk)?;
+            staged.push((channel_id, mls_group_mailbox_id(group.group_id()), commit));
+        }
+        Ok(staged)
+    }
+
+    /// Ids of the server's channels that have an MLS group, with their mailboxes.
+    pub fn server_channel_mailboxes(&self, server_id: &[u8; 32]) -> Vec<([u8; 32], [u8; 32])> {
+        self.server_channel_ids(server_id)
+            .into_iter()
+            .filter_map(|cid| self.channel_groups.get(&cid).map(|g| (cid, mls_group_mailbox_id(g.group_id()))))
+            .collect()
     }
 
     /// Migrate pre-upgrade groups to include ExternalSendersExtension.
@@ -968,6 +1006,15 @@ impl GhostClient {
     /// Export GroupInfo for a server's default channel so other clients can recover via external commit.
     pub fn export_server_info(&self, server_id: &[u8; 32]) -> Result<Vec<u8>> {
         let group = self.default_group(server_id)?;
+        group.export_group_info(&self.provider)
+    }
+
+    /// Export GroupInfo for one channel's MLS group, which is what that channel's
+    /// mailbox must hold for external-commit joins of that channel.
+    pub fn export_channel_group_info(&self, channel_id: &[u8; 32]) -> Result<Vec<u8>> {
+        let group = self.channel_groups.get(channel_id).ok_or_else(|| {
+            GhostError::ServerNotLoaded(format!("channel {}", hex::encode(&channel_id[..8])))
+        })?;
         group.export_group_info(&self.provider)
     }
 

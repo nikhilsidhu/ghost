@@ -43,13 +43,7 @@ pub async fn recover(
             }
         };
         if accepted {
-            let server_id = {
-                let c = client.lock().await;
-                c.server_id_for_mailbox(mailbox_id)
-            };
-            if let Some(sid) = server_id {
-                publish_server_info(client, relay, &sid, mailbox_id).await;
-            }
+            publish_server_info(client, relay, mailbox_id).await;
             return Ok(true);
         }
     }

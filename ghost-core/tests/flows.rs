@@ -281,3 +281,37 @@ async fn receiver_rejects_messages_from_a_device_its_log_shows_revoked() {
     .expect("Carol never processed device B's message");
     outcome.unwrap();
 }
+
+#[tokio::test]
+async fn linked_device_rejoins_a_server_with_a_metadata_only_channel() {
+    use ghost_core::storage::{Channel, ChannelKind};
+    use ghost_core::wire::{channel_mailbox_id, derive_default_channel_id};
+
+    let relay_url = common::start_relay().await;
+    let account = create_account(&relay_url, "desktop").await;
+    let server_id = create_server(&account, "home").await;
+    {
+        let c = account.client.lock().await;
+        // The derived mailbox of the default channel is the one the client uses.
+        assert_eq!(
+            Some(channel_mailbox_id(&server_id, &derive_default_channel_id(&server_id))),
+            c.mailbox_id_for_server(&server_id)
+        );
+        // Channels added in the app are rows without an MLS group of their own.
+        c.store()
+            .insert_channel(&Channel {
+                channel_id: [0x77; 32],
+                server_id,
+                name: "random".into(),
+                kind: ChannelKind::Text,
+                position: 1,
+            })
+            .unwrap();
+    }
+
+    let (client_b, _relay_b, _vk) = pair_second_device(&relay_url, &account).await;
+    let c = client_b.lock().await;
+    assert!(c.store().get_server(&server_id).is_ok(), "rejoined despite the extra channel");
+    let channels = c.store().list_channels(&server_id).unwrap();
+    assert_eq!(channels.len(), 2, "the metadata-only channel is kept");
+}

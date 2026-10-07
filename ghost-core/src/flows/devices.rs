@@ -169,21 +169,18 @@ async fn post_removal(
         let r = relay.lock().await;
         r.post_blob(mailbox_id, commit).await
     };
-    let server_id = {
+    {
         let mut c = client.lock().await;
         match result {
             Ok(_) => {
                 let _ = c.merge_pending_commit_for_channel(channel_id);
-                c.server_id_for_mailbox(mailbox_id)
             }
             Err(_) => {
                 let _ = c.clear_pending_commit_for_channel(channel_id);
                 return false;
             }
         }
-    };
-    if let Some(sid) = server_id {
-        publish_server_info(client, relay, &sid, mailbox_id).await;
     }
+    publish_server_info(client, relay, mailbox_id).await;
     true
 }

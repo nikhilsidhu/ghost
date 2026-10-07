@@ -446,16 +446,30 @@ impl GhostGroup {
         provider: &GhostProvider,
         relay_vk: &[u8; 32],
     ) -> Result<Vec<u8>> {
+        self.set_external_sender(provider, relay_vk)
+    }
+
+    /// Make `relay_vk` the group's only external sender, replacing any previous
+    /// relay, so the relay now hosting the group may propose removals. Returns the
+    /// envelope-wrapped commit, staged but not merged.
+    pub fn set_external_sender(
+        &mut self,
+        provider: &GhostProvider,
+        relay_vk: &[u8; 32],
+    ) -> Result<Vec<u8>> {
         let external_sender = ExternalSender::new(
             SignaturePublicKey::from(relay_vk.to_vec()),
             Credential::new(CredentialType::Basic, b"ghost-relay".to_vec()),
         );
 
-        // Build new extensions: keep existing ones, add ExternalSenders
-        let mut ext_vec: Vec<Extension> = Vec::new();
-        for e in self.mls_group.extensions().iter() {
-            ext_vec.push(e.clone());
-        }
+        // Keep every other extension; the external sender list is replaced.
+        let mut ext_vec: Vec<Extension> = self
+            .mls_group
+            .extensions()
+            .iter()
+            .filter(|e| !matches!(e, Extension::ExternalSenders(_)))
+            .cloned()
+            .collect();
         ext_vec.push(Extension::ExternalSenders(vec![external_sender]));
 
         let extensions = Extensions::from_vec(ext_vec)

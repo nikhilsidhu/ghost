@@ -1,7 +1,10 @@
 //! Provisioning a linked or recovered device with the account's servers and sync state.
 
+use std::collections::HashMap;
+
 use crate::error::{GhostError, Result};
 use crate::wire::{
+    channel_mailbox_id, derive_default_channel_id,
     decode_sync_state_dump, encode_member_announce, encode_sync_state_dump, ProvisionPayload,
     SyncServerMeta,
 };
@@ -94,9 +97,9 @@ impl ProvisionBlob {
     }
 }
 
-/// Rejoin one server by external commit from the relay's stored GroupInfo, with retries.
-/// Returns `true` once every channel commit was accepted and the member announced.
-/// A relay that has no GroupInfo for the server (404) ends the attempts immediately.
+/// Rejoin one server by external commit from each channel's GroupInfo on the relay, with
+/// retries. Returns `true` once every channel commit was accepted and the member announced.
+/// A relay that refuses a channel's GroupInfo (404 or another client error) ends the attempts.
 pub async fn rejoin_server(
     client: &SharedClient,
     relay: &SharedRelay,
@@ -104,21 +107,31 @@ pub async fn rejoin_server(
     now: u64,
     label: &str,
 ) -> bool {
-    for _ in 0..MAX_REJOIN_ATTEMPTS {
-        let group_info = {
-            let r = relay.lock().await;
-            match r.get_server_info(&payload.mailbox_id).await {
-                Ok(gi) => gi,
-                Err(GhostError::RelayStatus { status: 404, .. }) => break,
-                Err(GhostError::RelayStatus { status, .. }) if status >= 500 => continue,
-                Err(GhostError::RelayStatus { .. }) => break,
-                Err(_) => continue,
+    'attempts: for _ in 0..MAX_REJOIN_ATTEMPTS {
+        // A channel with an MLS group publishes its GroupInfo under its own mailbox.
+        // Channels without one are metadata only; the default channel always has one.
+        let default_channel = derive_default_channel_id(&payload.server_id);
+        let mut group_infos = HashMap::new();
+        for channel in &payload.channels {
+            let mailbox_id = channel_mailbox_id(&payload.server_id, &channel.channel_id);
+            let fetched = {
+                let r = relay.lock().await;
+                r.get_server_info(&mailbox_id).await
+            };
+            match fetched {
+                Ok(gi) => {
+                    group_infos.insert(channel.channel_id, gi);
+                }
+                Err(GhostError::RelayStatus { status: 404, .. }) if channel.channel_id != default_channel => {}
+                Err(GhostError::RelayStatus { status, .. }) if status >= 500 => continue 'attempts,
+                Err(GhostError::RelayStatus { .. }) => break 'attempts,
+                Err(_) => continue 'attempts,
             }
-        };
+        }
 
         let channel_results = {
             let mut c = client.lock().await;
-            match c.join_from_provision(payload, &group_info, now) {
+            match c.join_from_provision(payload, &group_infos, now) {
                 Ok(results) => results,
                 Err(e) => {
                     eprintln!("{label}: join attempt failed for {}: {e}", hex::encode(&payload.server_id[..8]));
@@ -159,7 +172,9 @@ pub async fn rejoin_server(
             return false;
         }
 
-        publish_server_info(client, relay, &payload.server_id, &payload.mailbox_id).await;
+        for (_channel_id, _commit, mailbox_id) in &channel_results {
+            publish_server_info(client, relay, mailbox_id).await;
+        }
 
         let announce = {
             let mut c = client.lock().await;

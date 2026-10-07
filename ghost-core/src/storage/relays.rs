@@ -69,6 +69,32 @@ impl GhostStore {
         }
     }
 
+    /// Generation of the newest server location record accepted for a server (0 if none).
+    pub fn server_location_generation(&self, server_id: &[u8; 32]) -> Result<u64> {
+        self.conn
+            .query_row(
+                "SELECT location_generation FROM servers WHERE server_id = ?1",
+                [server_id.as_slice()],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|g| g as u64)
+            .map_err(|e| GhostError::Database(format!("server location generation: {e}")))
+    }
+
+    pub fn set_server_location_generation(&self, server_id: &[u8; 32], generation: u64) -> Result<()> {
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE servers SET location_generation = ?2 WHERE server_id = ?1",
+                rusqlite::params![server_id.as_slice(), generation as i64],
+            )
+            .map_err(|e| GhostError::Database(format!("set server location generation: {e}")))?;
+        if updated == 0 {
+            return Err(GhostError::Database("server not found".into()));
+        }
+        Ok(())
+    }
+
     /// Every relay that hosts at least one of this account's servers.
     pub fn server_relays(&self) -> Result<Vec<RelayRef>> {
         let mut stmt = self
@@ -134,5 +160,15 @@ mod tests {
         assert_eq!(store.server_relay(&sid).unwrap(), Some([0x07; 32]));
         assert_eq!(store.server_relays().unwrap(), vec![relay]);
         assert!(store.set_server_relay(&[0x66; 32], &[0x07; 32]).is_err());
+    }
+
+    #[test]
+    fn server_location_generation_roundtrip() {
+        let sid = [0x56; 32];
+        let store = store_with_server(sid);
+        assert_eq!(store.server_location_generation(&sid).unwrap(), 0);
+        store.set_server_location_generation(&sid, 9).unwrap();
+        assert_eq!(store.server_location_generation(&sid).unwrap(), 9);
+        assert!(store.set_server_location_generation(&[0x67; 32], 1).is_err());
     }
 }

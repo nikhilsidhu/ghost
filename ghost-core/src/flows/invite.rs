@@ -95,7 +95,7 @@ pub async fn join(
     }
 
     for (_channel_id, _commit, mailbox_id) in &channel_results {
-        publish_server_info(client, relay, &server_id, mailbox_id).await;
+        publish_server_info(client, relay, mailbox_id).await;
     }
 
     let announce = {

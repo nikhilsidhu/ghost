@@ -165,6 +165,11 @@ pub fn mls_group_mailbox_id(mls_group_id: &[u8]) -> [u8; 32] {
     ghost_wire::mls_group_mailbox_id(mls_group_id)
 }
 
+/// Mailbox of a server channel's MLS group, derivable without holding the group.
+pub fn channel_mailbox_id(server_id: &[u8; 32], channel_id: &[u8; 32]) -> [u8; 32] {
+    mls_group_mailbox_id(&derive_mls_group_id(server_id, channel_id))
+}
+
 pub fn derive_default_channel_id(server_id: &[u8; 32]) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(server_id);
@@ -735,6 +740,14 @@ pub fn decode_channel_op(data: &[u8]) -> Result<ChannelOpPayload> {
 const MEMBER_ANNOUNCE: u8 = 0x10;
 const AVATAR_UPDATE: u8 = 0x11;
 const AVATAR_CLEAR: u8 = 0x12;
+const SERVER_MOVED: u8 = 0x13;
+
+/// The server's creator announces that the server now lives on another relay.
+pub fn encode_server_moved(location: &ghost_wire::server_location::ServerLocation) -> Vec<u8> {
+    let mut buf = vec![SERVER_MOVED];
+    buf.extend_from_slice(&location.to_bytes());
+    buf
+}
 
 pub fn encode_member_announce(display_name: &str) -> Vec<u8> {
     let mut buf = Vec::new();
@@ -774,6 +787,9 @@ pub fn decode_metadata(data: &[u8]) -> Result<MetadataPayload> {
             Ok(MetadataPayload::AvatarUpdate { avatar_hash, avatar_key })
         }
         AVATAR_CLEAR => Ok(MetadataPayload::AvatarClear),
+        SERVER_MOVED => ghost_wire::server_location::ServerLocation::from_bytes(&data[1..])
+            .map(MetadataPayload::ServerMoved)
+            .map_err(|e| GhostError::Format(e.to_string())),
         _ => Err(GhostError::Format(format!("unknown metadata tag: {tag:#04x}"))),
     }
 }
@@ -783,6 +799,8 @@ pub enum MetadataPayload {
     MemberAnnounce { display_name: String },
     AvatarUpdate { avatar_hash: [u8; 32], avatar_key: [u8; 32] },
     AvatarClear,
+    /// Only meaningful from the server's creator; receivers verify the record.
+    ServerMoved(ghost_wire::server_location::ServerLocation),
 }
 
 // --- open_any: handle both app messages and commits from the relay ---

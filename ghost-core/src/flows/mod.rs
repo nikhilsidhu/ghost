@@ -17,6 +17,7 @@ pub mod members;
 pub mod pairing;
 pub mod provision;
 pub mod recovery;
+pub mod server;
 pub mod sync;
 
 use tokio::sync::Mutex;
@@ -115,26 +116,26 @@ pub fn server_relay_url(client: &GhostClient, server_id: &[u8; 32]) -> Option<St
     relay_ref.primary_https_url().map(str::to_string)
 }
 
-/// Upload the server's current GroupInfo so other members can recover via external commit.
-/// Best-effort: failures are logged, never fatal, because the group state is already correct locally.
-pub(crate) async fn publish_server_info(
-    client: &SharedClient,
-    relay: &SharedRelay,
-    server_id: &[u8; 32],
-    mailbox_id: &[u8; 32],
-) {
+/// Upload the current GroupInfo of the channel that owns `mailbox_id`, so other devices
+/// can join that channel by external commit. Best effort: failures are logged, never
+/// fatal, because the group state is already correct locally.
+pub(crate) async fn publish_server_info(client: &SharedClient, relay: &SharedRelay, mailbox_id: &[u8; 32]) {
     let group_info = {
         let c = client.lock().await;
-        match c.export_server_info(server_id) {
+        let exported = c
+            .channel_id_for_mailbox(mailbox_id)
+            .ok_or_else(|| crate::error::GhostError::ServerNotLoaded(hex::encode(&mailbox_id[..8])))
+            .and_then(|channel_id| c.export_channel_group_info(&channel_id));
+        match exported {
             Ok(gi) => gi,
             Err(e) => {
-                eprintln!("server_info export for {}: {e}", hex::encode(&server_id[..8]));
+                eprintln!("server_info export for mailbox {}: {e}", hex::encode(&mailbox_id[..8]));
                 return;
             }
         }
     };
     let r = relay.lock().await;
     if let Err(e) = r.put_server_info(mailbox_id, group_info).await {
-        eprintln!("server_info upload for {}: {e}", hex::encode(&server_id[..8]));
+        eprintln!("server_info upload for mailbox {}: {e}", hex::encode(&mailbox_id[..8]));
     }
 }

@@ -152,6 +152,7 @@ pub fn initialize(conn: &Connection) -> Result<()> {
     add_column_if_missing(conn, "idlog_state", "home_relay_ref", "BLOB")?;
     add_column_if_missing(conn, "idlog_state", "home_set_at_seq", "INTEGER NOT NULL DEFAULT 0")?;
     add_column_if_missing(conn, "servers", "relay_vk", "BLOB")?;
+    add_column_if_missing(conn, "servers", "location_generation", "INTEGER NOT NULL DEFAULT 0")?;
 
     Ok(())
 }
