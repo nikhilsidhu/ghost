@@ -1,0 +1,19 @@
+[package]
+name = "ghost-audio"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0"
+
+# A call's audio track: noise suppression, voice activity, volume normalization, Opus,
+# jitter buffers, mixing. Devices plug in through a 48 kHz mono interface, so the app
+# brings real ones and tests bring synthetic ones.
+
+[dependencies]
+ghost-media = { path = "../ghost-media" }
+opus = "0.3"
+nnnoiseless = "0.5"
+tokio = { version = "1", features = ["sync"] }
+
+[features]
+# Synthetic devices: a tone generator for capture and a recorder for playback.
+test-util = []
