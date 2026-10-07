@@ -6,6 +6,14 @@ use crate::error::{GhostError, Result};
 pub fn initialize(conn: &Connection) -> Result<()> {
     let text = MessageType::Text as u8;
 
+    // kt_state was keyed by relay URL; it is now keyed by relay key. The old rows
+    // cannot be re-keyed offline, so the first fetch after upgrading starts a fresh
+    // consistency chain, exactly as a new install does.
+    if has_column(conn, "kt_state", "relay_url")? {
+        conn.execute_batch("DROP TABLE kt_state;")
+            .map_err(|e| GhostError::Database(format!("drop legacy kt_state: {e}")))?;
+    }
+
     conn.execute_batch(&format!(
         "
         CREATE TABLE IF NOT EXISTS servers (
@@ -114,21 +122,56 @@ pub fn initialize(conn: &Connection) -> Result<()> {
         );
 
         CREATE TABLE IF NOT EXISTS idlog_state (
-            account_fp BLOB PRIMARY KEY,
-            head_seq   INTEGER NOT NULL,
-            head_hash  BLOB NOT NULL,
-            master_vk  BLOB
+            account_fp      BLOB PRIMARY KEY,
+            head_seq        INTEGER NOT NULL,
+            head_hash       BLOB NOT NULL,
+            master_vk       BLOB,
+            home_relay_vk   BLOB,
+            home_relay_ref  BLOB,
+            home_set_at_seq INTEGER NOT NULL DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS kt_state (
-            relay_url  TEXT PRIMARY KEY,
+            relay_vk   BLOB PRIMARY KEY,
             tree_size  INTEGER NOT NULL,
             root_hash  BLOB NOT NULL,
             checkpoint BLOB NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS relays (
+            relay_vk  BLOB PRIMARY KEY,
+            ref_bytes BLOB NOT NULL,
+            last_seen INTEGER NOT NULL
         );
         "
     ))
     .map_err(|e| GhostError::Database(format!("create tables: {e}")))?;
 
+    add_column_if_missing(conn, "idlog_cache", "anchored", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(conn, "idlog_state", "home_relay_vk", "BLOB")?;
+    add_column_if_missing(conn, "idlog_state", "home_relay_ref", "BLOB")?;
+    add_column_if_missing(conn, "idlog_state", "home_set_at_seq", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(conn, "servers", "relay_vk", "BLOB")?;
+
+    Ok(())
+}
+
+fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|e| GhostError::Database(format!("table_info {table}: {e}")))?;
+    let names: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|e| GhostError::Database(format!("table_info {table}: {e}")))?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(names.iter().any(|name| name == column))
+}
+
+fn add_column_if_missing(conn: &Connection, table: &str, column: &str, decl: &str) -> Result<()> {
+    if !has_column(conn, table, column)? {
+        conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"), [])
+            .map_err(|e| GhostError::Database(format!("add {table}.{column}: {e}")))?;
+    }
     Ok(())
 }

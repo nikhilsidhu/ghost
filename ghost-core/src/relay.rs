@@ -10,7 +10,14 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 
-use ghost_wire::{WS_FRAME_HEADER_SIZE, WS_SEQ_SIZE, WS_SIGNAL_EPOCH_MISMATCH, WS_SIGNAL_GAP};
+use ghost_wire::anchor::{decode_sequence, encode_sequence, AnchoredEntry, ImportRequest};
+use ghost_wire::merkle::Checkpoint;
+use ghost_wire::recovery_bundle::RecoveryBundle;
+use ghost_wire::relay_ref::RelayRef;
+use ghost_wire::{
+    SNAPSHOT_GENERATION_LEN, WS_FRAME_HEADER_SIZE, WS_SEQ_SIZE, WS_SIGNAL_EPOCH_MISMATCH, WS_SIGNAL_GAP,
+};
+use serde::Deserialize;
 
 use crate::error::{GhostError, Result};
 
@@ -18,30 +25,73 @@ const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 const RELAY_ERROR_PREFIX: &str = "error: ";
 
-/// Identity log entry with a KT inclusion proof.
-pub struct IdLogBlobWithProof {
-    pub seq: u64,
-    pub payload: Vec<u8>,
-    pub inclusion_proof: Vec<u8>,
+/// Header carrying the invite payload's optimistic-concurrency sequence number.
+pub const INVITE_SEQ_HEADER: &str = "X-Ghost-Seq";
+
+/// Typed error for a non-success response, keeping the relay's explanation.
+async fn status_err(context: &str, resp: reqwest::Response) -> GhostError {
+    let status = resp.status().as_u16();
+    let message = resp.text().await.unwrap_or_default();
+    GhostError::RelayStatus { status, context: context.to_string(), message }
 }
 
-/// Response from GET /idlog with KT proofs.
-pub struct IdLogWithProofs {
-    pub entries: Vec<IdLogBlobWithProof>,
-    pub checkpoint: Vec<u8>,
+/// Random id of one pairing session; only the pairing code carries it.
+pub type PairingToken = [u8; 16];
+
+/// An account's identity log as a relay serves it: every entry carries the
+/// proof its home relay sequenced it.
+#[derive(Debug)]
+pub struct AnchoredLog {
+    /// Relay that sequences the log; the serving relay's own key for a chain
+    /// that names no home.
+    pub home_relay_vk: [u8; 32],
+    pub entries: Vec<AnchoredEntry>,
 }
 
 #[derive(serde::Deserialize)]
 struct IdLogResponseJson {
+    home_relay_vk: String,
     entries: Vec<IdLogEntryJson>,
-    checkpoint: String,
 }
 
 #[derive(serde::Deserialize)]
 struct IdLogEntryJson {
-    seq: u64,
-    payload: String,
-    inclusion_proof: String,
+    anchored: String,
+}
+
+/// What a relay reports about an account it holds or mirrors.
+#[derive(Debug, serde::Deserialize)]
+pub struct AccountInfo {
+    #[serde(deserialize_with = "hex_32")]
+    pub home_relay_vk: [u8; 32],
+    pub head_seq: u64,
+    pub is_home: bool,
+}
+
+/// A relay's identity and how to reach it.
+pub struct RelayInfo {
+    pub relay_vk: [u8; 32],
+    pub protocol: u32,
+    pub relay_ref: RelayRef,
+    pub kt_head: Option<Checkpoint>,
+}
+
+#[derive(serde::Deserialize)]
+struct RelayInfoJson {
+    relay_vk: String,
+    protocol: u32,
+    r#ref: String,
+    kt_head: Option<String>,
+}
+
+fn hex_32<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<[u8; 32], D::Error> {
+    let text = String::deserialize(d)?;
+    decode_hex_32(&text).map_err(serde::de::Error::custom)
+}
+
+fn decode_hex_32(text: &str) -> Result<[u8; 32]> {
+    let bytes = hex::decode(text.trim()).map_err(|e| GhostError::Network(format!("hex: {e}")))?;
+    bytes.try_into().map_err(|_| GhostError::Network("expected 32 bytes".into()))
 }
 
 pub struct IncomingBlob {
@@ -97,35 +147,82 @@ impl AuthContext {
     }
 }
 
+/// Live mailbox connections and where each mailbox lives, shared by a client and
+/// every view it opens onto another relay, so one event stream and one set of
+/// subscriptions cover all relays the account uses.
+#[derive(Default)]
+struct Subscriptions {
+    connections: HashMap<[u8; 32], WsHandle>,
+    /// Relay base URL for each subscribed mailbox and each id added with `add_route`.
+    routes: HashMap<[u8; 32], String>,
+}
+
+impl Drop for Subscriptions {
+    fn drop(&mut self) {
+        for (_, handle) in self.connections.drain() {
+            handle.task.abort();
+        }
+    }
+}
+
 pub struct RelayClient {
     base_url: String,
-    ws_base_url: String,
     http: reqwest::Client,
     event_tx: mpsc::Sender<RelayEvent>,
-    connections: HashMap<[u8; 32], WsHandle>,
+    subscriptions: Arc<std::sync::Mutex<Subscriptions>>,
     auth: Option<Arc<AuthContext>>,
+}
+
+fn ws_base(base_url: &str) -> String {
+    base_url.replace("http://", "ws://").replace("https://", "wss://")
 }
 
 impl RelayClient {
     pub fn new(base_url: &str) -> (Self, mpsc::Receiver<RelayEvent>) {
         let base = base_url.trim_end_matches('/').to_string();
-        let ws_base = base
-            .replace("http://", "ws://")
-            .replace("https://", "wss://");
         let (event_tx, event_rx) = mpsc::channel(256);
         let client = Self {
             base_url: base,
-            ws_base_url: ws_base,
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(10))
                 .connect_timeout(std::time::Duration::from_secs(5))
                 .build()
                 .unwrap_or_default(),
             event_tx,
-            connections: HashMap::new(),
+            subscriptions: Arc::new(std::sync::Mutex::new(Subscriptions::default())),
             auth: None,
         };
         (client, event_rx)
+    }
+
+    /// A client for another relay that signs as the same device and shares this
+    /// client's subscriptions and event stream. Mailboxes subscribed through it
+    /// stay connected after it is dropped and are reachable from every view.
+    pub fn at(&self, base_url: &str) -> RelayClient {
+        let base = base_url.trim_end_matches('/').to_string();
+        RelayClient {
+            base_url: base,
+            http: self.http.clone(),
+            event_tx: self.event_tx.clone(),
+            subscriptions: self.subscriptions.clone(),
+            auth: self.auth.clone(),
+        }
+    }
+
+    /// Route mailbox-scoped requests for `id` (a mailbox or voice channel) to this view's relay.
+    pub fn add_route(&self, id: [u8; 32]) {
+        self.subscriptions.lock().unwrap().routes.insert(id, self.base_url.clone());
+    }
+
+    /// Base URL of the relay `id` lives on: its recorded route, else this view's relay.
+    fn base_for(&self, id: &[u8; 32]) -> String {
+        self.subscriptions
+            .lock()
+            .unwrap()
+            .routes
+            .get(id)
+            .cloned()
+            .unwrap_or_else(|| self.base_url.clone())
     }
 
     pub fn base_url(&self) -> &str {
@@ -137,26 +234,43 @@ impl RelayClient {
         self.auth = Some(Arc::new(AuthContext { account_fp, device_vk, signing_key }));
     }
 
-    /// Fetch the relay's Ed25519 verifying key (hex-encoded, 32 bytes).
-    pub async fn get_relay_key(&self) -> Result<[u8; 32]> {
+    /// Sign as the same device as `other`, for talking to another relay.
+    pub fn copy_auth_from(&mut self, other: &RelayClient) {
+        self.auth = other.auth.clone();
+    }
+
+    /// Fetch the relay's identity, reachability hints and KT head.
+    pub async fn get_relay_info(&self) -> Result<RelayInfo> {
         let resp = self
             .http
-            .get(format!("{}/relay_key", self.base_url))
+            .get(format!("{}/relay", self.base_url))
             .send()
             .await
             .map_err(|e| GhostError::Network(e.to_string()))?;
         if !resp.status().is_success() {
-            return Err(GhostError::Network(format!("get relay_key: {}", resp.status())));
+            return Err(status_err("get relay info", resp).await);
         }
-        let hex_str = resp
-            .text()
-            .await
-            .map_err(|e| GhostError::Network(e.to_string()))?;
-        let bytes = hex::decode(hex_str.trim())
-            .map_err(|e| GhostError::Network(format!("relay_key hex: {e}")))?;
-        bytes
-            .try_into()
-            .map_err(|_| GhostError::Network("relay_key must be 32 bytes".into()))
+        let body: RelayInfoJson = resp.json().await.map_err(|e| GhostError::Network(e.to_string()))?;
+        let relay_vk = decode_hex_32(&body.relay_vk)?;
+        let mut relay_ref = RelayRef::decode(&body.r#ref)
+            .map_err(|e| GhostError::Network(format!("relay ref: {e}")))?;
+        if relay_ref.relay_vk != relay_vk {
+            return Err(GhostError::Network("relay ref names a different relay".into()));
+        }
+        // A relay without a configured public URL is still reachable where we dialed it.
+        if relay_ref.primary_https_url().is_none() {
+            relay_ref = RelayRef::https(relay_vk, &self.base_url);
+        }
+        let kt_head = match body.kt_head {
+            Some(b64) => {
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(&b64)
+                    .map_err(|e| GhostError::Network(format!("base64: {e}")))?;
+                Some(Checkpoint::from_bytes(&bytes).map_err(|e| GhostError::Network(format!("kt head: {e}")))?)
+            }
+            None => None,
+        };
+        Ok(RelayInfo { relay_vk, protocol: body.protocol, relay_ref, kt_head })
     }
 
     /// Apply auth headers to a request builder if auth is configured.
@@ -174,51 +288,62 @@ impl RelayClient {
     }
 
     /// Subscribe to a mailbox. The connection is established in the background
-    /// with automatic reconnection on failure.
+    /// with automatic reconnection on failure. A mailbox already routed to a relay
+    /// reconnects there, from whichever view this is called on; a new mailbox is
+    /// opened on this view's relay and routed to it.
     pub fn subscribe(&mut self, mailbox_id: [u8; 32], last_seen_seq: u64) {
-        let url = format!(
-            "{}/ws/{}",
-            self.ws_base_url,
-            URL_SAFE_NO_PAD.encode(mailbox_id)
-        );
-
-        if let Some(old) = self.connections.remove(&mailbox_id) {
-            old.task.abort();
-        }
+        let base = self.base_for(&mailbox_id);
+        let url = format!("{}/ws/{}", ws_base(&base), URL_SAFE_NO_PAD.encode(mailbox_id));
 
         let (outbox_tx, outbox_rx) = mpsc::channel(64);
         let event_tx = self.event_tx.clone();
         let auth = self.auth.clone();
         let task = tokio::spawn(ws_task(url, mailbox_id, last_seen_seq, event_tx, outbox_rx, auth));
-        self.connections
-            .insert(mailbox_id, WsHandle { outbox: outbox_tx, task });
+
+        let mut subs = self.subscriptions.lock().unwrap();
+        if let Some(old) = subs.connections.insert(mailbox_id, WsHandle { outbox: outbox_tx, task }) {
+            old.task.abort();
+        }
+        subs.routes.insert(mailbox_id, base);
+    }
+
+    /// Signed WebSocket upgrade request for a voice channel's signaling socket. The relay
+    /// authenticates the voice socket exactly like the mailbox socket.
+    pub fn voice_ws_request(&self, channel_id: &[u8; 32]) -> Result<tokio_tungstenite::tungstenite::http::Request<()>> {
+        let auth = self
+            .auth
+            .as_ref()
+            .ok_or_else(|| GhostError::Network("relay client has no device auth".into()))?;
+        let url = format!("{}/voice/{}", ws_base(&self.base_for(channel_id)), URL_SAFE_NO_PAD.encode(channel_id));
+        Ok(signed_ws_request(&url, auth))
     }
 
     pub fn unsubscribe(&mut self, mailbox_id: &[u8; 32]) {
-        if let Some(handle) = self.connections.remove(mailbox_id) {
+        if let Some(handle) = self.subscriptions.lock().unwrap().connections.remove(mailbox_id) {
             handle.task.abort();
         }
     }
 
-    pub async fn send(&self, mailbox_id: &[u8; 32], blob: Vec<u8>) -> Result<()> {
-        let handle = self
+    /// Outbox of a mailbox's live connection, on whichever relay it was opened.
+    fn outbox(&self, mailbox_id: &[u8; 32]) -> Result<mpsc::Sender<WsOutgoing>> {
+        self.subscriptions
+            .lock()
+            .unwrap()
             .connections
             .get(mailbox_id)
-            .ok_or_else(|| GhostError::Network("not subscribed to mailbox".into()))?;
-        handle
-            .outbox
+            .map(|handle| handle.outbox.clone())
+            .ok_or_else(|| GhostError::Network("not subscribed to mailbox".into()))
+    }
+
+    pub async fn send(&self, mailbox_id: &[u8; 32], blob: Vec<u8>) -> Result<()> {
+        self.outbox(mailbox_id)?
             .send(WsOutgoing::Binary(blob))
             .await
             .map_err(|_| GhostError::Network("ws connection closed".into()))
     }
 
     pub async fn send_text(&self, mailbox_id: &[u8; 32], text: String) -> Result<()> {
-        let handle = self
-            .connections
-            .get(mailbox_id)
-            .ok_or_else(|| GhostError::Network("not subscribed to mailbox".into()))?;
-        handle
-            .outbox
+        self.outbox(mailbox_id)?
             .send(WsOutgoing::Text(text))
             .await
             .map_err(|_| GhostError::Network("ws connection closed".into()))
@@ -229,17 +354,14 @@ impl RelayClient {
         let path = format!("/box/{}", URL_SAFE_NO_PAD.encode(mailbox_id));
         let req = self
             .http
-            .post(format!("{}{}", self.base_url, path))
+            .post(format!("{}{}", self.base_for(mailbox_id), path))
             .body(blob);
         let resp = self.authenticated("POST", &path, req)
             .send()
             .await
             .map_err(|e| GhostError::Network(e.to_string()))?;
         if !resp.status().is_success() {
-            return Err(GhostError::Network(format!(
-                "post blob: {}",
-                resp.status()
-            )));
+            return Err(status_err("post blob", resp).await);
         }
         #[derive(serde::Deserialize)]
         struct PostResp { seq: u64, #[serde(default)] epoch_mismatch: bool }
@@ -248,6 +370,21 @@ impl RelayClient {
             .await
             .map_err(|e| GhostError::Network(e.to_string()))?;
         Ok(PostBlobResult { seq: body.seq, epoch_mismatch: body.epoch_mismatch })
+    }
+
+    /// Delete every relay-side record of a mailbox: log, group state, membership, server info.
+    /// Creator-only on the relay (strict: the relay must hold group state naming this account).
+    pub async fn delete_mailbox(&self, mailbox_id: &[u8; 32]) -> Result<()> {
+        let path = format!("/box/{}", URL_SAFE_NO_PAD.encode(mailbox_id));
+        let req = self.http.delete(format!("{}{}", self.base_for(mailbox_id), path));
+        let resp = self.authenticated("DELETE", &path, req)
+            .send()
+            .await
+            .map_err(|e| GhostError::Network(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(status_err("delete mailbox", resp).await);
+        }
+        Ok(())
     }
 
     pub async fn register_invite(&self, token: &str, expires_at: u64) -> Result<()> {
@@ -261,34 +398,34 @@ impl RelayClient {
             .await
             .map_err(|e| GhostError::Network(e.to_string()))?;
         if !resp.status().is_success() {
-            return Err(GhostError::Network(format!(
-                "register invite: {}",
-                resp.status()
-            )));
+            return Err(status_err("register invite", resp).await);
         }
         Ok(())
     }
 
-    pub async fn post_join(&self, token: &str, payload: Vec<u8>) -> Result<()> {
+    /// Upload (or refresh) the payload joiners fetch for an invite token. `expected_seq`
+    /// must equal the relay's current sequence for the token; a stale value yields a 409
+    /// `RelayStatus`, meaning another joiner refreshed the payload first.
+    pub async fn put_invite_payload(&self, token: &str, expected_seq: u64, payload: Vec<u8>) -> Result<()> {
         let path = format!("/invite/{}/join", token);
         let req = self
             .http
             .post(format!("{}{}", self.base_url, path))
+            .header(INVITE_SEQ_HEADER, expected_seq.to_string())
             .body(payload);
         let resp = self.authenticated("POST", &path, req)
             .send()
             .await
             .map_err(|e| GhostError::Network(e.to_string()))?;
         if !resp.status().is_success() {
-            return Err(GhostError::Network(format!(
-                "post join: {}",
-                resp.status()
-            )));
+            return Err(status_err("put invite payload", resp).await);
         }
         Ok(())
     }
 
-    pub async fn get_join(&self, token: &str) -> Result<Vec<u8>> {
+    /// Fetch the current invite payload and its sequence number. `None` when the inviter
+    /// has not uploaded a payload yet. Works without auth so joiners can call it.
+    pub async fn get_invite_payload(&self, token: &str) -> Result<Option<(u64, Vec<u8>)>> {
         let path = format!("/invite/{}/join", token);
         let req = self
             .http
@@ -298,18 +435,22 @@ impl RelayClient {
             .await
             .map_err(|e| GhostError::Network(e.to_string()))?;
         if resp.status() == reqwest::StatusCode::NO_CONTENT {
-            return Err(GhostError::Network("join not yet submitted".into()));
+            return Ok(None);
         }
         if !resp.status().is_success() {
-            return Err(GhostError::Network(format!(
-                "get join: {}",
-                resp.status()
-            )));
+            return Err(status_err("get invite payload", resp).await);
         }
-        resp.bytes()
+        let seq = resp
+            .headers()
+            .get(INVITE_SEQ_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let bytes = resp
+            .bytes()
             .await
-            .map(|b| b.to_vec())
-            .map_err(|e| GhostError::Network(e.to_string()))
+            .map_err(|e| GhostError::Network(e.to_string()))?;
+        Ok(Some((seq, bytes.to_vec())))
     }
 
     pub async fn post_accept(&self, token: &str, payload: Vec<u8>) -> Result<()> {
@@ -323,10 +464,7 @@ impl RelayClient {
             .await
             .map_err(|e| GhostError::Network(e.to_string()))?;
         if !resp.status().is_success() {
-            return Err(GhostError::Network(format!(
-                "post accept: {}",
-                resp.status()
-            )));
+            return Err(status_err("post accept", resp).await);
         }
         Ok(())
     }
@@ -342,10 +480,7 @@ impl RelayClient {
             return Err(GhostError::Network("accept not yet submitted".into()));
         }
         if !resp.status().is_success() {
-            return Err(GhostError::Network(format!(
-                "get accept: {}",
-                resp.status()
-            )));
+            return Err(status_err("get accept", resp).await);
         }
         resp.bytes()
             .await
@@ -357,17 +492,14 @@ impl RelayClient {
         let path = format!("/box/{}/server_info", URL_SAFE_NO_PAD.encode(mailbox_id));
         let req = self
             .http
-            .put(format!("{}{}", self.base_url, path))
+            .put(format!("{}{}", self.base_for(mailbox_id), path))
             .body(data);
         let resp = self.authenticated("PUT", &path, req)
             .send()
             .await
             .map_err(|e| GhostError::Network(e.to_string()))?;
         if !resp.status().is_success() {
-            return Err(GhostError::Network(format!(
-                "put server_info: {}",
-                resp.status()
-            )));
+            return Err(status_err("put server_info", resp).await);
         }
         Ok(())
     }
@@ -376,16 +508,13 @@ impl RelayClient {
         let path = format!("/box/{}/server_info", URL_SAFE_NO_PAD.encode(mailbox_id));
         let req = self
             .http
-            .get(format!("{}{}", self.base_url, path));
+            .get(format!("{}{}", self.base_for(mailbox_id), path));
         let resp = self.authenticated("GET", &path, req)
             .send()
             .await
             .map_err(|e| GhostError::Network(e.to_string()))?;
         if !resp.status().is_success() {
-            return Err(GhostError::Network(format!(
-                "get server_info: {}",
-                resp.status()
-            )));
+            return Err(status_err("get server_info", resp).await);
         }
         resp.bytes()
             .await
@@ -402,14 +531,14 @@ impl RelayClient {
         let path = format!("/box/{}/avatar/{}", URL_SAFE_NO_PAD.encode(mailbox_id), hex::encode(fingerprint));
         let req = self
             .http
-            .put(format!("{}{}", self.base_url, path))
+            .put(format!("{}{}", self.base_for(mailbox_id), path))
             .body(data);
         let resp = self.authenticated("PUT", &path, req)
             .send()
             .await
             .map_err(|e| GhostError::Network(e.to_string()))?;
         if !resp.status().is_success() {
-            return Err(GhostError::Network(format!("put avatar: {}", resp.status())));
+            return Err(status_err("put avatar", resp).await);
         }
         Ok(())
     }
@@ -422,7 +551,7 @@ impl RelayClient {
         let path = format!("/box/{}/avatar/{}", URL_SAFE_NO_PAD.encode(mailbox_id), hex::encode(fingerprint));
         let req = self
             .http
-            .get(format!("{}{}", self.base_url, path));
+            .get(format!("{}{}", self.base_for(mailbox_id), path));
         let resp = self.authenticated("GET", &path, req)
             .send()
             .await
@@ -431,7 +560,7 @@ impl RelayClient {
             return Ok(None);
         }
         if !resp.status().is_success() {
-            return Err(GhostError::Network(format!("get avatar: {}", resp.status())));
+            return Err(status_err("get avatar", resp).await);
         }
         resp.bytes()
             .await
@@ -447,23 +576,23 @@ impl RelayClient {
         let path = format!("/box/{}/avatar/{}", URL_SAFE_NO_PAD.encode(mailbox_id), hex::encode(fingerprint));
         let req = self
             .http
-            .delete(format!("{}{}", self.base_url, path));
+            .delete(format!("{}{}", self.base_for(mailbox_id), path));
         let resp = self.authenticated("DELETE", &path, req)
             .send()
             .await
             .map_err(|e| GhostError::Network(e.to_string()))?;
         if !resp.status().is_success() {
-            return Err(GhostError::Network(format!("delete avatar: {}", resp.status())));
+            return Err(status_err("delete avatar", resp).await);
         }
         Ok(())
     }
 
-    /// Push an identity log entry to the relay.
+    /// Append a raw entry at the account's home relay; returns the home's anchor for it.
     pub async fn put_idlog_entry(
         &self,
         account_fp: &[u8; 32],
         payload: Vec<u8>,
-    ) -> Result<()> {
+    ) -> Result<AnchoredEntry> {
         let path = format!("/idlog/{}", hex::encode(account_fp));
         let url = format!("{}{}", self.base_url, path);
         let req = self.authenticated("PUT", &path, self.http.put(&url).body(payload));
@@ -472,17 +601,92 @@ impl RelayClient {
             .await
             .map_err(|e| GhostError::Network(e.to_string()))?;
         if !resp.status().is_success() {
-            return Err(GhostError::Network(format!("put idlog: {}", resp.status())));
+            return Err(status_err("put idlog", resp).await);
+        }
+        let bytes = resp.bytes().await.map_err(|e| GhostError::Network(e.to_string()))?;
+        AnchoredEntry::from_bytes(&bytes).map_err(|e| GhostError::Network(format!("anchored entry: {e}")))
+    }
+
+    /// Push home-anchored entries to a relay that mirrors the account. `invite`
+    /// admits an account the relay has not seen; no credentials are needed
+    /// because every entry carries its own signatures and anchor.
+    pub async fn put_anchored_entries(
+        &self,
+        account_fp: &[u8; 32],
+        entries: &[AnchoredEntry],
+        invite: Option<&str>,
+    ) -> Result<AccountInfo> {
+        let mut url = format!("{}/idlog/{}/anchored", self.base_url, hex::encode(account_fp));
+        if let Some(token) = invite {
+            url.push_str("?invite=");
+            url.push_str(token);
+        }
+        let resp = self
+            .http
+            .put(&url)
+            .body(encode_sequence(entries))
+            .send()
+            .await
+            .map_err(|e| GhostError::Network(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(status_err("put anchored idlog", resp).await);
+        }
+        resp.json().await.map_err(|e| GhostError::Network(e.to_string()))
+    }
+
+    /// Ask this relay to become the account's home; returns the anchors it issued
+    /// for the newly sequenced entries. Needs no credentials.
+    pub async fn import_account(&self, account_fp: &[u8; 32], request: &ImportRequest) -> Result<Vec<AnchoredEntry>> {
+        let url = format!("{}/accounts/{}/import", self.base_url, hex::encode(account_fp));
+        let resp = self
+            .http
+            .post(&url)
+            .body(request.to_bytes())
+            .send()
+            .await
+            .map_err(|e| GhostError::Network(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(status_err("import account", resp).await);
+        }
+        let bytes = resp.bytes().await.map_err(|e| GhostError::Network(e.to_string()))?;
+        decode_sequence(&bytes).map_err(|e| GhostError::Network(format!("import anchors: {e}")))
+    }
+
+    /// Tell the home which relays may pull this account's identity log (replaces the set).
+    pub async fn put_mirror_grants(&self, account_fp: &[u8; 32], relays: &[[u8; 32]]) -> Result<()> {
+        let path = format!("/accounts/{}/mirrors", hex::encode(account_fp));
+        let req = self.http.put(format!("{}{}", self.base_url, path)).body(relays.concat());
+        let resp = self.authenticated("PUT", &path, req)
+            .send()
+            .await
+            .map_err(|e| GhostError::Network(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(status_err("put mirror grants", resp).await);
         }
         Ok(())
     }
 
-    /// Fetch identity log entries with KT inclusion proofs.
+    /// Where this relay believes the account is homed.
+    pub async fn get_account(&self, account_fp: &[u8; 32]) -> Result<AccountInfo> {
+        let path = format!("/accounts/{}", hex::encode(account_fp));
+        let req = self.http.get(format!("{}{}", self.base_url, path));
+        let resp = self
+            .authenticated("GET", &path, req)
+            .send()
+            .await
+            .map_err(|e| GhostError::Network(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(status_err("get account", resp).await);
+        }
+        resp.json().await.map_err(|e| GhostError::Network(e.to_string()))
+    }
+
+    /// Fetch an account's anchored identity log.
     pub async fn get_idlog(
         &self,
         account_fp: &[u8; 32],
         after_seq: u64,
-    ) -> Result<IdLogWithProofs> {
+    ) -> Result<AnchoredLog> {
         let path = format!("/idlog/{}", hex::encode(account_fp));
         let mut url = format!("{}{}", self.base_url, path);
         if after_seq > 0 {
@@ -495,7 +699,7 @@ impl RelayClient {
             .await
             .map_err(|e| GhostError::Network(e.to_string()))?;
         if !resp.status().is_success() {
-            return Err(GhostError::Network(format!("get idlog: {}", resp.status())));
+            return Err(status_err("get idlog", resp).await);
         }
         let body: IdLogResponseJson = resp
             .json()
@@ -503,30 +707,19 @@ impl RelayClient {
             .map_err(|e| GhostError::Network(e.to_string()))?;
 
         let b64 = &base64::engine::general_purpose::STANDARD;
-        let checkpoint = b64
-            .decode(&body.checkpoint)
-            .map_err(|e| GhostError::Network(format!("base64: {e}")))?;
+        let home_relay_vk = decode_hex_32(&body.home_relay_vk)?;
         let entries = body
             .entries
             .into_iter()
             .map(|e| {
-                let payload = b64
-                    .decode(&e.payload)
+                let bytes = b64
+                    .decode(&e.anchored)
                     .map_err(|e| GhostError::Network(format!("base64: {e}")))?;
-                let inclusion_proof = b64
-                    .decode(&e.inclusion_proof)
-                    .map_err(|e| GhostError::Network(format!("base64: {e}")))?;
-                Ok(IdLogBlobWithProof {
-                    seq: e.seq,
-                    payload,
-                    inclusion_proof,
-                })
+                AnchoredEntry::from_bytes(&bytes)
+                    .map_err(|e| GhostError::Network(format!("anchored entry: {e}")))
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(IdLogWithProofs {
-            entries,
-            checkpoint,
-        })
+        Ok(AnchoredLog { home_relay_vk, entries })
     }
 
     /// Fetch a KT consistency proof proving the tree at `from` is a prefix of `to`.
@@ -546,10 +739,7 @@ impl RelayClient {
             .await
             .map_err(|e| GhostError::Network(e.to_string()))?;
         if !resp.status().is_success() {
-            return Err(GhostError::Network(format!(
-                "get consistency proof: {}",
-                resp.status()
-            )));
+            return Err(status_err("get consistency proof", resp).await);
         }
         resp.bytes()
             .await
@@ -557,59 +747,47 @@ impl RelayClient {
             .map_err(|e| GhostError::Network(e.to_string()))
     }
 
-    /// Post a pairing offer (existing device → relay).
-    pub async fn post_pairing_offer(
-        &self,
-        account_fp: &[u8; 32],
-        payload: Vec<u8>,
-    ) -> Result<()> {
+    /// Open a pairing session (existing device). Replaces any earlier session for the account.
+    pub async fn post_pairing_offer(&self, account_fp: &[u8; 32], token: &PairingToken, sealed_offer: Vec<u8>) -> Result<()> {
         let path = format!("/pair/{}", hex::encode(account_fp));
-        let req = self
-            .http
-            .post(format!("{}{}", self.base_url, path))
-            .body(payload);
+        let mut body = Vec::with_capacity(token.len() + sealed_offer.len());
+        body.extend_from_slice(token);
+        body.extend_from_slice(&sealed_offer);
+        let req = self.http.post(format!("{}{}", self.base_url, path)).body(body);
         let resp = self.authenticated("POST", &path, req)
             .send()
             .await
             .map_err(|e| GhostError::Network(e.to_string()))?;
         if !resp.status().is_success() {
-            return Err(GhostError::Network(format!("post pairing offer: {}", resp.status())));
+            return Err(status_err("post pairing offer", resp).await);
         }
         Ok(())
     }
 
-    /// Post a pairing response (new device → relay).
-    pub async fn post_pairing_response(
-        &self,
-        account_fp: &[u8; 32],
-        payload: Vec<u8>,
-    ) -> Result<()> {
+    fn pairing_path(account_fp: &[u8; 32], token: &PairingToken, suffix: &str) -> String {
+        format!("/pair/{}/{}{suffix}", hex::encode(account_fp), hex::encode(token))
+    }
+
+    /// Answer a pairing offer (new device, unauthenticated). Only the first answer counts.
+    pub async fn post_pairing_response(&self, account_fp: &[u8; 32], token: &PairingToken, sealed: Vec<u8>) -> Result<()> {
+        let path = Self::pairing_path(account_fp, token, "/respond");
         let resp = self
             .http
-            .post(format!(
-                "{}/pair/{}/respond",
-                self.base_url,
-                hex::encode(account_fp),
-            ))
-            .body(payload)
+            .post(format!("{}{}", self.base_url, path))
+            .body(sealed)
             .send()
             .await
             .map_err(|e| GhostError::Network(e.to_string()))?;
         if !resp.status().is_success() {
-            return Err(GhostError::Network(format!("post pairing response: {}", resp.status())));
+            return Err(status_err("post pairing response", resp).await);
         }
         Ok(())
     }
 
-    /// Poll for a pairing response (existing device polls relay).
-    pub async fn get_pairing_response(
-        &self,
-        account_fp: &[u8; 32],
-    ) -> Result<Option<Vec<u8>>> {
-        let path = format!("/pair/{}/response", hex::encode(account_fp));
-        let req = self
-            .http
-            .get(format!("{}{}", self.base_url, path));
+    /// Poll for the new device's answer (existing device). `None` until it arrives.
+    pub async fn get_pairing_response(&self, account_fp: &[u8; 32], token: &PairingToken) -> Result<Option<Vec<u8>>> {
+        let path = Self::pairing_path(account_fp, token, "/response");
+        let req = self.http.get(format!("{}{}", self.base_url, path));
         let resp = self.authenticated("GET", &path, req)
             .send()
             .await
@@ -618,7 +796,7 @@ impl RelayClient {
             return Ok(None);
         }
         if !resp.status().is_success() {
-            return Err(GhostError::Network(format!("get pairing response: {}", resp.status())));
+            return Err(status_err("get pairing response", resp).await);
         }
         resp.bytes()
             .await
@@ -626,53 +804,107 @@ impl RelayClient {
             .map_err(|e| GhostError::Network(e.to_string()))
     }
 
-    /// Store encrypted recovery blob on relay.
-    pub async fn put_recovery_blob(
-        &self,
-        account_fp: &[u8; 32],
-        data: Vec<u8>,
-    ) -> Result<()> {
+    /// Fetch the sealed pairing offer (new device, unauthenticated).
+    pub async fn get_pairing_offer(&self, account_fp: &[u8; 32], token: &PairingToken) -> Result<Vec<u8>> {
+        let path = Self::pairing_path(account_fp, token, "");
+        let resp = self
+            .http
+            .get(format!("{}{}", self.base_url, path))
+            .send()
+            .await
+            .map_err(|e| GhostError::Network(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(status_err("get pairing offer", resp).await);
+        }
+        resp.bytes()
+            .await
+            .map(|b| b.to_vec())
+            .map_err(|e| GhostError::Network(e.to_string()))
+    }
+
+    /// Upload the sealed provision blob for a new device (existing device, authenticated).
+    pub async fn put_provision(&self, account_fp: &[u8; 32], token: &PairingToken, sealed: Vec<u8>) -> Result<()> {
+        let path = Self::pairing_path(account_fp, token, "/provision");
+        let req = self.http.put(format!("{}{}", self.base_url, path)).body(sealed);
+        let resp = self.authenticated("PUT", &path, req)
+            .send()
+            .await
+            .map_err(|e| GhostError::Network(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(status_err("put provision", resp).await);
+        }
+        Ok(())
+    }
+
+    /// Fetch the sealed provision blob (new device, unauthenticated). `None` until uploaded.
+    pub async fn get_provision(&self, account_fp: &[u8; 32], token: &PairingToken) -> Result<Option<Vec<u8>>> {
+        let path = Self::pairing_path(account_fp, token, "/provision");
+        let resp = self
+            .http
+            .get(format!("{}{}", self.base_url, path))
+            .send()
+            .await
+            .map_err(|e| GhostError::Network(e.to_string()))?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            return Err(status_err("get provision", resp).await);
+        }
+        resp.bytes()
+            .await
+            .map(|b| Some(b.to_vec()))
+            .map_err(|e| GhostError::Network(e.to_string()))
+    }
+
+    /// Store the account's recovery bundle. 409 means the relay holds an equal
+    /// or newer generation.
+    pub async fn put_recovery_bundle(&self, account_fp: &[u8; 32], bundle: &RecoveryBundle) -> Result<()> {
         let path = format!("/recovery/{}", hex::encode(account_fp));
         let req = self
             .http
             .put(format!("{}{}", self.base_url, path))
-            .body(data);
+            .body(bundle.to_bytes());
         let resp = self.authenticated("PUT", &path, req)
             .send()
             .await
             .map_err(|e| GhostError::Network(e.to_string()))?;
         if !resp.status().is_success() {
-            return Err(GhostError::Network(format!("put recovery: {}", resp.status())));
+            return Err(status_err("put recovery", resp).await);
         }
         Ok(())
     }
 
-    /// Store encrypted sync state snapshot on relay.
+    /// Store a sealed sync snapshot. 409 means the relay holds an equal or newer generation.
     pub async fn put_sync_state(
         &self,
         account_fp: &[u8; 32],
-        data: Vec<u8>,
+        generation: u64,
+        sealed: Vec<u8>,
     ) -> Result<()> {
         let path = format!("/sync_state/{}", hex::encode(account_fp));
+        let mut body = Vec::with_capacity(SNAPSHOT_GENERATION_LEN + sealed.len());
+        body.extend_from_slice(&generation.to_be_bytes());
+        body.extend_from_slice(&sealed);
         let req = self
             .http
             .put(format!("{}{}", self.base_url, path))
-            .body(data);
+            .body(body);
         let resp = self.authenticated("PUT", &path, req)
             .send()
             .await
             .map_err(|e| GhostError::Network(e.to_string()))?;
         if !resp.status().is_success() {
-            return Err(GhostError::Network(format!("put sync_state: {}", resp.status())));
+            return Err(status_err("put sync_state", resp).await);
         }
         Ok(())
     }
 
-    /// Fetch encrypted sync state snapshot from relay.
+    /// Fetch the sealed sync snapshot and its generation.
     pub async fn get_sync_state(
         &self,
         account_fp: &[u8; 32],
-    ) -> Result<Option<Vec<u8>>> {
+    ) -> Result<Option<(u64, Vec<u8>)>> {
         let path = format!("/sync_state/{}", hex::encode(account_fp));
         let req = self
             .http
@@ -685,19 +917,21 @@ impl RelayClient {
             return Ok(None);
         }
         if !resp.status().is_success() {
-            return Err(GhostError::Network(format!("get sync_state: {}", resp.status())));
+            return Err(status_err("get sync_state", resp).await);
         }
-        resp.bytes()
-            .await
-            .map(|b| Some(b.to_vec()))
-            .map_err(|e| GhostError::Network(e.to_string()))
+        let body = resp.bytes().await.map_err(|e| GhostError::Network(e.to_string()))?;
+        if body.len() < SNAPSHOT_GENERATION_LEN {
+            return Err(GhostError::Network("sync_state response missing generation".into()));
+        }
+        let generation = u64::from_be_bytes(body[..SNAPSHOT_GENERATION_LEN].try_into().unwrap());
+        Ok(Some((generation, body[SNAPSHOT_GENERATION_LEN..].to_vec())))
     }
 
-    /// Fetch encrypted recovery blob from relay.
-    pub async fn get_recovery_blob(
+    /// Fetch the account's recovery bundle. Unauthenticated and rate-limited by the relay.
+    pub async fn get_recovery_bundle(
         &self,
         account_fp: &[u8; 32],
-    ) -> Result<Option<Vec<u8>>> {
+    ) -> Result<Option<RecoveryBundle>> {
         let resp = self
             .http
             .get(format!(
@@ -712,22 +946,15 @@ impl RelayClient {
             return Ok(None);
         }
         if !resp.status().is_success() {
-            return Err(GhostError::Network(format!("get recovery: {}", resp.status())));
+            return Err(status_err("get recovery", resp).await);
         }
-        resp.bytes()
-            .await
-            .map(|b| Some(b.to_vec()))
+        let body = resp.bytes().await.map_err(|e| GhostError::Network(e.to_string()))?;
+        RecoveryBundle::from_bytes(&body)
+            .map(Some)
             .map_err(|e| GhostError::Network(e.to_string()))
     }
 }
 
-impl Drop for RelayClient {
-    fn drop(&mut self) {
-        for (_, handle) in self.connections.drain() {
-            handle.task.abort();
-        }
-    }
-}
 
 /// Persistent task that maintains a WebSocket connection with automatic reconnection.
 async fn ws_task(
@@ -750,23 +977,7 @@ async fn ws_task(
         first_attempt = false;
 
         let ws = if let Some(ref auth) = auth {
-            let ws_path = url.find("//")
-                .and_then(|i| url[i+2..].find('/').map(|j| &url[i+2+j..]))
-                .unwrap_or("/");
-            let h = auth.sign_for("GET", ws_path);
-            let req = tokio_tungstenite::tungstenite::http::Request::builder()
-                .uri(&url)
-                .header("Host", url_host(&url))
-                .header("Connection", "Upgrade")
-                .header("Upgrade", "websocket")
-                .header("Sec-WebSocket-Version", "13")
-                .header("Sec-WebSocket-Key", tokio_tungstenite::tungstenite::handshake::client::generate_key())
-                .header("X-Ghost-Account", &h.account)
-                .header("X-Ghost-Device", &h.device)
-                .header("X-Ghost-Timestamp", &h.timestamp)
-                .header("X-Ghost-Signature", &h.signature)
-                .body(())
-                .unwrap();
+            let req = signed_ws_request(&url, auth);
             match tokio_tungstenite::connect_async(req).await {
                 Ok((ws, _)) => ws,
                 Err(_) => continue,
@@ -868,6 +1079,28 @@ async fn ws_task(
 
         let _ = event_tx.send(RelayEvent::ConnectionState { mailbox_id, connected: false }).await;
     }
+}
+
+/// WebSocket upgrade request for `url` carrying Ghost's signed device-auth headers.
+fn signed_ws_request(url: &str, auth: &AuthContext) -> tokio_tungstenite::tungstenite::http::Request<()> {
+    let ws_path = url
+        .find("//")
+        .and_then(|i| url[i + 2..].find('/').map(|j| &url[i + 2 + j..]))
+        .unwrap_or("/");
+    let h = auth.sign_for("GET", ws_path);
+    tokio_tungstenite::tungstenite::http::Request::builder()
+        .uri(url)
+        .header("Host", url_host(url))
+        .header("Connection", "Upgrade")
+        .header("Upgrade", "websocket")
+        .header("Sec-WebSocket-Version", "13")
+        .header("Sec-WebSocket-Key", tokio_tungstenite::tungstenite::handshake::client::generate_key())
+        .header("X-Ghost-Account", &h.account)
+        .header("X-Ghost-Device", &h.device)
+        .header("X-Ghost-Timestamp", &h.timestamp)
+        .header("X-Ghost-Signature", &h.signature)
+        .body(())
+        .expect("well-formed upgrade request")
 }
 
 fn parse_ack(text: &str, mailbox_id: [u8; 32]) -> Option<Ack> {

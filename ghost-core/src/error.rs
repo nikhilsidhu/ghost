@@ -41,6 +41,12 @@ pub enum GhostError {
     #[error("network: {0}")]
     Network(String),
 
+    /// The relay answered with a non-success HTTP status. Callers branch on
+    /// `status` (404, 409, ...) instead of matching on error strings; `message`
+    /// is the relay's explanation, for logs.
+    #[error("relay: {context}: HTTP {status}: {message}")]
+    RelayStatus { status: u16, context: String, message: String },
+
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }

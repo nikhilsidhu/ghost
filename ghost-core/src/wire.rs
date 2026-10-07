@@ -7,6 +7,7 @@ use crate::crypto::{
 use crate::error::{GhostError, Result};
 use crate::mls::group::GhostGroup;
 use crate::storage::{ChannelKind, ServerKind, MemberRole};
+use ghost_wire::relay_ref::RelayRef;
 
 const MAX_REFERENCES: usize = 255;
 
@@ -227,6 +228,32 @@ fn read_u8(data: &[u8], pos: &mut usize) -> Result<u8> {
     Ok(val)
 }
 
+/// Trailing `[len:2][RelayRef]` naming the relay that hosts a server; length 0
+/// means the account's home relay.
+fn write_relay_ref(buf: &mut Vec<u8>, relay_ref: Option<&RelayRef>) {
+    let bytes = relay_ref.map(RelayRef::to_bytes).unwrap_or_default();
+    buf.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+    buf.extend_from_slice(&bytes);
+}
+
+/// Reads what `write_relay_ref` wrote; data encoded before the field existed ends here.
+fn read_relay_ref(data: &[u8], pos: &mut usize) -> Result<Option<RelayRef>> {
+    if *pos == data.len() {
+        return Ok(None);
+    }
+    let len = read_u16(data, pos)? as usize;
+    if len == 0 {
+        return Ok(None);
+    }
+    if data.len() < *pos + len {
+        return Err(GhostError::Format("relay ref truncated".into()));
+    }
+    let relay_ref = RelayRef::from_bytes(&data[*pos..*pos + len])
+        .map_err(|e| GhostError::Format(e.to_string()))?;
+    *pos += len;
+    Ok(Some(relay_ref))
+}
+
 fn read_u16(data: &[u8], pos: &mut usize) -> Result<u16> {
     if *pos + 2 > data.len() {
         return Err(GhostError::Format("truncated u16".into()));
@@ -380,31 +407,12 @@ pub enum SyncReceiveResult {
 
 /// Encrypt a sync message with AES-256-GCM. Returns nonce || ciphertext.
 pub fn sync_seal(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>> {
-    use aes_gcm::aead::{Aead, AeadCore, OsRng};
-    use aes_gcm::{Aes256Gcm, KeyInit};
-    let cipher = Aes256Gcm::new(key.into());
-    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
-    let ct = cipher
-        .encrypt(&nonce, plaintext)
-        .map_err(|e| GhostError::Format(format!("sync seal: {e}")))?;
-    let mut blob = Vec::with_capacity(12 + ct.len());
-    blob.extend_from_slice(&nonce);
-    blob.extend_from_slice(&ct);
-    Ok(blob)
+    crate::crypto::aead::seal(key, plaintext, "sync")
 }
 
 /// Decrypt a sync message (nonce || ciphertext).
 pub fn sync_open(key: &[u8; 32], blob: &[u8]) -> Result<Vec<u8>> {
-    use aes_gcm::aead::Aead;
-    use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
-    if blob.len() < 12 {
-        return Err(GhostError::Format("sync blob too short".into()));
-    }
-    let nonce = Nonce::from_slice(&blob[..12]);
-    let cipher = Aes256Gcm::new(key.into());
-    cipher
-        .decrypt(nonce, &blob[12..])
-        .map_err(|e| GhostError::Format(format!("sync open: {e}")))
+    crate::crypto::aead::open(key, blob, "sync")
 }
 
 // --- Mutation sync wire format ---
@@ -531,6 +539,8 @@ pub struct ProvisionPayload {
     pub members: Vec<InviteMember>,
     pub channels: Vec<InviteChannel>,
     pub mailbox_id: [u8; 32],
+    /// Relay hosting the server; `None` for the account's home relay.
+    pub relay_ref: Option<RelayRef>,
 }
 
 impl ProvisionPayload {
@@ -556,6 +566,7 @@ impl ProvisionPayload {
         }
 
         buf.extend_from_slice(&self.mailbox_id);
+        write_relay_ref(&mut buf, self.relay_ref.as_ref());
         buf
     }
 
@@ -589,6 +600,7 @@ impl ProvisionPayload {
         }
 
         let mailbox_id = read_blob32(data, &mut pos)?;
+        let relay_ref = read_relay_ref(data, &mut pos)?;
 
         if pos != data.len() {
             return Err(GhostError::Format(format!(
@@ -597,7 +609,7 @@ impl ProvisionPayload {
             )));
         }
 
-        Ok(Self { server_id, server_name, kind, members, channels, mailbox_id })
+        Ok(Self { server_id, server_name, kind, members, channels, mailbox_id, relay_ref })
     }
 }
 
@@ -609,6 +621,9 @@ pub struct SyncServerMeta {
     pub kind: ServerKind,
     pub mailbox_id: [u8; 32],
     pub channels: Vec<InviteChannel>,
+    /// Relay hosting the server; `None` for the account's home relay. Encoded
+    /// last so snapshots written before the field existed still decode.
+    pub relay_ref: Option<RelayRef>,
 }
 
 impl SyncServerMeta {
@@ -624,6 +639,7 @@ impl SyncServerMeta {
             buf.push(c.kind.to_byte());
             buf.extend_from_slice(&c.position.to_be_bytes());
         }
+        write_relay_ref(&mut buf, self.relay_ref.as_ref());
         buf
     }
 
@@ -643,6 +659,7 @@ impl SyncServerMeta {
                 group_info_bytes: vec![],
             });
         }
+        let relay_ref = read_relay_ref(data, &mut pos)?;
         if pos != data.len() {
             return Err(GhostError::Format(format!(
                 "sync server meta: {} trailing bytes",
@@ -650,7 +667,7 @@ impl SyncServerMeta {
             )));
         }
 
-        Ok(Self { server_name, kind, mailbox_id, channels })
+        Ok(Self { server_name, kind, mailbox_id, channels, relay_ref })
     }
 }
 
@@ -806,11 +823,21 @@ fn extract_sender_identity(
     Ok((account_fp, device_vk))
 }
 
+/// Whether the identity log this client holds shows `device_vk` revoked for
+/// `account_fp`. Accounts and devices the client has no log entry for count as
+/// not revoked: relays and MLS removal stop those, and a device added since the
+/// last refresh must not be rejected.
+pub type RevocationCheck<'a> = &'a dyn Fn(&[u8; 32], &[u8; 32]) -> bool;
+
 /// Verify a self-validating credential: blake3(master_vk) == account_fp,
-/// then ed25519_verify(master_vk, delegation_payload, delegation_sig).
+/// then ed25519_verify(master_vk, delegation_payload, delegation_sig), then that
+/// the device has not been revoked. The delegation outlives a revocation, so
+/// without the last check a revoked device stays valid until it is removed from
+/// every group.
 fn validate_device_credential(
     credential: &Credential,
     device_vk: &[u8; 32],
+    revoked: RevocationCheck,
 ) -> Result<()> {
     let parsed = crate::mls::credential::parse_credential(credential)?;
 
@@ -833,6 +860,9 @@ fn validate_device_credential(
     let sig = ed25519_dalek::Signature::from_bytes(&parsed.delegation_sig);
     master_vk.verify_strict(&msg, &sig)
         .map_err(|e| GhostError::IdentityLog(format!("delegation signature invalid: {e}")))?;
+    if revoked(&parsed.account_fp, device_vk) {
+        return Err(GhostError::IdentityLog("sender device has been revoked".into()));
+    }
     Ok(())
 }
 
@@ -844,17 +874,18 @@ fn extract_leaf_identity(leaf: &openmls::prelude::LeafNode) -> Result<([u8; 32],
     Ok((account_fp, device_vk))
 }
 
-/// Validate sender's self-validating credential (delegation signature).
+/// Validate sender's self-validating credential (delegation signature, not revoked).
 pub(crate) fn validate_sender(
     group: &GhostGroup,
     credential: &Credential,
     sender: &Sender,
     staged_commit: Option<&openmls::prelude::StagedCommit>,
+    revoked: RevocationCheck,
 ) -> Result<()> {
     match sender {
         Sender::Member(_) => {
             let (_account_fp, device_vk) = extract_sender_identity(group, credential, sender)?;
-            validate_device_credential(credential, &device_vk)?;
+            validate_device_credential(credential, &device_vk, revoked)?;
         }
         Sender::NewMemberCommit => {
             let staged = staged_commit
@@ -862,7 +893,7 @@ pub(crate) fn validate_sender(
             let leaf = staged.update_path_leaf_node()
                 .ok_or_else(|| GhostError::Mls("external commit missing update path".into()))?;
             let (_account_fp, device_vk) = extract_leaf_identity(leaf)?;
-            validate_device_credential(leaf.credential(), &device_vk)?;
+            validate_device_credential(leaf.credential(), &device_vk, revoked)?;
         }
         Sender::External(_) => {}
         Sender::NewMemberProposal => {}
@@ -873,7 +904,7 @@ pub(crate) fn validate_sender(
         for add in staged.add_proposals() {
             let leaf = add.add_proposal().key_package().leaf_node();
             let (_fp, vk) = extract_leaf_identity(leaf)?;
-            validate_device_credential(leaf.credential(), &vk)?;
+            validate_device_credential(leaf.credential(), &vk, revoked)?;
         }
     }
 
@@ -888,6 +919,7 @@ pub fn open_any(
     group: &mut GhostGroup,
     provider: &GhostProvider,
     blob: &[u8],
+    revoked: RevocationCheck,
 ) -> Result<InboundMessage> {
     ghost_wire::decode_envelope(blob)
         .map_err(|e| GhostError::Format(format!("envelope: {e}")))?;
@@ -906,11 +938,11 @@ pub fn open_any(
                 ));
             }
 
-            validate_sender(group, &credential, &sender, None)?;
+            validate_sender(group, &credential, &sender, None, revoked)?;
             Ok(InboundMessage::Application(msg))
         }
         ProcessedMessageContent::StagedCommitMessage(staged_commit) => {
-            validate_sender(group, &credential, &sender, Some(&staged_commit))?;
+            validate_sender(group, &credential, &sender, Some(&staged_commit), revoked)?;
 
             let removed = extract_removed_fps(group, &staged_commit);
             group.merge_staged_commit(provider, *staged_commit)?;
@@ -979,6 +1011,7 @@ pub fn open(
     group: &mut GhostGroup,
     provider: &GhostProvider,
     blob: &[u8],
+    revoked: RevocationCheck,
 ) -> Result<ApplicationMessage> {
     ghost_wire::decode_envelope(blob)
         .map_err(|e| GhostError::Format(format!("envelope: {e}")))?;
@@ -995,7 +1028,7 @@ pub fn open(
             if msg.sender_fp != sender_account_fp {
                 return Err(GhostError::Format("sender_fp does not match MLS credential".into()));
             }
-            validate_sender(group, &credential, &sender, None)?;
+            validate_sender(group, &credential, &sender, None, revoked)?;
             Ok(msg)
         }
         _ => Err(GhostError::Mls("expected application message".into())),
@@ -1256,7 +1289,7 @@ mod tests {
 
         let blob = seal(&mut group_a, &provider_a, &msg).unwrap();
 
-        let decrypted = open(&mut group_b, &provider_b, &blob, ).unwrap();
+        let decrypted = open(&mut group_b, &provider_b, &blob, &|_, _| false).unwrap();
 
         assert_eq!(decrypted.message_type, MessageType::Text);
         assert_eq!(decrypted.channel_id, test_channel());
@@ -1297,8 +1330,41 @@ mod tests {
 
         let blob = seal(&mut group_a, &provider_a, &msg).unwrap();
 
-        let result = open(&mut group_b, &provider_b, &blob, );
+        let result = open(&mut group_b, &provider_b, &blob, &|_, _| false);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn reject_message_from_revoked_device() {
+        let provider_a = GhostProvider::new_in_memory().unwrap();
+        let provider_b = GhostProvider::new_in_memory().unwrap();
+        let id_a = Identity::from_seed([0x01; 32]).unwrap();
+        let id_b = Identity::from_seed([0x02; 32]).unwrap();
+
+        let server_id = [0x42; 32];
+        let channel_id = derive_default_channel_id(&server_id);
+        let mut group_a =
+            GhostGroup::create_with_id(&provider_a, &id_a, &server_id, &channel_id, None).unwrap();
+        let kp_b = generate_key_package(&provider_b, &id_b).unwrap();
+        let (_commit, welcome) = group_a.add_member(&provider_a, kp_b).unwrap();
+        group_a.merge_pending_commit(&provider_a).unwrap();
+        let mut group_b =
+            GhostGroup::join(&provider_b, &id_b, &welcome.to_bytes().unwrap()).unwrap();
+
+        let msg = ApplicationMessage::new(
+            MessageType::Text, test_channel(), id_a.fingerprint, 1000, [0u8; 32], vec![], b"still here".to_vec(),
+        )
+        .unwrap();
+        let blob = seal(&mut group_a, &provider_a, &msg).unwrap();
+
+        // A's delegation is still valid, but B's log shows A's device revoked.
+        let a_fp = id_a.fingerprint;
+        let a_vk = id_a.verifying_key.to_bytes();
+        let revoked = move |fp: &[u8; 32], vk: &[u8; 32]| *fp == a_fp && *vk == a_vk;
+        let Err(err) = open(&mut group_b, &provider_b, &blob, &revoked) else {
+            panic!("a message from a revoked device was accepted");
+        };
+        assert!(err.to_string().contains("revoked"), "{err}");
     }
 
     #[test]
@@ -1482,9 +1548,11 @@ mod tests {
                 },
             ],
             mailbox_id: [0x66; 32],
+            relay_ref: Some(RelayRef::https([0x77; 32], "https://relay.example")),
         };
         let bytes = pp.to_bytes();
         let decoded = ProvisionPayload::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.relay_ref, pp.relay_ref);
         assert_eq!(decoded.server_id, pp.server_id);
         assert_eq!(decoded.server_name, pp.server_name);
         assert_eq!(decoded.members.len(), 2);
@@ -1505,9 +1573,11 @@ mod tests {
             members: vec![],
             channels: vec![],
             mailbox_id: [0xEE; 32],
+            relay_ref: None,
         };
         let bytes = pp.to_bytes();
         let decoded = ProvisionPayload::from_bytes(&bytes).unwrap();
+        assert!(decoded.relay_ref.is_none());
         assert!(decoded.members.is_empty());
         assert!(decoded.channels.is_empty());
     }
@@ -1521,6 +1591,7 @@ mod tests {
             members: vec![],
             channels: vec![],
             mailbox_id: [0x22; 32],
+            relay_ref: None,
         };
         let bytes = pp.to_bytes();
         assert!(ProvisionPayload::from_bytes(&bytes[..bytes.len() - 10]).is_err());
@@ -1535,6 +1606,7 @@ mod tests {
             members: vec![],
             channels: vec![],
             mailbox_id: [0x22; 32],
+            relay_ref: None,
         };
         let mut bytes = pp.to_bytes();
         bytes.push(0xFF); // trailing junk
@@ -1559,6 +1631,7 @@ mod tests {
                 group_info_bytes: vec![],
             }],
             mailbox_id: [0x33; 32],
+            relay_ref: None,
         };
         let sync_entries = vec![
             ("order:servers".to_string(), Some(vec![0x01, 0x02]), 100),
@@ -1745,10 +1818,12 @@ mod tests {
                     group_info_bytes: vec![],
                 },
             ],
+            relay_ref: Some(RelayRef::https([0x77; 32], "https://relay.example")),
         };
         let bytes = meta.to_bytes();
         let decoded = SyncServerMeta::from_bytes(&bytes).unwrap();
 
+        assert_eq!(decoded.relay_ref, meta.relay_ref);
         assert_eq!(decoded.server_name, "test server");
         assert_eq!(decoded.kind, ServerKind::Server);
         assert_eq!(decoded.mailbox_id, [0xAA; 32]);
@@ -1766,6 +1841,7 @@ mod tests {
             kind: ServerKind::Dm,
             mailbox_id: [0x11; 32],
             channels: vec![],
+            relay_ref: None,
         };
         let mut bytes = meta.to_bytes();
         bytes.push(0xFF);
@@ -1779,10 +1855,28 @@ mod tests {
             kind: ServerKind::Dm,
             mailbox_id: [0x22; 32],
             channels: vec![],
+            relay_ref: None,
         };
         let bytes = meta.to_bytes();
         let decoded = SyncServerMeta::from_bytes(&bytes).unwrap();
         assert_eq!(decoded.server_name, "empty");
         assert!(decoded.channels.is_empty());
+    }
+
+    #[test]
+    fn sync_server_meta_written_before_relay_field_still_decodes() {
+        let meta = SyncServerMeta {
+            server_name: "old".into(),
+            kind: ServerKind::Server,
+            mailbox_id: [0x33; 32],
+            channels: vec![],
+            relay_ref: None,
+        };
+        let mut bytes = meta.to_bytes();
+        // Old snapshots end before the two-byte relay length.
+        bytes.truncate(bytes.len() - 2);
+        let decoded = SyncServerMeta::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.server_name, "old");
+        assert!(decoded.relay_ref.is_none());
     }
 }

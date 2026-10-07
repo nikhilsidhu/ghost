@@ -1,6 +1,7 @@
 pub mod client;
 pub mod crypto;
 pub mod error;
+pub mod flows;
 pub mod identity;
 pub mod idlog_cache;
 pub mod mls;

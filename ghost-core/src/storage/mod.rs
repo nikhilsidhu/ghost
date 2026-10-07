@@ -7,6 +7,7 @@ pub mod members;
 pub mod messages;
 pub mod read_state;
 pub mod relay_state;
+pub mod relays;
 pub mod sync_state;
 mod schema;
 

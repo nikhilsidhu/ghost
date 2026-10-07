@@ -5,6 +5,7 @@ pub use ghost_wire::idlog::{
 };
 
 use ed25519_dalek::SigningKey;
+use ghost_wire::relay_ref::RelayRef;
 
 // ── Entry creation helpers ──────────────────────────────────────────
 
@@ -114,6 +115,31 @@ pub fn create_recovery(
     };
     sign_entry(master_key, &mut entry);
     counter_sign(new_device_key, &mut entry);
+    entry
+}
+
+/// Name the relay that sequences this account's log. `authorizer_key` is the
+/// master key or an active device.
+pub fn create_set_home_relay(
+    state: &LogState,
+    authorizer_key: &SigningKey,
+    relay_ref: RelayRef,
+) -> LogEntry {
+    let mut entry = LogEntry {
+        seq: state.head_seq + 1,
+        prev_hash: state.head_hash,
+        account_fp: state.account_fp,
+        entry_type: EntryType::SetHomeRelay,
+        timestamp: now_millis(),
+        body: EntryBody::SetHomeRelay {
+            relay_vk: relay_ref.relay_vk,
+            authorizer_key: authorizer_key.verifying_key().to_bytes(),
+            relay_ref,
+        },
+        signature: [0u8; 64],
+        counter_signature: None,
+    };
+    sign_entry(authorizer_key, &mut entry);
     entry
 }
 

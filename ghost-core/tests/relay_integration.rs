@@ -92,13 +92,9 @@ fn register_identity_in_cache(client: &mut GhostClient, identity: &Identity) {
             revoked_at_seq: None,
         },
     );
-    let state = LogState {
-        account_fp: identity.fingerprint,
-        master_verifying_key: None,
-        devices,
-        head_seq: 1,
-        head_hash: [0u8; 32],
-    };
+    let mut state = LogState::empty(identity.fingerprint);
+    state.devices = devices;
+    state.head_seq = 1;
     client.cache_own_identity_log(state);
 }
 
@@ -330,11 +326,12 @@ async fn invite_with_real_key_package() {
         .await
         .unwrap();
     relay_joiner
-        .post_join(token, kp_bytes.clone())
+        .put_invite_payload(token, 0, kp_bytes.clone())
         .await
         .unwrap();
 
-    let retrieved_kp_bytes = relay_inviter.get_join(token).await.unwrap();
+    let (seq, retrieved_kp_bytes) = relay_inviter.get_invite_payload(token).await.unwrap().unwrap();
+    assert_eq!(seq, 1);
     assert_eq!(retrieved_kp_bytes, kp_bytes);
 
     // Deserialize and validate the key package on the inviter side

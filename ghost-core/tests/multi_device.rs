@@ -2,7 +2,7 @@ mod common;
 
 use std::time::Duration;
 
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 
 use ghost_core::client::GhostClient;
@@ -73,11 +73,7 @@ async fn push_and_validate(
         relay.put_idlog_entry(fp, e.to_bytes()).await.unwrap();
     }
     let resp = relay.get_idlog(fp, 0).await.unwrap();
-    let parsed: Vec<LogEntry> = resp
-        .entries
-        .iter()
-        .map(|b| LogEntry::from_bytes(&b.payload).unwrap())
-        .collect();
+    let parsed: Vec<LogEntry> = resp.entries.iter().map(|a| a.entry.clone()).collect();
     validate_chain(&parsed).unwrap()
 }
 
@@ -103,11 +99,7 @@ async fn idlog_genesis_add_revoke_full_lifecycle() {
     let resp2 = relay.get_idlog(&fp, 0).await.unwrap();
     assert_eq!(resp2.entries.len(), resp.entries.len() + 1);
 
-    let entries: Vec<LogEntry> = resp2
-        .entries
-        .iter()
-        .map(|b| LogEntry::from_bytes(&b.payload).unwrap())
-        .collect();
+    let entries: Vec<LogEntry> = resp2.entries.iter().map(|a| a.entry.clone()).collect();
     let s2 = validate_chain(&entries).unwrap();
     assert_eq!(s2.active_devices().count(), 2);
 
@@ -116,11 +108,7 @@ async fn idlog_genesis_add_revoke_full_lifecycle() {
     relay.put_idlog_entry(&fp, add3.to_bytes()).await.unwrap();
 
     let resp3 = relay.get_idlog(&fp, 0).await.unwrap();
-    let entries3: Vec<LogEntry> = resp3
-        .entries
-        .iter()
-        .map(|b| LogEntry::from_bytes(&b.payload).unwrap())
-        .collect();
+    let entries3: Vec<LogEntry> = resp3.entries.iter().map(|a| a.entry.clone()).collect();
     let s3 = validate_chain(&entries3).unwrap();
     assert_eq!(s3.active_devices().count(), 3);
 
@@ -132,11 +120,7 @@ async fn idlog_genesis_add_revoke_full_lifecycle() {
         .unwrap();
 
     let resp4 = relay.get_idlog(&fp, 0).await.unwrap();
-    let entries4: Vec<LogEntry> = resp4
-        .entries
-        .iter()
-        .map(|b| LogEntry::from_bytes(&b.payload).unwrap())
-        .collect();
+    let entries4: Vec<LogEntry> = resp4.entries.iter().map(|a| a.entry.clone()).collect();
     let s4 = validate_chain(&entries4).unwrap();
     assert_eq!(s4.active_devices().count(), 2);
     assert!(!s4.is_active_device(&device2.verifying_key().to_bytes()));
@@ -297,24 +281,17 @@ async fn pairing_offer_response_encrypted_roundtrip() {
     relay_a.set_auth(fp, device1.verifying_key().to_bytes(), device1.clone());
 
     let secret = [0x42u8; 32];
+    let token = [0x24u8; 16];
     let offer_pt = b"relay_url|display_name|avatar_hash";
     let offer_sealed = sync_seal(&secret, offer_pt).unwrap();
-    relay_a.post_pairing_offer(&fp, offer_sealed).await.unwrap();
+    relay_a.post_pairing_offer(&fp, &token, offer_sealed).await.unwrap();
 
     // No response yet
-    assert!(relay_a.get_pairing_response(&fp).await.unwrap().is_none());
+    assert!(relay_a.get_pairing_response(&fp, &token).await.unwrap().is_none());
 
-    // Fetch offer via HTTP (simulating QR code scan)
-    let http = reqwest::Client::new();
-    let offer_blob = http
-        .get(format!("{}/pair/{}", relay_url, hex::encode(fp)))
-        .send()
-        .await
-        .unwrap()
-        .bytes()
-        .await
-        .unwrap()
-        .to_vec();
+    // The new device fetches the offer with no credentials (simulating a QR code scan)
+    let (guest, _) = RelayClient::new(&relay_url);
+    let offer_blob = guest.get_pairing_offer(&fp, &token).await.unwrap();
     let offer_opened = sync_open(&secret, &offer_blob).unwrap();
     assert_eq!(offer_opened, offer_pt);
 
@@ -324,14 +301,10 @@ async fn pairing_offer_response_encrypted_roundtrip() {
     response_pt.extend_from_slice(&device_b_key.to_bytes());
     response_pt.extend_from_slice(b"phone");
     let response_sealed = sync_seal(&secret, &response_pt).unwrap();
-    http.post(format!("{}/pair/{}/respond", relay_url, hex::encode(fp)))
-        .body(response_sealed)
-        .send()
-        .await
-        .unwrap();
+    guest.post_pairing_response(&fp, &token, response_sealed).await.unwrap();
 
     // Device A decrypts response, recovers device B's key
-    let response_blob = relay_a.get_pairing_response(&fp).await.unwrap().unwrap();
+    let response_blob = relay_a.get_pairing_response(&fp, &token).await.unwrap().unwrap();
     let response_opened = sync_open(&secret, &response_blob).unwrap();
     let recovered_key: [u8; 32] = response_opened[..32].try_into().unwrap();
     assert_eq!(recovered_key, device_b_key.to_bytes());
@@ -381,7 +354,9 @@ fn sync_group_add_device_via_external_commit() {
     let mut devices = HashMap::new();
     devices.insert(a_vk, DeviceInfo { verifying_key: a_vk, label: "desktop".into(), added_at_seq: 1, revoked_at_seq: None });
     devices.insert(b_vk, DeviceInfo { verifying_key: b_vk, label: "phone".into(), added_at_seq: 2, revoked_at_seq: None });
-    let log_state = LogState { account_fp: fp_a, master_verifying_key: None, devices, head_seq: 2, head_hash: [0u8; 32] };
+    let mut log_state = LogState::empty(fp_a);
+    log_state.devices = devices;
+    log_state.head_seq = 2;
     client_a.cache_own_identity_log(log_state);
 
     let (commit, mailbox_b) = client_b.join_sync_group(&gi).unwrap();
@@ -418,7 +393,9 @@ fn sync_mutation_encrypted_decrypted() {
     let mut devices = HashMap::new();
     devices.insert(a_vk, DeviceInfo { verifying_key: a_vk, label: "desktop".into(), added_at_seq: 1, revoked_at_seq: None });
     devices.insert(b_vk, DeviceInfo { verifying_key: b_vk, label: "phone".into(), added_at_seq: 2, revoked_at_seq: None });
-    let log_state = LogState { account_fp: fp_a, master_verifying_key: None, devices, head_seq: 2, head_hash: [0u8; 32] };
+    let mut log_state = LogState::empty(fp_a);
+    log_state.devices = devices;
+    log_state.head_seq = 2;
     client_a.cache_own_identity_log(log_state.clone());
     client_b.cache_own_identity_log(log_state);
 
@@ -472,7 +449,9 @@ fn sync_revocation_prevents_decryption() {
     let mut devices = HashMap::new();
     devices.insert(a_vk, DeviceInfo { verifying_key: a_vk, label: "desktop".into(), added_at_seq: 1, revoked_at_seq: None });
     devices.insert(b_vk, DeviceInfo { verifying_key: b_vk, label: "phone".into(), added_at_seq: 2, revoked_at_seq: None });
-    let log_state = LogState { account_fp: fp_a, master_verifying_key: None, devices, head_seq: 2, head_hash: [0u8; 32] };
+    let mut log_state = LogState::empty(fp_a);
+    log_state.devices = devices;
+    log_state.head_seq = 2;
     client_a.cache_own_identity_log(log_state.clone());
     client_b.cache_own_identity_log(log_state);
 
@@ -528,12 +507,10 @@ fn sync_state_survives_dump_import_cycle() {
 #[tokio::test]
 async fn full_pairing_then_sync_exchange() {
     let relay_url = common::start_relay().await;
-    let http = reqwest::Client::new();
 
     // 1. Device A creates account
     let (master, device_a, genesis, fp, _seed) = make_account("desktop");
     let master_vk = master.verifying_key().to_bytes();
-    let fp_hex = hex::encode(fp);
     let (mut relay_a, _) = RelayClient::new(&relay_url);
     relay_a.set_auth(fp, device_a.verifying_key().to_bytes(), device_a.clone());
     relay_a
@@ -559,22 +536,20 @@ async fn full_pairing_then_sync_exchange() {
 
     // 3. Device A posts pairing offer (authenticated)
     let secret = [0x42u8; 32];
+    let token = [0x24u8; 16];
     let offer = sync_seal(&secret, b"offer-data").unwrap();
-    relay_a.post_pairing_offer(&fp, offer).await.unwrap();
+    relay_a.post_pairing_offer(&fp, &token, offer).await.unwrap();
 
     // 4. Device B responds with its key (unauthenticated)
+    let (guest, _) = RelayClient::new(&relay_url);
     let device_b = SigningKey::generate(&mut OsRng);
     let mut response_pt = device_b.to_bytes().to_vec();
     response_pt.extend_from_slice(b"phone");
     let response = sync_seal(&secret, &response_pt).unwrap();
-    http.post(format!("{}/pair/{}/respond", relay_url, fp_hex))
-        .body(response)
-        .send()
-        .await
-        .unwrap();
+    guest.post_pairing_response(&fp, &token, response).await.unwrap();
 
     // 5. Device A gets response (authenticated)
-    let resp_blob = relay_a.get_pairing_response(&fp).await.unwrap().unwrap();
+    let resp_blob = relay_a.get_pairing_response(&fp, &token).await.unwrap().unwrap();
     let resp_pt = sync_open(&secret, &resp_blob).unwrap();
     let b_key_bytes: [u8; 32] = resp_pt[..32].try_into().unwrap();
     let b_signing_key = SigningKey::from_bytes(&b_key_bytes);
@@ -595,25 +570,7 @@ async fn full_pairing_then_sync_exchange() {
     provision_pt.extend_from_slice(&encode_sync_state_dump(&sync_dump).unwrap());
     let provision_sealed = sync_seal(&secret, &provision_pt).unwrap();
 
-    // put_provision requires auth — sign as device_a
-    let prov_timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let da_vk = device_a.verifying_key().to_bytes();
-    let prov_path = format!("/pair/{}/provision", fp_hex);
-    let prov_msg = ghost_wire::auth::auth_message("PUT", &prov_path, &fp, &da_vk, prov_timestamp, None);
-    let prov_sig = device_a.sign(&prov_msg);
-
-    http.put(format!("{}/pair/{}/provision", relay_url, fp_hex))
-        .header("x-ghost-account", hex::encode(fp))
-        .header("x-ghost-device", hex::encode(da_vk))
-        .header("x-ghost-timestamp", prov_timestamp.to_string())
-        .header("x-ghost-signature", hex::encode(prov_sig.to_bytes()))
-        .body(provision_sealed)
-        .send()
-        .await
-        .unwrap();
+    relay_a.put_provision(&fp, &token, provision_sealed).await.unwrap();
 
     // Push AddDevice to identity log
     let chain_state = validate_chain(&[genesis.clone()]).unwrap();
@@ -625,11 +582,7 @@ async fn full_pairing_then_sync_exchange() {
 
     // 6. Device B: validate chain, fetch provision, join sync group
     let all_resp = relay_a.get_idlog(&fp, 0).await.unwrap();
-    let all_entries: Vec<LogEntry> = all_resp
-        .entries
-        .iter()
-        .map(|b| LogEntry::from_bytes(&b.payload).unwrap())
-        .collect();
+    let all_entries: Vec<LogEntry> = all_resp.entries.iter().map(|a| a.entry.clone()).collect();
     let state = validate_chain(&all_entries).unwrap();
     assert_eq!(state.active_devices().count(), 2);
     assert!(state.is_active_device(&device_b.verifying_key().to_bytes()));
@@ -637,15 +590,7 @@ async fn full_pairing_then_sync_exchange() {
     // Cache identity log in Device A so sync credential validation passes
     client_a.cache_own_identity_log(state.clone());
 
-    let prov_blob = http
-        .get(format!("{}/pair/{}/provision", relay_url, fp_hex))
-        .send()
-        .await
-        .unwrap()
-        .bytes()
-        .await
-        .unwrap()
-        .to_vec();
+    let prov_blob = guest.get_provision(&fp, &token).await.unwrap().unwrap();
     let prov_pt = sync_open(&secret, &prov_blob).unwrap();
     let recovered_sync_key: [u8; 32] = prov_pt[..32].try_into().unwrap();
     let gi_len = u32::from_be_bytes(prov_pt[32..36].try_into().unwrap()) as usize;
@@ -733,17 +678,19 @@ async fn recovery_full_flow() {
 
     // 2. Export seed + sync_key encrypted with passphrase, store on relay
     let recovery_blob = export_recovery_blob(&seed, &old_sync_key, "my-recovery-passphrase").unwrap();
-    relay
-        .put_recovery_blob(&fp, recovery_blob.clone())
-        .await
-        .unwrap();
+    let bundle = ghost_wire::recovery_bundle::RecoveryBundle {
+        generation: 1,
+        recovery_blob: recovery_blob.clone(),
+        master_blob: vec![],
+    };
+    relay.put_recovery_bundle(&fp, &bundle).await.unwrap();
 
     // 3. All devices lost. New device fetches recovery blob.
-    let fetched = relay.get_recovery_blob(&fp).await.unwrap().unwrap();
-    assert_eq!(fetched, recovery_blob);
+    let fetched = relay.get_recovery_bundle(&fp).await.unwrap().unwrap();
+    assert_eq!(fetched, bundle);
 
     // 4. Decrypt → derive master key
-    let recovered = import_recovery_blob(&fetched, "my-recovery-passphrase").unwrap();
+    let recovered = import_recovery_blob(&fetched.recovery_blob, "my-recovery-passphrase").unwrap();
     assert_eq!(recovered.seed, seed);
     assert_eq!(recovered.sync_key.unwrap(), old_sync_key);
     let recovered_seed = recovered.seed;
@@ -757,11 +704,7 @@ async fn recovery_full_flow() {
     // 5. Create Recovery entry, push to relay
     let recovery_device = SigningKey::generate(&mut OsRng);
     let chain_resp = relay.get_idlog(&fp, 0).await.unwrap();
-    let chain_entries: Vec<LogEntry> = chain_resp
-        .entries
-        .iter()
-        .map(|b| LogEntry::from_bytes(&b.payload).unwrap())
-        .collect();
+    let chain_entries: Vec<LogEntry> = chain_resp.entries.iter().map(|a| a.entry.clone()).collect();
     let chain_state = validate_chain(&chain_entries).unwrap();
     assert_eq!(chain_state.active_devices().count(), 2);
 
@@ -777,11 +720,7 @@ async fn recovery_full_flow() {
 
     // 6. Validate: only recovery device is active
     let final_resp = relay.get_idlog(&fp, 0).await.unwrap();
-    let final_entries: Vec<LogEntry> = final_resp
-        .entries
-        .iter()
-        .map(|b| LogEntry::from_bytes(&b.payload).unwrap())
-        .collect();
+    let final_entries: Vec<LogEntry> = final_resp.entries.iter().map(|a| a.entry.clone()).collect();
     let final_state = validate_chain(&final_entries).unwrap();
     assert_eq!(final_state.active_devices().count(), 1);
     assert!(final_state.is_active_device(&recovery_device.verifying_key().to_bytes()));

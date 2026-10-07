@@ -1,11 +1,8 @@
-use aes_gcm::aead::{Aead, AeadCore, OsRng};
-use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
-use sframe::frame::{EncryptedFrameView, MediaFrameView};
-use sframe::frame::MonotonicCounter;
+use sframe::frame::{EncryptedFrameView, MediaFrameView, MonotonicCounter};
 use sframe::key::{DecryptionKey, EncryptionKey};
 use sframe::CipherSuite;
 
-use crate::crypto::{GhostProvider, VOICE_EXPORT_LABEL, VOICE_PRESENCE_EXPORT_LABEL};
+use crate::crypto::{aead, GhostProvider, VOICE_EXPORT_LABEL, VOICE_PRESENCE_EXPORT_LABEL};
 use crate::error::{GhostError, Result};
 
 use super::group::GhostGroup;
@@ -65,7 +62,8 @@ pub fn encrypt_voice_frame(
     let enc_key = EncryptionKey::derive_from(VOICE_CIPHER_SUITE, 0u64, key)
         .map_err(|e| GhostError::Crypto(format!("sframe key derive: {e}")))?;
     let mut counter = MonotonicCounter::with_start_value(sequence as u64, u64::MAX);
-    let media = MediaFrameView::new(&mut counter, frame);
+    let media = MediaFrameView::try_new(&mut counter, frame)
+        .map_err(|e| GhostError::Crypto(format!("sframe counter: {e}")))?;
     let mut buf = Vec::new();
     media
         .encrypt_into(&enc_key, &mut buf)
@@ -80,13 +78,13 @@ pub fn decrypt_voice_frame(
     _sequence: u32,
     encrypted: &[u8],
 ) -> Result<Vec<u8>> {
-    let mut dec_key = DecryptionKey::derive_from(VOICE_CIPHER_SUITE, 0u64, key)
+    let dec_key = DecryptionKey::derive_from(VOICE_CIPHER_SUITE, 0u64, key)
         .map_err(|e| GhostError::Crypto(format!("sframe key derive: {e}")))?;
     let frame = EncryptedFrameView::try_from(encrypted)
         .map_err(|e| GhostError::Crypto(format!("sframe parse: {e}")))?;
     let mut buf = Vec::new();
     frame
-        .decrypt_into(&mut dec_key, &mut buf)
+        .decrypt_into(&dec_key, &mut buf)
         .map_err(|e| GhostError::Crypto(format!("sframe decrypt: {e}")))?;
     Ok(buf)
 }
@@ -142,29 +140,12 @@ pub fn derive_presence_key(
 
 /// Encrypt a presence state blob. Wire format: [nonce:12][ciphertext+tag].
 pub fn seal_presence(key: &[u8; 32], state: &PresenceState) -> Result<Vec<u8>> {
-    let cipher = Aes256Gcm::new(key.into());
-    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
-    let plaintext = state.to_bytes();
-    let ciphertext = cipher
-        .encrypt(&nonce, plaintext.as_ref())
-        .map_err(|e| GhostError::Crypto(format!("presence seal: {e}")))?;
-    let mut blob = Vec::with_capacity(12 + ciphertext.len());
-    blob.extend_from_slice(&nonce);
-    blob.extend_from_slice(&ciphertext);
-    Ok(blob)
+    aead::seal(key, &state.to_bytes(), "presence")
 }
 
 /// Decrypt a presence blob. Returns the parsed state.
 pub fn open_presence(key: &[u8; 32], blob: &[u8]) -> Result<PresenceState> {
-    if blob.len() < 12 + 16 {
-        return Err(GhostError::Crypto("presence blob too short".into()));
-    }
-    let nonce = Nonce::from_slice(&blob[..12]);
-    let ciphertext = &blob[12..];
-    let cipher = Aes256Gcm::new(key.into());
-    let plaintext = cipher
-        .decrypt(nonce, ciphertext)
-        .map_err(|_| GhostError::Crypto("presence open: auth failed".into()))?;
+    let plaintext = aead::open(key, blob, "presence")?;
     PresenceState::from_bytes(&plaintext)
 }
 

@@ -41,8 +41,12 @@ pub enum ReceiveResult {
     /// Message received, but sender's kt_head_hash doesn't match our cached copy. Likely stale cache; could indicate a split-view attack.
     MessageWithKtWarning(ApplicationMessage),
     CommitProcessed,
-    /// This client was removed from the group by a commit.
+    /// The account was removed from the group by a commit: no device of it remains.
     Kicked,
+    /// This device's leaf was removed while other devices of the account remain,
+    /// which is what revoking this device does. Other devices are unaffected, so
+    /// this must not be propagated to the account's sync state.
+    DeviceRemoved,
     /// A commit removed these members (fingerprints) from the group.
     MembersRemoved(Vec<[u8; 32]>),
     /// A proposal was queued (e.g. relay Remove). Creator should commit pending proposals.
@@ -182,113 +186,50 @@ impl GhostClient {
         &self.idlog_cache
     }
 
-    /// Cache identity log entries from the relay and validate the chain.
-    pub fn cache_identity_log(
-        &mut self,
-        account_fp: &[u8; 32],
-        entries: &[(u64, Vec<u8>)],
-    ) -> Result<ghost_wire::idlog::LogState> {
-        self.idlog_cache
-            .cache_and_validate(&self.store, account_fp, entries)
+    /// Verifying key of the relay this client is connected to, once fetched.
+    pub fn relay_vk(&self) -> Option<[u8; 32]> {
+        self.relay_vk
     }
 
-    /// Return the previously-seen KT tree size for this relay, or 0 if none.
-    /// The app layer uses this to decide whether to fetch a consistency proof.
-    pub fn kt_last_tree_size(&self, relay_url: &str) -> Result<u64> {
-        Ok(self
-            .store
-            .get_kt_state(relay_url)?
-            .map(|s| s.tree_size)
-            .unwrap_or(0))
+    /// Validate an anchored identity log (chain plus every home anchor), merge it
+    /// into the local cache, and return the account's state.
+    pub fn cache_anchored_log(
+        &mut self,
+        account_fp: &[u8; 32],
+        log: &crate::relay::AnchoredLog,
+    ) -> Result<ghost_wire::idlog::LogState> {
+        self.idlog_cache.cache_and_validate(&self.store, account_fp, log)
     }
 
-    /// Verify KT proofs and cache identity log entries.
-    ///
-    /// 1. Verify checkpoint signature (relay's Ed25519 key)
-    /// 2. Verify each entry's inclusion proof against the checkpoint root
-    /// 3. If we have a previous checkpoint, verify the consistency proof
-    ///    proving the old tree is a prefix of the new tree
-    /// 4. Persist the new checkpoint and cache the identity log chain
-    ///
-    /// `consistency_proof_bytes`: required when we already have a checkpoint
-    /// for this relay (i.e. `kt_last_tree_size() > 0`). Pass `None` on first
-    /// fetch.
-    pub fn cache_identity_log_with_proofs(
-        &mut self,
-        relay_url: &str,
-        account_fp: &[u8; 32],
-        response: &crate::relay::IdLogWithProofs,
-        consistency_proof_bytes: Option<&[u8]>,
-    ) -> Result<ghost_wire::idlog::LogState> {
-        use ghost_wire::merkle::{leaf_hash, Checkpoint, ConsistencyProof, InclusionProof};
+    /// Last KT head accepted from this relay, if any.
+    pub fn kt_head(&self, relay_vk: &[u8; 32]) -> Result<Option<ghost_wire::merkle::Checkpoint>> {
+        match self.store.get_kt_state(relay_vk)? {
+            Some(state) => ghost_wire::merkle::Checkpoint::from_bytes(&state.checkpoint)
+                .map(Some)
+                .map_err(|e| GhostError::IdentityLog(format!("stored kt head: {e}"))),
+            None => Ok(None),
+        }
+    }
 
-        let relay_vk = self.relay_vk.ok_or_else(|| {
-            GhostError::IdentityLog("no relay verifying key configured".into())
-        })?;
-        let vk = ed25519_dalek::VerifyingKey::from_bytes(&relay_vk)
+    /// Accept a new KT head from `relay_vk`: it must be signed by that relay and
+    /// extend the last head accepted from it (`proof` covers the growth). A relay
+    /// that shows two clients different trees fails this check on one of them.
+    pub fn accept_kt_head(
+        &mut self,
+        relay_vk: &[u8; 32],
+        head: &ghost_wire::merkle::Checkpoint,
+        proof: Option<&ghost_wire::merkle::ConsistencyProof>,
+    ) -> Result<()> {
+        let vk = ed25519_dalek::VerifyingKey::from_bytes(relay_vk)
             .map_err(|e| GhostError::IdentityLog(format!("bad relay vk: {e}")))?;
-
-        // 1. Verify checkpoint signature
-        let checkpoint = Checkpoint::from_bytes(&response.checkpoint)
-            .map_err(|e| GhostError::IdentityLog(format!("bad checkpoint: {e}")))?;
-        checkpoint
-            .verify(&vk)
-            .map_err(|_| GhostError::IdentityLog("checkpoint signature invalid".into()))?;
-
-        // 2. Verify each entry's inclusion proof
-        for entry in &response.entries {
-            if entry.inclusion_proof.is_empty() {
-                continue; // entry predates KT tree
-            }
-            let proof = InclusionProof::from_bytes(&entry.inclusion_proof)
-                .map_err(|e| GhostError::IdentityLog(format!("bad inclusion proof: {e}")))?;
-            let lh = leaf_hash(&entry.payload);
-            if !proof.verify(&lh, &checkpoint.root_hash) {
-                return Err(GhostError::IdentityLog(
-                    "inclusion proof verification failed".into(),
-                ));
-            }
+        head.verify(&vk)
+            .map_err(|_| GhostError::IdentityLog("kt head signature invalid".into()))?;
+        if let Some(prior) = self.kt_head(relay_vk)? {
+            ghost_wire::merkle::verify_extension(&prior, head, proof).map_err(|e| {
+                GhostError::IdentityLog(format!("kt head does not extend the last one seen ({e}); possible split view"))
+            })?;
         }
-
-        // 3. Verify consistency with previously-seen checkpoint
-        if let Some(prev) = self.store.get_kt_state(relay_url)? {
-            if checkpoint.tree_size < prev.tree_size {
-                return Err(GhostError::IdentityLog(
-                    "relay checkpoint went backwards".into(),
-                ));
-            }
-            if checkpoint.tree_size > prev.tree_size {
-                let proof_bytes = consistency_proof_bytes.ok_or_else(|| {
-                    GhostError::IdentityLog(
-                        "consistency proof required but not provided".into(),
-                    )
-                })?;
-                let proof = ConsistencyProof::from_bytes(proof_bytes)
-                    .map_err(|e| GhostError::IdentityLog(format!("bad consistency proof: {e}")))?;
-                if !proof.verify(&prev.root_hash, &checkpoint.root_hash) {
-                    return Err(GhostError::IdentityLog(
-                        "consistency proof verification failed — possible split-view attack".into(),
-                    ));
-                }
-            }
-            // tree_size == prev.tree_size: same checkpoint, no consistency proof needed
-        }
-
-        // 4. Persist new checkpoint and cache the identity log
-        self.store.set_kt_state(
-            relay_url,
-            checkpoint.tree_size,
-            &checkpoint.root_hash,
-            &response.checkpoint,
-        )?;
-
-        let entries: Vec<(u64, Vec<u8>)> = response
-            .entries
-            .iter()
-            .map(|e| (e.seq, e.payload.clone()))
-            .collect();
-        self.idlog_cache
-            .cache_and_validate(&self.store, account_fp, &entries)
+        self.store.set_kt_state(relay_vk, head.tree_size, &head.root_hash, &head.to_bytes())
     }
 
     /// Insert a pre-validated LogState directly (e.g. for our own account).
@@ -386,6 +327,8 @@ impl GhostClient {
     /// Application messages use sync_seal (epoch-independent).
     /// Commits/proposals use MLS (membership management).
     pub fn receive_sync(&mut self, blob: &[u8]) -> Result<SyncReceiveResult> {
+        let cache = &self.idlog_cache;
+        let revoked = |fp: &[u8; 32], vk: &[u8; 32]| cache.is_revoked(fp, vk);
         let group = self.sync_group.as_mut()
             .ok_or_else(|| GhostError::Format("no sync group".into()))?;
         let (envelope_type, _epoch) = ghost_wire::decode_envelope(blob)
@@ -417,7 +360,7 @@ impl GhostClient {
                         let sender = processed.sender().clone();
                         match processed.into_content() {
                             openmls::prelude::ProcessedMessageContent::StagedCommitMessage(staged) => {
-                                crate::wire::validate_sender(group, &credential, &sender, Some(&staged))?;
+                                crate::wire::validate_sender(group, &credential, &sender, Some(&staged), &revoked)?;
                                 group.merge_staged_commit(&self.provider, *staged)?;
                                 Ok(SyncReceiveResult::CommitProcessed)
                             }
@@ -502,7 +445,16 @@ impl GhostClient {
                 .collect(),
             channels: invite_channels,
             mailbox_id,
+            relay_ref: self.server_relay_ref(server_id)?,
         })
+    }
+
+    /// Relay hosting a server, as recorded at join time; `None` means the home relay.
+    fn server_relay_ref(&self, server_id: &[u8; 32]) -> Result<Option<ghost_wire::relay_ref::RelayRef>> {
+        match self.store.server_relay(server_id)? {
+            Some(relay_vk) => Ok(self.store.get_relay(&relay_vk)?),
+            None => Ok(None),
+        }
     }
 
     /// Export lightweight server metadata for sync_state (no members).
@@ -526,6 +478,7 @@ impl GhostClient {
                     group_info_bytes: Vec::new(),
                 })
                 .collect(),
+            relay_ref: self.server_relay_ref(server_id)?,
         })
     }
 
@@ -811,11 +764,13 @@ impl GhostClient {
         blob: &[u8],
         received_at: Option<u64>,
     ) -> Result<ApplicationMessage> {
+        let cache = &self.idlog_cache;
+        let revoked = |fp: &[u8; 32], vk: &[u8; 32]| cache.is_revoked(fp, vk);
         let group = self.channel_groups.get_mut(channel_id).ok_or_else(|| {
             GhostError::ServerNotLoaded(format!("channel {}", hex::encode(&channel_id[..8])))
         })?;
 
-        let msg = open(group, &self.provider, blob)?;
+        let msg = open(group, &self.provider, blob, &revoked)?;
 
         let recv_ts = received_at.unwrap_or_else(|| {
             SystemTime::now()
@@ -1385,11 +1340,13 @@ impl GhostClient {
         blob: &[u8],
         received_at: Option<u64>,
     ) -> Result<ReceiveResult> {
+        let cache = &self.idlog_cache;
+        let revoked = |fp: &[u8; 32], vk: &[u8; 32]| cache.is_revoked(fp, vk);
         let group = self.channel_groups.get_mut(channel_id).ok_or_else(|| {
             GhostError::ServerNotLoaded(format!("channel {}", hex::encode(&channel_id[..8])))
         })?;
 
-        let inbound = match open_any(group, &self.provider, blob) {
+        let inbound = match open_any(group, &self.provider, blob, &revoked) {
             Err(GhostError::SelfMessage) => return Ok(ReceiveResult::Skipped),
             other => other?,
         };
@@ -1436,16 +1393,21 @@ impl GhostClient {
                     GhostError::ServerNotLoaded(format!("channel {}", hex::encode(&channel_id[..8])))
                 })?;
 
-                // Check if we were fully kicked (all our leaves removed from this channel)
+                // This device is out once its own leaf is gone. If other devices of the
+                // account remain, only this device was removed (it was revoked).
                 if removed.contains(&self.identity.fingerprint) {
-                    let still_in = group.members().any(|m| {
-                        crate::mls::credential::parse_credential(&m.credential)
-                            .ok()
-                            .map(|pc| pc.account_fp == self.identity.fingerprint)
-                            .unwrap_or(false)
-                    });
-                    if !still_in {
-                        return Ok(ReceiveResult::Kicked);
+                    let own_vk = self.identity.verifying_key.as_bytes();
+                    let device_still_in = group.members().any(|m| m.signature_key.as_slice() == own_vk);
+                    if !device_still_in {
+                        let account_still_in = group.members().any(|m| {
+                            crate::mls::credential::parse_credential(&m.credential)
+                                .is_ok_and(|pc| pc.account_fp == self.identity.fingerprint)
+                        });
+                        return Ok(if account_still_in {
+                            ReceiveResult::DeviceRemoved
+                        } else {
+                            ReceiveResult::Kicked
+                        });
                     }
                 }
 
@@ -1518,13 +1480,9 @@ mod tests {
                 revoked_at_seq: None,
             },
         );
-        let state = LogState {
-            account_fp: identity.fingerprint,
-            master_verifying_key: None,
-            devices,
-            head_seq: 1,
-            head_hash: [0u8; 32],
-        };
+        let mut state = LogState::empty(identity.fingerprint);
+        state.devices = devices;
+        state.head_seq = 1;
         client.idlog_cache.insert(state);
     }
 
