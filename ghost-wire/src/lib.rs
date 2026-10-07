@@ -8,6 +8,7 @@ pub mod policy_mls;
 pub mod recovery_bundle;
 pub mod relay_ref;
 pub mod server_location;
+pub mod voice;
 
 /// Envelope framing for blobs transiting the relay.
 ///
@@ -46,10 +47,12 @@ pub const WS_SIGNAL_EPOCH_MISMATCH: &str = "epoch_mismatch";
 
 // WS close codes (4000-4999 = application-defined)
 pub const WS_CLOSE_DEVICE_REVOKED: u16 = 4001;
+/// The account was removed from the group whose mailbox (or voice room) this was.
+pub const WS_CLOSE_REMOVED: u16 = 4002;
 
-// Voice packet: [header_len:2][channel_id:32][slot_id:4][flags:1][epoch:8][seq:4][payload_len:2][payload...]
-// Relay reads first 38 bytes (header_len + channel_id + slot_id) for routing.
-// slot_id is relay-assigned per WS connection; replaces fingerprint in the header.
+// Voice packet: [header_len:2][room_id:32][slot_id:4][flags:1][epoch:8][seq:4][payload_len:2][payload...]
+// Relay reads first 38 bytes (header_len + room_id + slot_id) for routing.
+// room_id and slot_id are relay-assigned at the authenticated voice join (see `voice`).
 // epoch identifies which MLS epoch key encrypted the payload.
 pub const VOICE_HEADER_SIZE: usize = 53;
 pub const VOICE_RELAY_PREFIX: usize = 38;
