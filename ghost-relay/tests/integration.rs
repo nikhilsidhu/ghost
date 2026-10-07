@@ -165,6 +165,8 @@ fn test_config() -> Config {
         db_path: None,
         log_retention_hours: 72,
         log_min_entries: 100,
+        public_url: None,
+        mirror_refresh_secs: 30,
     }
 }
 
@@ -889,45 +891,59 @@ fn pair_url(base: &str, fp: &[u8; 32]) -> String {
     format!("{base}/pair/{}", hex::encode(fp))
 }
 
+fn session_url(base: &str, fp: &[u8; 32], token: &[u8; 16]) -> String {
+    format!("{}/{}", pair_url(base, fp), hex::encode(token))
+}
+
+/// Open a pairing session for `auth` with `token`, as the existing device does.
+async fn open_pairing(base: &str, auth: &TestAuth, token: &[u8; 16], offer: &[u8]) -> StatusCode {
+    let url = pair_url(base, &auth.account_fp);
+    let mut body = token.to_vec();
+    body.extend_from_slice(offer);
+    let client = reqwest::Client::new();
+    auth.sign("POST", &url, client.post(&url).body(body)).send().await.unwrap().status()
+}
+
 #[tokio::test]
 async fn pairing_full_flow() {
     let base = start_server(test_config()).await;
     let auth = TestAuth::generate();
     auth.register(&base).await;
     let client = reqwest::Client::new();
+    let token = [0x11; 16];
 
-    // Existing device posts offer (authenticated)
-    let offer_url = pair_url(&base, &auth.account_fp);
-    let resp = auth.sign("POST", &offer_url, client
-        .post(&offer_url)
-        .body(b"encrypted-offer".to_vec()))
-        .send().await.unwrap();
-    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert_eq!(open_pairing(&base, &auth, &token, b"encrypted-offer").await, StatusCode::CREATED);
+    let session = session_url(&base, &auth.account_fp, &token);
+
+    // The new device fetches the offer with the token alone.
+    let resp = client.get(&session).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.bytes().await.unwrap().as_ref(), b"encrypted-offer");
 
     // Poll for response — none yet (authenticated)
-    let resp_url = format!("{}/response", pair_url(&base, &auth.account_fp));
-    let resp = auth.sign("GET", &resp_url, client.get(&resp_url))
-        .send().await.unwrap();
+    let resp_url = format!("{session}/response");
+    let resp = auth.sign("GET", &resp_url, client.get(&resp_url)).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
     // New device posts response (unauthenticated)
-    let respond_url = format!("{}/respond", pair_url(&base, &auth.account_fp));
-    let resp = client
-        .post(&respond_url)
-        .body(b"encrypted-response".to_vec())
-        .send().await.unwrap();
-    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let resp = client.post(format!("{session}/respond")).body(b"encrypted-response".to_vec()).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
 
-    // Existing device polls — gets response (authenticated)
-    let resp = auth.sign("GET", &resp_url, client.get(&resp_url))
-        .send().await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(resp.bytes().await.unwrap().as_ref(), b"encrypted-response");
+    // Existing device polls — gets response, and the session stays alive
+    for _ in 0..2 {
+        let resp = auth.sign("GET", &resp_url, client.get(&resp_url)).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.bytes().await.unwrap().as_ref(), b"encrypted-response");
+    }
 
-    // Second poll — session still alive
-    let resp = auth.sign("GET", &resp_url, client.get(&resp_url))
-        .send().await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+    // Provision round trip
+    let prov_url = format!("{session}/provision");
+    let resp = client.get(&prov_url).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let resp = auth.sign("PUT", &prov_url, client.put(&prov_url).body(b"sealed-provision".to_vec())).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let resp = client.get(&prov_url).send().await.unwrap();
+    assert_eq!(resp.bytes().await.unwrap().as_ref(), b"sealed-provision");
 }
 
 #[tokio::test]
@@ -937,10 +953,45 @@ async fn pairing_respond_without_offer_rejected() {
     let fp = [0xB2; 32];
 
     let resp = client
-        .post(format!("{}/respond", pair_url(&base, &fp)))
+        .post(format!("{}/respond", session_url(&base, &fp, &[0x22; 16])))
         .body(b"response".to_vec())
         .send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn pairing_wrong_token_cannot_read_or_answer() {
+    let base = start_server(test_config()).await;
+    let auth = TestAuth::generate();
+    auth.register(&base).await;
+    let client = reqwest::Client::new();
+    open_pairing(&base, &auth, &[0x33; 16], b"offer").await;
+
+    // Knowing the account fingerprint is not enough without the code's token.
+    let wrong = session_url(&base, &auth.account_fp, &[0x34; 16]);
+    assert_eq!(client.get(&wrong).send().await.unwrap().status(), StatusCode::NOT_FOUND);
+    let resp = client.post(format!("{wrong}/respond")).body(b"hijack".to_vec()).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn pairing_response_cannot_be_replaced() {
+    let base = start_server(test_config()).await;
+    let auth = TestAuth::generate();
+    auth.register(&base).await;
+    let client = reqwest::Client::new();
+    let token = [0x44; 16];
+    open_pairing(&base, &auth, &token, b"offer").await;
+    let session = session_url(&base, &auth.account_fp, &token);
+
+    let first = client.post(format!("{session}/respond")).body(b"first".to_vec()).send().await.unwrap();
+    assert_eq!(first.status(), StatusCode::CREATED);
+    let second = client.post(format!("{session}/respond")).body(b"second".to_vec()).send().await.unwrap();
+    assert_eq!(second.status(), StatusCode::CONFLICT);
+
+    let resp_url = format!("{session}/response");
+    let resp = auth.sign("GET", &resp_url, client.get(&resp_url)).send().await.unwrap();
+    assert_eq!(resp.bytes().await.unwrap().as_ref(), b"first");
 }
 
 #[tokio::test]
@@ -950,13 +1001,13 @@ async fn pairing_offer_overwrite() {
     auth.register(&base).await;
     let client = reqwest::Client::new();
 
-    // Post offer, then overwrite with new offer (authenticated)
-    let offer_url = pair_url(&base, &auth.account_fp);
-    auth.sign("POST", &offer_url, client.post(&offer_url).body(b"offer-1".to_vec())).send().await.unwrap();
-    auth.sign("POST", &offer_url, client.post(&offer_url).body(b"offer-2".to_vec())).send().await.unwrap();
+    // A new session replaces the old one; the old token stops working.
+    open_pairing(&base, &auth, &[0x55; 16], b"offer-1").await;
+    open_pairing(&base, &auth, &[0x56; 16], b"offer-2").await;
 
-    // Fetch back the offer (unauthenticated — new device)
-    let resp = client.get(&offer_url).send().await.unwrap();
+    let old = client.get(session_url(&base, &auth.account_fp, &[0x55; 16])).send().await.unwrap();
+    assert_eq!(old.status(), StatusCode::NOT_FOUND);
+    let resp = client.get(session_url(&base, &auth.account_fp, &[0x56; 16])).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(resp.bytes().await.unwrap().as_ref(), b"offer-2");
 }
@@ -1218,7 +1269,9 @@ async fn auth_cross_account_sync_state_rejected() {
     // Account B writes its own sync state (should succeed)
     let client = reqwest::Client::new();
     let url_b = format!("{base}/sync_state/{}", hex::encode(auth_b.account_fp));
-    let resp = auth_b.sign("PUT", &url_b, client.put(&url_b).body(b"b-state".to_vec())).send().await.unwrap();
+    let mut b_state = 1u64.to_be_bytes().to_vec();
+    b_state.extend_from_slice(b"b-state");
+    let resp = auth_b.sign("PUT", &url_b, client.put(&url_b).body(b_state)).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
     // Account A tries to read account B's sync state → rejected
@@ -1226,7 +1279,9 @@ async fn auth_cross_account_sync_state_rejected() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
     // Account A tries to overwrite account B's sync state → rejected
-    let resp = auth_a.sign("PUT", &url_b, client.put(&url_b).body(b"evil".to_vec())).send().await.unwrap();
+    let mut evil = 2u64.to_be_bytes().to_vec();
+    evil.extend_from_slice(b"evil");
+    let resp = auth_a.sign("PUT", &url_b, client.put(&url_b).body(evil)).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
@@ -1240,20 +1295,27 @@ async fn auth_cross_account_recovery_rejected() {
     let auth_b = TestAuth::generate();
     auth_b.register(&base).await;
 
-    // Account B stores its recovery blob
+    // Account B stores its recovery bundle
     let client = reqwest::Client::new();
     let url_b = format!("{base}/recovery/{}", hex::encode(auth_b.account_fp));
-    let resp = auth_b.sign("PUT", &url_b, client.put(&url_b).body(b"recovery-blob".to_vec())).send().await.unwrap();
+    let bundle = |generation: u64, blob: &[u8]| {
+        ghost_wire::recovery_bundle::RecoveryBundle { generation, recovery_blob: blob.to_vec(), master_blob: vec![] }.to_bytes()
+    };
+    let resp = auth_b.sign("PUT", &url_b, client.put(&url_b).body(bundle(5, b"recovery-blob"))).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
-    // Account A tries to overwrite B's recovery blob → rejected
-    let resp = auth_a.sign("PUT", &url_b, client.put(&url_b).body(b"evil".to_vec())).send().await.unwrap();
+    // Account A tries to overwrite B's recovery bundle → rejected
+    let resp = auth_a.sign("PUT", &url_b, client.put(&url_b).body(bundle(6, b"evil"))).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // B replaying an older generation is refused too (rollback)
+    let resp = auth_b.sign("PUT", &url_b, client.put(&url_b).body(bundle(4, b"old"))).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
 
     // Recovery GET is public (no auth needed for bootstrap)
     let resp = reqwest::get(&url_b).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(resp.bytes().await.unwrap().as_ref(), b"recovery-blob");
+    assert_eq!(resp.bytes().await.unwrap().as_ref(), bundle(5, b"recovery-blob").as_slice());
 }
 
 #[tokio::test]
@@ -1268,7 +1330,8 @@ async fn auth_cross_account_provision_rejected() {
 
     // Account A tries to PUT provision for account B → rejected
     let client = reqwest::Client::new();
-    let url_b = format!("{base}/pair/{}/provision", hex::encode(auth_b.account_fp));
+    open_pairing(&base, &auth_b, &[0x66; 16], b"offer").await;
+    let url_b = format!("{}/provision", session_url(&base, &auth_b.account_fp, &[0x66; 16]));
     let resp = auth_a.sign("PUT", &url_b, client.put(&url_b).body(b"evil-provision".to_vec())).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
@@ -1455,10 +1518,10 @@ fn export_group_info_bytes(
 
 async fn fetch_relay_vk(base: &str) -> [u8; 32] {
     let client = reqwest::Client::new();
-    let resp = client.get(format!("{base}/relay_key")).send().await.unwrap();
+    let resp = client.get(format!("{base}/relay")).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let hex_str = resp.text().await.unwrap();
-    let bytes = hex::decode(hex_str.trim()).unwrap();
+    let body: Value = resp.json().await.unwrap();
+    let bytes = hex::decode(body["relay_vk"].as_str().unwrap()).unwrap();
     bytes.try_into().unwrap()
 }
 
@@ -1509,13 +1572,21 @@ fn create_self_update_commit(
 // ── MLS enforcement tests ────────────────────────────────────────
 
 #[tokio::test]
-async fn relay_key_endpoint() {
+async fn relay_info_endpoint() {
     let base = start_server(test_config()).await;
     let vk = fetch_relay_vk(&base).await;
     assert_ne!(vk, [0u8; 32]);
     // Second fetch returns same key
     let vk2 = fetch_relay_vk(&base).await;
     assert_eq!(vk, vk2);
+
+    let client = reqwest::Client::new();
+    let body: Value = client.get(format!("{base}/relay")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(body["protocol"].as_u64().unwrap(), 2);
+    assert!(body["kt_head"].is_null(), "no entries yet");
+    let relay_ref = ghost_wire::relay_ref::RelayRef::decode(body["ref"].as_str().unwrap()).unwrap();
+    assert_eq!(relay_ref.relay_vk, vk);
+    assert!(relay_ref.endpoints.is_empty(), "no public_url configured");
 }
 
 #[tokio::test]
@@ -1736,41 +1807,171 @@ async fn idlog_append_creates_kt_leaf() {
 }
 
 #[tokio::test]
-async fn get_idlog_returns_valid_proofs() {
+async fn get_idlog_returns_anchored_entries() {
     let (base, st) = start_server_with_state(test_config()).await;
     let alice = TestAuth::generate();
-    alice.register(&base).await;
 
-    // Fetch identity log — should include inclusion proof and checkpoint
+    // PUT answers with the anchor for the new entry.
     let client = reqwest::Client::new();
     let url = format!("{base}/idlog/{}", hex::encode(alice.account_fp));
+    let resp = client.put(&url).body(alice.genesis_bytes()).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let put_anchor = ghost_wire::anchor::AnchoredEntry::from_bytes(&resp.bytes().await.unwrap()).unwrap();
+    assert_eq!(put_anchor.entry.seq, 1);
+    assert!(put_anchor.verify_anchor(&st.relay_vk, None).is_ok());
+
+    // GET serves the same anchored entry and names this relay as home.
     let req = client.get(&url);
     let resp = alice.sign("GET", &url, req).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["home_relay_vk"].as_str().unwrap(), hex::encode(st.relay_vk));
     let entries = body["entries"].as_array().unwrap();
     assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["seq"].as_u64().unwrap(), 1);
+    let anchored_bytes = B64.decode(entries[0]["anchored"].as_str().unwrap()).unwrap();
+    assert_eq!(anchored_bytes, put_anchor.to_bytes());
 
-    // Decode checkpoint and inclusion proof
-    let checkpoint_b64 = body["checkpoint"].as_str().unwrap();
-    let checkpoint_bytes = B64.decode(checkpoint_b64).unwrap();
-    let checkpoint = ghost_wire::merkle::Checkpoint::from_bytes(&checkpoint_bytes).unwrap();
+    let anchored = ghost_wire::anchor::AnchoredEntry::from_bytes(&anchored_bytes).unwrap();
+    assert_eq!(anchored.entry.to_bytes(), alice.genesis_bytes());
+    assert_eq!(anchored.checkpoint.tree_size, 1);
+    let mut state = ghost_wire::idlog::LogState::empty(alice.account_fp);
+    ghost_wire::anchor::validate_anchored_entry(&mut state, &anchored, Some(&st.relay_vk), |_| None).unwrap();
+    assert_eq!(state.head_seq, 1);
+}
 
-    let proof_b64 = entries[0]["inclusion_proof"].as_str().unwrap();
-    let proof_bytes = B64.decode(proof_b64).unwrap();
-    assert!(!proof_bytes.is_empty());
+#[tokio::test]
+async fn anchored_push_registers_foreign_account_with_invite_only() {
+    let (home_base, home_state) = start_server_with_state(test_config()).await;
+    let (mirror_base, _mirror_state) = start_server_with_state(test_config()).await;
+    let client = reqwest::Client::new();
 
-    let proof = ghost_wire::merkle::InclusionProof::from_bytes(&proof_bytes).unwrap();
+    // Alice is created at the home relay (genesis + SetHomeRelay).
+    let alice = TestAuth::generate();
+    let home_url = format!("{home_base}/idlog/{}", hex::encode(alice.account_fp));
+    let resp = client.put(&home_url).body(alice.genesis_bytes()).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let genesis = ghost_wire::idlog::LogEntry::from_bytes(&alice.genesis_bytes()).unwrap();
+    let state = ghost_wire::idlog::validate_chain(&[genesis]).unwrap();
+    let mut set_home = ghost_wire::idlog::LogEntry {
+        seq: 2,
+        prev_hash: state.head_hash,
+        account_fp: alice.account_fp,
+        entry_type: ghost_wire::idlog::EntryType::SetHomeRelay,
+        timestamp: 2000,
+        body: ghost_wire::idlog::EntryBody::SetHomeRelay {
+            relay_vk: home_state.relay_vk,
+            authorizer_key: alice.device_key.verifying_key().to_bytes(),
+            relay_ref: ghost_wire::relay_ref::RelayRef::https(home_state.relay_vk, &home_base),
+        },
+        signature: [0u8; 64],
+        counter_signature: None,
+    };
+    let msg = ghost_wire::idlog::sign_message(&set_home);
+    set_home.signature = alice.device_key.sign(&msg).to_bytes();
+    let resp = alice
+        .sign("PUT", &home_url, client.put(&home_url).body(set_home.to_bytes()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
 
-    // Verify inclusion proof against checkpoint root
-    let payload_b64 = entries[0]["payload"].as_str().unwrap();
-    let payload = B64.decode(payload_b64).unwrap();
-    let leaf_hash = ghost_wire::merkle::leaf_hash(&payload);
-    assert!(proof.verify(&leaf_hash, &checkpoint.root_hash));
+    // Fetch the anchored chain from the home.
+    let resp = alice.sign("GET", &home_url, client.get(&home_url)).send().await.unwrap();
+    let body: Value = resp.json().await.unwrap();
+    let mut chain = Vec::new();
+    for e in body["entries"].as_array().unwrap() {
+        chain.extend_from_slice(&B64.decode(e["anchored"].as_str().unwrap()).unwrap());
+    }
 
-    // Verify checkpoint signature with relay's key
-    let relay_vk = ed25519_dalek::VerifyingKey::from_bytes(&st.relay_vk).unwrap();
-    assert!(checkpoint.verify(&relay_vk).is_ok());
+    // The mirror has never heard of Alice: her device cannot authenticate there.
+    let mirror_url = format!("{mirror_base}/idlog/{}", hex::encode(alice.account_fp));
+    let probe = format!("{mirror_base}/accounts/{}", hex::encode(alice.account_fp));
+    let resp = alice.sign("GET", &probe, client.get(&probe)).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // Without an invite the anchored push is refused.
+    let resp = client.put(format!("{mirror_url}/anchored")).body(chain.clone()).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let resp = client
+        .put(format!("{mirror_url}/anchored?invite=nope"))
+        .body(chain.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // Bob, a member of the mirror, registers an invite there.
+    let bob = TestAuth::generate();
+    bob.register(&mirror_base).await;
+    let invite_url = format!("{mirror_base}/invite");
+    let expires_at = ghost_relay::util::now_millis() + 60_000;
+    let resp = bob
+        .sign("POST", &invite_url, client.post(&invite_url).json(&serde_json::json!({"token": "tok1", "expires_at": expires_at})))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // With the invite the mirror validates the chain and registers Alice as a guest.
+    let resp = client
+        .put(format!("{mirror_url}/anchored?invite=tok1"))
+        .body(chain.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let info: Value = resp.json().await.unwrap();
+    assert_eq!(info["home_relay_vk"].as_str().unwrap(), hex::encode(home_state.relay_vk));
+    assert_eq!(info["is_home"].as_bool().unwrap(), false);
+    assert_eq!(info["head_seq"].as_u64().unwrap(), 2);
+
+    // Alice's device now authenticates at the mirror and sees the same view.
+    let resp = alice.sign("GET", &probe, client.get(&probe)).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = alice.sign("GET", &mirror_url, client.get(&mirror_url)).send().await.unwrap();
+    let mirrored: Value = resp.json().await.unwrap();
+    assert_eq!(mirrored["home_relay_vk"].as_str().unwrap(), hex::encode(home_state.relay_vk));
+    assert_eq!(mirrored["entries"].as_array().unwrap().len(), 2);
+
+    // Raw appends are refused at the mirror: the home sequences the log.
+    let device2 = SigningKey::generate(&mut OsRng);
+    let state = {
+        let entries: Vec<_> = mirrored["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| {
+                ghost_wire::anchor::AnchoredEntry::from_bytes(&B64.decode(e["anchored"].as_str().unwrap()).unwrap())
+                    .unwrap()
+                    .entry
+            })
+            .collect();
+        ghost_wire::idlog::validate_chain(&entries).unwrap()
+    };
+    let mut add = ghost_wire::idlog::LogEntry {
+        seq: 3,
+        prev_hash: state.head_hash,
+        account_fp: alice.account_fp,
+        entry_type: ghost_wire::idlog::EntryType::AddDevice,
+        timestamp: 3000,
+        body: ghost_wire::idlog::EntryBody::AddDevice {
+            device_verifying_key: device2.verifying_key().to_bytes(),
+            device_label: "phone".into(),
+            authorizer_key: alice.device_key.verifying_key().to_bytes(),
+        },
+        signature: [0u8; 64],
+        counter_signature: None,
+    };
+    let msg = ghost_wire::idlog::sign_message(&add);
+    add.signature = alice.device_key.sign(&msg).to_bytes();
+    add.counter_signature = Some(device2.sign(&msg).to_bytes());
+    let resp = alice
+        .sign("PUT", &mirror_url, client.put(&mirror_url).body(add.to_bytes()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
 }
 
 #[tokio::test]

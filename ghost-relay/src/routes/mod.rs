@@ -1,10 +1,11 @@
+mod accounts;
 mod avatar;
 mod blob;
 mod idlog;
 mod kt;
 pub(crate) mod pair;
 mod recovery;
-mod relay_key;
+mod relay;
 mod server_info;
 mod sync_state;
 mod health;
@@ -31,17 +32,22 @@ pub fn router(state: AppState) -> Router {
     let max_body = state.config.max_blob_size;
     Router::new()
         .route("/health", get(health::health))
-        .route("/relay_key", get(relay_key::get))
+        .route("/relay", get(relay::get))
+        .route("/accounts/{account_fp}", get(accounts::get))
+        .route("/accounts/{account_fp}/import", post(accounts::import))
+        .route("/accounts/{account_fp}/mirrors", put(accounts::put_mirrors))
         .route("/box/{mailbox_id}", post(blob::post_blob).get(blob::get_blobs).delete(blob::delete_mailbox))
         .route("/box/{mailbox_id}/server_info", put(server_info::put).get(server_info::get))
         .route("/box/{mailbox_id}/avatar/{fingerprint}", put(avatar::put).get(avatar::get).delete(avatar::delete))
         .route("/idlog/{account_fp}", put(idlog::put).get(idlog::get))
+        .route("/idlog/{account_fp}/anchored", put(idlog::put_anchored))
         .route("/kt/head", get(kt::head))
         .route("/kt/consistency-proof", get(kt::consistency_proof))
-        .route("/pair/{account_fp}", post(pair::post_offer).get(pair::get_offer))
-        .route("/pair/{account_fp}/respond", post(pair::post_respond))
-        .route("/pair/{account_fp}/response", get(pair::get_response))
-        .route("/pair/{account_fp}/provision", put(pair::put_provision).get(pair::get_provision))
+        .route("/pair/{account_fp}", post(pair::post_offer))
+        .route("/pair/{account_fp}/{token}", get(pair::get_offer))
+        .route("/pair/{account_fp}/{token}/respond", post(pair::post_respond))
+        .route("/pair/{account_fp}/{token}/response", get(pair::get_response))
+        .route("/pair/{account_fp}/{token}/provision", put(pair::put_provision).get(pair::get_provision))
         .route("/recovery/{account_fp}", put(recovery::put).get(recovery::get))
         .route("/sync_state/{account_fp}", put(sync_state::put).get(sync_state::get))
         .route("/ws/{mailbox_id}", get(ws::ws_upgrade))

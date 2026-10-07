@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 
 use tracing_subscriber::EnvFilter;
 
-use ghost_relay::{config, routes, state, storage, udp, worker};
+use ghost_relay::{config, federation, routes, state, storage, udp, worker};
 
 #[tokio::main]
 async fn main() {
@@ -25,6 +25,7 @@ async fn main() {
     let state = state::new_state(config, storage);
 
     tokio::spawn(worker::run(state.clone()));
+    tokio::spawn(federation::run(state.clone()));
     tokio::spawn(udp::run(state.clone()));
 
     let app = routes::router(state);

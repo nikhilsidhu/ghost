@@ -2,6 +2,7 @@ pub mod auth;
 pub mod config;
 pub mod constants;
 pub mod error;
+pub mod federation;
 pub mod mailbox;
 pub mod mls_storage;
 pub mod rate_limit;

@@ -23,3 +23,7 @@ pub const DEFAULT_LOG_MIN_ENTRIES: u64 = 100; // keep at least this many per mai
 
 // Avatar blob storage
 pub const MAX_AVATAR_SIZE: usize = 512 * 1024; // 512 KB
+
+// Multi-relay: how often a mirror pulls new identity log entries from each account's home
+pub const DEFAULT_MIRROR_REFRESH_SECS: u64 = 30;
+pub const MIRROR_FETCH_TIMEOUT_SECS: u64 = 10;

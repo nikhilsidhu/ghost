@@ -38,13 +38,31 @@ impl FromRef<AppState> for AppState {
     }
 }
 
-/// Validate auth headers and return the authenticated device identity.
+/// Validate auth headers and return the authenticated device identity: a valid
+/// signature from a device this relay admits (see `Storage::may_authenticate`).
 pub fn validate_auth_headers(
     headers: &HeaderMap,
     method: &str,
     path: &str,
     state: &AppState,
 ) -> Result<DeviceAuth, RelayError> {
+    let auth = verify_signed_headers(headers, method, path)?;
+    // The device must be active in an account this relay homes, hosts a group
+    // for, or has admitted by invite; revoked or unknown devices stop here.
+    let allowed = state
+        .storage
+        .may_authenticate(&auth.account_fp, &auth.device_vk, crate::util::now_millis())
+        .map_err(|e| RelayError::Storage(format!("device lookup: {e}")))?;
+    if !allowed {
+        return Err(RelayError::Unauthorized("unknown, revoked, or unregistered device".into()));
+    }
+    Ok(auth)
+}
+
+/// Check the auth headers' timestamp and signature only, without asking whether
+/// the signing key belongs to an admitted device. Callers that accept other keys
+/// (an account's master key) decide that themselves.
+pub fn verify_signed_headers(headers: &HeaderMap, method: &str, path: &str) -> Result<DeviceAuth, RelayError> {
     let account_hex = header_str(headers, "x-ghost-account")?;
     let device_hex = header_str(headers, "x-ghost-device")?;
     let timestamp_str = header_str(headers, "x-ghost-timestamp")?;
@@ -69,13 +87,6 @@ pub fn validate_auth_headers(
     };
     if diff > ghost_wire::auth::AUTH_TIMESTAMP_TOLERANCE {
         return Err(RelayError::Unauthorized("stale timestamp".into()));
-    }
-
-    // Check device is active in identity log
-    let active = state.storage.is_active_device(&account_fp, &device_vk)
-        .map_err(|e| RelayError::Storage(format!("device lookup: {e}")))?;
-    if !active {
-        return Err(RelayError::Unauthorized("unknown or revoked device".into()));
     }
 
     // Verify signature

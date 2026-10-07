@@ -1,4 +1,7 @@
+use ghost_wire::anchor::{validate_anchored_entry, AnchoredEntry};
 use ghost_wire::idlog;
+use ghost_wire::merkle::Checkpoint;
+use ghost_wire::relay_ref::RelayRef;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
 use std::path::Path;
@@ -15,28 +18,74 @@ pub struct LogEntry {
     pub payload: Vec<u8>,
 }
 
+/// One identity log entry as stored. The anchor columns are empty only for
+/// entries this relay sequenced before anchoring existed; the home regenerates
+/// those from its KT tree on read.
 pub struct IdLogRow {
     pub seq: u64,
     pub payload: Vec<u8>,
+    pub inclusion_proof: Option<Vec<u8>>,
+    pub checkpoint: Option<Vec<u8>>,
+}
+
+/// What this relay knows about an account whose log it holds or mirrors.
+#[derive(Debug, Clone)]
+pub struct AccountRow {
+    pub account_fp: [u8; 32],
+    pub home_relay_vk: [u8; 32],
+    pub home_relay_ref: Vec<u8>,
+    pub home_set_at_seq: u64,
+    pub is_home: bool,
+    pub head_seq: u64,
+    /// Devices of this account may authenticate here until this time (millis)
+    /// even without a mailbox membership; set when an invite admits the account.
+    pub guest_until: u64,
+}
+
+/// One device-linking rendezvous, addressed by account and a random token that
+/// only the pairing code carries.
+pub struct PairingRow {
+    pub offer: Vec<u8>,
+    pub response: Option<Vec<u8>>,
+    pub provision: Option<Vec<u8>>,
+}
+
+/// Result of accepting one identity log entry.
+#[derive(Debug)]
+pub struct IdlogAppend {
+    pub seq: u64,
+    pub revoked: Vec<[u8; 32]>,
+    pub home_relay_vk: [u8; 32],
+    pub is_home: bool,
 }
 
 pub struct Storage {
     conn: Mutex<Connection>,
+    relay_vk: [u8; 32],
 }
 
 impl Storage {
     pub fn open(path: &Path) -> Result<Self, RelayError> {
         let conn = Connection::open(path).map_err(|e| RelayError::Storage(e.to_string()))?;
-        let s = Self { conn: Mutex::new(conn) };
-        s.init()?;
-        Ok(s)
+        Self::from_connection(conn)
     }
 
     pub fn open_in_memory() -> Result<Self, RelayError> {
         let conn = Connection::open_in_memory().map_err(|e| RelayError::Storage(e.to_string()))?;
-        let s = Self { conn: Mutex::new(conn) };
+        Self::from_connection(conn)
+    }
+
+    fn from_connection(conn: Connection) -> Result<Self, RelayError> {
+        let mut s = Self { conn: Mutex::new(conn), relay_vk: [0u8; 32] };
         s.init()?;
+        s.relay_vk = s.get_or_create_relay_keypair()?.0;
+        s.backfill_accounts()?;
         Ok(s)
+    }
+
+    /// This relay's Ed25519 verifying key, which names it in RelayRefs.
+    pub fn relay_vk(&self) -> [u8; 32] {
+        self.relay_vk
     }
 
     fn init(&self) -> Result<(), RelayError> {
@@ -167,9 +216,91 @@ impl Storage {
                  seq        INTEGER NOT NULL,
                  leaf_index INTEGER NOT NULL,
                  PRIMARY KEY (account_fp, seq)
-             ) WITHOUT ROWID;",
+             ) WITHOUT ROWID;
+
+             CREATE TABLE IF NOT EXISTS pairing (
+                 account_fp BLOB NOT NULL,
+                 token      BLOB NOT NULL,
+                 offer      BLOB NOT NULL,
+                 response   BLOB,
+                 provision  BLOB,
+                 expires_at INTEGER NOT NULL,
+                 PRIMARY KEY (account_fp, token)
+             ) WITHOUT ROWID;
+
+             CREATE TABLE IF NOT EXISTS mirror_grants (
+                 account_fp BLOB NOT NULL,
+                 relay_vk   BLOB NOT NULL,
+                 PRIMARY KEY (account_fp, relay_vk)
+             ) WITHOUT ROWID;
+
+             CREATE TABLE IF NOT EXISTS accounts (
+                 account_fp      BLOB PRIMARY KEY,
+                 home_relay_vk   BLOB NOT NULL,
+                 home_relay_ref  BLOB NOT NULL,
+                 home_set_at_seq INTEGER NOT NULL,
+                 is_home         INTEGER NOT NULL,
+                 head_seq        INTEGER NOT NULL,
+                 guest_until     INTEGER NOT NULL DEFAULT 0,
+                 last_refresh    INTEGER NOT NULL
+             );",
         )
         .map_err(|e| RelayError::Storage(e.to_string()))?;
+
+        Self::add_column_if_missing(&conn, "identity_log", "inclusion_proof", "BLOB")?;
+        Self::add_column_if_missing(&conn, "identity_log", "checkpoint", "BLOB")?;
+        Self::add_column_if_missing(&conn, "recovery_blob", "generation", "INTEGER NOT NULL DEFAULT 0")?;
+        Self::add_column_if_missing(&conn, "sync_state", "generation", "INTEGER NOT NULL DEFAULT 0")?;
+        Ok(())
+    }
+
+    fn add_column_if_missing(
+        conn: &Connection,
+        table: &str,
+        column: &str,
+        decl: &str,
+    ) -> Result<(), RelayError> {
+        let map_err = |e: rusqlite::Error| RelayError::Storage(e.to_string());
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})")).map_err(map_err)?;
+        let exists = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(map_err)?
+            .filter_map(|r| r.ok())
+            .any(|name| name == column);
+        if !exists {
+            conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"), [])
+                .map_err(map_err)?;
+        }
+        Ok(())
+    }
+
+    /// Accounts whose logs predate the accounts table were all created here,
+    /// so this relay is their home.
+    fn backfill_accounts(&self) -> Result<(), RelayError> {
+        let conn = self.conn.lock().unwrap();
+        let map_err = |e: rusqlite::Error| RelayError::Storage(e.to_string());
+        let mut stmt = conn
+            .prepare(
+                "SELECT account_fp, MAX(seq) FROM identity_log
+                 WHERE account_fp NOT IN (SELECT account_fp FROM accounts)
+                 GROUP BY account_fp",
+            )
+            .map_err(map_err)?;
+        let rows: Vec<(Vec<u8>, i64)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(map_err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_err)?;
+        let home_ref = RelayRef::key_only(self.relay_vk).to_bytes();
+        for (fp, head_seq) in rows {
+            conn.execute(
+                "INSERT INTO accounts (account_fp, home_relay_vk, home_relay_ref, home_set_at_seq,
+                                       is_home, head_seq, guest_until, last_refresh)
+                 VALUES (?1, ?2, ?3, 0, 1, ?4, 0, ?5)",
+                params![fp, self.relay_vk.as_slice(), home_ref, head_seq, now_millis() as i64],
+            )
+            .map_err(map_err)?;
+        }
         Ok(())
     }
 
@@ -452,12 +583,13 @@ impl Storage {
         Ok(())
     }
 
-    /// Append a validated identity log entry. Returns (revoked device keys, entry seq).
+    /// Home path: accept a raw entry from one of the account's devices, sequence
+    /// it, and record this relay as home. Mirrors must use `append_anchored_entries`.
     pub fn append_idlog_entry(
         &self,
         account_fp: &[u8; 32],
         payload: &[u8],
-    ) -> Result<(Vec<[u8; 32]>, u64), RelayError> {
+    ) -> Result<IdlogAppend, RelayError> {
         let entry = idlog::LogEntry::from_bytes(payload)
             .map_err(|e| RelayError::BadRequest(format!("invalid entry: {e}")))?;
 
@@ -467,20 +599,47 @@ impl Storage {
 
         let conn = self.conn.lock().unwrap();
 
+        if let Some(account) = Self::load_account(&conn, account_fp)? {
+            if !account.is_home {
+                return Err(RelayError::WrongHome(format!(
+                    "account is homed at relay {}; this relay only mirrors it",
+                    hex::encode(account.home_relay_vk),
+                )));
+            }
+        }
+        if let idlog::EntryBody::SetHomeRelay { relay_vk, .. } = &entry.body {
+            if *relay_vk != self.relay_vk {
+                return Err(RelayError::WrongHome(
+                    "a move to another relay must be imported at that relay".into(),
+                ));
+            }
+        }
+
         // Build log state from point-reads instead of replaying the full chain
         let mut state = Self::build_log_state(&conn, account_fp)?;
-
-        // Validate the new entry (signatures, authority, seq, prev_hash)
-        idlog::validate_entry(&mut state, &entry)
-            .map_err(|e| RelayError::BadRequest(format!("validation failed: {e}")))?;
-
-        // Collect device keys that will be revoked by this entry
-        let revoked = Self::collect_revoked_keys(&conn, account_fp, &entry)?;
-
-        // Store entry + update device_keys atomically
         let tx = conn
             .unchecked_transaction()
             .map_err(|e| RelayError::Storage(e.to_string()))?;
+        let result = Self::apply_home_entry(&tx, account_fp, &mut state, &entry, self.relay_vk)?;
+        tx.commit().map_err(|e| RelayError::Storage(e.to_string()))?;
+        Ok(result)
+    }
+
+    /// Validate one raw entry against `state` and store it unanchored, as the
+    /// entry's home. The caller anchors it through the KT tree afterwards.
+    fn apply_home_entry(
+        tx: &Connection,
+        account_fp: &[u8; 32],
+        state: &mut idlog::LogState,
+        entry: &idlog::LogEntry,
+        own_vk: [u8; 32],
+    ) -> Result<IdlogAppend, RelayError> {
+        // Validate the new entry (signatures, authority, seq, prev_hash)
+        idlog::validate_entry(state, entry)
+            .map_err(|e| RelayError::BadRequest(format!("validation failed: {e}")))?;
+
+        // Read before device_keys changes: a Recovery revokes whatever is active now
+        let revoked = Self::collect_revoked_keys(tx, account_fp, entry)?;
 
         tx.execute(
             "INSERT INTO identity_log (account_fp, seq, prev_hash, payload, received_at)
@@ -489,17 +648,360 @@ impl Storage {
                 account_fp.as_slice(),
                 entry.seq as i64,
                 entry.prev_hash.as_slice(),
-                payload,
+                entry.to_bytes(),
                 now_millis() as i64,
             ],
         )
         .map_err(|e| RelayError::Storage(e.to_string()))?;
 
-        // Update device_keys table based on entry type
-        Self::update_device_keys(&tx, account_fp, &entry)?;
+        Self::update_device_keys(tx, account_fp, entry)?;
+        let (home_relay_vk, is_home) = Self::upsert_account(tx, account_fp, state, Some(own_vk), own_vk)?;
+        Ok(IdlogAppend { seq: entry.seq, revoked, home_relay_vk, is_home })
+    }
 
+    /// Attach the home's inclusion proof and checkpoint to an entry this relay
+    /// sequenced, once the KT tree has absorbed it.
+    pub fn store_anchor(
+        &self,
+        account_fp: &[u8; 32],
+        seq: u64,
+        inclusion_proof: &[u8],
+        checkpoint: &[u8],
+    ) -> Result<(), RelayError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE identity_log SET inclusion_proof = ?3, checkpoint = ?4
+             WHERE account_fp = ?1 AND seq = ?2",
+            params![account_fp.as_slice(), seq as i64, inclusion_proof, checkpoint],
+        )
+        .map_err(|e| RelayError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Mirror path: accept entries another relay sequenced, each carrying that
+    /// home's proof. Also the path for registering a foreign account (full
+    /// chain from genesis) and for learning that an account moved home.
+    /// Entries already held are skipped if identical and rejected if not.
+    pub fn append_anchored_entries(
+        &self,
+        account_fp: &[u8; 32],
+        entries: &[AnchoredEntry],
+    ) -> Result<Vec<IdlogAppend>, RelayError> {
+        let conn = self.conn.lock().unwrap();
+        let mut state = Self::build_log_state(&conn, account_fp)?;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| RelayError::Storage(e.to_string()))?;
+        let results = Self::apply_anchored_entries(&tx, account_fp, &mut state, entries, self.relay_vk)?;
         tx.commit().map_err(|e| RelayError::Storage(e.to_string()))?;
-        Ok((revoked, entry.seq))
+        Ok(results)
+    }
+
+    /// Make this relay the account's home: store the existing chain with the
+    /// anchors its previous home issued, then sequence `new_entries` here. The
+    /// first new entry must be a `SetHomeRelay` naming this relay, so every entry
+    /// this relay anchors comes after the move that makes it home; at most a
+    /// `Recovery` may follow it. All or nothing.
+    pub fn import_account(
+        &self,
+        account_fp: &[u8; 32],
+        prefix: &[AnchoredEntry],
+        new_entries: &[idlog::LogEntry],
+    ) -> Result<Vec<IdlogAppend>, RelayError> {
+        let Some((first, rest)) = new_entries.split_first() else {
+            return Err(RelayError::BadRequest("import carries no new entries".into()));
+        };
+        match &first.body {
+            idlog::EntryBody::SetHomeRelay { relay_vk, .. } if *relay_vk == self.relay_vk => {}
+            _ => {
+                return Err(RelayError::BadRequest(
+                    "the first imported entry must be a SetHomeRelay naming this relay".into(),
+                ))
+            }
+        }
+        if rest.len() > 1 || rest.iter().any(|e| !matches!(e.body, idlog::EntryBody::Recovery { .. })) {
+            return Err(RelayError::BadRequest("only a Recovery may follow the SetHomeRelay".into()));
+        }
+        if new_entries.iter().chain(prefix.iter().map(|a| &a.entry)).any(|e| e.account_fp != *account_fp) {
+            return Err(RelayError::BadRequest("account_fp mismatch with URL".into()));
+        }
+
+        let conn = self.conn.lock().unwrap();
+        let mut state = Self::build_log_state(&conn, account_fp)?;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| RelayError::Storage(e.to_string()))?;
+        let mut results = Self::apply_anchored_entries(&tx, account_fp, &mut state, prefix, self.relay_vk)?;
+        for entry in new_entries {
+            results.push(Self::apply_home_entry(&tx, account_fp, &mut state, entry, self.relay_vk)?);
+        }
+        tx.commit().map_err(|e| RelayError::Storage(e.to_string()))?;
+        Ok(results)
+    }
+
+    /// Validate anchored entries against `state` and store them with their anchors.
+    /// Only accounts whose chain names a home are accepted: a chain without a
+    /// `SetHomeRelay` gives no relay key to verify its anchors against.
+    fn apply_anchored_entries(
+        tx: &Connection,
+        account_fp: &[u8; 32],
+        state: &mut idlog::LogState,
+        entries: &[AnchoredEntry],
+        own_vk: [u8; 32],
+    ) -> Result<Vec<IdlogAppend>, RelayError> {
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Entries before the chain's first SetHomeRelay were anchored by the
+        // relay that entry names, which is where the account was created.
+        let first_home = Self::first_home_relay(tx, account_fp)?.or_else(|| {
+            entries.iter().find_map(|a| match &a.entry.body {
+                idlog::EntryBody::SetHomeRelay { relay_vk, .. } => Some(*relay_vk),
+                _ => None,
+            })
+        });
+        let implied = first_home.ok_or_else(|| {
+            RelayError::Unprocessable(
+                "account names no home relay; it must append SetHomeRelay at its home first".into(),
+            )
+        })?;
+
+        let mut results = Vec::with_capacity(entries.len());
+        for anchored in entries {
+            let entry = &anchored.entry;
+            if entry.account_fp != *account_fp {
+                return Err(RelayError::BadRequest("account_fp mismatch with URL".into()));
+            }
+            if entry.seq <= state.head_seq {
+                let stored_hash: Option<Vec<u8>> = tx
+                    .query_row(
+                        "SELECT payload FROM identity_log WHERE account_fp = ?1 AND seq = ?2",
+                        params![account_fp.as_slice(), entry.seq as i64],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|e| RelayError::Storage(e.to_string()))?
+                    .map(|payload: Vec<u8>| blake3::hash(&payload).as_bytes().to_vec());
+                if stored_hash.as_deref() == Some(idlog::entry_hash(entry).as_slice()) {
+                    continue;
+                }
+                return Err(RelayError::Conflict);
+            }
+
+            let revoked = Self::collect_revoked_keys(tx, account_fp, entry)?;
+            let prior_for_home = |home: &[u8; 32]| Self::last_checkpoint_from(tx, account_fp, home);
+            validate_anchored_entry(state, anchored, Some(&implied), prior_for_home)
+                .map_err(|e| RelayError::Unprocessable(format!("anchored entry {}: {e}", entry.seq)))?;
+
+            tx.execute(
+                "INSERT INTO identity_log (account_fp, seq, prev_hash, payload, received_at,
+                                           inclusion_proof, checkpoint)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    account_fp.as_slice(),
+                    entry.seq as i64,
+                    entry.prev_hash.as_slice(),
+                    entry.to_bytes(),
+                    now_millis() as i64,
+                    anchored.inclusion_proof.to_bytes(),
+                    anchored.checkpoint.to_bytes().as_slice(),
+                ],
+            )
+            .map_err(|e| RelayError::Storage(e.to_string()))?;
+            Self::update_device_keys(tx, account_fp, entry)?;
+            let (home_relay_vk, is_home) = Self::upsert_account(tx, account_fp, state, Some(implied), own_vk)?;
+            results.push(IdlogAppend { seq: entry.seq, revoked, home_relay_vk, is_home });
+        }
+        Ok(results)
+    }
+
+    /// Relay named by the account's earliest stored `SetHomeRelay`, if any.
+    fn first_home_relay(conn: &Connection, account_fp: &[u8; 32]) -> Result<Option<[u8; 32]>, RelayError> {
+        let mut stmt = conn
+            .prepare_cached("SELECT payload FROM identity_log WHERE account_fp = ?1 ORDER BY seq")
+            .map_err(|e| RelayError::Storage(e.to_string()))?;
+        let payloads: Vec<Vec<u8>> = stmt
+            .query_map(params![account_fp.as_slice()], |row| row.get(0))
+            .map_err(|e| RelayError::Storage(e.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| RelayError::Storage(e.to_string()))?;
+        for payload in payloads {
+            let entry = idlog::LogEntry::from_bytes(&payload)
+                .map_err(|e| RelayError::Storage(format!("corrupt idlog entry: {e}")))?;
+            if let idlog::EntryBody::SetHomeRelay { relay_vk, .. } = entry.body {
+                return Ok(Some(relay_vk));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Newest stored checkpoint for the account that was signed by `home`.
+    fn last_checkpoint_from(
+        conn: &Connection,
+        account_fp: &[u8; 32],
+        home: &[u8; 32],
+    ) -> Option<Checkpoint> {
+        let vk = ed25519_dalek::VerifyingKey::from_bytes(home).ok()?;
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT checkpoint FROM identity_log
+                 WHERE account_fp = ?1 AND checkpoint IS NOT NULL
+                 ORDER BY seq DESC",
+            )
+            .ok()?;
+        let stored: Vec<Vec<u8>> = stmt
+            .query_map(params![account_fp.as_slice()], |row| row.get(0))
+            .ok()?
+            .filter_map(|r| r.ok())
+            .collect();
+        stored
+            .iter()
+            .filter_map(|bytes| Checkpoint::from_bytes(bytes).ok())
+            .find(|cp| cp.verify(&vk).is_ok())
+    }
+
+    /// Record the chain's current home and head. A chain that names no home
+    /// is homed at `implied_home`, falling back to this relay. Returns
+    /// (home_relay_vk, is_home).
+    fn upsert_account(
+        conn: &Connection,
+        account_fp: &[u8; 32],
+        state: &idlog::LogState,
+        implied_home: Option<[u8; 32]>,
+        own_vk: [u8; 32],
+    ) -> Result<([u8; 32], bool), RelayError> {
+        let home_relay_vk = state.home_relay_vk.or(implied_home).unwrap_or(own_vk);
+        let home_relay_ref = state
+            .home_relay_ref
+            .clone()
+            .unwrap_or_else(|| RelayRef::key_only(home_relay_vk))
+            .to_bytes();
+        let is_home = home_relay_vk == own_vk;
+        conn.execute(
+            "INSERT INTO accounts (account_fp, home_relay_vk, home_relay_ref, home_set_at_seq,
+                                   is_home, head_seq, guest_until, last_refresh)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)
+             ON CONFLICT (account_fp) DO UPDATE SET
+                 home_relay_vk = ?2, home_relay_ref = ?3, home_set_at_seq = ?4,
+                 is_home = ?5, head_seq = ?6, last_refresh = ?7",
+            params![
+                account_fp.as_slice(),
+                home_relay_vk.as_slice(),
+                home_relay_ref,
+                state.home_set_at_seq as i64,
+                is_home as i64,
+                state.head_seq as i64,
+                now_millis() as i64,
+            ],
+        )
+        .map_err(|e| RelayError::Storage(e.to_string()))?;
+        Ok((home_relay_vk, is_home))
+    }
+
+    fn load_account(
+        conn: &Connection,
+        account_fp: &[u8; 32],
+    ) -> Result<Option<AccountRow>, RelayError> {
+        conn.query_row(
+            "SELECT home_relay_vk, home_relay_ref, home_set_at_seq, is_home, head_seq, guest_until
+             FROM accounts WHERE account_fp = ?1",
+            params![account_fp.as_slice()],
+            |row| {
+                let vk: Vec<u8> = row.get(0)?;
+                Ok(AccountRow {
+                    account_fp: *account_fp,
+                    home_relay_vk: vk.try_into().map_err(|_| {
+                        rusqlite::Error::InvalidColumnType(0, "home_relay_vk".into(), rusqlite::types::Type::Blob)
+                    })?,
+                    home_relay_ref: row.get(1)?,
+                    home_set_at_seq: row.get::<_, i64>(2)? as u64,
+                    is_home: row.get::<_, i64>(3)? == 1,
+                    head_seq: row.get::<_, i64>(4)? as u64,
+                    guest_until: row.get::<_, i64>(5)? as u64,
+                })
+            },
+        )
+        .optional()
+        .map_err(|e| RelayError::Storage(e.to_string()))
+    }
+
+    /// Accounts this relay holds but does not home, for pulling from their homes.
+    pub fn mirrored_accounts(&self) -> Result<Vec<AccountRow>, RelayError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare_cached("SELECT account_fp FROM accounts WHERE is_home = 0")
+            .map_err(|e| RelayError::Storage(e.to_string()))?;
+        let fps: Vec<Vec<u8>> = stmt
+            .query_map([], |row| row.get(0))
+            .map_err(|e| RelayError::Storage(e.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| RelayError::Storage(e.to_string()))?;
+        let mut rows = Vec::with_capacity(fps.len());
+        for fp in fps {
+            let fp: [u8; 32] = fp
+                .try_into()
+                .map_err(|_| RelayError::Storage("corrupt account_fp in accounts".into()))?;
+            if let Some(row) = Self::load_account(&conn, &fp)? {
+                rows.push(row);
+            }
+        }
+        Ok(rows)
+    }
+
+    pub fn get_account(&self, account_fp: &[u8; 32]) -> Result<Option<AccountRow>, RelayError> {
+        let conn = self.conn.lock().unwrap();
+        Self::load_account(&conn, account_fp)
+    }
+
+    /// Let the account's devices authenticate here until `until` (millis),
+    /// which an invite grants so a joiner can post its first commits.
+    pub fn set_account_guest_until(&self, account_fp: &[u8; 32], until: u64) -> Result<(), RelayError> {
+        let conn = self.conn.lock().unwrap();
+        let updated = conn
+            .execute(
+                "UPDATE accounts SET guest_until = MAX(guest_until, ?2) WHERE account_fp = ?1",
+                params![account_fp.as_slice(), until as i64],
+            )
+            .map_err(|e| RelayError::Storage(e.to_string()))?;
+        if updated == 0 {
+            return Err(RelayError::NotFound);
+        }
+        Ok(())
+    }
+
+    /// Whether a device may make authenticated requests here: it must be an
+    /// active device of an account this relay homes, that belongs to a mailbox
+    /// here, or that an invite admitted recently.
+    pub fn may_authenticate(
+        &self,
+        account_fp: &[u8; 32],
+        device_vk: &[u8; 32],
+        now: u64,
+    ) -> Result<bool, RelayError> {
+        let conn = self.conn.lock().unwrap();
+        let active: Option<i64> = conn
+            .query_row(
+                "SELECT active FROM device_keys WHERE account_fp = ?1 AND device_vk = ?2",
+                params![account_fp.as_slice(), device_vk.as_slice()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| RelayError::Storage(e.to_string()))?;
+        if active != Some(1) {
+            return Ok(false);
+        }
+        let Some(account) = Self::load_account(&conn, account_fp)? else {
+            return Ok(false);
+        };
+        if account.is_home || account.guest_until > now {
+            return Ok(true);
+        }
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM mailbox_members WHERE account_fp = ?1)",
+            params![account_fp.as_slice()],
+            |row| row.get(0),
+        )
+        .map_err(|e| RelayError::Storage(e.to_string()))
     }
 
     /// Reconstruct LogState from point-reads: last entry (head_seq, head_hash),
@@ -578,12 +1080,27 @@ impl Storage {
             });
         }
 
+        // A v1 account never set a home, so the accounts row carries this
+        // relay's own key and `home_set_at_seq` 0; the chain state stays None.
+        let account = Self::load_account(conn, account_fp)?;
+        let (home_relay_vk, home_relay_ref, home_set_at_seq) = match account {
+            Some(a) if a.home_set_at_seq > 0 => {
+                let r = RelayRef::from_bytes(&a.home_relay_ref)
+                    .map_err(|e| RelayError::Storage(format!("corrupt home_relay_ref: {e}")))?;
+                (Some(a.home_relay_vk), Some(r), a.home_set_at_seq)
+            }
+            _ => (None, None, 0),
+        };
+
         Ok(idlog::LogState {
             account_fp: *account_fp,
             master_verifying_key: Some(master_vk),
             devices,
             head_seq,
             head_hash,
+            home_relay_vk,
+            home_relay_ref,
+            home_set_at_seq,
         })
     }
 
@@ -665,6 +1182,7 @@ impl Storage {
                     params![account_fp.as_slice(), device_verifying_key.as_slice(), entry.seq as i64],
                 ).map_err(map_err)?;
             }
+            idlog::EntryBody::SetHomeRelay { .. } => {}
         }
         Ok(())
     }
@@ -697,7 +1215,7 @@ impl Storage {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare_cached(
-                "SELECT seq, payload FROM identity_log
+                "SELECT seq, payload, inclusion_proof, checkpoint FROM identity_log
                  WHERE account_fp = ?1 AND seq > ?2
                  ORDER BY seq",
             )
@@ -708,6 +1226,8 @@ impl Storage {
                 Ok(IdLogRow {
                     seq: row.get::<_, i64>(0)? as u64,
                     payload: row.get(1)?,
+                    inclusion_proof: row.get(2)?,
+                    checkpoint: row.get(3)?,
                 })
             })
             .map_err(|e| RelayError::Storage(e.to_string()))?;
@@ -716,56 +1236,174 @@ impl Storage {
             .map_err(|e| RelayError::Storage(e.to_string()))
     }
 
-    /// Store or update a recovery blob for an account.
-    pub fn put_recovery_blob(
-        &self,
-        account_fp: &[u8; 32],
-        data: &[u8],
-    ) -> Result<(), RelayError> {
+    /// Replace the set of relays the account allows to pull its log from here.
+    pub fn set_mirror_grants(&self, account_fp: &[u8; 32], relays: &[[u8; 32]]) -> Result<(), RelayError> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO recovery_blob (account_fp, data, updated_at)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT (account_fp) DO UPDATE SET data = ?2, updated_at = ?3",
-            params![account_fp.as_slice(), data, now_millis() as i64],
-        )
-        .map_err(|e| RelayError::Storage(e.to_string()))?;
-        Ok(())
+        let tx = conn.unchecked_transaction().map_err(|e| RelayError::Storage(e.to_string()))?;
+        tx.execute("DELETE FROM mirror_grants WHERE account_fp = ?1", params![account_fp.as_slice()])
+            .map_err(|e| RelayError::Storage(e.to_string()))?;
+        for relay_vk in relays {
+            tx.execute(
+                "INSERT OR IGNORE INTO mirror_grants (account_fp, relay_vk) VALUES (?1, ?2)",
+                params![account_fp.as_slice(), relay_vk.as_slice()],
+            )
+            .map_err(|e| RelayError::Storage(e.to_string()))?;
+        }
+        tx.commit().map_err(|e| RelayError::Storage(e.to_string()))
     }
 
-    /// Get a recovery blob for an account.
-    pub fn get_recovery_blob(
-        &self,
-        account_fp: &[u8; 32],
-    ) -> Result<Option<Vec<u8>>, RelayError> {
+    pub fn is_mirror_granted(&self, account_fp: &[u8; 32], relay_vk: &[u8; 32]) -> Result<bool, RelayError> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT data FROM recovery_blob WHERE account_fp = ?1",
-            params![account_fp.as_slice()],
+            "SELECT EXISTS(SELECT 1 FROM mirror_grants WHERE account_fp = ?1 AND relay_vk = ?2)",
+            params![account_fp.as_slice(), relay_vk.as_slice()],
             |row| row.get(0),
+        )
+        .map_err(|e| RelayError::Storage(e.to_string()))
+    }
+
+    /// The account's master key, from the genesis entry this relay holds.
+    pub fn account_master_vk(&self, account_fp: &[u8; 32]) -> Result<Option<[u8; 32]>, RelayError> {
+        let conn = self.conn.lock().unwrap();
+        let genesis: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT payload FROM identity_log WHERE account_fp = ?1 AND seq = 1",
+                params![account_fp.as_slice()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| RelayError::Storage(e.to_string()))?;
+        let Some(genesis) = genesis else { return Ok(None) };
+        match idlog::LogEntry::from_bytes(&genesis).map(|e| e.body) {
+            Ok(idlog::EntryBody::Genesis { master_verifying_key, .. }) => Ok(Some(master_verifying_key)),
+            _ => Err(RelayError::Storage("seq 1 is not a valid genesis".into())),
+        }
+    }
+
+    /// Open a pairing session, replacing any other session for the account.
+    pub fn pairing_open(&self, account_fp: &[u8; 32], token: &[u8], offer: &[u8], expires_at: u64) -> Result<(), RelayError> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction().map_err(|e| RelayError::Storage(e.to_string()))?;
+        tx.execute("DELETE FROM pairing WHERE account_fp = ?1", params![account_fp.as_slice()])
+            .map_err(|e| RelayError::Storage(e.to_string()))?;
+        tx.execute(
+            "INSERT INTO pairing (account_fp, token, offer, expires_at) VALUES (?1, ?2, ?3, ?4)",
+            params![account_fp.as_slice(), token, offer, expires_at as i64],
+        )
+        .map_err(|e| RelayError::Storage(e.to_string()))?;
+        tx.commit().map_err(|e| RelayError::Storage(e.to_string()))
+    }
+
+    /// A live (unexpired) pairing session.
+    pub fn pairing_get(&self, account_fp: &[u8; 32], token: &[u8], now: u64) -> Result<Option<PairingRow>, RelayError> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT offer, response, provision FROM pairing
+             WHERE account_fp = ?1 AND token = ?2 AND expires_at > ?3",
+            params![account_fp.as_slice(), token, now as i64],
+            |row| Ok(PairingRow { offer: row.get(0)?, response: row.get(1)?, provision: row.get(2)? }),
         )
         .optional()
         .map_err(|e| RelayError::Storage(e.to_string()))
     }
 
-    pub fn put_sync_state(&self, account_fp: &[u8; 32], data: &[u8]) -> Result<(), RelayError> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO sync_state (account_fp, data, updated_at)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT (account_fp) DO UPDATE SET data = ?2, updated_at = ?3",
-            params![account_fp.as_slice(), data, now_millis() as i64],
-        )
-        .map_err(|e| RelayError::Storage(e.to_string()))?;
-        Ok(())
+    /// Record the new device's response. Only the first response is kept, so
+    /// nobody can replace it once the new device has answered.
+    pub fn pairing_set_response(&self, account_fp: &[u8; 32], token: &[u8], response: &[u8], now: u64) -> Result<(), RelayError> {
+        self.pairing_fill(account_fp, token, "response", response, now)
     }
 
-    pub fn get_sync_state(&self, account_fp: &[u8; 32]) -> Result<Option<Vec<u8>>, RelayError> {
+    pub fn pairing_set_provision(&self, account_fp: &[u8; 32], token: &[u8], provision: &[u8], now: u64) -> Result<(), RelayError> {
+        self.pairing_fill(account_fp, token, "provision", provision, now)
+    }
+
+    /// Set a column of a live session once: 404 for no live session, 409 if already set.
+    fn pairing_fill(&self, account_fp: &[u8; 32], token: &[u8], column: &str, data: &[u8], now: u64) -> Result<(), RelayError> {
+        let conn = self.conn.lock().unwrap();
+        let updated = conn
+            .execute(
+                &format!(
+                    "UPDATE pairing SET {column} = ?4
+                     WHERE account_fp = ?1 AND token = ?2 AND expires_at > ?3 AND {column} IS NULL"
+                ),
+                params![account_fp.as_slice(), token, now as i64, data],
+            )
+            .map_err(|e| RelayError::Storage(e.to_string()))?;
+        if updated == 1 {
+            return Ok(());
+        }
+        let live: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pairing WHERE account_fp = ?1 AND token = ?2 AND expires_at > ?3)",
+                params![account_fp.as_slice(), token, now as i64],
+                |row| row.get(0),
+            )
+            .map_err(|e| RelayError::Storage(e.to_string()))?;
+        Err(if live { RelayError::Conflict } else { RelayError::NotFound })
+    }
+
+    /// Delete expired pairing sessions; returns how many.
+    pub fn pairing_sweep(&self, now: u64) -> Result<usize, RelayError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM pairing WHERE expires_at <= ?1", params![now as i64])
+            .map_err(|e| RelayError::Storage(e.to_string()))
+    }
+
+    /// Store a recovery bundle unless the stored one has an equal or newer generation.
+    pub fn put_recovery_bundle(&self, account_fp: &[u8; 32], generation: u64, bundle: &[u8]) -> Result<(), RelayError> {
+        self.put_generational("recovery_blob", account_fp, generation, bundle)
+    }
+
+    /// Stored recovery data and its generation; generation 0 marks a bare blob
+    /// written before bundles existed.
+    pub fn get_recovery_bundle(&self, account_fp: &[u8; 32]) -> Result<Option<(u64, Vec<u8>)>, RelayError> {
+        self.get_generational("recovery_blob", account_fp)
+    }
+
+    /// Store a sealed sync snapshot unless the stored one has an equal or newer generation.
+    pub fn put_sync_state(&self, account_fp: &[u8; 32], generation: u64, data: &[u8]) -> Result<(), RelayError> {
+        self.put_generational("sync_state", account_fp, generation, data)
+    }
+
+    pub fn get_sync_state(&self, account_fp: &[u8; 32]) -> Result<Option<(u64, Vec<u8>)>, RelayError> {
+        self.get_generational("sync_state", account_fp)
+    }
+
+    /// Last-writer-wins upsert for per-account replicated objects. Devices write
+    /// these to every relay they use, so a stale copy must never replace a newer one.
+    fn put_generational(&self, table: &str, account_fp: &[u8; 32], generation: u64, data: &[u8]) -> Result<(), RelayError> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction().map_err(|e| RelayError::Storage(e.to_string()))?;
+        let stored: Option<i64> = tx
+            .query_row(
+                &format!("SELECT generation FROM {table} WHERE account_fp = ?1"),
+                params![account_fp.as_slice()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| RelayError::Storage(e.to_string()))?;
+        if let Some(stored) = stored {
+            if generation <= stored as u64 {
+                return Err(RelayError::Conflict);
+            }
+        }
+        tx.execute(
+            &format!(
+                "INSERT INTO {table} (account_fp, data, updated_at, generation) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (account_fp) DO UPDATE SET data = ?2, updated_at = ?3, generation = ?4"
+            ),
+            params![account_fp.as_slice(), data, now_millis() as i64, generation as i64],
+        )
+        .map_err(|e| RelayError::Storage(e.to_string()))?;
+        tx.commit().map_err(|e| RelayError::Storage(e.to_string()))
+    }
+
+    fn get_generational(&self, table: &str, account_fp: &[u8; 32]) -> Result<Option<(u64, Vec<u8>)>, RelayError> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT data FROM sync_state WHERE account_fp = ?1",
+            &format!("SELECT generation, data FROM {table} WHERE account_fp = ?1"),
             params![account_fp.as_slice()],
-            |row| row.get(0),
+            |row| Ok((row.get::<_, i64>(0)? as u64, row.get(1)?)),
         )
         .optional()
         .map_err(|e| RelayError::Storage(e.to_string()))
@@ -1637,5 +2275,317 @@ mod tests {
         use ed25519_dalek::Signer;
         let sig = sk.sign(b"test");
         vk.verify_strict(b"test", &sig).unwrap();
+    }
+
+    // ── Anchored (mirror) path ──────────────────────────────────────────
+
+    /// Stand-in for another relay's KT tree: anchors entries under its own key.
+    struct FakeHome {
+        sk: ed25519_dalek::SigningKey,
+        leaves: Vec<[u8; 32]>,
+    }
+
+    impl FakeHome {
+        fn new() -> Self {
+            Self { sk: ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng), leaves: Vec::new() }
+        }
+
+        fn vk(&self) -> [u8; 32] {
+            self.sk.verifying_key().to_bytes()
+        }
+
+        fn anchor(&mut self, entry_bytes: &[u8]) -> AnchoredEntry {
+            use ghost_wire::merkle::{leaf_hash, InclusionProof, MerkleTree};
+            self.leaves.push(leaf_hash(entry_bytes));
+            let mut tree = MerkleTree::new();
+            for l in &self.leaves {
+                tree.append(*l);
+            }
+            let index = self.leaves.len() as u64 - 1;
+            AnchoredEntry {
+                entry: ghost_wire::idlog::LogEntry::from_bytes(entry_bytes).unwrap(),
+                inclusion_proof: InclusionProof::generate(index, &self.leaves),
+                checkpoint: Checkpoint::sign(tree.size(), tree.root(), 1000, &self.sk),
+            }
+        }
+    }
+
+    fn make_set_home_relay(
+        state: &ghost_wire::idlog::LogState,
+        auth: &ed25519_dalek::SigningKey,
+        relay_vk: [u8; 32],
+    ) -> Vec<u8> {
+        use ed25519_dalek::Signer;
+        let mut entry = ghost_wire::idlog::LogEntry {
+            seq: state.head_seq + 1,
+            prev_hash: state.head_hash,
+            account_fp: state.account_fp,
+            entry_type: ghost_wire::idlog::EntryType::SetHomeRelay,
+            timestamp: 4000,
+            body: ghost_wire::idlog::EntryBody::SetHomeRelay {
+                relay_vk,
+                authorizer_key: auth.verifying_key().to_bytes(),
+                relay_ref: RelayRef::key_only(relay_vk),
+            },
+            signature: [0u8; 64],
+            counter_signature: None,
+        };
+        let msg = ghost_wire::idlog::sign_message(&entry);
+        entry.signature = auth.sign(&msg).to_bytes();
+        entry.to_bytes()
+    }
+
+    fn chain_state(entries: &[Vec<u8>]) -> ghost_wire::idlog::LogState {
+        let parsed: Vec<_> = entries
+            .iter()
+            .map(|b| ghost_wire::idlog::LogEntry::from_bytes(b).unwrap())
+            .collect();
+        ghost_wire::idlog::validate_chain(&parsed).unwrap()
+    }
+
+    /// A v2 account created at `home`: genesis + SetHomeRelay, both anchored.
+    fn foreign_account(home: &mut FakeHome) -> ([u8; 32], ed25519_dalek::SigningKey, Vec<AnchoredEntry>, Vec<Vec<u8>>) {
+        let (fp, mk, dk) = test_account();
+        let genesis = make_genesis(&mk, &dk);
+        let set_home = make_set_home_relay(&chain_state(std::slice::from_ref(&genesis)), &dk, home.vk());
+        let anchored = vec![home.anchor(&genesis), home.anchor(&set_home)];
+        (fp, dk, anchored, vec![genesis, set_home])
+    }
+
+    #[test]
+    fn home_append_records_account_as_homed_here() {
+        let store = Storage::open_in_memory().unwrap();
+        let (fp, mk, dk) = test_account();
+        let result = store.append_idlog_entry(&fp, &make_genesis(&mk, &dk)).unwrap();
+        assert!(result.is_home);
+        assert_eq!(result.home_relay_vk, store.relay_vk());
+        let account = store.get_account(&fp).unwrap().unwrap();
+        assert!(account.is_home);
+        assert_eq!(account.head_seq, 1);
+        assert_eq!(account.home_set_at_seq, 0, "v1 chain names no home");
+    }
+
+    #[test]
+    fn home_accepts_set_home_relay_naming_itself_and_rejects_others() {
+        let store = Storage::open_in_memory().unwrap();
+        let (fp, mk, dk) = test_account();
+        let genesis = make_genesis(&mk, &dk);
+        store.append_idlog_entry(&fp, &genesis).unwrap();
+        let state = chain_state(std::slice::from_ref(&genesis));
+
+        let elsewhere = make_set_home_relay(&state, &dk, [0x99; 32]);
+        let err = store.append_idlog_entry(&fp, &elsewhere).unwrap_err();
+        assert!(matches!(err, RelayError::WrongHome(_)), "{err}");
+
+        let here = make_set_home_relay(&state, &dk, store.relay_vk());
+        let result = store.append_idlog_entry(&fp, &here).unwrap();
+        assert!(result.is_home);
+        let account = store.get_account(&fp).unwrap().unwrap();
+        assert_eq!(account.home_set_at_seq, 2);
+        // The chain state now carries the home for later validation.
+        let conn = store.conn.lock().unwrap();
+        let rebuilt = Storage::build_log_state(&conn, &fp).unwrap();
+        assert_eq!(rebuilt.home_relay_vk, Some(store.relay_vk()));
+        assert_eq!(rebuilt.home_set_at_seq, 2);
+    }
+
+    #[test]
+    fn anchored_chain_registers_mirrored_account() {
+        let store = Storage::open_in_memory().unwrap();
+        let mut home = FakeHome::new();
+        let (fp, dk, anchored, _) = foreign_account(&mut home);
+
+        let results = store.append_anchored_entries(&fp, &anchored).unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(!results[1].is_home);
+        assert_eq!(results[1].home_relay_vk, home.vk());
+
+        let account = store.get_account(&fp).unwrap().unwrap();
+        assert!(!account.is_home);
+        assert_eq!(account.head_seq, 2);
+        assert!(store.is_active_device(&fp, &dk.verifying_key().to_bytes()).unwrap());
+
+        let rows = store.get_idlog(&fp, 0).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.inclusion_proof.is_some() && r.checkpoint.is_some()));
+    }
+
+    #[test]
+    fn anchored_chain_rejected_when_checkpoint_not_from_home() {
+        let store = Storage::open_in_memory().unwrap();
+        let mut home = FakeHome::new();
+        let mut impostor = FakeHome::new();
+        let (fp, _dk, _, raw) = foreign_account(&mut home);
+        // Same chain, but anchored by a relay the chain does not name.
+        let forged = vec![impostor.anchor(&raw[0]), impostor.anchor(&raw[1])];
+        let err = store.append_anchored_entries(&fp, &forged).unwrap_err();
+        assert!(matches!(err, RelayError::Unprocessable(_)), "{err}");
+        assert!(store.get_account(&fp).unwrap().is_none(), "nothing persisted");
+        assert!(store.get_idlog(&fp, 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn anchored_chain_without_home_is_rejected() {
+        let store = Storage::open_in_memory().unwrap();
+        let mut home = FakeHome::new();
+        let (fp, mk, dk) = test_account();
+        let anchored = vec![home.anchor(&make_genesis(&mk, &dk))];
+        let err = store.append_anchored_entries(&fp, &anchored).unwrap_err();
+        assert!(matches!(err, RelayError::Unprocessable(_)), "{err}");
+        assert!(store.get_account(&fp).unwrap().is_none());
+    }
+
+    #[test]
+    fn mirror_rejects_raw_entries_and_replays_are_idempotent() {
+        let store = Storage::open_in_memory().unwrap();
+        let mut home = FakeHome::new();
+        let (fp, dk, anchored, raw) = foreign_account(&mut home);
+        store.append_anchored_entries(&fp, &anchored).unwrap();
+
+        // A device must append at the home, not here.
+        let dk2 = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let add = make_add_device(&chain_state(&raw), &dk, &dk2);
+        let err = store.append_idlog_entry(&fp, &add).unwrap_err();
+        assert!(matches!(err, RelayError::WrongHome(_)), "{err}");
+
+        // Pushing the same anchored chain again is a no-op.
+        let again = store.append_anchored_entries(&fp, &anchored).unwrap();
+        assert!(again.is_empty());
+        assert_eq!(store.get_idlog(&fp, 0).unwrap().len(), 2);
+
+        // A different entry at a held seq is a fork.
+        let mut forked = anchored[1].clone();
+        forked.entry.timestamp += 1;
+        let err = store.append_anchored_entries(&fp, &[forked]).unwrap_err();
+        assert!(matches!(err, RelayError::Conflict));
+    }
+
+    #[test]
+    fn anchored_revocation_updates_device_keys_and_reports_revoked() {
+        let store = Storage::open_in_memory().unwrap();
+        let mut home = FakeHome::new();
+        let (fp, dk, anchored, mut raw) = foreign_account(&mut home);
+        store.append_anchored_entries(&fp, &anchored).unwrap();
+
+        let dk2 = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let add = make_add_device(&chain_state(&raw), &dk, &dk2);
+        raw.push(add.clone());
+        let revoke = make_revoke_device(&chain_state(&raw), &dk, &dk2.verifying_key().to_bytes());
+        let tail = vec![home.anchor(&add), home.anchor(&revoke)];
+
+        let results = store.append_anchored_entries(&fp, &tail).unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results[0].revoked.is_empty());
+        assert_eq!(results[1].revoked, vec![dk2.verifying_key().to_bytes()]);
+        assert!(!store.is_active_device(&fp, &dk2.verifying_key().to_bytes()).unwrap());
+        assert!(store.is_active_device(&fp, &dk.verifying_key().to_bytes()).unwrap());
+    }
+
+    #[test]
+    fn accept_p6_anchored_entry_rejected_on_checkpoint_regression() {
+        let store = Storage::open_in_memory().unwrap();
+        let mut home = FakeHome::new();
+        let (fp, dk, anchored, raw) = foreign_account(&mut home);
+        store.append_anchored_entries(&fp, &anchored).unwrap();
+
+        // Anchor the next entry with a checkpoint older than the one already held.
+        let dk2 = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let add = make_add_device(&chain_state(&raw), &dk, &dk2);
+        let mut stale = home.anchor(&add);
+        stale.checkpoint = anchored[0].checkpoint.clone();
+        stale.inclusion_proof.tree_size = stale.checkpoint.tree_size;
+        let err = store.append_anchored_entries(&fp, &[stale]).unwrap_err();
+        assert!(matches!(err, RelayError::Unprocessable(_)), "{err}");
+    }
+
+    #[test]
+    fn anchored_rehome_switches_home_on_old_home_and_mirror() {
+        let old_home_store = Storage::open_in_memory().unwrap();
+        let mirror = Storage::open_in_memory().unwrap();
+        let mut new_home = FakeHome::new();
+
+        // Account lives at old_home_store, which anchors with its real KT key.
+        let (fp, mk, dk) = test_account();
+        let genesis = make_genesis(&mk, &dk);
+        old_home_store.append_idlog_entry(&fp, &genesis).unwrap();
+        let set_home = make_set_home_relay(&chain_state(std::slice::from_ref(&genesis)), &dk, old_home_store.relay_vk());
+        old_home_store.append_idlog_entry(&fp, &set_home).unwrap();
+
+        // Build the old home's anchors the way kt_append_and_sign would.
+        let (_vk, sk_bytes) = old_home_store.get_or_create_relay_keypair().unwrap();
+        let mut old_home_tree = FakeHome {
+            sk: ed25519_dalek::SigningKey::from_keypair_bytes(&sk_bytes).unwrap(),
+            leaves: Vec::new(),
+        };
+        let a1 = old_home_tree.anchor(&genesis);
+        let a2 = old_home_tree.anchor(&set_home);
+        old_home_store.store_anchor(&fp, 1, &a1.inclusion_proof.to_bytes(), &a1.checkpoint.to_bytes()).unwrap();
+        old_home_store.store_anchor(&fp, 2, &a2.inclusion_proof.to_bytes(), &a2.checkpoint.to_bytes()).unwrap();
+        mirror.append_anchored_entries(&fp, &[a1.clone(), a2.clone()]).unwrap();
+
+        // The device moves to new_home; the new home anchors the whole chain.
+        let move_entry = make_set_home_relay(&chain_state(&[genesis.clone(), set_home.clone()]), &dk, new_home.vk());
+        let _ = new_home.anchor(&genesis);
+        let _ = new_home.anchor(&set_home);
+        let moved = new_home.anchor(&move_entry);
+
+        for store in [&old_home_store, &mirror] {
+            let results = store.append_anchored_entries(&fp, std::slice::from_ref(&moved)).unwrap();
+            assert_eq!(results.len(), 1);
+            assert!(!results[0].is_home);
+            assert_eq!(results[0].home_relay_vk, new_home.vk());
+            let account = store.get_account(&fp).unwrap().unwrap();
+            assert!(!account.is_home);
+            assert_eq!(account.home_relay_vk, new_home.vk());
+            assert_eq!(account.home_set_at_seq, 3);
+        }
+
+        // The old home no longer sequences raw entries for the account.
+        let dk2 = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let add = make_add_device(&chain_state(&[genesis, set_home, move_entry]), &dk, &dk2);
+        let err = old_home_store.append_idlog_entry(&fp, &add).unwrap_err();
+        assert!(matches!(err, RelayError::WrongHome(_)));
+    }
+
+    #[test]
+    fn may_authenticate_requires_home_membership_or_guest_window() {
+        let store = Storage::open_in_memory().unwrap();
+        let mut home = FakeHome::new();
+        let (fp, dk, anchored, _) = foreign_account(&mut home);
+        let dk_vk = dk.verifying_key().to_bytes();
+        let now = 10_000;
+
+        assert!(!store.may_authenticate(&fp, &dk_vk, now).unwrap(), "unknown account");
+        store.append_anchored_entries(&fp, &anchored).unwrap();
+        assert!(!store.may_authenticate(&fp, &dk_vk, now).unwrap(), "mirrored but not a member");
+
+        store.set_account_guest_until(&fp, now + 1).unwrap();
+        assert!(store.may_authenticate(&fp, &dk_vk, now).unwrap(), "guest window");
+        assert!(!store.may_authenticate(&fp, &dk_vk, now + 1).unwrap(), "guest window closed");
+
+        store.update_mailbox_members(&[0xAB; 32], &[fp]).unwrap();
+        assert!(store.may_authenticate(&fp, &dk_vk, now + 1).unwrap(), "mailbox member");
+        assert!(!store.may_authenticate(&fp, &[0x55; 32], now + 1).unwrap(), "unknown device");
+
+        // Accounts homed here always authenticate.
+        let (fp2, mk2, dk2) = test_account();
+        store.append_idlog_entry(&fp2, &make_genesis(&mk2, &dk2)).unwrap();
+        assert!(store.may_authenticate(&fp2, &dk2.verifying_key().to_bytes(), now).unwrap());
+    }
+
+    #[test]
+    fn backfill_marks_legacy_accounts_as_homed_here() {
+        let store = Storage::open_in_memory().unwrap();
+        let (fp, mk, dk) = test_account();
+        store.append_idlog_entry(&fp, &make_genesis(&mk, &dk)).unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute("DELETE FROM accounts", []).unwrap();
+        }
+        store.backfill_accounts().unwrap();
+        let account = store.get_account(&fp).unwrap().unwrap();
+        assert!(account.is_home);
+        assert_eq!(account.home_relay_vk, store.relay_vk());
+        assert_eq!(account.head_seq, 1);
     }
 }

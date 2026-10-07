@@ -21,11 +21,13 @@ pub async fn run(state: AppState) {
         }
 
         // Sweep expired pairing sessions
-        crate::routes::pair::reap_expired(&state).await;
+        crate::routes::pair::reap_expired(&state);
 
         // Sweep expired rate limiter entries
         state.recovery_limiter.sweep();
         state.idlog_recovery_limiter.sweep();
+        state.idlog_anchored_limiter.sweep();
+        state.idlog_import_limiter.sweep();
 
         // Sweep old log entries (retain at least min_entries per mailbox)
         if retention_ms > 0 {

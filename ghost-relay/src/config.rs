@@ -8,6 +8,10 @@ pub struct Config {
     pub db_path: Option<String>,
     pub log_retention_hours: u64,
     pub log_min_entries: u64,
+    /// Base URL clients reach this relay at, advertised in its RelayRef.
+    pub public_url: Option<String>,
+    /// Seconds between pulls of mirrored accounts' logs from their home relays.
+    pub mirror_refresh_secs: u64,
 }
 
 impl Config {
@@ -23,6 +27,8 @@ impl Config {
             db_path: std::env::var("GHOST_DB_PATH").ok(),
             log_retention_hours: parse_env("GHOST_LOG_RETENTION_HOURS", DEFAULT_LOG_RETENTION_HOURS),
             log_min_entries: parse_env("GHOST_LOG_MIN_ENTRIES", DEFAULT_LOG_MIN_ENTRIES),
+            public_url: std::env::var("GHOST_PUBLIC_URL").ok(),
+            mirror_refresh_secs: parse_env("GHOST_MIRROR_REFRESH_SECS", DEFAULT_MIRROR_REFRESH_SECS),
         }
     }
 }

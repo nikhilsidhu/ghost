@@ -17,9 +17,15 @@ pub async fn put(
     let id = decode_mailbox_id(&mailbox_id)?;
     state.check_membership(&id, &auth.account_fp)?;
     if !state.is_creator(&id, &auth.account_fp).await {
-        return Err(crate::error::RelayError::Forbidden(
-            "only group creator can update server info".into(),
-        ));
+        // Members keep the published GroupInfo current after their commits, so other
+        // devices can join by external commit; they cannot change the group state.
+        if !state.group_info_matches_state(&id, &body).await? {
+            return Err(crate::error::RelayError::Forbidden(
+                "members may only publish GroupInfo for the relay's current group state".into(),
+            ));
+        }
+        state.storage.put_server_info(&id, &body)?;
+        return Ok(StatusCode::NO_CONTENT);
     }
     state.storage.put_server_info(&id, &body)?;
 

@@ -43,19 +43,6 @@ pub struct OpEntry {
     pub blob: Vec<u8>,
 }
 
-/// Ephemeral pairing session for device linking (5-minute TTL, in-memory only)
-pub struct PairingSession {
-    pub offer: Vec<u8>,
-    pub response: Option<Vec<u8>>,
-    pub expires_at: Instant,
-}
-
-/// One-shot provision blob posted by device A after pairing, fetched by device B
-pub struct ProvisionEntry {
-    pub data: Vec<u8>,
-    pub expires_at: Instant,
-}
-
 pub struct Inner {
     pub mailboxes: RwLock<HashMap<[u8; 32], Mailbox>>,
     pub invites: RwLock<HashMap<String, Invite>>,
@@ -68,8 +55,6 @@ pub struct Inner {
     pub storage: Storage,
     pub voice_presence: RwLock<Vec<VpEntry>>,
     pub online_presence: RwLock<Vec<OpEntry>>,
-    pub pairing: RwLock<HashMap<[u8; 32], PairingSession>>,
-    pub provision: RwLock<HashMap<[u8; 32], ProvisionEntry>>,
     pub next_conn_id: AtomicU64,
     /// Broadcast (account_fp, device_vk) when a device is revoked, so WS
     /// connections belonging to that device can close immediately.
@@ -84,6 +69,10 @@ pub struct Inner {
     pub kt_tree: RwLock<ghost_wire::merkle::MerkleTree>,
     /// Per-account rate limiter for unauthenticated recovery blob downloads
     pub recovery_limiter: RateLimiter,
+    /// Anchored-entry pushes per account, since the route takes no credentials.
+    pub idlog_anchored_limiter: RateLimiter,
+    /// Home imports per account; a move is rare and the route takes no credentials.
+    pub idlog_import_limiter: RateLimiter,
     /// Per-account rate limiter for identity log Recovery entries (account takeover defense)
     pub idlog_recovery_limiter: RateLimiter,
 }
@@ -128,25 +117,21 @@ impl Inner {
         Ok((seq, epoch_mismatch))
     }
 
-    /// Hash an identity log entry, append it to the KT Merkle tree,
-    /// sign a new checkpoint, and persist everything.
+    /// Sequence an identity log entry this relay homes: append its hash to the
+    /// KT tree, sign a checkpoint, persist, and return the anchor that lets
+    /// mirrors verify the entry without contacting this relay.
     pub async fn kt_append_and_sign(
         &self,
-        entry_payload: &[u8],
-        account_fp: &[u8; 32],
-        seq: u64,
-    ) {
-        let lh = ghost_wire::merkle::leaf_hash(entry_payload);
+        entry: &ghost_wire::idlog::LogEntry,
+    ) -> Result<ghost_wire::anchor::AnchoredEntry, RelayError> {
+        let entry_bytes = entry.to_bytes();
+        let lh = ghost_wire::merkle::leaf_hash(&entry_bytes);
 
         // Hold the tree lock for the entire operation to prevent concurrent
         // appends from racing on leaf_index or seeing partial DB state.
         let mut tree = self.kt_tree.write().await;
 
-        if let Err(e) = self.storage.kt_append_leaf(&lh, account_fp, seq) {
-            tracing::warn!("kt_append_leaf failed: {e}");
-            return;
-        }
-
+        let leaf_index = self.storage.kt_append_leaf(&lh, &entry.account_fp, entry.seq)?;
         tree.append(lh);
 
         let root = tree.root();
@@ -154,30 +139,52 @@ impl Inner {
 
         // Update the O(log N) internal nodes along the right edge
         let storage = &self.storage;
+        let load = |start: u64, count: u64| storage.kt_load_hash(start, count).ok().flatten();
         let mut pending_nodes = Vec::new();
         ghost_wire::merkle::update_stored_nodes(
             size,
-            &|start, count| storage.kt_load_hash(start, count).ok().flatten(),
+            &load,
             &mut |start, count, hash| pending_nodes.push((start, count, hash)),
         );
-        if let Err(e) = self.storage.kt_store_nodes(&pending_nodes) {
-            tracing::warn!("kt_store_nodes failed: {e}");
-            return;
-        }
+        self.storage.kt_store_nodes(&pending_nodes)?;
 
-        let sk = match ed25519_dalek::SigningKey::from_keypair_bytes(&self.relay_sk_bytes) {
-            Ok(sk) => sk,
-            Err(e) => {
-                tracing::warn!("kt checkpoint sign: bad relay key: {e}");
-                return;
-            }
+        let sk = ed25519_dalek::SigningKey::from_keypair_bytes(&self.relay_sk_bytes)
+            .map_err(|e| RelayError::Storage(format!("kt checkpoint sign: bad relay key: {e}")))?;
+        let checkpoint = ghost_wire::merkle::Checkpoint::sign(size, root, now_millis(), &sk);
+        let cp_bytes = checkpoint.to_bytes();
+        self.storage.kt_persist_state(tree.frontier(), size, &root, &cp_bytes)?;
+
+        let inclusion_proof =
+            ghost_wire::merkle::InclusionProof::generate_from_store(leaf_index, size, &load);
+        self.storage
+            .store_anchor(&entry.account_fp, entry.seq, &inclusion_proof.to_bytes(), &cp_bytes)?;
+
+        Ok(ghost_wire::anchor::AnchoredEntry { entry: entry.clone(), inclusion_proof, checkpoint })
+    }
+
+    /// Anchor for an entry this relay sequenced before anchors were stored:
+    /// a fresh proof against the current tree head.
+    pub async fn regenerate_anchor(
+        &self,
+        entry: &ghost_wire::idlog::LogEntry,
+    ) -> Result<Option<ghost_wire::anchor::AnchoredEntry>, RelayError> {
+        let Some(leaf_index) = self.storage.kt_get_leaf_index(&entry.account_fp, entry.seq)? else {
+            return Ok(None);
         };
-        let cp = ghost_wire::merkle::Checkpoint::sign(size, root, now_millis(), &sk);
-        let cp_bytes = cp.to_bytes();
-
-        if let Err(e) = self.storage.kt_persist_state(tree.frontier(), size, &root, &cp_bytes) {
-            tracing::warn!("kt_persist_state failed: {e}");
+        // Read size and checkpoint under the tree lock so they describe the same head.
+        let tree = self.kt_tree.read().await;
+        let (cp_bytes, size) = self.storage.kt_load_checkpoint_with_size()?;
+        drop(tree);
+        if leaf_index >= size {
+            return Ok(None);
         }
+        let checkpoint = ghost_wire::merkle::Checkpoint::from_bytes(&cp_bytes)
+            .map_err(|e| RelayError::Storage(format!("stored checkpoint: {e}")))?;
+        let storage = &self.storage;
+        let load = |start: u64, count: u64| storage.kt_load_hash(start, count).ok().flatten();
+        let inclusion_proof =
+            ghost_wire::merkle::InclusionProof::generate_from_store(leaf_index, size, &load);
+        Ok(Some(ghost_wire::anchor::AnchoredEntry { entry: entry.clone(), inclusion_proof, checkpoint }))
     }
 
     /// Validate a commit or proposal via PublicGroup.
@@ -336,6 +343,18 @@ impl Inner {
         Ok(())
     }
 
+    /// Close sessions and queue MLS removals for every device these entries revoked.
+    pub async fn apply_revocations(&self, account_fp: &[u8; 32], appended: &[crate::storage::IdlogAppend]) {
+        for result in appended {
+            for device_vk in &result.revoked {
+                let _ = self.revocation_tx.send((*account_fp, *device_vk));
+            }
+            for device_vk in &result.revoked {
+                self.generate_removal_proposals(account_fp, device_vk).await;
+            }
+        }
+    }
+
     /// Generate external remove proposals for a revoked device across all groups
     /// the account belongs to. Non-fatal: logs warnings on failure.
     pub async fn generate_removal_proposals(
@@ -467,13 +486,13 @@ impl Inner {
     }
 
     /// Parse GroupInfo bytes, create/update PublicGroup, and update mailbox members.
-    pub async fn init_public_group(
+    /// Verify a GroupInfo (signature by a leaf of its own tree, tree hash against its
+    /// context) and build the public group it describes, persisting into `storage`.
+    fn public_group_from_info<S: openmls_traits::public_storage::PublicStorageProvider<{ openmls_traits::storage::CURRENT_VERSION }>>(
         &self,
-        mailbox_id: &[u8; 32],
+        storage: &S,
         group_info_bytes: &[u8],
-    ) -> Result<(), RelayError> {
-        let mls_storage = MlsPublicStorage::new(self.storage.conn());
-
+    ) -> Result<PublicGroup, RelayError> {
         let msg_in = MlsMessageIn::tls_deserialize_exact(group_info_bytes)
             .map_err(|e| RelayError::BadRequest(format!("GroupInfo parse: {e}")))?;
 
@@ -489,14 +508,31 @@ impl Inner {
             .ratchet_tree()
             .clone();
 
-        let (pg, _gi) = PublicGroup::from_external(
-            &self.relay_crypto,
-            &mls_storage,
-            ratchet_tree,
-            vgi,
-            ProposalStore::new(),
-        )
-        .map_err(|e| RelayError::BadRequest(format!("PublicGroup init: {e}")))?;
+        let (pg, _gi) = PublicGroup::from_external(&self.relay_crypto, storage, ratchet_tree, vgi, ProposalStore::new())
+            .map_err(|e| RelayError::BadRequest(format!("PublicGroup init: {e}")))?;
+        Ok(pg)
+    }
+
+    /// Whether a GroupInfo faithfully describes the group state this relay already
+    /// validated: signed by a member and carrying exactly the current group context.
+    /// Lets any member refresh the published GroupInfo after a commit without being
+    /// able to change what the relay believes the group is.
+    pub async fn group_info_matches_state(&self, mailbox_id: &[u8; 32], group_info_bytes: &[u8]) -> Result<bool, RelayError> {
+        let scratch = openmls_rust_crypto::MemoryStorage::default();
+        let pg = self.public_group_from_info(&scratch, group_info_bytes)?;
+        let groups = self.groups.read().await;
+        Ok(groups
+            .get(mailbox_id)
+            .is_some_and(|(existing, _)| existing.group_context() == pg.group_context()))
+    }
+
+    pub async fn init_public_group(
+        &self,
+        mailbox_id: &[u8; 32],
+        group_info_bytes: &[u8],
+    ) -> Result<(), RelayError> {
+        let mls_storage = MlsPublicStorage::new(self.storage.conn());
+        let pg = self.public_group_from_info(&mls_storage, group_info_bytes)?;
 
         // Don't regress to a stale epoch
         let new_epoch = pg.group_context().epoch().as_u64();
@@ -616,6 +652,10 @@ pub fn new_state(config: Config, storage: Storage) -> AppState {
     let recovery_limiter = RateLimiter::new(5, std::time::Duration::from_secs(15 * 60));
     // Identity log Recovery entries: 3 per 24-hour sliding window
     let idlog_recovery_limiter = RateLimiter::new(3, std::time::Duration::from_secs(24 * 60 * 60));
+    // Anchored pushes are self-verifying but unauthenticated: 60 per account per hour
+    let idlog_anchored_limiter = RateLimiter::new(60, std::time::Duration::from_secs(60 * 60));
+    // Home imports: 5 per account per 24 hours
+    let idlog_import_limiter = RateLimiter::new(5, std::time::Duration::from_secs(24 * 60 * 60));
     Arc::new(Inner {
         mailboxes: RwLock::new(HashMap::new()),
         invites: RwLock::new(HashMap::new()),
@@ -628,8 +668,6 @@ pub fn new_state(config: Config, storage: Storage) -> AppState {
         storage,
         voice_presence: RwLock::new(Vec::new()),
         online_presence: RwLock::new(Vec::new()),
-        pairing: RwLock::new(HashMap::new()),
-        provision: RwLock::new(HashMap::new()),
         next_conn_id: AtomicU64::new(1),
         revocation_tx,
         groups: RwLock::new(groups),
@@ -638,6 +676,8 @@ pub fn new_state(config: Config, storage: Storage) -> AppState {
         relay_sk_bytes,
         kt_tree: RwLock::new(kt_tree),
         recovery_limiter,
+        idlog_anchored_limiter,
+        idlog_import_limiter,
         idlog_recovery_limiter,
     })
 }

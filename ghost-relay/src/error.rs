@@ -24,6 +24,14 @@ pub enum RelayError {
     #[error("conflict")]
     Conflict,
 
+    /// This relay does not sequence the account's log; the body names the home.
+    #[error("wrong home: {0}")]
+    WrongHome(String),
+
+    /// Well-formed but fails a cryptographic check (anchor, chain, generation).
+    #[error("unprocessable: {0}")]
+    Unprocessable(String),
+
     #[error("rate limited")]
     RateLimited,
 
@@ -41,6 +49,8 @@ impl IntoResponse for RelayError {
             Self::Forbidden(msg) => (StatusCode::FORBIDDEN, msg.clone()),
             Self::PayloadTooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "payload too large".into()),
             Self::Conflict => (StatusCode::CONFLICT, "conflict".into()),
+            Self::WrongHome(msg) => (StatusCode::CONFLICT, msg.clone()),
+            Self::Unprocessable(msg) => (StatusCode::UNPROCESSABLE_ENTITY, msg.clone()),
             Self::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "rate limited".into()),
             Self::Storage(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
         };
