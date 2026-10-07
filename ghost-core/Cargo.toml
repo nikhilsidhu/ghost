@@ -6,7 +6,9 @@ license = "AGPL-3.0"
 
 [dependencies]
 ed25519-dalek = { version = "2", features = ["rand_core"] }
-keyring = { version = "3", features = ["apple-native", "windows-native", "linux-native"] }
+# Linux: the kernel keyring alone is lost at reboot, so it only caches entries kept in the
+# desktop Secret Service; crypto-rust encrypts them on the D-Bus session.
+keyring = { version = "3", features = ["apple-native", "windows-native", "linux-native-sync-persistent", "crypto-rust"] }
 blake3 = "1"
 argon2 = "0.5"
 hkdf = "0.12"
