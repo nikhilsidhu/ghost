@@ -1,6 +1,7 @@
 mod accounts;
 mod avatar;
 mod blob;
+mod channels;
 mod idlog;
 mod kt;
 pub(crate) mod pair;
@@ -46,6 +47,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/box/{mailbox_id}", post(blob::post_blob).get(blob::get_blobs).delete(blob::delete_mailbox))
         .route("/box/{mailbox_id}/server_info", put(server_info::put).get(server_info::get))
+        .route("/servers/{server_mailbox}/channels", get(channels::list))
         .route("/box/{mailbox_id}/avatar/{fingerprint}", put(avatar::put).get(avatar::get).delete(avatar::delete))
         .route("/idlog/{account_fp}", put(idlog::put).get(idlog::get))
         .route("/idlog/{account_fp}/anchored", put(idlog::put_anchored))

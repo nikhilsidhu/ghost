@@ -74,8 +74,13 @@ pub async fn get_blobs(
     headers: HeaderMap,
 ) -> Result<Json<Vec<BlobEntry>>> {
     let id = decode_mailbox_id(&mailbox_id)?;
-    state.check_membership(&id, &auth.account_fp)?;
+    let limit = state.read_limit(&id, &auth.account_fp)?;
     let after_seq = query.after.unwrap_or(0);
+    // Someone removed from the group reads up to its removal and never waits for more.
+    if let Some(last) = limit {
+        let entries = state.storage.read_from(&id, after_seq, DEFAULT_READ_LIMIT)?;
+        return Ok(Json(to_entries(entries.into_iter().filter(|e| e.seq <= last).collect())));
+    }
 
     let timeout_ms: u64 = headers
         .get("X-Ghost-Long-Poll")
@@ -125,9 +130,9 @@ pub async fn delete_mailbox(
     Path(mailbox_id): Path<String>,
 ) -> Result<StatusCode> {
     let id = decode_mailbox_id(&mailbox_id)?;
-    if !state.is_creator_strict(&id, &auth.account_fp).await {
+    if !state.may_delete(&id, &auth.account_fp).await {
         return Err(crate::error::RelayError::Forbidden(
-            "only group creator can delete a mailbox".into(),
+            "only the server's owner, or a channel manager for a private channel, can delete a mailbox".into(),
         ));
     }
     state.delete_mailbox(&id).await?;

@@ -51,13 +51,16 @@ pub async fn ws_upgrade(
         Ok(id) => id,
         Err(e) => return e.into_response(),
     };
-    if let Err(e) = state.check_membership(&id, &auth.account_fp) {
-        return e.into_response();
-    }
-    ws.on_upgrade(move |socket| ws_connection(socket, id, state, auth))
+    let read_limit = match state.read_limit(&id, &auth.account_fp) {
+        Ok(limit) => limit,
+        Err(e) => return e.into_response(),
+    };
+    ws.on_upgrade(move |socket| ws_connection(socket, id, state, auth, read_limit))
 }
 
-async fn ws_connection(socket: WebSocket, mailbox_id: [u8; 32], state: AppState, auth: DeviceAuth) {
+/// `read_limit` is set for an account removed from the group: it gets the entries up
+/// to its removal and the connection ends.
+async fn ws_connection(socket: WebSocket, mailbox_id: [u8; 32], state: AppState, auth: DeviceAuth, read_limit: Option<u64>) {
     let (mut sink, mut stream) = socket.split();
     let conn_id = state.next_conn_id.fetch_add(1, Relaxed);
 
@@ -117,6 +120,9 @@ async fn ws_connection(socket: WebSocket, mailbox_id: [u8; 32], state: AppState,
                 break;
             }
             for entry in &entries {
+                if read_limit.is_some_and(|last| entry.seq > last) {
+                    return;
+                }
                 last_seen = entry.seq;
                 let frame = encode_frame(entry.seq, entry.received_at, &entry.payload);
                 if sink.send(Message::binary(frame)).await.is_err() {
@@ -124,6 +130,9 @@ async fn ws_connection(socket: WebSocket, mailbox_id: [u8; 32], state: AppState,
                 }
             }
         }
+    }
+    if read_limit.is_some() {
+        return;
     }
 
     // Voice state snapshot: send current voice presence for this mailbox

@@ -26,7 +26,7 @@ openmls_basic_credential = "0.5"
 openmls_traits = "0.5"
 hex = "0.4"
 smallvec = "1"
-ghost-wire = { path = "../ghost-wire" }
+ghost-wire = { path = "../ghost-wire", features = ["mls"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 reqwest = { version = "0.12", features = ["json"] }
 

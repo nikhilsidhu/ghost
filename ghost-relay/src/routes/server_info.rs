@@ -16,7 +16,7 @@ pub async fn put(
 ) -> Result<StatusCode> {
     let id = decode_mailbox_id(&mailbox_id)?;
     state.check_membership(&id, &auth.account_fp)?;
-    if !state.is_creator(&id, &auth.account_fp).await {
+    if !state.may_initialize(&id, &auth.account_fp).await {
         // Members keep the published GroupInfo current after their commits, so other
         // devices can join by external commit; they cannot change the group state.
         if !state.group_info_matches_state(&id, &body).await? {
@@ -27,13 +27,15 @@ pub async fn put(
         state.storage.put_server_info(&id, &body)?;
         return Ok(StatusCode::NO_CONTENT);
     }
-    state.storage.put_server_info(&id, &body)?;
-
-    // Try to initialize/update PublicGroup from the uploaded GroupInfo.
-    // Failure is non-fatal: pre-upgrade groups may have non-standard GroupInfo.
-    if let Err(e) = state.init_public_group(&id, &body).await {
-        tracing::warn!("PublicGroup init skipped for {mailbox_id}: {e}");
+    // Initialize/update the PublicGroup from the uploaded GroupInfo. A policy refusal
+    // rejects the upload; other failures are non-fatal, since pre-upgrade groups may
+    // have non-standard GroupInfo.
+    match state.init_public_group(&id, &body, &auth.account_fp).await {
+        Err(e @ crate::error::RelayError::Forbidden(_)) => return Err(e),
+        Err(e) => tracing::warn!("PublicGroup init skipped for {mailbox_id}: {e}"),
+        Ok(()) => {}
     }
+    state.storage.put_server_info(&id, &body)?;
 
     Ok(StatusCode::NO_CONTENT)
 }

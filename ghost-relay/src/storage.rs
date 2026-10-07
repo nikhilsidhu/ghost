@@ -176,6 +176,15 @@ impl Storage {
                  PRIMARY KEY (mailbox_id, account_fp)
              ) WITHOUT ROWID;
 
+             -- Accounts removed from a mailbox's group, and the sequence of the commit
+             -- that removed them: the last entry they may still read.
+             CREATE TABLE IF NOT EXISTS mailbox_departures (
+                 mailbox_id BLOB NOT NULL,
+                 account_fp BLOB NOT NULL,
+                 last_seq INTEGER NOT NULL,
+                 PRIMARY KEY (mailbox_id, account_fp)
+             ) WITHOUT ROWID;
+
              CREATE TABLE IF NOT EXISTS mailbox_group_map (
                  mailbox_id BLOB PRIMARY KEY,
                  group_id BLOB NOT NULL
@@ -484,6 +493,8 @@ impl Storage {
         tx.execute("DELETE FROM server_info WHERE mailbox_id = ?1", params![mid])
             .map_err(|e| RelayError::Storage(e.to_string()))?;
         tx.execute("DELETE FROM mailbox_members WHERE mailbox_id = ?1", params![mid])
+            .map_err(|e| RelayError::Storage(e.to_string()))?;
+        tx.execute("DELETE FROM mailbox_departures WHERE mailbox_id = ?1", params![mid])
             .map_err(|e| RelayError::Storage(e.to_string()))?;
         if let Some(gid) = &group_id {
             tx.execute("DELETE FROM mls_public_group WHERE group_id = ?1", params![gid.as_slice()])
@@ -1567,6 +1578,33 @@ impl Storage {
             )
             .map_err(|e| RelayError::Storage(e.to_string()))?;
         Ok(exists)
+    }
+
+    /// Record that accounts left a mailbox's group with the commit at `seq`. They may
+    /// still read up to that commit, which is how their devices learn of the removal.
+    pub fn record_departures(&self, mailbox_id: &[u8; 32], accounts: &[[u8; 32]], seq: u64) -> Result<(), RelayError> {
+        let conn = self.conn.lock().unwrap();
+        for account in accounts {
+            conn.execute(
+                "INSERT OR REPLACE INTO mailbox_departures (mailbox_id, account_fp, last_seq) VALUES (?1, ?2, ?3)",
+                params![mailbox_id.as_slice(), account.as_slice(), seq as i64],
+            )
+            .map_err(|e| RelayError::Storage(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// The last sequence an account that left the mailbox's group may read.
+    pub fn departure_seq(&self, mailbox_id: &[u8; 32], account_fp: &[u8; 32]) -> Result<Option<u64>, RelayError> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT last_seq FROM mailbox_departures WHERE mailbox_id = ?1 AND account_fp = ?2",
+            params![mailbox_id.as_slice(), account_fp.as_slice()],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map(|seq| seq.map(|s| s as u64))
+        .map_err(|e| RelayError::Storage(e.to_string()))
     }
 
     /// Load or generate the relay Ed25519 keypair.
