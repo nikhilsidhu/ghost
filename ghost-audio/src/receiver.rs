@@ -153,6 +153,8 @@ pub(crate) struct Receiver {
     /// Samples still to take out quickly: playout started (or resumed) with more
     /// buffered than its target, as when a talk spurt's pre-roll arrives all at once.
     catch_up: usize,
+    /// The share of frames lost lately, by a moving average over frames.
+    loss_rate: f32,
     /// Over the receiver's life.
     stats: PlayoutStats,
     /// Frames that arrived, late ones included, and their encoded size.
@@ -184,6 +186,7 @@ impl Receiver {
             window_ticks: 0,
             cooldown: 0,
             catch_up: 0,
+            loss_rate: 0.0,
             stats: PlayoutStats::default(),
             #[cfg(feature = "devtools")]
             received: (0, 0),
@@ -204,6 +207,7 @@ impl Receiver {
         self.policy.arrived(sequence, arrived);
         if self.next.is_some_and(|next| before(sequence, next)) {
             self.stats.dropped_late += 1;
+            self.note_lost(1);
             return Some(frame);
         }
         if self.frames.len() >= PLAYOUT_MAX_BUFFERED {
@@ -239,8 +243,21 @@ impl Receiver {
         last.wrapping_sub(self.next.unwrap_or(*first)).wrapping_add(1)
     }
 
+    /// The delay playout aims for, in frames: what the delay policy asks, and a frame
+    /// more while frames are being lost, so the next one's FEC is at hand.
     pub fn target(&self) -> u32 {
-        self.policy.target()
+        let target = self.policy.target();
+        if self.loss_rate >= FEC_LOSS_RATE { target.max(PLAYOUT_MIN_TARGET + 1) } else { target }
+    }
+
+    fn note_played(&mut self) {
+        self.loss_rate *= 1.0 - LOSS_RATE_WEIGHT;
+    }
+
+    fn note_lost(&mut self, frames: u64) {
+        for _ in 0..frames {
+            self.loss_rate += LOSS_RATE_WEIGHT * (1.0 - self.loss_rate);
+        }
     }
 
     /// Nothing to play and nothing coming: the sender is gone or long paused.
@@ -284,7 +301,7 @@ impl Receiver {
             Some(next) => next,
             // Not playing: start once the target depth has gathered.
             None => {
-                let target = self.policy.target();
+                let target = self.target();
                 match self.first() {
                     Some(first) if self.depth() >= target => {
                         self.catch_up_from(target);
@@ -300,6 +317,7 @@ impl Receiver {
             self.stats.waited += u64::from(self.waited_run);
             self.waited_run = 0;
             self.stats.played += 1;
+            self.note_played();
             let decoded = self.decoder.decode_float(&frame, &mut self.decoded, false);
             self.spent.push(frame);
             decoded
@@ -324,16 +342,18 @@ impl Receiver {
                 let lost = skipped.min(self.waited_run) as u64;
                 waited -= lost;
                 self.stats.concealed += lost;
+                self.note_lost(lost);
             }
             self.stats.waited += waited;
             self.next = Some(first);
             self.waited_run = 0;
-            self.catch_up_from(self.policy.target());
+            self.catch_up_from(self.target());
             return self.produce();
         } else {
             // A gap: this frame is lost. The next frame's FEC carries a rough copy.
             self.next = Some(next.wrapping_add(1));
             self.concealed_run += 1;
+            self.note_lost(1);
             match self.position(next.wrapping_add(1)) {
                 Some(following) => {
                     self.stats.recovered += 1;
@@ -372,7 +392,7 @@ impl Receiver {
             (self.low_water, self.high_water) = (u32::MAX, 0);
             self.window_ticks = 0;
         }
-        let target = self.policy.target();
+        let target = self.target();
         // Depths count frames after this one; this one plays now, so delay is one more.
         let least = self.low_water.min(self.last_low_water).saturating_add(1);
         let most = self.high_water.max(self.last_high_water) + 1;
@@ -493,6 +513,32 @@ mod tests {
             receiver.produce();
         }
         assert_eq!((receiver.stats.played, receiver.stats.recovered), (3, 1));
+    }
+
+    #[test]
+    fn while_frames_are_lost_playout_keeps_one_more_for_their_fec() {
+        let mut receiver = receiver();
+        let encoded = frames(1).remove(0);
+        let now = Instant::now();
+        let mut sequence = 0u32;
+        let mut feed = |receiver: &mut Receiver, count: u32, lose_every: u32| {
+            for _ in 0..count {
+                if lose_every == 0 || sequence % lose_every != 0 {
+                    receiver.insert(sequence, encoded.clone(), now);
+                }
+                sequence += 1;
+                // Two buffered, so a lost frame has the next one at hand.
+                if receiver.frames.len() >= 2 {
+                    receiver.produce();
+                }
+            }
+        };
+        feed(&mut receiver, 200, 0);
+        assert_eq!(receiver.target(), PLAYOUT_MIN_TARGET, "a clean stream keeps the least delay");
+        feed(&mut receiver, 200, 10);
+        assert_eq!(receiver.target(), PLAYOUT_MIN_TARGET + 1, "one frame in ten lost");
+        feed(&mut receiver, 600, 0);
+        assert_eq!(receiver.target(), PLAYOUT_MIN_TARGET, "the extra frame goes once the loss stops");
     }
 
     #[test]

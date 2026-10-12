@@ -55,6 +55,12 @@ pub const PLAYOUT_MIN_TARGET: u32 = 2;
 pub const PLAYOUT_MAX_TARGET: u32 = 10;
 /// Frames held per sender at most.
 pub const PLAYOUT_MAX_BUFFERED: usize = 50;
+/// Each frame's weight in a sender's recent loss rate (about two seconds' memory).
+pub const LOSS_RATE_WEIGHT: f32 = 0.01;
+/// Recent loss at which the sender protects its frames (the first Opus loss step), and
+/// so playout keeps one frame more: a lost frame is rebuilt from the next one's FEC only
+/// if that one is already here when its turn comes.
+pub const FEC_LOSS_RATE: f32 = OPUS_LOSS_STEPS[0] as f32 / 100.0;
 /// Decoded samples a sender's playout keeps room for: the largest device buffers plus a
 /// lengthened frame, so playback does not allocate.
 pub const PLAYOUT_OUTPUT_ROOM: usize = FRAME_SAMPLES * 8;
