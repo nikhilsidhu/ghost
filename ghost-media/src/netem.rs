@@ -121,7 +121,7 @@ impl Forwarder {
                 let upstream = match upstream_for(&shared, client, relay).await {
                     Ok(upstream) => upstream,
                     Err(e) => {
-                        eprintln!("netem: upstream socket: {e}");
+                        tracing::warn!("netem: upstream socket: {e}");
                         continue;
                     }
                 };

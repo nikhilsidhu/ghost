@@ -1,14 +1,15 @@
 use std::net::SocketAddr;
 
-use tracing_subscriber::EnvFilter;
-
+use ghost_log::LogFile;
 use ghost_relay::{config, server, storage};
+
+/// Directory for the relay's daily log files. Unset, it logs to stderr alone, for the
+/// service manager to keep.
+const LOG_DIR_ENV: &str = "GHOST_LOG_DIR";
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .init();
+    let _log = ghost_log::init(std::env::var_os(LOG_DIR_ENV).map(|dir| LogFile { dir: dir.into(), stem: "ghost-relay" }));
 
     let config = config::Config::from_env();
     let port = config.port;
@@ -18,8 +19,8 @@ async fn main() {
             storage::Storage::open(std::path::Path::new(path)).expect("failed to open persistent storage")
         }
         None => {
-            tracing::warn!("no GHOST_DB_PATH set — using in-memory storage (state lost on restart)");
-            storage::Storage::open_in_memory().expect("failed to open storage")
+            tracing::warn!("no GHOST_DB_PATH set: storing in a temporary folder that goes with the process");
+            storage::Storage::open_ephemeral().expect("failed to open storage")
         }
     };
     let addr = SocketAddr::from(([0, 0, 0, 0], port));

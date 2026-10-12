@@ -1,6 +1,7 @@
-use std::sync::Arc;
+// A release build on Windows opens no console window beside the app's.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use tauri::Manager;
+use std::sync::Arc;
 
 mod audio;
 mod audio_test;
@@ -11,31 +12,29 @@ mod config;
 mod constants;
 mod device_watcher;
 mod dto;
+mod error;
 mod idle_task;
 mod relay_task;
 mod setup;
 mod state;
 mod sync_utils;
 
-#[cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+/// Daily log files, inside the data directory.
+const LOG_DIR: &str = "logs";
+
 fn main() {
+    // Before anything is logged, so every line is seen.
+    let log_file = ghost_log::LogFile { dir: setup::ghost_dir().join(LOG_DIR), stem: "ghost" };
+    let _log = ghost_log::init(Some(log_file));
     let setup::SetupResult {
         state: app_state,
         inbox_rx,
         voice_loop,
+        phase,
     } = setup::initialize();
-    let client = app_state.client.clone();
-    let idle_client = app_state.client.clone();
-    let relay = app_state.relay.clone();
-    let idle_relay = app_state.relay.clone();
-    let presence = app_state.presence.clone();
-    let idle_presence = app_state.presence.clone();
-    let voice = app_state.voice.clone();
-    let audio = app_state.audio.clone();
-    let idle_config = app_state.config.clone();
-    let idle_config_path = app_state.config_path.clone();
+    let handles = app_state.handles();
     let relay_task_handle = app_state.relay_task_handle.clone();
-    let data_dir = app_state.config_path.parent().unwrap().to_path_buf();
+    let relay_for_exit = app_state.relay.clone();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
@@ -44,6 +43,7 @@ fn main() {
             #[cfg(target_os = "macos")]
             {
                 use objc2_app_kit::{NSColor, NSWindow};
+                use tauri::Manager;
 
                 let window = app.get_webview_window("main").unwrap();
                 let ns_window = unsafe { &*(window.ns_window().unwrap() as *mut NSWindow) };
@@ -53,44 +53,24 @@ fn main() {
             }
 
             let handle = app.handle().clone();
-            let relay_config = idle_config.clone();
-            let relay_config_path = idle_config_path.clone();
-            let relay_task_handle = relay_task_handle.clone();
-            let jh = tauri::async_runtime::spawn(relay_task::run(
-                handle.clone(),
-                client,
-                relay,
-                inbox_rx,
-                presence,
-                data_dir,
-                relay_config,
-                relay_config_path,
-                audio.clone(),
-                voice.clone(),
-            ));
-            *relay_task_handle.blocking_lock() = Some(jh);
-            let voice_sink = Arc::new(relay_task::TauriSink::new(
-                handle.clone(),
-                idle_config.clone(),
-                idle_config_path.clone(),
-                audio,
-                voice.clone(),
-            ));
+            // Without an account there is nothing to run a session for; the command that
+            // makes, links or recovers one starts it.
+            if phase != state::AccountPhase::None {
+                let jh = tauri::async_runtime::spawn(relay_task::run(handle.clone(), handles.clone(), inbox_rx));
+                *relay_task_handle.blocking_lock() = Some(jh);
+            }
+            let voice_sink = Arc::new(relay_task::TauriSink::new(handle.clone(), handles.clone()));
             tauri::async_runtime::spawn(voice_loop.run(voice_sink));
-            tauri::async_runtime::spawn(idle_task::run(
-                handle,
-                idle_client,
-                idle_relay,
-                idle_presence,
-                voice,
-                idle_config,
-                idle_config_path,
-            ));
+            tauri::async_runtime::spawn(idle_task::run(handle, handles));
 
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_identity,
+            commands::live_state,
+            commands::note_activity,
+            commands::dismiss_alert,
+            commands::set_auto_mute_on_idle,
             commands::list_servers,
             commands::create_server,
             commands::create_dm,
@@ -100,9 +80,11 @@ fn main() {
             commands::get_server_order,
             commands::list_messages,
             commands::send_message,
+            commands::retry_message,
             commands::create_channel,
             commands::rename_channel,
             commands::delete_channel,
+            commands::reorder_channels,
             commands::create_private_channel,
             commands::get_channel_access,
             commands::set_channel_access,
@@ -112,6 +94,10 @@ fn main() {
             commands::mark_channel_read,
             commands::create_invite,
             commands::join_by_invite,
+            commands::kept_out,
+            commands::let_back_in,
+            commands::forget_server,
+            commands::accept_relay_state,
             commands::move_server,
             commands::follow_server_move,
             commands::get_config,
@@ -142,19 +128,37 @@ fn main() {
             commands::get_cached_avatar,
             commands::get_devices,
             commands::revoke_device,
+            commands::rename_device,
+            commands::get_account_status,
+            commands::begin_create_account,
+            commands::confirm_new_account,
+            commands::cancel_create_account,
             commands::start_pairing,
             commands::check_pairing,
+            commands::confirm_pairing,
             commands::cancel_pairing,
             commands::join_as_new_device,
-            commands::set_recovery_passphrase,
-            commands::skip_recovery_setup,
-            commands::get_recovery_code,
-            commands::change_recovery_passphrase,
-            commands::has_recovery_blob,
-            commands::recover_account,
+            commands::begin_recovery,
+            commands::confirm_recovery,
+            commands::recover_through_relay,
+            commands::cancel_recovery,
+            commands::check_recovery_key,
+            commands::begin_replace_recovery_key,
+            commands::confirm_new_recovery_key,
+            commands::cancel_new_recovery_key,
+            commands::move_home,
+            commands::reset_device,
+            commands::resume_unfinished_account,
             commands::exit_app,
             commands::spawn_dev_instance,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running ghost");
+        .build(tauri::generate_context!())
+        .expect("error while building ghost")
+        .run(move |_app, event| {
+            // Quitting closes every relay connection, so relays show this device
+            // offline at once.
+            if let tauri::RunEvent::Exit = event {
+                tauri::async_runtime::block_on(relay_for_exit.close_all(constants::EXIT_CLOSE_WAIT));
+            }
+        });
 }

@@ -1,14 +1,20 @@
 import { createSignal } from "solid-js";
 import { listen } from "@tauri-apps/api/event";
-import type { Identity, Server, Channel, Member, Message, VoiceState, VoiceParticipants, VoiceSpeaking, VoiceMuteState, VoiceQuality, OnlinePresenceEvent, ServerRoles, VoiceChannelMembers, VoiceChannelMember } from "./types";
+import type {
+  Identity, Server, Channel, Member, Message, VoiceState, CallPhase, MediaPath, VoiceParticipants, VoiceSpeaking, VoiceMuteState, VoiceQuality,
+  OnlinePresenceEvent, ServerRoles, VoiceChannelMembers, VoiceChannelMember, OnlineStatus, PresenceStatus, Connectivity,
+  LiveState, Invite, ChannelWaiting,
+} from "./types";
 import {
   getIdentity, listServers, listChannels, listMembers, getServerRoles,
-  markChannelRead,
+  markChannelRead, forgetServer as forgetServerCommand,
   joinVoice, leaveVoice, setVoiceMuted, setVoiceDeafened,
   getConfig,
   getCachedAvatar,
 } from "./api";
-import { initKeybinds, onPttActiveChange } from "./keybinds";
+import { liveState, noteActivity } from "./api";
+import { applyAlertsSnapshot, listenForAccountAlerts } from "./alerts";
+import { initKeybinds, onPttActiveChange, setInputMode as setKeybindInputMode } from "./keybinds";
 import { sections } from "./settings-registry";
 
 // Backend settings (relay URL, display name) live in ~/.ghost/config.toml.
@@ -36,11 +42,25 @@ const [members, setMembers] = createSignal<Member[]>([]);
 const [serverRoles, setServerRoles] = createSignal<ServerRoles | null>(null);
 const [selectedChannelId, setSelectedChannelId] = createSignal<string | null>(null);
 const [allChannels, setAllChannels] = createSignal<Channel[]>([]);
+/** Members of every server, for contacts; fetched when first wanted, again after a change. */
 const [allMembers, setAllMembers] = createSignal<Member[]>([]);
+let contactsStale = true;
+let contactsLoading: Promise<void> | null = null;
 
 // --- UI ---
 
-const [inviteLink, setInviteLink] = createSignal<string | null>(null);
+/** The invite just made, shown with its link and when it ends. */
+const [invite, setInvite] = createSignal<Invite | null>(null);
+/** Private channels whose messages wait for a change to their server's group. */
+const [waitingChannels, setWaitingChannels] = createSignal<Set<string>>(new Set());
+
+const applyChannelWaiting = (event: ChannelWaiting) =>
+  setWaitingChannels((prev) => {
+    const next = new Set(prev);
+    if (event.waiting) next.add(event.channel_id);
+    else next.delete(event.channel_id);
+    return next;
+  });
 /** Link a server's creator shares after moving it to another relay. */
 const [moveLink, setMoveLink] = createSignal<string | null>(null);
 const [showInfo, setShowInfo] = createSignal(false);
@@ -50,30 +70,40 @@ const [settingsCategory, setSettingsCategory] = createSignal("");
 const [dmViewActive, setDmViewActive] = createSignal(false);
 const [profileOpen, setProfileOpen] = createSignal(false);
 const toggleProfile = () => setProfileOpen((v) => !v);
-const [relayConnected, setRelayConnected] = createSignal(false);
-const INVISIBLE = "invisible" as const;
-const [ownStatus, setOwnStatus] = createSignal<string>("online");
+const NO_CONNECTIVITY: Connectivity = { home: false, any: false, relays_down: [], relays_refusing: [], catching_up: false };
+const [connectivity, setConnectivity] = createSignal<Connectivity>(NO_CONNECTIVITY);
+const relayConnected = () => connectivity().any;
+const INVISIBLE: OnlineStatus = "invisible";
+const [ownStatus, setOwnStatus] = createSignal<OnlineStatus>("online");
 const [ownStatusMessage, setOwnStatusMessage] = createSignal<string>("");
 const [selectedExpiry, setSelectedExpiry] = createSignal<number>(0);
 const [expiresAt, setExpiresAt] = createSignal<number | null>(null);
 const [autoMuted, setAutoMuted] = createSignal(false);
-const presenceByServer = new Map<string, Map<string, { status: string; status_message: string | null }>>();
-const [onlinePresence, setOnlinePresence] = createSignal<Map<string, { status: string; status_message: string | null }>>(new Map());
+/** A member's presence as shown: their status, and this device's own as it chose it. */
+interface ShownPresence {
+  status: PresenceStatus | OnlineStatus;
+  status_message: string | null;
+}
+const presenceByServer = new Map<string, Map<string, ShownPresence>>();
+const [onlinePresence, setOnlinePresence] = createSignal<Map<string, ShownPresence>>(new Map());
 
-// Avatar data URLs keyed by fingerprint
+// Avatar object URLs keyed by fingerprint, each revoked once replaced.
 const [avatarUrls, setAvatarUrls] = createSignal<Map<string, string>>(new Map());
 const avatarUrl = (fp: string) => avatarUrls().get(fp);
 const loadAvatar = async (fp: string) => {
-  const dataUrl = await getCachedAvatar(fp).catch(() => null);
-  setAvatarUrls(prev => {
+  const bytes = await getCachedAvatar(fp).catch(() => new ArrayBuffer(0));
+  setAvatarUrls((prev) => {
     const next = new Map(prev);
-    if (dataUrl) { next.set(fp, dataUrl); } else { next.delete(fp); }
+    const previous = next.get(fp);
+    if (previous) URL.revokeObjectURL(previous);
+    if (bytes.byteLength > 0) next.set(fp, URL.createObjectURL(new Blob([bytes])));
+    else next.delete(fp);
     return next;
   });
 };
 
 const rebuildPresence = () => {
-  const flat = new Map<string, { status: string; status_message: string | null }>();
+  const flat = new Map<string, ShownPresence>();
   for (const [, smap] of presenceByServer) {
     for (const [fp, info] of smap) flat.set(fp, info);
   }
@@ -97,11 +127,28 @@ const toggleSettings = () => {
 const [voiceConnected, setVoiceConnected] = createSignal(false);
 const [voiceServerId, setVoiceServerId] = createSignal<string | null>(null);
 const [voiceChannelId, setVoiceChannelId] = createSignal<string | null>(null);
+/** Where this device's call stands: joining, live or reconnecting. */
+const [voicePhase, setVoicePhase] = createSignal<CallPhase | null>(null);
+/** Whether the call's media reaches the voice server. */
+const [voiceMediaPath, setVoiceMediaPath] = createSignal<MediaPath | null>(null);
 const [isMuted, setIsMuted] = createSignal(false);
 const [isDeafened, setIsDeafened] = createSignal(false);
 const [voiceParticipants, setVoiceParticipants] = createSignal<string[]>([]);
 const [speakingSet, setSpeakingSet] = createSignal<Set<string>>(new Set());
-const [voiceError, setVoiceError] = createSignal<string | null>(null);
+/** A voice failure or notice and the channel it concerns, shown under that channel for a while. */
+const [voiceError, setVoiceError] = createSignal<{ channelId: string; message: string; notice: boolean } | null>(null);
+/** How long a voice failure or notice stays shown. */
+const VOICE_ERROR_MS = 5000;
+/** The channel last asked to join, which a failure reported later concerns. */
+let voiceAttempt: string | null = null;
+let voiceErrorTimer: ReturnType<typeof setTimeout> | undefined;
+const showVoiceError = (message: string, notice = false) => {
+  const channelId = voiceAttempt ?? voiceChannelId();
+  if (!channelId) return;
+  clearTimeout(voiceErrorTimer);
+  setVoiceError({ channelId, message, notice });
+  voiceErrorTimer = setTimeout(() => setVoiceError(null), VOICE_ERROR_MS);
+};
 // Persists after disconnect so we can still show who's in the channel
 const [voiceParticipantChannelId, setVoiceParticipantChannelId] = createSignal<string | null>(null);
 // Per-participant mute/deafen state from relay
@@ -134,7 +181,9 @@ const toggleDeafen = () => {
 const endCall = () => { leaveVoice().catch(() => {}); };
 
 const joinVoiceChannel = (serverId: string, channelId: string) => {
-  joinVoice(serverId, channelId, isMuted(), isDeafened()).catch(() => {});
+  voiceAttempt = channelId;
+  setVoiceError(null);
+  joinVoice(serverId, channelId, isMuted(), isDeafened()).catch((e) => showVoiceError(String(e)));
 };
 
 const isSpeaking = (fingerprint: string) => speakingSet().has(fingerprint);
@@ -146,6 +195,25 @@ const selectedServer = () => servers().find((s) => s.server_id === selectedServe
 const selectedChannelName = () => channels().find((c) => c.channel_id === selectedChannelId())?.name ?? "";
 const dms = () => servers().filter((s) => s.kind === "dm" || s.kind === "group");
 const serverList = () => servers().filter((s) => s.kind === "server");
+
+/** Fetch the members of every server for `contacts`, unless they are current. */
+const loadContacts = (): Promise<void> => {
+  if (!contactsStale) return Promise.resolve();
+  if (contactsLoading) return contactsLoading;
+  contactsLoading = (async () => {
+    const results = await Promise.all(servers().map((s) => listMembers(s.server_id).catch(() => [] as Member[])));
+    setAllMembers(results.flat());
+    contactsStale = false;
+  })().finally(() => {
+    contactsLoading = null;
+  });
+  return contactsLoading;
+};
+
+/** Contacts are fetched again the next time they are wanted. */
+const invalidateContacts = () => {
+  contactsStale = true;
+};
 
 // Known contacts: all members across servers, deduplicated, excluding self
 const contacts = () => {
@@ -179,14 +247,6 @@ const refreshChannels = async () => {
   setAllChannels((prev) => [...prev.filter((c) => c.server_id !== sid), ...ch]);
 };
 
-const refreshAllMembers = async () => {
-  const ss = servers();
-  if (ss.length === 0) { setAllMembers([]); return; }
-  const results = await Promise.all(ss.map((s) => listMembers(s.server_id)));
-  setAllMembers(results.flat());
-};
-
-
 const refreshRoles = async () => {
   const sid = selectedServerId();
   if (!sid) { setServerRoles(null); return; }
@@ -202,6 +262,18 @@ const refreshMembers = async () => {
 };
 
 // --- Actions ---
+
+/** Forget a server this account was removed from or stopped following, with its history, closing it if open. */
+const forgetServer = async (id: string) => {
+  await forgetServerCommand(id);
+  if (selectedServerId() === id) {
+    setSelectedServerId(null);
+    setSelectedChannelId(null);
+    setChannels([]);
+    setMembers([]);
+  }
+  await refreshServers();
+};
 
 const selectServer = async (id: string | null) => {
   setDmViewActive(false);
@@ -260,32 +332,123 @@ const updateIdentity = async () => {
 };
 
 
+const applyRelayConnectivity = (c: Connectivity) => {
+  setConnectivity(c);
+  if (c.any) rebuildPresence();
+};
+
+const applyVoiceChannelMembers = ({ channel_id, members }: VoiceChannelMembers) => {
+  setVoiceChannelMembers(prev => {
+    const next = new Map(prev);
+    if (members.length === 0) next.delete(channel_id);
+    else next.set(channel_id, members);
+    return next;
+  });
+};
+
+const applyOnlinePresence = ({ server_id, members }: OnlinePresenceEvent) => {
+  const serverMap = new Map<string, ShownPresence>();
+  for (const member of members) {
+    serverMap.set(member.fingerprint, { status: member.status, status_message: member.status_message });
+    // Load avatar for members that have one cached but not yet loaded
+    if (member.avatar_hash && !avatarUrl(member.fingerprint)) {
+      loadAvatar(member.fingerprint);
+    }
+  }
+  presenceByServer.set(server_id, serverMap);
+  rebuildPresence();
+};
+
+const applyVoiceState = (s: VoiceState) => {
+  setVoiceConnected(s.connected);
+  setVoiceServerId(s.server_id);
+  setVoiceChannelId(s.channel_id);
+  setVoicePhase(s.phase);
+  setVoiceMediaPath(s.media_path);
+  setIsMuted(s.muted);
+  setIsDeafened(s.deafened);
+  if (s.channel_id) setVoiceParticipantChannelId(s.channel_id);
+  const selfFp = identity()?.fingerprint;
+  if (s.connected) {
+    // Update self mute state in the per-participant map
+    if (selfFp) {
+      setVoiceMuteStates(prev => {
+        const next = new Map(prev);
+        next.set(selfFp, { muted: s.muted, deafened: s.deafened });
+        return next;
+      });
+    }
+  } else {
+    // Remove self from participants but keep others visible
+    if (selfFp) setVoiceParticipants(prev => prev.filter(fp => fp !== selfFp));
+    setSpeakingSet(new Set<string>());
+    setVoiceQuality(null);
+  }
+};
+
+/** Show the session as the snapshot has it, rosters replaced whole. */
+const applyLiveState = (live: LiveState) => {
+  presenceByServer.clear();
+  setVoiceChannelMembers(new Map());
+  applyRelayConnectivity(live.connectivity);
+  for (const event of live.online) applyOnlinePresence(event);
+  for (const event of live.voice) applyVoiceChannelMembers(event);
+  if (live.voice_state) applyVoiceState(live.voice_state);
+  setWaitingChannels(new Set(live.waiting_channels));
+  setOwnStatus(live.status);
+  rebuildPresence();
+  applyAlertsSnapshot(live);
+};
+
+let listeningForLiveState = false;
+
+/** Listen for everything the session only reports as events, then read the snapshot of
+ * what it reported before: once, at start, so nothing falls between the two. A new
+ * session (after a relay change) resets the snapshot. */
+const listenForLiveState = () => {
+  if (listeningForLiveState) return;
+  listeningForLiveState = true;
+  listenForAccountAlerts();
+  listen<Connectivity>("relay-connectivity", (event) => applyRelayConnectivity(event.payload));
+  listen<OnlinePresenceEvent>("online-presence", (event) => applyOnlinePresence(event.payload));
+  listen<VoiceChannelMembers>("voice-channel-members", (event) => applyVoiceChannelMembers(event.payload));
+  listen<VoiceState>("voice-state", (event) => applyVoiceState(event.payload));
+  listen<ChannelWaiting>("channel-waiting", (event) => applyChannelWaiting(event.payload));
+  listen<OnlineStatus>("idle-transition", (event) => {
+    setOwnStatus(event.payload);
+    rebuildPresence();
+  });
+  const readSnapshot = () => liveState().then(applyLiveState).catch(() => {});
+  listen("live-reset", () => {
+    setConnectivity(NO_CONNECTIVITY);
+    readSnapshot();
+  });
+  readSnapshot();
+};
+
 const initialize = async () => {
   await updateIdentity();
   await refreshServers();
   await refreshAllChannels();
-  await refreshAllMembers();
 
+  // A server changed, or the server list did. Only what is on screen is fetched again;
+  // contacts are fetched when next wanted.
   listen<string>("sync", (event) => {
     const sid = event.payload;
+    invalidateContacts();
+    refreshServers();
     if (sid === "all") {
-      refreshServers();
       refreshAllChannels();
-      refreshAllMembers();
-      return;
-    }
-    if (sid === selectedServerId()) {
+    } else if (sid === selectedServerId()) {
       refreshChannels();
       refreshMembers();
     }
-    refreshServers();
-    refreshAllMembers();
   });
 
   listen<string>("display-name-sync", () => {
     updateIdentity();
     refreshMembers();
-    refreshAllMembers();
+    invalidateContacts();
   });
 
   listen("sync-read-state", () => {
@@ -303,33 +466,6 @@ const initialize = async () => {
       ));
     } else {
       refreshServers();
-    }
-  });
-
-  listen<VoiceState>("voice-state", (event) => {
-    const s = event.payload;
-    setVoiceConnected(s.connected);
-    setVoiceServerId(s.server_id);
-    setVoiceChannelId(s.channel_id);
-    setIsMuted(s.muted);
-    setIsDeafened(s.deafened);
-    if (s.channel_id) setVoiceParticipantChannelId(s.channel_id);
-    if (s.connected) {
-      // Update self mute state in the per-participant map
-      const selfFp = identity()?.fingerprint;
-      if (selfFp) {
-        setVoiceMuteStates(prev => {
-          const next = new Map(prev);
-          next.set(selfFp, { muted: s.muted, deafened: s.deafened });
-          return next;
-        });
-      }
-    } else {
-      // Remove self from participants but keep others visible
-      const selfFp = identity()?.fingerprint;
-      if (selfFp) setVoiceParticipants(prev => prev.filter(fp => fp !== selfFp));
-      setSpeakingSet(new Set<string>());
-      setVoiceQuality(null);
     }
   });
 
@@ -359,79 +495,65 @@ const initialize = async () => {
     setVoiceQuality(event.payload);
   });
 
-  listen<VoiceChannelMembers>("voice-channel-members", (event) => {
-    const { channel_id, members } = event.payload;
-    setVoiceChannelMembers(prev => {
-      const next = new Map(prev);
-      if (members.length === 0) next.delete(channel_id);
-      else next.set(channel_id, members);
-      return next;
-    });
-  });
 
-  listen<string>("voice-takeover", (event) => {
-    const channelId = event.payload;
-    if (voiceChannelId() === channelId) {
-      leaveVoice().catch(() => {});
-    }
-  });
-
-  listen<string>("kicked", (event) => {
-    const sid = event.payload;
-    if (selectedServerId() === sid) {
-      setSelectedServerId(null);
-      setSelectedChannelId(null);
-      setChannels([]);
-      setMembers([]);
-    }
+  // A server this account was removed from stays, read-only, with who removed it.
+  listen<string>("kicked", () => {
     refreshServers();
     refreshAllChannels();
-    refreshAllMembers();
+    invalidateContacts();
   });
 
-  listen<boolean>("relay-connectivity", (event) => {
-    setRelayConnected(event.payload);
-    if (event.payload) rebuildPresence();
-  });
-
-  listen<OnlinePresenceEvent>("online-presence", (event) => {
-    const { server_id, members } = event.payload;
-    const serverMap = new Map<string, { status: string; status_message: string | null }>();
-    for (const member of members) {
-      serverMap.set(member.fingerprint, { status: member.status, status_message: member.status_message });
-      // Load avatar for members that have one cached but not yet loaded
-      if (member.avatar_hash && !avatarUrl(member.fingerprint)) {
-        loadAvatar(member.fingerprint);
-      }
-    }
-    presenceByServer.set(server_id, serverMap);
-    rebuildPresence();
-  });
+  // Acting in this window ends idle at once; the idle task alone notices at its next poll.
+  const noteActivityIfIdle = () => {
+    if (ownStatus() === "idle") noteActivity().catch(() => {});
+  };
+  window.addEventListener("focus", noteActivityIfIdle);
+  document.addEventListener("pointerdown", noteActivityIfIdle);
+  document.addEventListener("keydown", noteActivityIfIdle);
 
   listen<string>("voice-error", (event) => {
     console.error("voice:", event.payload);
-    setVoiceError(event.payload);
-    setTimeout(() => setVoiceError(null), 5000);
+    showVoiceError(event.payload);
+  });
+
+  listen<string>("voice-notice", (event) => {
+    console.warn("voice:", event.payload);
+    showVoiceError(event.payload, true);
   });
 
   onPttActiveChange((active) => setIsPttKeyHeld(active));
   initKeybinds().catch((e) => console.error("keybinds init failed:", e));
   getConfig().then((c) => {
     setIsPttMode(c.input_mode === "push_to_talk");
-    if (c.status) setOwnStatus(c.status);
     if (c.status_message) setOwnStatusMessage(c.status_message);
+    setExpiresAt(c.status_expiry);
     rebuildPresence();
   }).catch(() => {});
 
-  listen<string>("idle-transition", (event) => {
-    setOwnStatus(event.payload);
-    rebuildPresence();
+  // Another device of the account chose a status or a status message: the session
+  // already announces it; show it here too.
+  listen("sync-status", () => {
+    getConfig().then((c) => {
+      setOwnStatus(c.status);
+      setOwnStatusMessage(c.status_message ?? "");
+      setExpiresAt(c.status_expiry);
+      if (!c.status_message) setSelectedExpiry(0);
+      rebuildPresence();
+    }).catch(() => {});
   });
 
-  listen<boolean>("auto-muted", () => {
-    setIsMuted(true);
-    setAutoMuted(true);
+  // An audio setting came from another device; the settings page refreshes itself.
+  listen<string>("sync-pref", (event) => {
+    if (event.payload !== "input_mode") return;
+    getConfig().then((c) => {
+      setIsPttMode(c.input_mode === "push_to_talk");
+      setKeybindInputMode(c.input_mode);
+    }).catch(() => {});
   });
+
+  // Whether the call's mute is the one going idle applied; the mute itself follows
+  // `voice-state`.
+  listen<boolean>("auto-muted", (event) => setAutoMuted(event.payload));
 
   listen<string>("avatar-updated", (event) => {
     loadAvatar(event.payload);
@@ -457,18 +579,18 @@ const initialize = async () => {
 export {
   identity, servers, selectedServerId, channels, members, serverRoles, refreshRoles,
   selectedChannelId, allChannels,
-  inviteLink, moveLink, showInfo, desiredChannelKind,
+  invite, moveLink, showInfo, desiredChannelKind, waitingChannels,
   selectedServer, selectedChannelName,
-  dmViewActive, dms, serverList, contacts,
-  selectServer, selectChannel, selectDm, activateDmView,
-  updateIdentity, initialize,
-  refreshServers, refreshChannels, refreshAllChannels, refreshAllMembers,
-  setInviteLink, setMoveLink, setShowInfo, setDesiredChannelKind,
+  dmViewActive, dms, serverList, contacts, loadContacts, invalidateContacts,
+  selectServer, selectChannel, selectDm, activateDmView, forgetServer,
+  updateIdentity, initialize, listenForLiveState,
+  refreshServers, refreshChannels, refreshAllChannels,
+  setInvite, setMoveLink, setShowInfo, setDesiredChannelKind,
   settingsOpen, settingsCategory, setSettingsCategory, toggleSettings,
-  profileOpen, setProfileOpen, toggleProfile, relayConnected, onlinePresence,
+  profileOpen, setProfileOpen, toggleProfile, relayConnected, connectivity, onlinePresence,
   INVISIBLE, ownStatus, setOwnStatus, ownStatusMessage, setOwnStatusMessage, selectedExpiry, setSelectedExpiry, expiresAt, setExpiresAt, rebuildPresence, autoMuted, setAutoMuted,
   isInCall, isMuted, isDeafened, isPttMode, setIsPttMode, isPttKeyHeld, pttMuteAttempt, toggleMute, toggleDeafen, endCall,
-  voiceChannelId, voiceServerId, voiceParticipants, speakingSet, voiceError,
+  voiceChannelId, voiceServerId, voicePhase, voiceMediaPath, voiceParticipants, speakingSet, voiceError,
   joinVoiceChannel, isSpeaking, isInVoiceChannel,
   voiceParticipantChannelId, voiceMuteStates, voiceQuality,
   voiceChannelMembers,

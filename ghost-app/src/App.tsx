@@ -1,29 +1,34 @@
 import { createSignal, onMount, Show } from "solid-js";
-import { getConfig } from "./lib/api";
+import { getAccountStatus } from "./lib/api";
+import { deviceRemoved } from "./lib/alerts";
+import { listenForLiveState } from "./lib/store";
 import { Layout } from "./components/Layout";
 import { SetupScreen } from "./components/SetupScreen";
+import { RemovedScreen } from "./components/AccountScreens";
+import type { AccountPhase } from "./lib/types";
 
 export default function App() {
-  const [ready, setReady] = createSignal(false);
-  const [needsSetup, setNeedsSetup] = createSignal(false);
+  const [phase, setPhase] = createSignal<AccountPhase | null>(null);
 
-  onMount(async () => {
-    const cfg = await getConfig();
-    if (!cfg.display_name) {
-      setNeedsSetup(true);
-    }
-    setReady(true);
-  });
-
-  const handleSetupComplete = () => {
-    setNeedsSetup(false);
+  const refresh = async () => {
+    const status = await getAccountStatus();
+    setPhase(status.phase);
   };
 
+  onMount(async () => {
+    listenForLiveState();
+    await refresh();
+  });
+
   return (
-    <Show when={ready()}>
-      <Show when={needsSetup()} fallback={<Layout />}>
-        <SetupScreen onComplete={handleSetupComplete} />
-      </Show>
+    <Show when={phase()}>
+      {(current) => (
+        <Show when={!deviceRemoved()} fallback={<RemovedScreen />}>
+          <Show when={current() === "ready"} fallback={<SetupScreen onComplete={refresh} />}>
+            <Layout />
+          </Show>
+        </Show>
+      )}
     </Show>
   );
 }

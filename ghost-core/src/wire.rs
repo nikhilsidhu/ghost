@@ -5,8 +5,10 @@ use crate::crypto::{
     PROTOCOL_VERSION,
 };
 use crate::error::{GhostError, Result};
+use crate::idlog_cache::{CredentialClaim, DeviceStatus};
 use crate::mls::group::GhostGroup;
-use crate::storage::{ChannelKind, ServerKind, MemberRole};
+use crate::storage::{ChannelKind, ServerKind};
+use ghost_wire::bytes::{put_prefixed16, put_prefixed32, put_string, Reader};
 use ghost_wire::policy::PolicyError;
 use ghost_wire::policy_mls::{self, GroupFacts, ServerAt};
 use ghost_wire::relay_ref::RelayRef;
@@ -89,40 +91,35 @@ impl ApplicationMessage {
 
     /// Deserialize from wire format.
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        let mut pos = 0;
+        let mut r = Reader::new(data);
 
-        let version = read_u8(data, &mut pos)?;
+        let version = r.u8()?;
         if version != PROTOCOL_VERSION {
             return Err(GhostError::Format(format!(
                 "unsupported version: {version:#04x}"
             )));
         }
 
-        let type_byte = read_u8(data, &mut pos)?;
-        let message_type = MessageType::try_from(type_byte)
+        let message_type = MessageType::try_from(r.u8()?)
             .map_err(|v| GhostError::Format(format!("unknown message type: {v:#04x}")))?;
+        if message_type.is_local() {
+            return Err(GhostError::Format(format!("message type {message_type:?} is made by receivers, never sent")));
+        }
 
-        let channel_id = read_blob32(data, &mut pos)?;
-        let sender_fp = read_blob32(data, &mut pos)?;
-        let timestamp = read_u64(data, &mut pos)?;
-        let message_id = read_blob32(data, &mut pos)?;
-        let kt_head_hash = read_blob32(data, &mut pos)?;
+        let channel_id = r.array()?;
+        let sender_fp = r.array()?;
+        let timestamp = r.u64()?;
+        let message_id = r.array()?;
+        let kt_head_hash = r.array()?;
 
-        let ref_count = read_u8(data, &mut pos)? as usize;
+        let ref_count = r.u8()? as usize;
         let mut references = Vec::with_capacity(ref_count);
         for _ in 0..ref_count {
-            references.push(read_blob32(data, &mut pos)?);
+            references.push(r.array()?);
         }
 
-        let content_len = read_u32(data, &mut pos)? as usize;
-        if pos + content_len != data.len() {
-            return Err(GhostError::Format(format!(
-                "expected {} bytes, got {}",
-                pos + content_len,
-                data.len()
-            )));
-        }
-        let content = data[pos..].to_vec();
+        let content = r.prefixed32()?.to_vec();
+        r.finish()?;
 
         let expected_id = derive_message_id(&channel_id, &sender_fp, timestamp, &content);
         if message_id != expected_id {
@@ -182,10 +179,10 @@ pub fn derive_default_channel_id(server_id: &[u8; 32]) -> [u8; 32] {
 
 // --- InvitePayload: metadata + GroupInfo for external commit joins ---
 
+#[derive(Clone)]
 pub struct InviteMember {
     pub fingerprint: [u8; 32],
     pub display_name: String,
-    pub role: MemberRole,
 }
 
 #[derive(Debug, Clone)]
@@ -194,12 +191,14 @@ pub struct InviteChannel {
     pub name: String,
     pub kind: ChannelKind,
     pub position: i32,
-    /// Per-channel MLS GroupInfo for external-commit joins.
+    /// GroupInfo for an external-commit join into the channel's group, when the payload
+    /// carries one; invites leave it empty, as joiners read the server group's from the relay.
     pub group_info_bytes: Vec<u8>,
 }
 
 /// What an invite link opens: the server's public face and the grant that admits
 /// the holder. Stored on the relay sealed under a key only the link carries.
+#[derive(Clone)]
 pub struct InvitePayload {
     pub server_id: [u8; 32],
     pub server_name: String,
@@ -214,236 +213,125 @@ fn write_role_names(buf: &mut Vec<u8>, role_names: &[(u8, String)]) {
     buf.push(role_names.len() as u8);
     for (role_id, name) in role_names {
         buf.push(*role_id);
-        write_string(buf, name);
+        put_string(buf, name);
     }
 }
 
-fn read_role_names(data: &[u8], pos: &mut usize) -> Result<Vec<(u8, String)>> {
-    let count = read_u8(data, pos)? as usize;
-    (0..count).map(|_| Ok((read_u8(data, pos)?, read_string(data, pos)?))).collect()
+fn read_role_names(r: &mut Reader) -> Result<Vec<(u8, String)>> {
+    let count = r.u8()? as usize;
+    (0..count).map(|_| Ok((r.u8()?, r.string()?))).collect()
 }
 
 /// Names the invite payload in seal and open errors.
 pub const INVITE_PAYLOAD_CONTEXT: &str = "invite payload";
 
-fn write_string(buf: &mut Vec<u8>, s: &str) {
-    let bytes = s.as_bytes();
-    buf.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
-    buf.extend_from_slice(bytes);
-}
-
-fn read_string(data: &[u8], pos: &mut usize) -> Result<String> {
-    if *pos + 2 > data.len() {
-        return Err(GhostError::Format("truncated string length".into()));
-    }
-    let len = u16::from_be_bytes(data[*pos..*pos + 2].try_into().unwrap()) as usize;
-    *pos += 2;
-    if *pos + len > data.len() {
-        return Err(GhostError::Format("truncated string".into()));
-    }
-    let s = String::from_utf8(data[*pos..*pos + len].to_vec())
-        .map_err(|_| GhostError::Format("invalid UTF-8".into()))?;
-    *pos += len;
-    Ok(s)
-}
-
-fn read_u8(data: &[u8], pos: &mut usize) -> Result<u8> {
-    if *pos >= data.len() {
-        return Err(GhostError::Format("truncated u8".into()));
-    }
-    let val = data[*pos];
-    *pos += 1;
-    Ok(val)
-}
-
 /// Trailing `[len:2][RelayRef]` naming the relay that hosts a server; length 0
 /// means the account's home relay.
 fn write_relay_ref(buf: &mut Vec<u8>, relay_ref: Option<&RelayRef>) {
-    let bytes = relay_ref.map(RelayRef::to_bytes).unwrap_or_default();
-    buf.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
-    buf.extend_from_slice(&bytes);
+    put_prefixed16(buf, &relay_ref.map(RelayRef::to_bytes).unwrap_or_default());
 }
 
-/// Reads what `write_relay_ref` wrote; data encoded before the field existed ends here.
-fn read_relay_ref(data: &[u8], pos: &mut usize) -> Result<Option<RelayRef>> {
-    if *pos == data.len() {
+/// Reads what `write_relay_ref` wrote.
+fn read_relay_ref(r: &mut Reader) -> Result<Option<RelayRef>> {
+    let bytes = r.prefixed16()?;
+    if bytes.is_empty() {
         return Ok(None);
     }
-    let len = read_u16(data, pos)? as usize;
-    if len == 0 {
-        return Ok(None);
-    }
-    if data.len() < *pos + len {
-        return Err(GhostError::Format("relay ref truncated".into()));
-    }
-    let relay_ref = RelayRef::from_bytes(&data[*pos..*pos + len])
-        .map_err(|e| GhostError::Format(e.to_string()))?;
-    *pos += len;
-    Ok(Some(relay_ref))
-}
-
-fn read_u16(data: &[u8], pos: &mut usize) -> Result<u16> {
-    if *pos + 2 > data.len() {
-        return Err(GhostError::Format("truncated u16".into()));
-    }
-    let val = u16::from_be_bytes(data[*pos..*pos + 2].try_into().unwrap());
-    *pos += 2;
-    Ok(val)
-}
-
-fn read_u64(data: &[u8], pos: &mut usize) -> Result<u64> {
-    if *pos + 8 > data.len() {
-        return Err(GhostError::Format("truncated u64".into()));
-    }
-    let val = u64::from_be_bytes(data[*pos..*pos + 8].try_into().unwrap());
-    *pos += 8;
-    Ok(val)
-}
-
-fn read_u32(data: &[u8], pos: &mut usize) -> Result<u32> {
-    if *pos + 4 > data.len() {
-        return Err(GhostError::Format("truncated u32".into()));
-    }
-    let val = u32::from_be_bytes(data[*pos..*pos + 4].try_into().unwrap());
-    *pos += 4;
-    Ok(val)
-}
-
-fn read_i32(data: &[u8], pos: &mut usize) -> Result<i32> {
-    if *pos + 4 > data.len() {
-        return Err(GhostError::Format("truncated i32".into()));
-    }
-    let val = i32::from_be_bytes(data[*pos..*pos + 4].try_into().unwrap());
-    *pos += 4;
-    Ok(val)
-}
-
-fn read_blob32(data: &[u8], pos: &mut usize) -> Result<[u8; 32]> {
-    if *pos + 32 > data.len() {
-        return Err(GhostError::Format("truncated blob32".into()));
-    }
-    let blob: [u8; 32] = data[*pos..*pos + 32].try_into().unwrap();
-    *pos += 32;
-    Ok(blob)
+    RelayRef::from_bytes(bytes).map(Some).map_err(|e| GhostError::Format(e.to_string()))
 }
 
 impl InvitePayload {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         buf.extend_from_slice(&self.server_id);
-        write_string(&mut buf, &self.server_name);
+        put_string(&mut buf, &self.server_name);
         buf.push(self.kind.to_byte());
 
         buf.extend_from_slice(&(self.members.len() as u16).to_be_bytes());
         for m in &self.members {
             buf.extend_from_slice(&m.fingerprint);
-            write_string(&mut buf, &m.display_name);
-            buf.push(m.role.to_byte());
+            put_string(&mut buf, &m.display_name);
         }
 
         buf.extend_from_slice(&(self.channels.len() as u16).to_be_bytes());
         for c in &self.channels {
             buf.extend_from_slice(&c.channel_id);
-            write_string(&mut buf, &c.name);
+            put_string(&mut buf, &c.name);
             buf.push(c.kind.to_byte());
             buf.extend_from_slice(&c.position.to_be_bytes());
-            buf.extend_from_slice(&(c.group_info_bytes.len() as u32).to_be_bytes());
-            buf.extend_from_slice(&c.group_info_bytes);
+            put_prefixed32(&mut buf, &c.group_info_bytes);
         }
 
         write_role_names(&mut buf, &self.role_names);
-        let grant = self.grant.to_bytes();
-        buf.extend_from_slice(&(grant.len() as u16).to_be_bytes());
-        buf.extend_from_slice(&grant);
+        put_prefixed16(&mut buf, &self.grant.to_bytes());
         buf
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        let mut pos = 0;
+        let mut r = Reader::new(data);
 
-        let server_id = read_blob32(data, &mut pos)?;
-        let server_name = read_string(data, &mut pos)?;
-        let kind = ServerKind::from_byte(read_u8(data, &mut pos)?)?;
+        let server_id = r.array()?;
+        let server_name = r.string()?;
+        let kind = ServerKind::from_byte(r.u8()?)?;
 
-        let member_count = read_u16(data, &mut pos)? as usize;
+        let member_count = r.u16()? as usize;
         let mut members = Vec::with_capacity(member_count);
         for _ in 0..member_count {
             members.push(InviteMember {
-                fingerprint: read_blob32(data, &mut pos)?,
-                display_name: read_string(data, &mut pos)?,
-                role: MemberRole::from_byte(read_u8(data, &mut pos)?)?,
+                fingerprint: r.array()?,
+                display_name: r.string()?,
             });
         }
 
-        let channel_count = read_u16(data, &mut pos)? as usize;
+        let channel_count = r.u16()? as usize;
         let mut channels = Vec::with_capacity(channel_count);
         for _ in 0..channel_count {
-            let channel_id = read_blob32(data, &mut pos)?;
-            let name = read_string(data, &mut pos)?;
-            let kind = ChannelKind::from_byte(read_u8(data, &mut pos)?)?;
-            let position = read_i32(data, &mut pos)?;
-            let gi_len = read_u32(data, &mut pos)? as usize;
-            if pos + gi_len > data.len() {
-                return Err(GhostError::Format("truncated channel group info".into()));
-            }
-            let group_info_bytes = data[pos..pos + gi_len].to_vec();
-            pos += gi_len;
             channels.push(InviteChannel {
-                channel_id, name, kind, position, group_info_bytes,
+                channel_id: r.array()?,
+                name: r.string()?,
+                kind: ChannelKind::from_byte(r.u8()?)?,
+                position: r.i32()?,
+                group_info_bytes: r.prefixed32()?.to_vec(),
             });
         }
 
-        let role_names = read_role_names(data, &mut pos)?;
-        let grant_len = read_u16(data, &mut pos)? as usize;
-        if pos + grant_len > data.len() {
-            return Err(GhostError::Format("truncated invite grant".into()));
-        }
-        let grant = ghost_wire::policy::InviteGrant::from_bytes(&data[pos..pos + grant_len])
+        let role_names = read_role_names(&mut r)?;
+        let grant = ghost_wire::policy::InviteGrant::from_bytes(r.prefixed16()?)
             .map_err(|e| GhostError::Format(format!("invite grant: {e}")))?;
-        pos += grant_len;
 
-        if pos != data.len() {
-            return Err(GhostError::Format(format!(
-                "invite payload: {} trailing bytes",
-                data.len() - pos
-            )));
-        }
+        r.finish()?;
 
         Ok(Self { server_id, server_name, kind, members, channels, role_names, grant })
     }
 }
 
-// --- Sync MLS group ---
-
-const SYNC_GROUP_TAG: &[u8] = b"ghost-sync-group-v1";
-
-/// Deterministic server_id for the sync MLS group, derived from account fingerprint.
-pub fn sync_server_id(account_fp: &[u8; 32]) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(account_fp);
-    hasher.update(SYNC_GROUP_TAG);
-    hasher.finalize().into()
-}
+// --- Device sync ---
 
 /// Sync message types sent between a user's devices.
 #[repr(u8)]
 pub enum SyncMessageType {
+    /// A server joined, with what the other devices need to join it too. The `server:`
+    /// state entry is the truth; this carries members' names, too large for state.
     ServerProvisioned = 0x01,
-    ServerLeft = 0x02,
-    VoiceTakeover = 0x03,
+    /// A state change: `encode_mutation`.
     MutationSync = 0x04,
-    SyncKeyRotate = 0x05,
+    /// A removal waits for the home: every device stops sending sync until it lands.
+    /// Body: the device being removed.
+    SyncPause = 0x06,
+    /// The account's log changed through this device (a device linked or removed, the
+    /// recovery key replaced, a new account key generation, the home moved): read it now.
+    /// No body.
+    AccountChanged = 0x07,
 }
 
-/// Result of processing an inbound sync MLS message.
+/// Result of taking in a sync blob.
 #[derive(Debug)]
 pub enum SyncReceiveResult {
-    /// Decrypted application message: [msg_type:1][payload...]
-    Application(Vec<u8>),
-    /// A commit was processed (device added/removed, epoch advanced).
-    CommitProcessed,
-    /// Our own message echoed back by the relay.
-    SelfMessage,
+    /// Opened: `[msg_type:1][payload...]`, with the sending device and its sequence
+    /// number, and how many of its earlier messages are still missing.
+    Application { plaintext: Vec<u8>, sender: [u8; 32], gap: u64 },
+    /// A copy of a message this device already took in, or its own message back.
+    Seen,
 }
 
 /// Encrypt a sync message with AES-256-GCM. Returns nonce || ciphertext.
@@ -466,111 +354,117 @@ pub const SYNC_KEY_DISPLAY_NAME: &str = "profile:display_name";
 pub const SYNC_KEY_NOISE_SUPPRESSION: &str = "pref:noise_suppression";
 pub const SYNC_KEY_AGC: &str = "pref:agc";
 pub const SYNC_KEY_INPUT_MODE: &str = "pref:input_mode";
+/// The voice activity threshold, a decimal number.
+pub const SYNC_KEY_VAD_THRESHOLD: &str = "pref:vad_threshold";
+/// The microphone gain, a decimal number.
+pub const SYNC_KEY_INPUT_GAIN: &str = "pref:input_gain";
 pub const SYNC_KEY_STATUS: &str = "status:current";
 pub const SYNC_KEY_STATUS_MESSAGE: &str = "status:message";
 pub const SYNC_KEY_SERVER_PREFIX: &str = "server:";
 
 /// Encode a mutation: [op:1][ts:8 BE][key_len:2 BE][key bytes][value bytes]
 pub fn encode_mutation(op: u8, ts: u64, key: &str, value: &[u8]) -> Vec<u8> {
-    let key_bytes = key.as_bytes();
-    let mut buf = Vec::with_capacity(1 + 8 + 2 + key_bytes.len() + value.len());
+    let mut buf = Vec::with_capacity(1 + 8 + 2 + key.len() + value.len());
     buf.push(op);
     buf.extend_from_slice(&ts.to_be_bytes());
-    buf.extend_from_slice(&(key_bytes.len() as u16).to_be_bytes());
-    buf.extend_from_slice(key_bytes);
+    put_string(&mut buf, key);
     buf.extend_from_slice(value);
     buf
 }
 
 /// Decode a mutation. Returns (op, ts, key, value).
 pub fn decode_mutation(data: &[u8]) -> Result<(u8, u64, String, Vec<u8>)> {
-    if data.len() < 11 {
-        return Err(GhostError::Format("mutation too short".into()));
-    }
-    let op = data[0];
-    let ts = u64::from_be_bytes(data[1..9].try_into().unwrap());
-    let key_len = u16::from_be_bytes(data[9..11].try_into().unwrap()) as usize;
-    if data.len() < 11 + key_len {
-        return Err(GhostError::Format("mutation key truncated".into()));
-    }
-    let key = std::str::from_utf8(&data[11..11 + key_len])
-        .map_err(|e| GhostError::Format(format!("mutation key: {e}")))?
-        .to_string();
-    let value = data[11 + key_len..].to_vec();
-    Ok((op, ts, key, value))
+    let mut r = Reader::new(data);
+    let op = r.u8()?;
+    let ts = r.u64()?;
+    let key = r.string()?;
+    Ok((op, ts, key, r.rest().to_vec()))
+}
+/// One key of the sync state: its value (`None` for a tombstone) and the clock of the
+/// write that set it.
+pub type SyncEntry = (String, Option<Vec<u8>>, u64);
+
+/// A device's sync state as carried in snapshots and provisions, with what it covers:
+/// for each device whose messages it includes, the highest sequence number.
+pub struct SyncDump {
+    pub covered: Vec<([u8; 32], u64)>,
+    pub entries: Vec<SyncEntry>,
 }
 
-/// Encode a sync state dump for provision blob.
+/// The version a dump starts with.
+const SYNC_DUMP_VERSION: u8 = 0xFE;
+/// The value length that marks a deleted key.
+const SYNC_TOMBSTONE: u16 = 0xFFFF;
+
+/// Encode a sync state dump.
+/// Wire: `[0xFE][covered:2 BE] covered × ([device_vk:32][high_seq:8])` then the entries as
+/// `[count:2 BE]` and for each `[key_len:2 BE][key][ts:8 BE][value_len:2 BE][value]`,
+/// value_len 0xFFFF = NULL tombstone.
+pub fn encode_sync_dump(dump: &SyncDump) -> Result<Vec<u8>> {
+    let mut buf = vec![SYNC_DUMP_VERSION];
+    buf.extend_from_slice(&(dump.covered.len() as u16).to_be_bytes());
+    for (device_vk, high) in &dump.covered {
+        buf.extend_from_slice(device_vk);
+        buf.extend_from_slice(&high.to_be_bytes());
+    }
+    buf.extend_from_slice(&encode_sync_state_dump(&dump.entries)?);
+    Ok(buf)
+}
+
+pub fn decode_sync_dump(data: &[u8]) -> Result<SyncDump> {
+    if data.first() != Some(&SYNC_DUMP_VERSION) {
+        return Err(GhostError::Format("sync state from an older app; update every device".into()));
+    }
+    let mut r = Reader::new(&data[1..]);
+    let count = r.u16()? as usize;
+    let mut covered = Vec::with_capacity(count);
+    for _ in 0..count {
+        covered.push((r.array()?, r.u64()?));
+    }
+    Ok(SyncDump { covered, entries: decode_sync_state_dump(r.rest())? })
+}
+/// Encode the entries of a sync state dump.
 /// Wire: [count:2 BE] then for each: [key_len:2 BE][key][ts:8 BE][value_len:2 BE][value]
 /// value_len 0xFFFF = NULL tombstone.
-pub fn encode_sync_state_dump(entries: &[(String, Option<Vec<u8>>, u64)]) -> Result<Vec<u8>> {
+pub fn encode_sync_state_dump(entries: &[SyncEntry]) -> Result<Vec<u8>> {
+    if entries.len() >= SYNC_DUMP_VERSION as usize * 256 {
+        return Err(GhostError::Format("too many sync entries for one dump".into()));
+    }
     let mut buf = Vec::new();
     buf.extend_from_slice(&(entries.len() as u16).to_be_bytes());
     for (key, value, ts) in entries {
-        let kb = key.as_bytes();
-        buf.extend_from_slice(&(kb.len() as u16).to_be_bytes());
-        buf.extend_from_slice(kb);
+        put_string(&mut buf, key);
         buf.extend_from_slice(&ts.to_be_bytes());
         match value {
             Some(v) => {
-                if v.len() >= 0xFFFF {
-                    return Err(GhostError::Format("sync value too large (0xFFFF reserved for tombstone)".into()));
+                if v.len() >= SYNC_TOMBSTONE as usize {
+                    return Err(GhostError::Format("sync value too large".into()));
                 }
-                buf.extend_from_slice(&(v.len() as u16).to_be_bytes());
-                buf.extend_from_slice(v);
+                put_prefixed16(&mut buf, v);
             }
-            None => {
-                buf.extend_from_slice(&0xFFFFu16.to_be_bytes());
-            }
+            None => buf.extend_from_slice(&SYNC_TOMBSTONE.to_be_bytes()),
         }
     }
     Ok(buf)
 }
 
 /// Decode a sync state dump from provision blob.
-pub fn decode_sync_state_dump(data: &[u8]) -> Result<Vec<(String, Option<Vec<u8>>, u64)>> {
-    if data.len() < 2 {
-        return Err(GhostError::Format("sync dump too short".into()));
-    }
-    let count = u16::from_be_bytes(data[0..2].try_into().unwrap()) as usize;
-    let mut pos = 2;
+pub fn decode_sync_state_dump(data: &[u8]) -> Result<Vec<SyncEntry>> {
+    let mut r = Reader::new(data);
+    let count = r.u16()? as usize;
     let mut entries = Vec::with_capacity(count);
     for _ in 0..count {
-        if pos + 2 > data.len() {
-            return Err(GhostError::Format("sync dump: key_len truncated".into()));
-        }
-        let key_len = u16::from_be_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
-        pos += 2;
-        if pos + key_len > data.len() {
-            return Err(GhostError::Format("sync dump: key truncated".into()));
-        }
-        let key = std::str::from_utf8(&data[pos..pos + key_len])
-            .map_err(|e| GhostError::Format(format!("sync dump key: {e}")))?
-            .to_string();
-        pos += key_len;
-        if pos + 8 > data.len() {
-            return Err(GhostError::Format("sync dump: ts truncated".into()));
-        }
-        let ts = u64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
-        pos += 8;
-        if pos + 2 > data.len() {
-            return Err(GhostError::Format("sync dump: value_len truncated".into()));
-        }
-        let value_len = u16::from_be_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
-        pos += 2;
-        if value_len == 0xFFFF {
-            entries.push((key, None, ts));
-        } else {
-            if pos + value_len > data.len() {
-                return Err(GhostError::Format("sync dump: value truncated".into()));
-            }
-            entries.push((key, Some(data[pos..pos + value_len].to_vec()), ts));
-            pos += value_len;
-        }
+        let key = r.string()?;
+        let ts = r.u64()?;
+        let value = match r.u16()? {
+            SYNC_TOMBSTONE => None,
+            len => Some(r.take(len as usize)?.to_vec()),
+        };
+        entries.push((key, value, ts));
     }
+    r.finish()?;
     Ok(entries)
 }
-
 // --- Provision payload: server metadata for device provisioning ---
 
 pub struct ProvisionPayload {
@@ -589,20 +483,19 @@ impl ProvisionPayload {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         buf.extend_from_slice(&self.server_id);
-        write_string(&mut buf, &self.server_name);
+        put_string(&mut buf, &self.server_name);
         buf.push(self.kind.to_byte());
 
         buf.extend_from_slice(&(self.members.len() as u16).to_be_bytes());
         for m in &self.members {
             buf.extend_from_slice(&m.fingerprint);
-            write_string(&mut buf, &m.display_name);
-            buf.push(m.role.to_byte());
+            put_string(&mut buf, &m.display_name);
         }
 
         buf.extend_from_slice(&(self.channels.len() as u16).to_be_bytes());
         for c in &self.channels {
             buf.extend_from_slice(&c.channel_id);
-            write_string(&mut buf, &c.name);
+            put_string(&mut buf, &c.name);
             buf.push(c.kind.to_byte());
             buf.extend_from_slice(&c.position.to_be_bytes());
         }
@@ -614,44 +507,38 @@ impl ProvisionPayload {
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        let mut pos = 0;
+        let mut r = Reader::new(data);
 
-        let server_id = read_blob32(data, &mut pos)?;
-        let server_name = read_string(data, &mut pos)?;
-        let kind = ServerKind::from_byte(read_u8(data, &mut pos)?)?;
+        let server_id = r.array()?;
+        let server_name = r.string()?;
+        let kind = ServerKind::from_byte(r.u8()?)?;
 
-        let member_count = read_u16(data, &mut pos)? as usize;
+        let member_count = r.u16()? as usize;
         let mut members = Vec::with_capacity(member_count);
         for _ in 0..member_count {
             members.push(InviteMember {
-                fingerprint: read_blob32(data, &mut pos)?,
-                display_name: read_string(data, &mut pos)?,
-                role: MemberRole::from_byte(read_u8(data, &mut pos)?)?,
+                fingerprint: r.array()?,
+                display_name: r.string()?,
             });
         }
 
-        let channel_count = read_u16(data, &mut pos)? as usize;
+        let channel_count = r.u16()? as usize;
         let mut channels = Vec::with_capacity(channel_count);
         for _ in 0..channel_count {
             channels.push(InviteChannel {
-                channel_id: read_blob32(data, &mut pos)?,
-                name: read_string(data, &mut pos)?,
-                kind: ChannelKind::from_byte(read_u8(data, &mut pos)?)?,
-                position: read_i32(data, &mut pos)?,
+                channel_id: r.array()?,
+                name: r.string()?,
+                kind: ChannelKind::from_byte(r.u8()?)?,
+                position: r.i32()?,
                 group_info_bytes: vec![],
             });
         }
 
-        let mailbox_id = read_blob32(data, &mut pos)?;
-        let relay_ref = read_relay_ref(data, &mut pos)?;
-        let role_names = read_role_names(data, &mut pos)?;
+        let mailbox_id = r.array()?;
+        let relay_ref = read_relay_ref(&mut r)?;
+        let role_names = read_role_names(&mut r)?;
 
-        if pos != data.len() {
-            return Err(GhostError::Format(format!(
-                "provision payload: {} trailing bytes",
-                data.len() - pos
-            )));
-        }
+        r.finish()?;
 
         Ok(Self { server_id, server_name, kind, members, channels, mailbox_id, relay_ref, role_names })
     }
@@ -665,57 +552,77 @@ pub struct SyncServerMeta {
     pub kind: ServerKind,
     pub mailbox_id: [u8; 32],
     pub channels: Vec<InviteChannel>,
-    /// Relay hosting the server; `None` for the account's home relay. Encoded
-    /// after the channels so snapshots written before the field existed still decode.
+    /// Relay hosting the server; `None` for the account's home relay.
     pub relay_ref: Option<RelayRef>,
-    /// Encoded last, absent from snapshots written before roles existed.
     pub role_names: Vec<(u8, String)>,
+    /// The account's removal from the server, once it happened: the server stays listed,
+    /// read-only. Encoded last; absent means not removed.
+    pub removal: Option<SyncRemoval>,
 }
+
+/// The account was removed from a server, by whom when the device that saw it knows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SyncRemoval {
+    pub by: Option<[u8; 32]>,
+}
+
+/// Tags of the removal at the end of a server entry.
+const SYNC_REMOVED_BY_UNKNOWN: u8 = 1;
+const SYNC_REMOVED_BY: u8 = 2;
 
 impl SyncServerMeta {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::new();
-        write_string(&mut buf, &self.server_name);
+        put_string(&mut buf, &self.server_name);
         buf.push(self.kind.to_byte());
         buf.extend_from_slice(&self.mailbox_id);
         buf.extend_from_slice(&(self.channels.len() as u16).to_be_bytes());
         for c in &self.channels {
             buf.extend_from_slice(&c.channel_id);
-            write_string(&mut buf, &c.name);
+            put_string(&mut buf, &c.name);
             buf.push(c.kind.to_byte());
             buf.extend_from_slice(&c.position.to_be_bytes());
         }
         write_relay_ref(&mut buf, self.relay_ref.as_ref());
         write_role_names(&mut buf, &self.role_names);
+        match self.removal {
+            None => {}
+            Some(SyncRemoval { by: None }) => buf.push(SYNC_REMOVED_BY_UNKNOWN),
+            Some(SyncRemoval { by: Some(by) }) => {
+                buf.push(SYNC_REMOVED_BY);
+                buf.extend_from_slice(&by);
+            }
+        }
         buf
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        let mut pos = 0;
-        let server_name = read_string(data, &mut pos)?;
-        let kind = ServerKind::from_byte(read_u8(data, &mut pos)?)?;
-        let mailbox_id = read_blob32(data, &mut pos)?;
-        let channel_count = read_u16(data, &mut pos)? as usize;
+        let mut r = Reader::new(data);
+        let server_name = r.string()?;
+        let kind = ServerKind::from_byte(r.u8()?)?;
+        let mailbox_id = r.array()?;
+        let channel_count = r.u16()? as usize;
         let mut channels = Vec::with_capacity(channel_count);
         for _ in 0..channel_count {
             channels.push(InviteChannel {
-                channel_id: read_blob32(data, &mut pos)?,
-                name: read_string(data, &mut pos)?,
-                kind: ChannelKind::from_byte(read_u8(data, &mut pos)?)?,
-                position: read_i32(data, &mut pos)?,
+                channel_id: r.array()?,
+                name: r.string()?,
+                kind: ChannelKind::from_byte(r.u8()?)?,
+                position: r.i32()?,
                 group_info_bytes: vec![],
             });
         }
-        let relay_ref = read_relay_ref(data, &mut pos)?;
-        let role_names = if pos == data.len() { Vec::new() } else { read_role_names(data, &mut pos)? };
-        if pos != data.len() {
-            return Err(GhostError::Format(format!(
-                "sync server meta: {} trailing bytes",
-                data.len() - pos
-            )));
-        }
+        let relay_ref = read_relay_ref(&mut r)?;
+        let role_names = read_role_names(&mut r)?;
+        let removal = match (!r.is_empty()).then(|| r.u8()).transpose()? {
+            None => None,
+            Some(SYNC_REMOVED_BY_UNKNOWN) => Some(SyncRemoval { by: None }),
+            Some(SYNC_REMOVED_BY) => Some(SyncRemoval { by: Some(r.array()?) }),
+            Some(tag) => return Err(GhostError::Format(format!("server entry: unknown removal tag {tag}"))),
+        };
+        r.finish()?;
 
-        Ok(Self { server_name, kind, mailbox_id, channels, relay_ref, role_names })
+        Ok(Self { server_name, kind, mailbox_id, channels, relay_ref, role_names, removal })
     }
 }
 
@@ -728,12 +635,17 @@ pub enum ChannelOpPayload {
     /// Sent inside a private channel by a device that just joined it: it cannot read
     /// anything from before its join, so members answer with `Create`.
     InfoRequest { channel_id: [u8; 32] },
+    /// Where the server's public channels go, from a member who may manage them: each
+    /// with its place in the whole list, which every device then stores as sent. Private
+    /// channels take their place through their own groups.
+    Reorder { positions: Vec<([u8; 32], i32)> },
 }
 
 const CHANNEL_OP_CREATE: u8 = 0x01;
 const CHANNEL_OP_RENAME: u8 = 0x02;
 const CHANNEL_OP_DELETE: u8 = 0x03;
 const CHANNEL_OP_INFO_REQUEST: u8 = 0x04;
+const CHANNEL_OP_REORDER: u8 = 0x05;
 
 /// What a private channel is called until a member tells a newly joined device.
 pub const UNNAMED_PRIVATE_CHANNEL: &str = "private channel";
@@ -746,12 +658,12 @@ pub fn encode_channel_op(op: &ChannelOpPayload) -> Vec<u8> {
             buf.extend_from_slice(channel_id);
             buf.push(kind.to_byte());
             buf.extend_from_slice(&position.to_be_bytes());
-            write_string(&mut buf, name);
+            put_string(&mut buf, name);
         }
         ChannelOpPayload::Rename { channel_id, name } => {
             buf.push(CHANNEL_OP_RENAME);
             buf.extend_from_slice(channel_id);
-            write_string(&mut buf, name);
+            put_string(&mut buf, name);
         }
         ChannelOpPayload::Delete { channel_id } => {
             buf.push(CHANNEL_OP_DELETE);
@@ -761,33 +673,46 @@ pub fn encode_channel_op(op: &ChannelOpPayload) -> Vec<u8> {
             buf.push(CHANNEL_OP_INFO_REQUEST);
             buf.extend_from_slice(channel_id);
         }
+        ChannelOpPayload::Reorder { positions } => {
+            buf.push(CHANNEL_OP_REORDER);
+            buf.extend_from_slice(&(positions.len() as u16).to_be_bytes());
+            for (channel_id, position) in positions {
+                buf.extend_from_slice(channel_id);
+                buf.extend_from_slice(&position.to_be_bytes());
+            }
+        }
     }
     buf
 }
 
 pub fn decode_channel_op(data: &[u8]) -> Result<ChannelOpPayload> {
-    let mut pos = 0;
-    let op = read_u8(data, &mut pos)?;
+    let mut r = Reader::new(data);
+    let op = r.u8()?;
     match op {
         CHANNEL_OP_CREATE => {
-            let channel_id = read_blob32(data, &mut pos)?;
-            let kind = ChannelKind::from_byte(read_u8(data, &mut pos)?)?;
-            let position = read_i32(data, &mut pos)?;
-            let name = read_string(data, &mut pos)?;
+            let channel_id = r.array()?;
+            let kind = ChannelKind::from_byte(r.u8()?)?;
+            let position = r.i32()?;
+            let name = r.string()?;
             Ok(ChannelOpPayload::Create { channel_id, name, kind, position })
         }
         CHANNEL_OP_RENAME => {
-            let channel_id = read_blob32(data, &mut pos)?;
-            let name = read_string(data, &mut pos)?;
+            let channel_id = r.array()?;
+            let name = r.string()?;
             Ok(ChannelOpPayload::Rename { channel_id, name })
         }
         CHANNEL_OP_DELETE => {
-            let channel_id = read_blob32(data, &mut pos)?;
+            let channel_id = r.array()?;
             Ok(ChannelOpPayload::Delete { channel_id })
         }
         CHANNEL_OP_INFO_REQUEST => {
-            let channel_id = read_blob32(data, &mut pos)?;
+            let channel_id = r.array()?;
             Ok(ChannelOpPayload::InfoRequest { channel_id })
+        }
+        CHANNEL_OP_REORDER => {
+            let count = r.u16()?;
+            let positions = (0..count).map(|_| Ok((r.array()?, r.i32()?))).collect::<Result<Vec<_>>>()?;
+            Ok(ChannelOpPayload::Reorder { positions })
         }
         _ => Err(GhostError::Format(format!("unknown channel op: {op:#04x}"))),
     }
@@ -799,13 +724,77 @@ const MEMBER_ANNOUNCE: u8 = 0x10;
 const AVATAR_UPDATE: u8 = 0x11;
 const AVATAR_CLEAR: u8 = 0x12;
 const SERVER_MOVED: u8 = 0x13;
-const ROLE_NAME: u8 = 0x14;
+const ROLE_NAMES: u8 = 0x14;
+const SERVER_STATE_REQUEST: u8 = 0x15;
+const SERVER_STATE: u8 = 0x16;
 
-/// A role's display name. Roles live in the server policy, which the relay can read,
-/// so their names travel only in encrypted metadata like this.
-pub fn encode_role_name(role_id: u8, name: &str) -> Vec<u8> {
-    let mut buf = vec![ROLE_NAME, role_id];
-    write_string(&mut buf, name);
+/// The server as a member who may manage its channels holds it, answering a joiner: its
+/// invite payload is from when the invite was made, and it cannot read the messages that
+/// changed the server before its join.
+#[derive(Clone)]
+pub struct ServerStatePayload {
+    /// The sequence of the request answered; the state is as of it.
+    pub request_seq: u64,
+    /// The public channels; private ones are found through discovery.
+    pub channels: Vec<InviteChannel>,
+    pub role_names: Vec<(u8, String)>,
+    /// The members whose names the answering device knows.
+    pub members: Vec<InviteMember>,
+}
+
+/// A joiner asks the server's members for the server's current state.
+pub fn encode_server_state_request() -> Vec<u8> {
+    vec![SERVER_STATE_REQUEST]
+}
+
+pub fn encode_server_state(state: &ServerStatePayload) -> Vec<u8> {
+    let mut buf = vec![SERVER_STATE];
+    buf.extend_from_slice(&state.request_seq.to_be_bytes());
+    buf.extend_from_slice(&(state.channels.len() as u16).to_be_bytes());
+    for c in &state.channels {
+        buf.extend_from_slice(&c.channel_id);
+        put_string(&mut buf, &c.name);
+        buf.push(c.kind.to_byte());
+        buf.extend_from_slice(&c.position.to_be_bytes());
+    }
+    write_role_names(&mut buf, &state.role_names);
+    buf.extend_from_slice(&(state.members.len() as u16).to_be_bytes());
+    for m in &state.members {
+        buf.extend_from_slice(&m.fingerprint);
+        put_string(&mut buf, &m.display_name);
+    }
+    buf
+}
+
+fn decode_server_state(data: &[u8]) -> Result<ServerStatePayload> {
+    let mut r = Reader::new(data);
+    let request_seq = r.u64()?;
+    let channel_count = r.u16()? as usize;
+    let mut channels = Vec::with_capacity(channel_count);
+    for _ in 0..channel_count {
+        channels.push(InviteChannel {
+            channel_id: r.array()?,
+            name: r.string()?,
+            kind: ChannelKind::from_byte(r.u8()?)?,
+            position: r.i32()?,
+            group_info_bytes: Vec::new(),
+        });
+    }
+    let role_names = read_role_names(&mut r)?;
+    let member_count = r.u16()? as usize;
+    let mut members = Vec::with_capacity(member_count);
+    for _ in 0..member_count {
+        members.push(InviteMember { fingerprint: r.array()?, display_name: r.string()? });
+    }
+    r.finish()?;
+    Ok(ServerStatePayload { request_seq, channels, role_names, members })
+}
+
+/// Roles' display names. Roles live in the server policy, which the relay can read, so
+/// their names travel only in encrypted metadata like this, all of them at once.
+pub fn encode_role_names(names: &[(u8, String)]) -> Vec<u8> {
+    let mut buf = vec![ROLE_NAMES];
+    write_role_names(&mut buf, names);
     buf
 }
 
@@ -819,7 +808,7 @@ pub fn encode_server_moved(location: &ghost_wire::server_location::ServerLocatio
 pub fn encode_member_announce(display_name: &str) -> Vec<u8> {
     let mut buf = Vec::new();
     buf.push(MEMBER_ANNOUNCE);
-    write_string(&mut buf, display_name);
+    put_string(&mut buf, display_name);
     buf
 }
 
@@ -839,25 +828,16 @@ pub fn encode_avatar_clear() -> Vec<u8> {
 pub fn decode_metadata(data: &[u8]) -> Result<MetadataPayload> {
     let tag = *data.first().ok_or_else(|| GhostError::Format("empty metadata".into()))?;
     match tag {
-        CHANNEL_OP_CREATE | CHANNEL_OP_RENAME | CHANNEL_OP_DELETE | CHANNEL_OP_INFO_REQUEST => {
+        CHANNEL_OP_CREATE | CHANNEL_OP_RENAME | CHANNEL_OP_DELETE | CHANNEL_OP_INFO_REQUEST | CHANNEL_OP_REORDER => {
             Ok(MetadataPayload::ChannelOp(decode_channel_op(data)?))
         }
-        ROLE_NAME => {
-            let mut pos = 1;
-            let role_id = read_u8(data, &mut pos)?;
-            let name = read_string(data, &mut pos)?;
-            Ok(MetadataPayload::RoleName { role_id, name })
-        }
-        MEMBER_ANNOUNCE => {
-            let mut pos = 1;
-            let name = read_string(data, &mut pos)?;
-            Ok(MetadataPayload::MemberAnnounce { display_name: name })
-        }
+        ROLE_NAMES => Ok(MetadataPayload::RoleNames(read_role_names(&mut Reader::new(&data[1..]))?)),
+        SERVER_STATE_REQUEST => Ok(MetadataPayload::ServerStateRequest),
+        SERVER_STATE => Ok(MetadataPayload::ServerState(decode_server_state(&data[1..])?)),
+        MEMBER_ANNOUNCE => Ok(MetadataPayload::MemberAnnounce { display_name: Reader::new(&data[1..]).string()? }),
         AVATAR_UPDATE => {
-            let mut pos = 1;
-            let avatar_hash = read_blob32(data, &mut pos)?;
-            let avatar_key = read_blob32(data, &mut pos)?;
-            Ok(MetadataPayload::AvatarUpdate { avatar_hash, avatar_key })
+            let mut r = Reader::new(&data[1..]);
+            Ok(MetadataPayload::AvatarUpdate { avatar_hash: r.array()?, avatar_key: r.array()? })
         }
         AVATAR_CLEAR => Ok(MetadataPayload::AvatarClear),
         SERVER_MOVED => ghost_wire::server_location::ServerLocation::from_bytes(&data[1..])
@@ -875,15 +855,25 @@ pub enum MetadataPayload {
     /// Only meaningful from the server's owner; receivers verify the record.
     ServerMoved(ghost_wire::server_location::ServerLocation),
     /// Only meaningful from a member who may manage roles.
-    RoleName { role_id: u8, name: String },
+    RoleNames(Vec<(u8, String)>),
+    /// From a joiner, for the server's current state.
+    ServerStateRequest,
+    /// Only meaningful from a member who may manage channels, to a device that asked.
+    ServerState(ServerStatePayload),
 }
 
 // --- open_any: handle both app messages and commits from the relay ---
 
 pub enum InboundMessage {
     Application(ApplicationMessage),
-    /// A commit was merged. Contains fingerprints of members removed by this commit.
-    Commit { removed: Vec<[u8; 32]> },
+    /// An application message from a device the receiver's identity log does not list
+    /// yet. Its key is spent by decrypting it, so it cannot be opened again: the caller
+    /// keeps it, refreshes the account's log, and accepts it only if the device then
+    /// shows active.
+    Unverified { msg: ApplicationMessage, claim: CredentialClaim },
+    /// A commit was merged: the members it removed (fingerprints) and the account that
+    /// made it.
+    Commit { removed: Vec<[u8; 32]>, committer: [u8; 32] },
     /// A proposal was queued (e.g. relay-generated Remove). Pending proposals
     /// should be committed by the group creator to advance the epoch.
     ProposalProcessed,
@@ -916,17 +906,14 @@ fn extract_sender_identity(
     Ok((account_fp, device_vk))
 }
 
-/// Whether the identity log this client holds shows `device_vk` revoked for
-/// `account_fp`. Accounts and devices the client has no log entry for count as
-/// not revoked: relays and MLS removal stop those, and a device added since the
-/// last refresh must not be rejected.
-pub type RevocationCheck<'a> = &'a dyn Fn(&[u8; 32], &[u8; 32]) -> bool;
+/// What the receiver's identity log says about the device a credential claims to be.
+pub type DeviceLookup<'a> = &'a dyn Fn(&CredentialClaim) -> DeviceStatus;
 
 /// What a receiver checks a commit against beyond MLS itself, so every member
 /// enforces the rules the relay enforces and a relay cannot slip a forbidden
 /// change past them.
 pub struct CommitChecks<'a> {
-    pub revoked: RevocationCheck<'a>,
+    pub devices: DeviceLookup<'a>,
     /// The group's mailbox, which invite grants for it name.
     pub mailbox: [u8; 32],
     /// When the relay received the commit, against which invite grants expire.
@@ -952,45 +939,35 @@ pub(crate) fn check_policy(
     };
     policy_mls::check_commit(sender, staged, aad, &facts, checks.server_at).map_err(|e| match e {
         PolicyError::ContextBehind { server_mailbox, epoch } => GhostError::PolicyBehind { server_mailbox, epoch },
-        other => GhostError::PermissionDenied(format!("commit refused: {other}")),
+        other => GhostError::PolicyRefused(other.to_string()),
     })
 }
 
-/// Verify a self-validating credential: blake3(master_vk) == account_fp,
-/// then ed25519_verify(master_vk, delegation_payload, delegation_sig), then that
-/// the device has not been revoked. The delegation outlives a revocation, so
-/// without the last check a revoked device stays valid until it is removed from
-/// every group.
-fn validate_device_credential(
-    credential: &Credential,
-    device_vk: &[u8; 32],
-    revoked: RevocationCheck,
-) -> Result<()> {
+/// The claim a credential makes for the device holding `device_vk`.
+pub(crate) fn claim_of(credential: &Credential, device_vk: &[u8; 32]) -> Result<CredentialClaim> {
     let parsed = crate::mls::credential::parse_credential(credential)?;
+    Ok(CredentialClaim {
+        account_fp: parsed.account_fp,
+        device_vk: *device_vk,
+        add_seq: parsed.add_seq,
+        add_entry_hash: parsed.add_entry_hash,
+    })
+}
 
-    // Verify master key matches account fingerprint
-    let computed_fp: [u8; 32] = blake3::hash(&parsed.master_vk).into();
-    if computed_fp != parsed.account_fp {
-        return Err(GhostError::IdentityLog(
-            "master_vk does not match account_fp".into(),
-        ));
+/// Accept a device only if the account's identity log lists it as active, added by
+/// the entry its credential names. A credential proves nothing by itself, so a device
+/// the receiver's log does not list yet is not accepted: the caller fetches the
+/// account's log and asks again.
+fn validate_device_credential(credential: &Credential, device_vk: &[u8; 32], devices: DeviceLookup) -> Result<()> {
+    let claim = claim_of(credential, device_vk)?;
+    match devices(&claim) {
+        DeviceStatus::Active => Ok(()),
+        DeviceStatus::Revoked => Err(GhostError::SenderRefused("sender device has been revoked".into())),
+        DeviceStatus::Unknown => Err(GhostError::UnknownDevice { account_fp: claim.account_fp }),
+        DeviceStatus::Contradicted => Err(GhostError::SenderRefused(
+            "sender's credential names a different identity log entry than its account's log holds; possible fork".into(),
+        )),
     }
-
-    // Verify delegation signature
-    let master_vk = ed25519_dalek::VerifyingKey::from_bytes(&parsed.master_vk)
-        .map_err(|e| GhostError::IdentityLog(format!("invalid master_vk: {e}")))?;
-    let mut msg = Vec::with_capacity(crate::identity::DELEGATION_DOMAIN.len() + 32 + 32 + 8);
-    msg.extend_from_slice(crate::identity::DELEGATION_DOMAIN);
-    msg.extend_from_slice(device_vk);
-    msg.extend_from_slice(&parsed.account_fp);
-    msg.extend_from_slice(&parsed.idlog_seq.to_be_bytes());
-    let sig = ed25519_dalek::Signature::from_bytes(&parsed.delegation_sig);
-    master_vk.verify_strict(&msg, &sig)
-        .map_err(|e| GhostError::IdentityLog(format!("delegation signature invalid: {e}")))?;
-    if revoked(&parsed.account_fp, device_vk) {
-        return Err(GhostError::IdentityLog("sender device has been revoked".into()));
-    }
-    Ok(())
 }
 
 /// Extract account fingerprint and device key from a leaf node's credential.
@@ -1001,18 +978,19 @@ fn extract_leaf_identity(leaf: &openmls::prelude::LeafNode) -> Result<([u8; 32],
     Ok((account_fp, device_vk))
 }
 
-/// Validate sender's self-validating credential (delegation signature, not revoked).
+/// Check every device a message or commit vouches for against the identity logs: its
+/// sender, and for a commit the members it adds.
 pub(crate) fn validate_sender(
     group: &GhostGroup,
     credential: &Credential,
     sender: &Sender,
     staged_commit: Option<&openmls::prelude::StagedCommit>,
-    revoked: RevocationCheck,
+    devices: DeviceLookup,
 ) -> Result<()> {
     match sender {
         Sender::Member(_) => {
             let (_account_fp, device_vk) = extract_sender_identity(group, credential, sender)?;
-            validate_device_credential(credential, &device_vk, revoked)?;
+            validate_device_credential(credential, &device_vk, devices)?;
         }
         Sender::NewMemberCommit => {
             let staged = staged_commit
@@ -1020,18 +998,17 @@ pub(crate) fn validate_sender(
             let leaf = staged.update_path_leaf_node()
                 .ok_or_else(|| GhostError::Mls("external commit missing update path".into()))?;
             let (_account_fp, device_vk) = extract_leaf_identity(leaf)?;
-            validate_device_credential(leaf.credential(), &device_vk, revoked)?;
+            validate_device_credential(leaf.credential(), &device_vk, devices)?;
         }
         Sender::External(_) => {}
         Sender::NewMemberProposal => {}
     }
 
-    // Validate credentials of all members being added
     if let Some(staged) = staged_commit {
         for add in staged.add_proposals() {
             let leaf = add.add_proposal().key_package().leaf_node();
             let (_fp, vk) = extract_leaf_identity(leaf)?;
-            validate_device_credential(leaf.credential(), &vk, revoked)?;
+            validate_device_credential(leaf.credential(), &vk, devices)?;
         }
     }
 
@@ -1040,8 +1017,10 @@ pub(crate) fn validate_sender(
 
 /// Process an inbound blob that could be an application message or a commit.
 /// Strips the envelope header, then decrypts. App messages are returned;
-/// commits are merged into the group automatically.
-/// Sender credentials are validated via self-validating delegation signatures.
+/// commits are merged into the group automatically. Every device involved is checked
+/// against the identity logs; a commit naming a device the receiver's log does not
+/// list fails with `UnknownDevice` before merging, so it can be processed again once
+/// the log is fetched.
 pub fn open_any(
     group: &mut GhostGroup,
     provider: &GhostProvider,
@@ -1055,7 +1034,7 @@ pub fn open_any(
     let credential = processed.credential().clone();
     let sender = processed.sender().clone();
     let aad = processed.aad().to_vec();
-    let revoked = checks.revoked;
+    let devices = checks.devices;
 
     match processed.into_content() {
         ProcessedMessageContent::ApplicationMessage(app_msg) => {
@@ -1067,16 +1046,23 @@ pub fn open_any(
                 ));
             }
 
-            validate_sender(group, &credential, &sender, None, revoked)?;
-            Ok(InboundMessage::Application(msg))
+            match validate_sender(group, &credential, &sender, None, devices) {
+                Ok(()) => Ok(InboundMessage::Application(msg)),
+                Err(GhostError::UnknownDevice { .. }) => {
+                    let (_fp, device_vk) = extract_sender_identity(group, &credential, &sender)?;
+                    Ok(InboundMessage::Unverified { msg, claim: claim_of(&credential, &device_vk)? })
+                }
+                Err(e) => Err(e),
+            }
         }
         ProcessedMessageContent::StagedCommitMessage(staged_commit) => {
-            validate_sender(group, &credential, &sender, Some(&staged_commit), revoked)?;
+            validate_sender(group, &credential, &sender, Some(&staged_commit), devices)?;
             check_policy(group, &sender, &staged_commit, &aad, checks)?;
 
             let removed = extract_removed_fps(group, &staged_commit);
+            let committer = crate::mls::credential::parse_credential(&credential)?.account_fp;
             group.merge_staged_commit(provider, *staged_commit)?;
-            Ok(InboundMessage::Commit { removed })
+            Ok(InboundMessage::Commit { removed, committer })
         }
         ProcessedMessageContent::ProposalMessage(proposal) => {
             // Which proposals a commit may include is decided when committing.
@@ -1135,13 +1121,13 @@ pub fn seal(
     Ok(out)
 }
 
-/// Strip envelope header, MLS-decrypt, and deserialize into an ApplicationMessage.
-/// Validates sender credentials via self-validating delegation signatures.
+/// Strip envelope header, MLS-decrypt, and deserialize into an ApplicationMessage,
+/// accepting it only from a device the identity logs list as active.
 pub fn open(
     group: &mut GhostGroup,
     provider: &GhostProvider,
     blob: &[u8],
-    revoked: RevocationCheck,
+    devices: DeviceLookup,
 ) -> Result<ApplicationMessage> {
     ghost_wire::decode_envelope(blob)
         .map_err(|e| GhostError::Format(format!("envelope: {e}")))?;
@@ -1158,7 +1144,7 @@ pub fn open(
             if msg.sender_fp != sender_account_fp {
                 return Err(GhostError::Format("sender_fp does not match MLS credential".into()));
             }
-            validate_sender(group, &credential, &sender, None, revoked)?;
+            validate_sender(group, &credential, &sender, None, devices)?;
             Ok(msg)
         }
         _ => Err(GhostError::Mls("expected application message".into())),
@@ -1169,9 +1155,35 @@ pub fn open(
 mod tests {
     use super::*;
     use crate::identity::Identity;
-    use crate::mls::credential::generate_key_package;
 
     const MESSAGE_ID_OFFSET: usize = 1 + 1 + 32 + 32 + 8;
+
+    /// A lookup for tests without identity logs: every device is active.
+    fn all_active(_: &CredentialClaim) -> DeviceStatus {
+        DeviceStatus::Active
+    }
+
+    /// Two members of one group: A made it and took in B's external join.
+    fn two_member_group() -> (GhostProvider, GhostGroup, GhostProvider, GhostGroup, Identity, Identity) {
+        let provider_a = GhostProvider::new_in_memory().unwrap();
+        let provider_b = GhostProvider::new_in_memory().unwrap();
+        let id_a = Identity::from_seed([0x01; 32]).unwrap();
+        let id_b = Identity::from_seed([0x02; 32]).unwrap();
+        let server_id = [0x42; 32];
+        let channel_id = derive_default_channel_id(&server_id);
+        let mut group_a = GhostGroup::create(&provider_a, &id_a, &server_id, &channel_id, None, None).unwrap();
+        let group_info = group_a.export_group_info(&provider_a).unwrap();
+        let (group_b, commit) =
+            GhostGroup::join_by_external_commit(&provider_b, &id_b, &group_info, &ghost_wire::policy::CommitAad::default()).unwrap();
+        let processed = group_a.process_message_bytes(&provider_a, &commit[ghost_wire::ENVELOPE_HEADER_SIZE..]).unwrap();
+        match processed.into_content() {
+            openmls::prelude::ProcessedMessageContent::StagedCommitMessage(staged) => {
+                group_a.merge_staged_commit(&provider_a, *staged).unwrap()
+            }
+            _ => panic!("B's join is a commit"),
+        }
+        (provider_a, group_a, provider_b, group_b, id_a, id_b)
+    }
 
     fn test_channel() -> [u8; 32] {
         [0xAA; 32]
@@ -1227,6 +1239,24 @@ mod tests {
         assert_eq!(decoded.references.len(), 1);
         assert_eq!(decoded.references[0], target);
         assert_eq!(decoded.content, b"replying");
+    }
+
+    #[test]
+    fn a_message_type_only_receivers_make_is_refused_from_a_sender() {
+        for local in [MessageType::Undecryptable, MessageType::HistoryGap] {
+            let msg = ApplicationMessage::new(local, test_channel(), test_sender(), 1000, [0u8; 32], vec![], b"forged".to_vec()).unwrap();
+            assert!(matches!(ApplicationMessage::from_bytes(&msg.to_bytes()), Err(GhostError::Format(_))), "{local:?} accepted from a sender");
+        }
+    }
+
+    #[test]
+    fn roundtrip_channel_reorder() {
+        let positions = vec![([0x11; 32], 0), ([0x22; 32], 2), ([0x33; 32], 3)];
+        let encoded = encode_channel_op(&ChannelOpPayload::Reorder { positions: positions.clone() });
+        match decode_channel_op(&encoded).unwrap() {
+            ChannelOpPayload::Reorder { positions: decoded } => assert_eq!(decoded, positions),
+            _ => panic!("decoded as another channel op"),
+        }
     }
 
     #[test]
@@ -1377,12 +1407,12 @@ mod tests {
     }
 
     #[test]
-    fn create_with_id_uses_derived_group_id() {
+    fn create_uses_derived_group_id() {
         let provider = GhostProvider::new_in_memory().unwrap();
         let id = Identity::from_seed([0x01; 32]).unwrap();
         let server_id = [0x42; 32];
         let channel_id = derive_default_channel_id(&server_id);
-        let group = GhostGroup::create_with_id(&provider, &id, &server_id, &channel_id, None, None).unwrap();
+        let group = GhostGroup::create(&provider, &id, &server_id, &channel_id, None, None).unwrap();
 
         let expected = derive_mls_group_id(&server_id, &channel_id);
         assert_eq!(group.group_id(), expected);
@@ -1390,20 +1420,7 @@ mod tests {
 
     #[test]
     fn seal_open_roundtrip() {
-        let provider_a = GhostProvider::new_in_memory().unwrap();
-        let provider_b = GhostProvider::new_in_memory().unwrap();
-        let id_a = Identity::from_seed([0x01; 32]).unwrap();
-        let id_b = Identity::from_seed([0x02; 32]).unwrap();
-
-        let server_id = [0x42; 32];
-        let channel_id = derive_default_channel_id(&server_id);
-        let mut group_a =
-            GhostGroup::create_with_id(&provider_a, &id_a, &server_id, &channel_id, None, None).unwrap();
-        let kp_b = generate_key_package(&provider_b, &id_b).unwrap();
-        let (_commit, welcome) = group_a.add_member(&provider_a, kp_b, &ghost_wire::policy::CommitAad::default()).unwrap();
-        group_a.merge_pending_commit(&provider_a).unwrap();
-        let mut group_b =
-            GhostGroup::join(&provider_b, &id_b, &welcome.to_bytes().unwrap()).unwrap();
+        let (provider_a, mut group_a, provider_b, mut group_b, id_a, _id_b) = two_member_group();
 
         let kt_hash = [0x42; 32];
         let msg = ApplicationMessage::new(
@@ -1419,7 +1436,7 @@ mod tests {
 
         let blob = seal(&mut group_a, &provider_a, &msg).unwrap();
 
-        let decrypted = open(&mut group_b, &provider_b, &blob, &|_, _| false).unwrap();
+        let decrypted = open(&mut group_b, &provider_b, &blob, &all_active).unwrap();
 
         assert_eq!(decrypted.message_type, MessageType::Text);
         assert_eq!(decrypted.channel_id, test_channel());
@@ -1431,20 +1448,7 @@ mod tests {
 
     #[test]
     fn reject_spoofed_sender_fp() {
-        let provider_a = GhostProvider::new_in_memory().unwrap();
-        let provider_b = GhostProvider::new_in_memory().unwrap();
-        let id_a = Identity::from_seed([0x01; 32]).unwrap();
-        let id_b = Identity::from_seed([0x02; 32]).unwrap();
-
-        let server_id = [0x42; 32];
-        let channel_id = derive_default_channel_id(&server_id);
-        let mut group_a =
-            GhostGroup::create_with_id(&provider_a, &id_a, &server_id, &channel_id, None, None).unwrap();
-        let kp_b = generate_key_package(&provider_b, &id_b).unwrap();
-        let (_commit, welcome) = group_a.add_member(&provider_a, kp_b, &ghost_wire::policy::CommitAad::default()).unwrap();
-        group_a.merge_pending_commit(&provider_a).unwrap();
-        let mut group_b =
-            GhostGroup::join(&provider_b, &id_b, &welcome.to_bytes().unwrap()).unwrap();
+        let (provider_a, mut group_a, provider_b, mut group_b, _id_a, id_b) = two_member_group();
 
         // Sender crafts a message claiming to be the other member
         let msg = ApplicationMessage::new(
@@ -1460,26 +1464,13 @@ mod tests {
 
         let blob = seal(&mut group_a, &provider_a, &msg).unwrap();
 
-        let result = open(&mut group_b, &provider_b, &blob, &|_, _| false);
+        let result = open(&mut group_b, &provider_b, &blob, &all_active);
         assert!(result.is_err());
     }
 
     #[test]
     fn reject_message_from_revoked_device() {
-        let provider_a = GhostProvider::new_in_memory().unwrap();
-        let provider_b = GhostProvider::new_in_memory().unwrap();
-        let id_a = Identity::from_seed([0x01; 32]).unwrap();
-        let id_b = Identity::from_seed([0x02; 32]).unwrap();
-
-        let server_id = [0x42; 32];
-        let channel_id = derive_default_channel_id(&server_id);
-        let mut group_a =
-            GhostGroup::create_with_id(&provider_a, &id_a, &server_id, &channel_id, None, None).unwrap();
-        let kp_b = generate_key_package(&provider_b, &id_b).unwrap();
-        let (_commit, welcome) = group_a.add_member(&provider_a, kp_b, &ghost_wire::policy::CommitAad::default()).unwrap();
-        group_a.merge_pending_commit(&provider_a).unwrap();
-        let mut group_b =
-            GhostGroup::join(&provider_b, &id_b, &welcome.to_bytes().unwrap()).unwrap();
+        let (provider_a, mut group_a, provider_b, mut group_b, id_a, _id_b) = two_member_group();
 
         let msg = ApplicationMessage::new(
             MessageType::Text, test_channel(), id_a.fingerprint, 1000, [0u8; 32], vec![], b"still here".to_vec(),
@@ -1487,14 +1478,39 @@ mod tests {
         .unwrap();
         let blob = seal(&mut group_a, &provider_a, &msg).unwrap();
 
-        // A's delegation is still valid, but B's log shows A's device revoked.
+        // B's log shows A's device revoked.
         let a_fp = id_a.fingerprint;
         let a_vk = id_a.verifying_key.to_bytes();
-        let revoked = move |fp: &[u8; 32], vk: &[u8; 32]| *fp == a_fp && *vk == a_vk;
-        let Err(err) = open(&mut group_b, &provider_b, &blob, &revoked) else {
+        let devices = move |claim: &CredentialClaim| {
+            if claim.account_fp == a_fp && claim.device_vk == a_vk { DeviceStatus::Revoked } else { DeviceStatus::Active }
+        };
+        let Err(err) = open(&mut group_b, &provider_b, &blob, &devices) else {
             panic!("a message from a revoked device was accepted");
         };
-        assert!(err.to_string().contains("revoked"), "{err}");
+        assert!(matches!(err, GhostError::SenderRefused(_)), "{err}");
+    }
+
+    #[test]
+    fn a_message_from_an_unlisted_device_is_held_not_accepted() {
+        let (provider_a, mut group_a, provider_b, mut group_b, id_a, _id_b) = two_member_group();
+
+        let msg = ApplicationMessage::new(
+            MessageType::Text, test_channel(), id_a.fingerprint, 1000, [0u8; 32], vec![], b"who am I".to_vec(),
+        )
+        .unwrap();
+        let blob = seal(&mut group_a, &provider_a, &msg).unwrap();
+
+        let unknown = |_: &CredentialClaim| DeviceStatus::Unknown;
+        let no_server = |_: &[u8; 32], _: u64| Err(PolicyError::Denied("no server".into()));
+        let checks = CommitChecks { devices: &unknown, mailbox: [0u8; 32], received_at: 0, server_at: &no_server };
+        match open_any(&mut group_b, &provider_b, &blob, &checks).unwrap() {
+            InboundMessage::Unverified { msg: held, claim } => {
+                assert_eq!(held.content, b"who am I");
+                assert_eq!(claim.account_fp, id_a.fingerprint);
+                assert_eq!(claim.device_vk, id_a.verifying_key.to_bytes());
+            }
+            _ => panic!("an unlisted device's message was not held"),
+        }
     }
 
     #[test]
@@ -1549,79 +1565,13 @@ mod tests {
 
     // --- Sync seal/open crypto tests ---
 
-    #[test]
-    fn sync_seal_open_roundtrip() {
-        let key = [0xAA; 32];
-        let plaintext = b"hello multi-device";
-        let sealed = sync_seal(&key, plaintext).unwrap();
-        assert_ne!(&sealed, plaintext); // not plaintext
-        assert_eq!(sealed.len(), 12 + plaintext.len() + 16); // nonce + payload + GCM tag
-        let opened = sync_open(&key, &sealed).unwrap();
-        assert_eq!(opened, plaintext);
-    }
-
-    #[test]
-    fn sync_open_wrong_key_fails() {
-        let sealed = sync_seal(&[0xAA; 32], b"secret").unwrap();
-        assert!(sync_open(&[0xBB; 32], &sealed).is_err());
-    }
-
-    #[test]
-    fn sync_open_truncated_blob_fails() {
-        let sealed = sync_seal(&[0xAA; 32], b"data").unwrap();
-        // Cut off the GCM tag
-        assert!(sync_open(&[0xAA; 32], &sealed[..sealed.len() - 4]).is_err());
-    }
-
-    #[test]
-    fn sync_open_too_short_fails() {
-        assert!(sync_open(&[0xAA; 32], &[0u8; 11]).is_err()); // less than nonce
-    }
-
-    #[test]
-    fn sync_seal_produces_different_nonces() {
-        let key = [0xCC; 32];
-        let a = sync_seal(&key, b"same").unwrap();
-        let b = sync_seal(&key, b"same").unwrap();
-        assert_ne!(a[..12], b[..12]); // nonces differ
-    }
-
-    #[test]
-    fn sync_open_tampered_ciphertext_fails() {
-        let key = [0xDD; 32];
-        let mut sealed = sync_seal(&key, b"authentic").unwrap();
-        sealed[14] ^= 0xFF; // flip a ciphertext byte
-        assert!(sync_open(&key, &sealed).is_err());
-    }
-
     // --- Sync state dump edge cases ---
-
-    #[test]
-    fn sync_state_dump_empty() {
-        let encoded = encode_sync_state_dump(&[]).unwrap();
-        let decoded = decode_sync_state_dump(&encoded).unwrap();
-        assert!(decoded.is_empty());
-    }
-
-    #[test]
-    fn sync_state_dump_decode_truncated_header() {
-        assert!(decode_sync_state_dump(&[0x00]).is_err()); // 1 byte, need 2
-    }
 
     #[test]
     fn sync_state_dump_decode_truncated_entry() {
         // Says 1 entry but no data follows
         let data = [0x00, 0x01];
         assert!(decode_sync_state_dump(&data).is_err());
-    }
-
-    #[test]
-    fn sync_state_dump_decode_truncated_value() {
-        // Build a valid entry header then cut off the value
-        let entries = vec![("k".to_string(), Some(vec![0xAA; 100]), 1)];
-        let mut encoded = encode_sync_state_dump(&entries).unwrap();
-        encoded.truncate(encoded.len() - 50); // chop value
-        assert!(decode_sync_state_dump(&encoded).is_err());
     }
 
     // --- Mutation edge cases ---
@@ -1653,12 +1603,10 @@ mod tests {
                 InviteMember {
                     fingerprint: [0x22; 32],
                     display_name: "Alice".to_string(),
-                    role: MemberRole::Creator,
                 },
                 InviteMember {
                     fingerprint: [0x33; 32],
                     display_name: "Bob".to_string(),
-                    role: MemberRole::Member,
                 },
             ],
             channels: vec![
@@ -1694,58 +1642,6 @@ mod tests {
         assert_eq!(decoded.channels[1].name, "voice");
         assert_eq!(decoded.mailbox_id, pp.mailbox_id);
         assert_eq!(decoded.role_names, pp.role_names);
-    }
-
-    #[test]
-    fn provision_payload_empty_server() {
-        let pp = ProvisionPayload {
-            server_id: [0xFF; 32],
-            server_name: "Empty".to_string(),
-            kind: ServerKind::Dm,
-            members: vec![],
-            channels: vec![],
-            mailbox_id: [0xEE; 32],
-            relay_ref: None,
-            role_names: vec![],
-        };
-        let bytes = pp.to_bytes();
-        let decoded = ProvisionPayload::from_bytes(&bytes).unwrap();
-        assert!(decoded.relay_ref.is_none());
-        assert!(decoded.members.is_empty());
-        assert!(decoded.channels.is_empty());
-    }
-
-    #[test]
-    fn provision_payload_truncated_fails() {
-        let pp = ProvisionPayload {
-            server_id: [0x11; 32],
-            server_name: "Test".to_string(),
-            kind: ServerKind::Server,
-            members: vec![],
-            channels: vec![],
-            mailbox_id: [0x22; 32],
-            relay_ref: None,
-            role_names: vec![],
-        };
-        let bytes = pp.to_bytes();
-        assert!(ProvisionPayload::from_bytes(&bytes[..bytes.len() - 10]).is_err());
-    }
-
-    #[test]
-    fn provision_payload_trailing_bytes_rejected() {
-        let pp = ProvisionPayload {
-            server_id: [0x11; 32],
-            server_name: "Test".to_string(),
-            kind: ServerKind::Server,
-            members: vec![],
-            channels: vec![],
-            mailbox_id: [0x22; 32],
-            relay_ref: None,
-            role_names: vec![],
-        };
-        let mut bytes = pp.to_bytes();
-        bytes.push(0xFF); // trailing junk
-        assert!(ProvisionPayload::from_bytes(&bytes).is_err());
     }
 
     // --- Provision blob (the full envelope: sync_key + payloads + sync state) ---
@@ -1806,18 +1702,6 @@ mod tests {
         assert!(recovered_sync[1].1.is_none()); // tombstone preserved
     }
 
-    #[test]
-    fn sync_state_dump_large_roundtrip() {
-        // Many entries to stress the count/offset logic
-        let entries: Vec<_> = (0..200)
-            .map(|i| (format!("key:{i}"), Some(vec![i as u8; 10]), i as u64))
-            .collect();
-        let encoded = encode_sync_state_dump(&entries).unwrap();
-        let decoded = decode_sync_state_dump(&encoded).unwrap();
-        assert_eq!(decoded.len(), 200);
-        assert_eq!(decoded[199].0, "key:199");
-    }
-
     // --- Domain separation ---
 
     #[test]
@@ -1828,9 +1712,9 @@ mod tests {
         let mls_gid = derive_mls_group_id(&id, &ch);
         let channel = derive_default_channel_id(&id);
         let mailbox = mls_group_mailbox_id(&id);
-        let sync_sid = sync_server_id(&id);
+        let sync_mailbox = ghost_wire::sync_mailbox_id(&id);
         // All four must be different (domain tags prevent collisions)
-        let all = [mls_gid, channel, mailbox, sync_sid];
+        let all = [mls_gid, channel, mailbox, sync_mailbox];
         for i in 0..all.len() {
             for j in (i + 1)..all.len() {
                 assert_ne!(all[i], all[j], "domain separation failed between derivation {i} and {j}");
@@ -1855,12 +1739,10 @@ mod tests {
                 InviteMember {
                     fingerprint: [0x22; 32],
                     display_name: "Alice".to_string(),
-                    role: MemberRole::Creator,
                 },
                 InviteMember {
                     fingerprint: [0x33; 32],
                     display_name: "Bob".to_string(),
-                    role: MemberRole::Member,
                 },
             ],
             channels: vec![InviteChannel {
@@ -1939,6 +1821,27 @@ mod tests {
     }
 
     #[test]
+    fn server_state_roundtrip() {
+        assert!(matches!(decode_metadata(&encode_server_state_request()).unwrap(), MetadataPayload::ServerStateRequest));
+        let state = ServerStatePayload {
+            request_seq: 41,
+            channels: vec![InviteChannel { channel_id: [1; 32], name: "news".into(), kind: ChannelKind::Voice, position: 3, group_info_bytes: Vec::new() }],
+            role_names: vec![(1, "staff".into())],
+            members: vec![InviteMember { fingerprint: [2; 32], display_name: "bob".into() }],
+        };
+        match decode_metadata(&encode_server_state(&state)).unwrap() {
+            MetadataPayload::ServerState(decoded) => {
+                assert_eq!(decoded.request_seq, 41);
+                assert_eq!(decoded.channels.len(), 1);
+                assert_eq!((decoded.channels[0].channel_id, decoded.channels[0].name.as_str(), decoded.channels[0].kind, decoded.channels[0].position), ([1; 32], "news", ChannelKind::Voice, 3));
+                assert_eq!(decoded.role_names, state.role_names);
+                assert_eq!((decoded.members[0].fingerprint, decoded.members[0].display_name.as_str()), ([2; 32], "bob"));
+            }
+            _ => panic!("decoded as other metadata"),
+        }
+    }
+
+    #[test]
     fn avatar_clear_roundtrip() {
         let encoded = encode_avatar_clear();
         let decoded = decode_metadata(&encoded).unwrap();
@@ -1969,6 +1872,7 @@ mod tests {
             ],
             relay_ref: Some(RelayRef::https([0x77; 32], "https://relay.example")),
             role_names: vec![],
+            removal: None,
         };
         let bytes = meta.to_bytes();
         let decoded = SyncServerMeta::from_bytes(&bytes).unwrap();
@@ -1985,6 +1889,26 @@ mod tests {
     }
 
     #[test]
+    fn sync_server_meta_carries_the_removal_and_who_made_it() {
+        let mut meta = SyncServerMeta {
+            server_name: "club".into(),
+            kind: ServerKind::Server,
+            mailbox_id: [0x44; 32],
+            channels: vec![],
+            relay_ref: None,
+            role_names: vec![(1, "mod".into())],
+            removal: Some(SyncRemoval { by: Some([0x55; 32]) }),
+        };
+        let decoded = SyncServerMeta::from_bytes(&meta.to_bytes()).unwrap();
+        assert_eq!(decoded.removal, Some(SyncRemoval { by: Some([0x55; 32]) }));
+        assert_eq!(decoded.role_names, vec![(1, "mod".to_string())]);
+
+        // A removal the relay reported without the removing commit names nobody.
+        meta.removal = Some(SyncRemoval { by: None });
+        assert_eq!(SyncServerMeta::from_bytes(&meta.to_bytes()).unwrap().removal, Some(SyncRemoval { by: None }));
+    }
+
+    #[test]
     fn sync_server_meta_trailing_bytes_rejected() {
         let meta = SyncServerMeta {
             server_name: "x".into(),
@@ -1993,6 +1917,7 @@ mod tests {
             channels: vec![],
             relay_ref: None,
             role_names: vec![],
+            removal: None,
         };
         let mut bytes = meta.to_bytes();
         bytes.push(0xFF);
@@ -2008,32 +1933,11 @@ mod tests {
             channels: vec![],
             relay_ref: None,
             role_names: vec![],
+            removal: None,
         };
         let bytes = meta.to_bytes();
         let decoded = SyncServerMeta::from_bytes(&bytes).unwrap();
         assert_eq!(decoded.server_name, "empty");
         assert!(decoded.channels.is_empty());
-    }
-
-    #[test]
-    fn sync_server_meta_written_before_relay_field_still_decodes() {
-        let meta = SyncServerMeta {
-            server_name: "old".into(),
-            kind: ServerKind::Server,
-            mailbox_id: [0x33; 32],
-            channels: vec![],
-            relay_ref: None,
-            role_names: vec![],
-        };
-        let mut bytes = meta.to_bytes();
-        // Snapshots from before roles end after the relay field; older ones end before
-        // its two-byte length.
-        bytes.truncate(bytes.len() - 1);
-        let decoded = SyncServerMeta::from_bytes(&bytes).unwrap();
-        assert!(decoded.role_names.is_empty());
-        bytes.truncate(bytes.len() - 2);
-        let decoded = SyncServerMeta::from_bytes(&bytes).unwrap();
-        assert_eq!(decoded.server_name, "old");
-        assert!(decoded.relay_ref.is_none());
     }
 }

@@ -6,7 +6,8 @@ use openmls::prelude::*;
 
 use crate::policy::{
     authorize_channel_commit, authorize_server_commit, ChannelPolicy, CommitAad, CommitSummary, Committer,
-    GrantContext, PolicyError, Removal, ServerPolicy, ServerView, CHANNEL_POLICY_EXTENSION, SERVER_POLICY_EXTENSION,
+    GrantContext, PolicyError, Removal, RemovedAccounts, ServerPolicy, ServerView, CHANNEL_POLICY_EXTENSION,
+    SERVER_POLICY_EXTENSION, SERVER_REMOVALS_EXTENSION,
 };
 
 /// Account fingerprint carried in a Ghost credential (its first 32 bytes).
@@ -22,6 +23,11 @@ pub fn policies(ext: &Extensions<GroupContext>) -> Result<(Option<ServerPolicy>,
     Ok((server, channel))
 }
 
+/// The removed list a server group's context extensions carry.
+pub fn removed_accounts(ext: &Extensions<GroupContext>) -> Result<Option<RemovedAccounts>, PolicyError> {
+    ext.unknown(SERVER_REMOVALS_EXTENSION).map(|e| RemovedAccounts::from_bytes(&e.0)).transpose()
+}
+
 /// Accounts in the group, each once.
 pub fn member_accounts(members: &[Member]) -> Vec<[u8; 32]> {
     let mut accounts: Vec<[u8; 32]> = Vec::new();
@@ -33,20 +39,13 @@ pub fn member_accounts(members: &[Member]) -> Vec<[u8; 32]> {
     accounts
 }
 
-/// The policy a server group is governed by. A group created before policies existed
-/// has the implicit one, owned by the account at its leftmost leaf: that is the
-/// creator's first device unless it was removed, and every verifier derives the same
-/// answer from the same tree.
-pub fn server_policy(extensions: &Extensions<GroupContext>, members: &[Member]) -> Result<ServerPolicy, PolicyError> {
-    if let (Some(policy), _) = policies(extensions)? {
-        return Ok(policy);
+/// The policy a server group is governed by: every server group carries one from its
+/// creation.
+pub fn server_policy(extensions: &Extensions<GroupContext>, _members: &[Member]) -> Result<ServerPolicy, PolicyError> {
+    match policies(extensions)? {
+        (Some(policy), _) => Ok(policy),
+        (None, _) => Err(denied("the group carries no server policy")),
     }
-    let owner = members
-        .iter()
-        .min_by_key(|m| m.index.u32())
-        .and_then(|m| account_of(&m.credential))
-        .ok_or_else(|| denied("group has no members"))?;
-    Ok(ServerPolicy::implicit(owner))
 }
 
 /// A server group's policy and members, for judging its private channels.
@@ -117,7 +116,20 @@ fn summarize(
             })
         })
         .collect::<Result<Vec<_>, PolicyError>>()?;
-    Ok(CommitSummary { committer, adds, removes, new_server_policy: None, new_channel_policy: None })
+    // An account departs when every one of its leaves is removed.
+    let removed_leaves: Vec<LeafNodeIndex> = staged.remove_proposals().map(|p| p.remove_proposal().removed()).collect();
+    let mut departed: Vec<[u8; 32]> = Vec::new();
+    for removal in &removes {
+        let every_leaf_removed = facts
+            .members
+            .iter()
+            .filter(|m| account_of(&m.credential) == Some(removal.account))
+            .all(|m| removed_leaves.contains(&m.index));
+        if every_leaf_removed && !departed.contains(&removal.account) {
+            departed.push(removal.account);
+        }
+    }
+    Ok(CommitSummary { committer, adds, removes, departed, new_server_policy: None, new_channel_policy: None, new_removed: None })
 }
 
 /// Decide a staged commit under the group's policy; `server_at` serves private
@@ -140,8 +152,13 @@ pub fn check_commit(
     let mut summary = summarize(sender, staged, facts, &aad)?;
     let (old_server, old_channel) = policies(facts.extensions)?;
     let (new_server, new_channel) = policies(staged.group_context().extensions())?;
+    let old_removed = removed_accounts(facts.extensions)?;
+    let new_removed = removed_accounts(staged.group_context().extensions())?;
 
     if let Some(channel) = old_channel {
+        if new_removed.is_some() {
+            return Err(denied("a channel group carries no removed list"));
+        }
         let Some(new_channel) = new_channel else {
             return Err(denied("a channel policy cannot be removed"));
         };
@@ -155,15 +172,20 @@ pub fn check_commit(
     if old_server.is_some() && new_server.is_none() {
         return Err(denied("a server policy cannot be removed"));
     }
+    if old_removed.is_some() && new_removed.is_none() {
+        return Err(denied("a removed list cannot be dropped"));
+    }
     let policy = server_policy(facts.extensions, facts.members)?;
+    let removed = old_removed.unwrap_or_default();
     summary.new_server_policy = new_server;
     summary.new_channel_policy = new_channel;
+    summary.new_removed = new_removed;
     let is_member_device = |account: &[u8; 32], device: &[u8; 32]| {
         facts
             .members
             .iter()
             .any(|m| m.signature_key.as_slice() == device && account_of(&m.credential).as_ref() == Some(account))
     };
-    let ctx = GrantContext { server_mailbox: facts.mailbox, now_millis: facts.now_millis, is_member_device: &is_member_device };
+    let ctx = GrantContext { server_mailbox: facts.mailbox, now_millis: facts.now_millis, is_member_device: &is_member_device, removed: &removed };
     authorize_server_commit(&policy, &summary, &ctx)
 }

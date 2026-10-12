@@ -208,8 +208,8 @@ async fn messages_survive_the_relay_being_killed_and_restarted() {
     // The relay dies mid-session and comes back on the same database; the devices
     // reconnect by themselves and the group carries on.
     relay.crash_and_restart().await;
-    bob.expect_event("reconnecting", |v| v["event"] == "relay_connectivity" && v["connected"] == true).await;
-    alice.expect_event("reconnecting", |v| v["event"] == "relay_connectivity" && v["connected"] == true).await;
+    bob.expect_event("reconnecting", |v| v["event"] == "relay_connectivity" && v["home"] == true).await;
+    alice.expect_event("reconnecting", |v| v["event"] == "relay_connectivity" && v["home"] == true).await;
     alice.request(json!({ "cmd": "say", "server": server, "channel": general, "text": "after the crash" })).await;
     bob.expect_message("after the crash").await;
 }

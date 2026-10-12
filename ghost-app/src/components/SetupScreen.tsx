@@ -1,210 +1,283 @@
-import { createSignal, Show, onCleanup } from "solid-js";
-import { setDisplayName, setRelayUrl, joinByInvite, joinAsNewDevice, setRecoveryPassphrase, skipRecoverySetup, recoverAccount } from "../lib/api";
-import { Loader, MonitorSmartphone, ArrowLeft, Copy, Check, ShieldAlert } from "lucide-solid";
+import { createSignal, Show, onCleanup, onMount } from "solid-js";
+import {
+  getAccountStatus, joinByInvite, joinAsNewDevice, beginCreateAccount, confirmNewAccount, cancelCreateAccount,
+  beginRecovery, confirmRecovery, recoverThroughRelay, cancelRecovery, resumeUnfinishedAccount,
+} from "../lib/api";
+import { Loader, MonitorSmartphone, ArrowLeft, ShieldAlert } from "lucide-solid";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { Button } from "./ui/button";
+import { RecoveryKeySteps, inputClass } from "./RecoveryKeySteps";
+import { errorCode } from "../lib/invoke";
+import type { RecoveryOutcome, SnapshotRestore } from "../lib/types";
+
+/** Linking failed: what the user can do about it, by the failure's code. */
+const describeLinkError = (e: unknown): string => {
+  switch (errorCode(e)) {
+    case "network":
+      return "couldn't reach the relay. check your connection and try again.";
+    case "not_found":
+      return "the pairing ended on your other device, or the code expired. generate a new code there.";
+    case "timed_out":
+      return "your other device didn't confirm. try again.";
+    default:
+      return String(e);
+  }
+};
+
+/** What a recovery did not bring back, for the user to hear; null when it all came back. */
+const describeRestore = (restore: SnapshotRestore | null): string | null => {
+  switch (restore) {
+    case "missing":
+      return "no saved list of your servers was found, so they aren't back yet. ask someone in each server for a new invite.";
+    case "unreadable":
+      return "the saved list of your servers was sealed with a key this recovery couldn't open, so they aren't back yet. ask someone in each server for a new invite.";
+    case "not_reached":
+      return "your relay didn't hand over your servers and settings yet. they come back on their own once it does.";
+    default:
+      return null;
+  }
+};
 
 interface Props {
   onComplete: () => void;
 }
 
-type Mode = "new" | "link" | "set-recovery-pass" | "recover";
+type Mode = "new" | "new-key" | "link" | "recover" | "recover-key" | "recover-home" | "done";
 
-const FLASH_MS = 1200;
+/** An invite link's parts, when `input` is one. */
+function parseInvite(input: string): { relay: string; token: string; key: string; r: string | null } | null {
+  try {
+    const url = new URL(input);
+    const relay = url.searchParams.get("relay");
+    const token = url.searchParams.get("token");
+    const key = url.searchParams.get("k");
+    if (relay && token && key) return { relay, token, key, r: url.searchParams.get("r") };
+  } catch {
+    // not a URL
+  }
+  return null;
+}
 
 export function SetupScreen(props: Props) {
   const [mode, setMode] = createSignal<Mode>("new");
   const [name, setName] = createSignal("");
+  /** What this device is called in the account's device list; the machine's name unless changed. */
+  const [deviceLabel, setDeviceLabel] = createSignal("");
   const [inviteOrRelay, setInviteOrRelay] = createSignal("");
+  const [defaultRelay, setDefaultRelay] = createSignal("");
   const [pairingCode, setPairingCode] = createSignal("");
   const [error, setError] = createSignal<string | null>(null);
   const [loading, setLoading] = createSignal(false);
   const [linkStatus, setLinkStatus] = createSignal<string | null>(null);
-
-  // Recovery setup state
-  const [passphrase, setPassphrase] = createSignal("");
-  const [passphraseConfirm, setPassphraseConfirm] = createSignal("");
-  const [recoveryCode, setRecoveryCode] = createSignal<string | null>(null);
-  const [codeCopied, setCodeCopied] = createSignal(false);
+  const [linkCode, setLinkCode] = createSignal<string | null>(null);
+  /** The new recovery key being shown, for a new or a recovered account. */
+  const [shownKey, setShownKey] = createSignal<string | null>(null);
+  /** An invite to join once the account exists. */
+  let pendingInvite: ReturnType<typeof parseInvite> = null;
 
   // Recover account state
-  const [recoverCode, setRecoverCode] = createSignal("");
-  const [recoverPassphrase, setRecoverPassphrase] = createSignal("");
-  const [recoverNewPassphrase, setRecoverNewPassphrase] = createSignal("");
-  const [recoverNewPassphraseConfirm, setRecoverNewPassphraseConfirm] = createSignal("");
+  const [recoverKey, setRecoverKey] = createSignal("");
+  const [recoverRelay, setRecoverRelay] = createSignal("");
+  const [unreachableHome, setUnreachableHome] = createSignal<string | null>(null);
+  /** Made or recovered, with something the user should hear before going on. */
+  const [done, setDone] = createSignal<{ title: string; note: string } | null>(null);
+  /** An account made here whose relay did not answer when the app last closed. */
+  const [unfinishedAt, setUnfinishedAt] = createSignal<string | null>(null);
+
+  /** Finish an account this device was making when the app last closed. */
+  const resumeUnfinished = async () => {
+    try {
+      const outcome = await resumeUnfinishedAccount();
+      if (outcome.outcome === "finished") {
+        props.onComplete();
+        return;
+      }
+      setUnfinishedAt(outcome.outcome === "waiting" ? outcome.relay_url : null);
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  onMount(async () => {
+    try {
+      const status = await getAccountStatus();
+      setDefaultRelay(status.relay_url);
+      setRecoverRelay(status.relay_url);
+      setDeviceLabel(status.device_label);
+    } catch {
+      // the fields stay empty
+    }
+    await resumeUnfinished();
+  });
+
+  const finishWith = (title: string, note: string | null) => {
+    if (!note) {
+      props.onComplete();
+      return;
+    }
+    setDone({ title, note });
+    setMode("done");
+  };
+
+  const reset = (target: Mode) => {
+    setMode(target);
+    setError(null);
+    setLoading(false);
+    setLinkStatus(null);
+    setLinkCode(null);
+    setShownKey(null);
+    setUnreachableHome(null);
+  };
+
+  // ── New account ──
 
   const handleNewAccount = async () => {
     const trimmedName = name().trim();
     if (!trimmedName) return;
-
     setLoading(true);
     setError(null);
-
     try {
-      await setDisplayName(trimmedName);
-
       const input = inviteOrRelay().trim();
-      if (input) {
-        // Try parsing as invite link first
-        try {
-          const url = new URL(input);
-          const relay = url.searchParams.get("relay");
-          const token = url.searchParams.get("token");
-          const key = url.searchParams.get("k");
-          if (relay && token && key) {
-            await setRelayUrl(relay);
-            await joinByInvite(relay, token, key, url.searchParams.get("r"));
-            setMode("set-recovery-pass");
-            setLoading(false);
-            return;
-          }
-        } catch {
-          // Not a URL with params — treat as relay URL
-        }
+      pendingInvite = parseInvite(input);
+      const relay = pendingInvite?.relay ?? (input || defaultRelay());
+      const key = await beginCreateAccount(trimmedName, relay, deviceLabel());
+      setShownKey(key);
+      setMode("new-key");
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setLoading(false);
+    }
+  };
 
-        await setRelayUrl(input);
+  const confirmAccount = async (typed: string) => {
+    await confirmNewAccount(typed);
+    let note: string | null = null;
+    if (pendingInvite) {
+      const invite = pendingInvite;
+      pendingInvite = null;
+      try {
+        await joinByInvite(invite.relay, invite.token, invite.key, invite.r);
+      } catch (e) {
+        // The account exists; the invite can be used again from inside the app.
+        note = `the invite didn't work: ${String(e)}. use it again from inside the app.`;
       }
-
-      setMode("set-recovery-pass");
-      setLoading(false);
-    } catch (e: any) {
-      setError(String(e));
-      setLoading(false);
     }
+    finishWith("your account is made.", note);
   };
 
-  const ppLongEnough = () => passphrase().length >= 12;
-  const ppMatch = () => passphraseConfirm().length === 0 || passphrase() === passphraseConfirm();
-  const ppReady = () => ppLongEnough() && passphraseConfirm().length > 0 && ppMatch();
-
-  const handleSetPassphrase = async () => {
-    if (!ppReady()) return;
-
-    setLoading(true);
-    setError(null);
-    try {
-      const code = await setRecoveryPassphrase(passphrase());
-      setPassphrase("");
-      setPassphraseConfirm("");
-      setRecoveryCode(code);
-      setLoading(false);
-    } catch (e: any) {
-      setError(String(e));
-      setLoading(false);
-    }
+  const cancelAccount = async () => {
+    await cancelCreateAccount().catch(() => {});
+    reset("new");
   };
 
-  const handleSkipRecovery = async () => {
-    try {
-      await skipRecoverySetup();
-      props.onComplete();
-    } catch (e: any) {
-      setError(String(e));
-    }
+  // ── Link ──
+
+  let unlisteners: UnlistenFn[] = [];
+  const stopListening = () => {
+    unlisteners.forEach((u) => u());
+    unlisteners = [];
   };
-
-  const copyRecoveryCode = () => {
-    const code = recoveryCode();
-    if (!code) return;
-    navigator.clipboard.writeText(code).catch(() => {});
-    setCodeCopied(true);
-    setTimeout(() => setCodeCopied(false), FLASH_MS);
-  };
-
-  const handleRecoverAccount = async () => {
-    const code = recoverCode().trim();
-    const pp = recoverPassphrase();
-    const newPp = recoverNewPassphrase();
-    const newPpConfirm = recoverNewPassphraseConfirm();
-    if (!code || !pp || !newPp) return;
-    if (newPp !== newPpConfirm) { setError("new passphrases don't match"); return; }
-    if (newPp.length < 12) { setError("new passphrase must be at least 12 characters"); return; }
-
-    setLoading(true);
-    setError(null);
-    try {
-      await recoverAccount(code, pp, newPp);
-      setRecoverPassphrase("");
-      setRecoverNewPassphrase("");
-      setRecoverNewPassphraseConfirm("");
-      setLoading(false);
-      props.onComplete();
-    } catch (e: any) {
-      const msg = String(e).toLowerCase();
-      if (msg.includes("404") || msg.includes("no recovery blob")) {
-        setError("no recovery blob found for this account");
-      } else if (msg.includes("decrypt") || msg.includes("aead") || msg.includes("passphrase")) {
-        setError("wrong passphrase");
-      } else if (msg.includes("invalid recovery code")) {
-        setError("invalid recovery code format");
-      } else if (msg.includes("bad fingerprint")) {
-        setError("invalid recovery code format");
-      } else {
-        setError(String(e));
-      }
-      setLoading(false);
-    }
-  };
-
-  let statusUnlisten: UnlistenFn | undefined;
-  onCleanup(() => statusUnlisten?.());
+  onCleanup(stopListening);
 
   const validatePairingCode = (code: string): string | null => {
-    const hexRegex = /^[0-9a-f]{64}$/i;
     const parts = code.split("#");
-    if (parts.length !== 3) return "invalid format — should be relay_url#fingerprint#secret";
+    if (parts.length < 4) return "that doesn't look like a pairing code";
     if (!parts[0].startsWith("http")) return "invalid relay url in pairing code";
-    if (!hexRegex.test(parts[1])) return "invalid fingerprint in pairing code";
-    if (!hexRegex.test(parts[2])) return "invalid secret in pairing code";
     return null;
   };
 
   const handleLinkDevice = async () => {
     const code = pairingCode().trim();
     if (!code) return;
-
     const validationError = validatePairingCode(code);
     if (validationError) {
       setError(validationError);
       return;
     }
-
     setLoading(true);
     setError(null);
     setLinkStatus("connecting…");
-
-    statusUnlisten = await listen<string>("link-status", (e) => {
-      setLinkStatus(e.payload);
-    });
-
+    unlisteners.push(await listen<string>("link-status", (e) => setLinkStatus(e.payload)));
+    unlisteners.push(await listen<string>("link-code", (e) => setLinkCode(e.payload)));
     try {
-      await joinAsNewDevice(code);
+      await joinAsNewDevice(code, deviceLabel());
       props.onComplete();
-    } catch (e: any) {
-      const msg = String(e);
-      if (msg.includes("fetch offer: ")) {
-        setError("couldn't reach relay. check your connection and try again.");
-      } else if (msg.includes("404") || msg.includes("NotFound")) {
-        setError("pairing code expired. generate a new code on your other device.");
-      } else if (msg.includes("timed out")) {
-        setError("other device didn't respond. try again.");
-      } else {
-        setError(msg);
-      }
+    } catch (e) {
+      setError(describeLinkError(e));
       setLinkStatus(null);
+      setLinkCode(null);
       setLoading(false);
     } finally {
-      statusUnlisten?.();
-      statusUnlisten = undefined;
+      stopListening();
     }
   };
 
-  const inputClass =
-    "w-full h-9 rounded px-3 text-sm bg-[var(--neutral-800)] text-[var(--neutral-100)] placeholder:text-[var(--neutral-600)] border border-[var(--neutral-700)] focus:border-[var(--purple-500)] outline-none";
+  // ── Recover ──
+
+  const handleBeginRecovery = async () => {
+    const key = recoverKey().trim();
+    const relay = recoverRelay().trim();
+    if (!key || !relay) return;
+    setLoading(true);
+    setError(null);
+    try {
+      setShownKey(await beginRecovery(key, relay, deviceLabel()));
+      setMode("recover-key");
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  /** Recovered: on into the app, unless the user is to hear what did not come back. */
+  const recovered = (outcome: RecoveryOutcome) => finishWith("your account is recovered.", describeRestore(outcome.restore));
+
+  const confirmRecoveredKey = async (typed: string) => {
+    const outcome = await confirmRecovery(typed);
+    if (outcome.outcome === "home_unreachable") {
+      setUnreachableHome(outcome.home_url ?? "your home relay");
+      setMode("recover-home");
+      return;
+    }
+    recovered(outcome);
+  };
+
+  const recoverHere = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      recovered(await recoverThroughRelay());
+    } catch (e) {
+      setError(String(e));
+      setLoading(false);
+    }
+  };
+
+  const cancelRecover = async () => {
+    await cancelRecovery().catch(() => {});
+    reset("recover");
+  };
+
+  /** The field naming this device, on every form that makes it part of an account. */
+  const deviceLabelField = () => (
+    <div>
+      <label class="text-xs text-[var(--neutral-400)] mb-1 block">this device's name</label>
+      <input
+        class={inputClass}
+        placeholder="how your other devices will list this one"
+        value={deviceLabel()}
+        onInput={(e) => setDeviceLabel(e.currentTarget.value)}
+        disabled={loading()}
+      />
+    </div>
+  );
 
   const backButton = (target: Mode) => (
     <button
       class="flex items-center gap-1 text-xs text-[var(--neutral-500)] hover:text-[var(--neutral-400)] cursor-pointer w-fit"
-      onClick={() => { setMode(target); setError(null); setLoading(false); setLinkStatus(null); setPassphrase(""); setPassphraseConfirm(""); setRecoverPassphrase(""); setRecoverNewPassphrase(""); setRecoverNewPassphraseConfirm(""); setRecoverCode(""); setPairingCode(""); }}
+      onClick={() => reset(target)}
     >
       <ArrowLeft size={12} />
       back
@@ -221,193 +294,141 @@ export function SetupScreen(props: Props) {
             <p class="text-xs text-[var(--neutral-500)] mt-1">encrypted chat</p>
           </div>
 
-          {/* ── Recovery passphrase setup (after account creation) ── */}
-          <Show when={mode() === "set-recovery-pass"}>
-            <Show when={!recoveryCode()} fallback={
-              /* ── Recovery code confirmation ── */
-              <div class="flex flex-col gap-3">
-                <p class="text-xs text-[var(--neutral-400)]">recovery configured. save this code — you'll need it along with your passphrase to recover your account.</p>
-                <div class="flex items-center gap-2 p-2.5 rounded bg-[var(--neutral-800)] border border-[var(--neutral-700)]">
-                  <span class="text-xs text-[var(--neutral-200)] font-mono break-all flex-1">{recoveryCode()}</span>
-                  <button
-                    class="flex-shrink-0 text-[var(--neutral-500)] hover:text-[var(--neutral-400)] cursor-pointer"
-                    onClick={copyRecoveryCode}
-                  >
-                    {codeCopied() ? <Check size={14} class="text-[var(--emerald-400)]" /> : <Copy size={14} />}
-                  </button>
-                </div>
-                <button
-                  class="w-full h-9 rounded text-sm font-medium bg-[var(--purple-600)] text-white hover:bg-[var(--purple-500)] cursor-pointer"
-                  onClick={() => props.onComplete()}
-                >
-                  continue
-                </button>
-              </div>
-            }>
-              {/* ── Passphrase input ── */}
-              <div class="flex flex-col gap-3">
-                <p class="text-xs text-[var(--neutral-400)]">set a recovery passphrase so you can recover your account if you lose all your devices.</p>
-                <div>
-                  <label class="text-xs text-[var(--neutral-400)] mb-1 block">recovery passphrase</label>
-                  <input
-                    class={inputClass}
-                    type="password"
-                    placeholder="at least 12 characters"
-                    value={passphrase()}
-                    onInput={(e) => setPassphrase(e.currentTarget.value)}
-                    onKeyDown={(e) => { if (e.key === "Enter") handleSetPassphrase(); }}
-                    autofocus
-                  />
-                  <Show when={passphrase().length > 0}>
-                    <p class={`text-xs mt-1 ${ppLongEnough() ? "text-[var(--emerald-400)]" : "text-[var(--neutral-600)]"}`}>
-                      {passphrase().length} / 12 characters
-                    </p>
-                  </Show>
-                </div>
-                <div>
-                  <label class="text-xs text-[var(--neutral-400)] mb-1 block">confirm passphrase</label>
-                  <input
-                    class={inputClass}
-                    type="password"
-                    placeholder="type it again"
-                    value={passphraseConfirm()}
-                    onInput={(e) => setPassphraseConfirm(e.currentTarget.value)}
-                    onKeyDown={(e) => { if (e.key === "Enter") handleSetPassphrase(); }}
-                  />
-                  <Show when={passphraseConfirm().length > 0 && !ppMatch()}>
-                    <p class="text-xs mt-1 text-[var(--red-400)]">passphrases don't match</p>
-                  </Show>
-                </div>
-
-                {error() && (
-                  <p class="text-xs text-[var(--red-400)]">{error()}</p>
-                )}
-
-                <button
-                  class="w-full h-9 rounded text-sm font-medium bg-[var(--purple-600)] text-white hover:bg-[var(--purple-500)] disabled:opacity-50 cursor-pointer disabled:cursor-default"
-                  onClick={handleSetPassphrase}
-                  disabled={!ppReady() || loading()}
-                >
-                  {loading() ? "encrypting…" : "set recovery passphrase"}
-                </button>
-
-                <button
-                  class="w-full h-9 rounded text-sm text-[var(--neutral-400)] hover:text-[var(--neutral-200)] border border-[var(--neutral-700)] hover:border-[var(--neutral-600)] cursor-pointer transition-colors duration-150"
-                  onClick={handleSkipRecovery}
-                >
-                  skip
-                </button>
-                <p class="text-xs text-[var(--neutral-600)] text-center">if you skip, you won't be able to recover your account if you lose all your devices</p>
-              </div>
-            </Show>
+          {/* ── New account: the recovery key, before anything is sent ── */}
+          <Show when={mode() === "new-key" && shownKey()}>
+            {(key) => (
+              <RecoveryKeySteps
+                shown={key()}
+                purpose="this is your recovery key: the only way back into your account if you lose every device."
+                confirm={confirmAccount}
+                onCancel={cancelAccount}
+                confirmLabel="create account"
+              />
+            )}
           </Show>
 
-          {/* ── Link device mode ── */}
+          {/* ── Link device ── */}
           <Show when={mode() === "link"}>
             <div class="flex flex-col gap-3">
               {backButton("new")}
-
               <div>
                 <label class="text-xs text-[var(--neutral-400)] mb-1 block">pairing code</label>
                 <input
                   class={inputClass}
-                  placeholder="paste code from your other device"
+                  placeholder="paste the code from your other device"
                   value={pairingCode()}
                   onInput={(e) => setPairingCode(e.currentTarget.value)}
                   onKeyDown={(e) => { if (e.key === "Enter") handleLinkDevice(); }}
+                  disabled={loading()}
                   autofocus
                 />
               </div>
-
+              {deviceLabelField()}
+              <Show when={linkCode()}>
+                <div class="flex flex-col gap-1 p-3 rounded bg-[var(--neutral-800)] border border-[var(--neutral-700)]">
+                  <p class="text-xs text-[var(--neutral-400)]">your other device shows a code. it should be:</p>
+                  <p class="text-2xl text-center font-mono tracking-widest text-[var(--neutral-100)]">{linkCode()}</p>
+                  <p class="text-xs text-[var(--neutral-500)]">confirm there, only if they match.</p>
+                </div>
+              </Show>
               <Show when={linkStatus()}>
                 <div class="flex items-center gap-1.5 text-xs text-[var(--neutral-500)]">
                   <Loader size={12} class="animate-spin" />
                   <span>{linkStatus()}</span>
                 </div>
               </Show>
-
-              {error() && (
-                <p class="text-xs text-[var(--red-400)]">{error()}</p>
-              )}
-
-              <button
-                class="w-full h-9 rounded text-sm font-medium bg-[var(--purple-600)] text-white hover:bg-[var(--purple-500)] disabled:opacity-50 cursor-pointer disabled:cursor-default"
-                onClick={handleLinkDevice}
-                disabled={!pairingCode().trim() || loading()}
-              >
+              {error() && <p class="text-xs text-[var(--red-400)]">{error()}</p>}
+              <Button size="lg" class="w-full" onClick={handleLinkDevice} disabled={!pairingCode().trim() || loading()}>
                 {loading() ? "linking…" : "link device"}
-              </button>
+              </Button>
             </div>
           </Show>
 
-          {/* ── Recover account mode ── */}
+          {/* ── Recover: key and relay ── */}
           <Show when={mode() === "recover"}>
             <div class="flex flex-col gap-3">
               {backButton("new")}
-
               <div>
-                <label class="text-xs text-[var(--neutral-400)] mb-1 block">recovery code</label>
+                <label class="text-xs text-[var(--neutral-400)] mb-1 block">recovery key</label>
                 <input
-                  class={inputClass}
-                  placeholder="relay.example.com#abc123..."
-                  value={recoverCode()}
-                  onInput={(e) => setRecoverCode(e.currentTarget.value)}
+                  class={`${inputClass} font-mono`}
+                  placeholder="XXXX-XXXX-XXXX-…"
+                  value={recoverKey()}
+                  onInput={(e) => setRecoverKey(e.currentTarget.value)}
                   autofocus
                 />
               </div>
-
               <div>
-                <label class="text-xs text-[var(--neutral-400)] mb-1 block">current recovery passphrase</label>
+                <label class="text-xs text-[var(--neutral-400)] mb-1 block">a relay your account uses</label>
                 <input
                   class={inputClass}
-                  type="password"
-                  placeholder="the passphrase you set during setup"
-                  value={recoverPassphrase()}
-                  onInput={(e) => setRecoverPassphrase(e.currentTarget.value)}
+                  placeholder="http://relay:7700"
+                  value={recoverRelay()}
+                  onInput={(e) => setRecoverRelay(e.currentTarget.value)}
+                  onKeyDown={(e) => { if (e.key === "Enter") handleBeginRecovery(); }}
                 />
+                <p class="text-xs text-[var(--neutral-600)] mt-1">your home relay, or any relay hosting a server you're in</p>
               </div>
+              {deviceLabelField()}
+              {error() && <p class="text-xs text-[var(--red-400)]">{error()}</p>}
+              <Button size="lg" class="w-full" onClick={handleBeginRecovery} disabled={!recoverKey().trim() || !recoverRelay().trim() || loading()}>
+                {loading() ? "looking up your account…" : "recover account"}
+              </Button>
+            </div>
+          </Show>
 
-              <div>
-                <label class="text-xs text-[var(--neutral-400)] mb-1 block">new recovery passphrase</label>
-                <input
-                  class={inputClass}
-                  type="password"
-                  placeholder="set a new passphrase (12+ characters)"
-                  value={recoverNewPassphrase()}
-                  onInput={(e) => setRecoverNewPassphrase(e.currentTarget.value)}
-                />
+          {/* ── Recover: the new key every recovery sets ── */}
+          <Show when={mode() === "recover-key" && shownKey()}>
+            {(key) => (
+              <RecoveryKeySteps
+                shown={key()}
+                purpose="recovering sets a new recovery key. the key you just used stops working once this is done."
+                confirm={confirmRecoveredKey}
+                onCancel={cancelRecover}
+                confirmLabel="recover account"
+              />
+            )}
+          </Show>
+
+          {/* ── Recover: the home relay did not answer ── */}
+          <Show when={mode() === "recover-home"}>
+            <div class="flex flex-col gap-3">
+              <p class="text-xs text-[var(--neutral-400)]">
+                your home relay, {unreachableHome()}, doesn't answer. you can recover through {recoverRelay()} and make it your home.
+                servers made on the old home stay there and come back if it does; everything else carries on from the new home.
+              </p>
+              <p class="text-xs text-[var(--neutral-400)]">if the home is only down for a moment, try again later instead.</p>
+              {error() && <p class="text-xs text-[var(--red-400)]">{error()}</p>}
+              <Button size="lg" class="w-full" onClick={recoverHere} disabled={loading()}>
+                {loading() ? "recovering…" : "make it my home and recover"}
+              </Button>
+              <Button variant="outline" size="lg" class="w-full" onClick={cancelRecover} disabled={loading()}>
+                try again later
+              </Button>
+            </div>
+          </Show>
+
+          {/* ── Made or recovered, with something to hear first ── */}
+          <Show when={mode() === "done" && done()}>
+            {(shown) => (
+              <div class="flex flex-col gap-3">
+                <p class="text-sm text-[var(--neutral-200)]">{shown().title}</p>
+                <p class="text-xs text-[var(--neutral-400)]">{shown().note}</p>
+                <Button size="lg" class="w-full" onClick={() => props.onComplete()}>
+                  continue
+                </Button>
               </div>
+            )}
+          </Show>
 
-              <div>
-                <label class="text-xs text-[var(--neutral-400)] mb-1 block">confirm new passphrase</label>
-                <input
-                  class={inputClass}
-                  type="password"
-                  placeholder="confirm new passphrase"
-                  value={recoverNewPassphraseConfirm()}
-                  onInput={(e) => setRecoverNewPassphraseConfirm(e.currentTarget.value)}
-                  onKeyDown={(e) => { if (e.key === "Enter") handleRecoverAccount(); }}
-                />
-              </div>
-
-              <Show when={loading()}>
-                <div class="flex items-center gap-1.5 text-xs text-[var(--neutral-500)]">
-                  <Loader size={12} class="animate-spin" />
-                  <span>recovering account…</span>
-                </div>
-              </Show>
-
-              {error() && (
-                <p class="text-xs text-[var(--red-400)]">{error()}</p>
-              )}
-
-              <button
-                class="w-full h-9 rounded text-sm font-medium bg-[var(--purple-600)] text-white hover:bg-[var(--purple-500)] disabled:opacity-50 cursor-pointer disabled:cursor-default"
-                onClick={handleRecoverAccount}
-                disabled={!recoverCode().trim() || !recoverPassphrase() || !recoverNewPassphrase() || !recoverNewPassphraseConfirm() || loading()}
-              >
-                {loading() ? "recovering…" : "recover account"}
-              </button>
+          {/* ── An account made here that its relay has not confirmed yet ── */}
+          <Show when={unfinishedAt() && mode() !== "done"}>
+            <div class="flex items-center gap-2 p-3 rounded bg-[var(--neutral-800)] border border-[var(--neutral-700)]">
+              <p class="text-xs text-[var(--neutral-400)] flex-1">
+                an account was being made on this device at {unfinishedAt()} when ghost closed, and that relay doesn't answer yet.
+                it's finished here once it does.
+              </p>
+              <Button size="sm" variant="outline" onClick={resumeUnfinished}>try again</Button>
             </div>
           </Show>
 
@@ -425,46 +446,30 @@ export function SetupScreen(props: Props) {
                   autofocus
                 />
               </div>
-
               <div>
                 <label class="text-xs text-[var(--neutral-400)] mb-1 block">invite link or relay url</label>
                 <input
                   class={inputClass}
-                  placeholder="paste invite link or http://relay:7700"
+                  placeholder={defaultRelay() || "paste invite link or http://relay:7700"}
                   value={inviteOrRelay()}
                   onInput={(e) => setInviteOrRelay(e.currentTarget.value)}
                   onKeyDown={(e) => { if (e.key === "Enter") handleNewAccount(); }}
                 />
-                <p class="text-xs text-[var(--neutral-600)] mt-1">optional — you can set this later</p>
+                <p class="text-xs text-[var(--neutral-600)] mt-1">your account lives on this relay; leave it to use the default</p>
               </div>
-
-              {error() && (
-                <p class="text-xs text-[var(--red-400)]">{error()}</p>
-              )}
-
-              <button
-                class="w-full h-9 rounded text-sm font-medium bg-[var(--purple-600)] text-white hover:bg-[var(--purple-500)] disabled:opacity-50 cursor-pointer disabled:cursor-default"
-                onClick={handleNewAccount}
-                disabled={!name().trim() || loading()}
-              >
-                {loading() ? "setting up…" : "get started"}
-              </button>
-
-              <button
-                class="w-full flex items-center justify-center gap-1.5 h-9 rounded text-sm text-[var(--neutral-400)] hover:text-[var(--neutral-200)] border border-[var(--neutral-700)] hover:border-[var(--neutral-600)] cursor-pointer transition-colors duration-150"
-                onClick={() => { setMode("link"); setError(null); }}
-              >
+              {deviceLabelField()}
+              {error() && <p class="text-xs text-[var(--red-400)]">{error()}</p>}
+              <Button size="lg" class="w-full" onClick={handleNewAccount} disabled={!name().trim() || loading()}>
+                {loading() ? "contacting relay…" : "get started"}
+              </Button>
+              <Button variant="outline" size="lg" class="w-full" onClick={() => reset("link")}>
                 <MonitorSmartphone size={14} />
                 link existing account
-              </button>
-
-              <button
-                class="w-full flex items-center justify-center gap-1.5 h-9 rounded text-sm text-[var(--neutral-400)] hover:text-[var(--neutral-200)] border border-[var(--neutral-700)] hover:border-[var(--neutral-600)] cursor-pointer transition-colors duration-150"
-                onClick={() => { setMode("recover"); setError(null); }}
-              >
+              </Button>
+              <Button variant="outline" size="lg" class="w-full" onClick={() => reset("recover")}>
                 <ShieldAlert size={14} />
                 recover account
-              </button>
+              </Button>
             </div>
           </Show>
         </div>

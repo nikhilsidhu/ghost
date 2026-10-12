@@ -12,10 +12,11 @@ mod policy;
 mod receiver;
 mod stretch;
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
-use ghost_media::{AudioTrack, TrackIo, TrackQuality};
+pub use ghost_media::{AudioTrack, TrackEvent, TrackIo};
+use ghost_media::TrackQuality;
 
 use constants::VAD_THRESHOLD;
 pub use devices::{AudioDevices, CaptureRead, DeviceStreams, Playback};
@@ -26,16 +27,6 @@ pub use receiver::PlayoutStats;
 pub enum NoiseSuppressionMode {
     Off = 0,
     Nnnoiseless = 1,
-}
-
-impl NoiseSuppressionMode {
-    /// From the configuration value: "off", or anything else for on.
-    pub fn from_config(s: &str) -> Self {
-        match s {
-            "off" => Self::Off,
-            _ => Self::Nnnoiseless,
-        }
-    }
 }
 
 impl From<u8> for NoiseSuppressionMode {
@@ -54,16 +45,6 @@ pub enum AgcMode {
     Auto = 1,
 }
 
-impl AgcMode {
-    /// From the configuration value: "off", or anything else for automatic.
-    pub fn from_config(s: &str) -> Self {
-        match s {
-            "off" => Self::Off,
-            _ => Self::Auto,
-        }
-    }
-}
-
 impl From<u8> for AgcMode {
     fn from(v: u8) -> Self {
         match v {
@@ -78,16 +59,6 @@ impl From<u8> for AgcMode {
 pub enum InputMode {
     VoiceActivity = 0,
     PushToTalk = 1,
-}
-
-impl InputMode {
-    /// From the configuration value: "push_to_talk", or anything else for voice activity.
-    pub fn from_config(s: &str) -> Self {
-        match s {
-            "push_to_talk" => Self::PushToTalk,
-            _ => Self::VoiceActivity,
-        }
-    }
 }
 
 impl From<u8> for InputMode {
@@ -113,6 +84,8 @@ pub(crate) struct AudioControls {
     pub input_gain: AtomicU32,
     pub input_mode: AtomicU8,
     pub ptt_active: AtomicBool,
+    /// RMS of the last captured frame after the input gain, 0 to 1, for a level meter.
+    pub input_level: AtomicU32,
     /// What playout has done this call, gathered every few seconds.
     pub playout_totals: Mutex<PlayoutStats>,
 }
@@ -132,15 +105,21 @@ impl AudioControls {
             input_gain: AtomicU32::new(1.0f32.to_bits()),
             input_mode: AtomicU8::new(InputMode::VoiceActivity as u8),
             ptt_active: AtomicBool::new(false),
+            input_level: AtomicU32::new(0.0f32.to_bits()),
             playout_totals: Mutex::new(PlayoutStats::default()),
         }
     }
 }
 
-/// The audio thread of the current call.
+/// The audio thread of the current call, and which start it came from.
 struct Running {
     stop: Arc<AtomicBool>,
+    run: TrackRun,
 }
+
+/// One start of the track, so whoever started it can stop that one alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrackRun(u64);
 
 /// Voice audio on a set of devices. Settings persist across calls and may change at
 /// any time; each call runs its own audio thread.
@@ -148,11 +127,53 @@ pub struct VoiceAudio {
     controls: Arc<AudioControls>,
     devices: Arc<dyn AudioDevices>,
     running: Mutex<Option<Running>>,
+    runs: AtomicU64,
 }
 
 impl VoiceAudio {
     pub fn new(devices: Arc<dyn AudioDevices>) -> Self {
-        Self { controls: Arc::new(AudioControls::new()), devices, running: Mutex::new(None) }
+        Self { controls: Arc::new(AudioControls::new()), devices, running: Mutex::new(None), runs: AtomicU64::new(0) }
+    }
+
+    /// Start the track as `AudioTrack::start` does, returning the run to stop later. A
+    /// failure of its devices goes to `io.events` unless the run was stopped first.
+    pub fn start_run(&self, io: TrackIo) -> Result<TrackRun, String> {
+        self.stop();
+        *self.controls.playout_totals.lock().unwrap() = PlayoutStats::default();
+        let stop = Arc::new(AtomicBool::new(false));
+        let run = TrackRun(self.runs.fetch_add(1, Ordering::Relaxed) + 1);
+        let (controls, devices, thread_stop, events) = (self.controls.clone(), self.devices.clone(), stop.clone(), io.events.clone());
+        std::thread::Builder::new()
+            .name("voice-audio".into())
+            .spawn(move || {
+                if let Err(e) = engine::run(controls, devices, io, thread_stop.clone()) {
+                    tracing::error!("voice audio thread failed: {e}");
+                    if !thread_stop.load(Ordering::Relaxed) {
+                        let _ = events.send(TrackEvent::Failed(e));
+                    }
+                }
+            })
+            .map_err(|e| format!("spawn audio thread: {e}"))?;
+        *self.running.lock().unwrap() = Some(Running { stop, run });
+        Ok(run)
+    }
+
+    /// Stop the track if `run` is still what runs; a later start is left alone.
+    pub fn stop_run(&self, run: TrackRun) {
+        let mut running = self.running.lock().unwrap();
+        if running.as_ref().is_some_and(|r| r.run == run) {
+            self.halt(running.take());
+        }
+    }
+
+    // The thread is told to stop and left to finish its current frame, rather than
+    // joined, so callers on an async runtime never block on device teardown.
+    fn halt(&self, running: Option<Running>) {
+        if let Some(running) = running {
+            running.stop.store(true, Ordering::Relaxed);
+        }
+        self.controls.speaking.store(false, Ordering::Relaxed);
+        self.controls.input_level.store(0.0f32.to_bits(), Ordering::Relaxed);
     }
 
     pub fn set_noise_suppression(&self, mode: NoiseSuppressionMode) {
@@ -182,6 +203,11 @@ impl VoiceAudio {
         self.controls.ptt_active.store(active, Ordering::Relaxed);
     }
 
+    /// How loud the microphone is right now, 0 to 1, after the input gain; 0 between calls.
+    pub fn input_level(&self) -> f32 {
+        f32::from_bits(self.controls.input_level.load(Ordering::Relaxed))
+    }
+
     /// What playout has done in the current call, as of the last quality reading.
     pub fn playout_stats(&self) -> PlayoutStats {
         *self.controls.playout_totals.lock().unwrap()
@@ -190,29 +216,12 @@ impl VoiceAudio {
 
 impl AudioTrack for VoiceAudio {
     fn start(&self, io: TrackIo) -> Result<(), String> {
-        self.stop();
-        *self.controls.playout_totals.lock().unwrap() = PlayoutStats::default();
-        let stop = Arc::new(AtomicBool::new(false));
-        let (controls, devices, thread_stop) = (self.controls.clone(), self.devices.clone(), stop.clone());
-        std::thread::Builder::new()
-            .name("voice-audio".into())
-            .spawn(move || {
-                if let Err(e) = engine::run(controls, devices, io, thread_stop) {
-                    eprintln!("voice audio thread failed: {e}");
-                }
-            })
-            .map_err(|e| format!("spawn audio thread: {e}"))?;
-        *self.running.lock().unwrap() = Some(Running { stop });
-        Ok(())
+        self.start_run(io).map(|_| ())
     }
 
-    // The thread is told to stop and left to finish its current frame, rather than
-    // joined, so callers on an async runtime never block on device teardown.
     fn stop(&self) {
-        if let Some(running) = self.running.lock().unwrap().take() {
-            running.stop.store(true, Ordering::Relaxed);
-        }
-        self.controls.speaking.store(false, Ordering::Relaxed);
+        let running = self.running.lock().unwrap().take();
+        self.halt(running);
     }
 
     fn set_muted(&self, muted: bool) {

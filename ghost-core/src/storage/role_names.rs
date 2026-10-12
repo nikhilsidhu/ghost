@@ -1,6 +1,6 @@
-use crate::error::{GhostError, Result};
+use crate::error::Result;
 
-use super::GhostStore;
+use super::{db, GhostStore};
 
 impl GhostStore {
     pub fn set_role_name(&self, server_id: &[u8; 32], role_id: u8, name: &str) -> Result<()> {
@@ -9,7 +9,7 @@ impl GhostStore {
                 "INSERT OR REPLACE INTO role_names (server_id, role_id, name) VALUES (?1, ?2, ?3)",
                 rusqlite::params![server_id.as_slice(), role_id, name],
             )
-            .map_err(|e| GhostError::Database(format!("set role name: {e}")))?;
+            .map_err(db("set role name"))?;
         Ok(())
     }
 
@@ -17,12 +17,12 @@ impl GhostStore {
         let mut stmt = self
             .conn
             .prepare("SELECT role_id, name FROM role_names WHERE server_id = ?1 ORDER BY role_id")
-            .map_err(|e| GhostError::Database(format!("list role names: {e}")))?;
+            .map_err(db("list role names"))?;
         let rows = stmt
             .query_map([server_id.as_slice()], |row| Ok((row.get::<_, u8>(0)?, row.get::<_, String>(1)?)))
-            .map_err(|e| GhostError::Database(format!("list role names: {e}")))?;
+            .map_err(db("list role names"))?;
         rows.collect::<std::result::Result<_, _>>()
-            .map_err(|e| GhostError::Database(format!("list role names: {e}")))
+            .map_err(db("list role names"))
     }
 }
 
@@ -36,7 +36,7 @@ mod tests {
         let server_id = [0x05; 32];
         let store = GhostStore::open_in_memory(&[0xAB; 32]).unwrap();
         store
-            .insert_server(&Server { server_id, name: "s".into(), kind: ServerKind::Server, creator_fp: [0x01; 32], created_at: 1 })
+            .insert_server(&Server { server_id, name: "s".into(), kind: ServerKind::Server, created_at: 1 }, crate::storage::OnConflict::Fail)
             .unwrap();
         store.set_role_name(&server_id, 2, "mods").unwrap();
         store.set_role_name(&server_id, 1, "admins").unwrap();

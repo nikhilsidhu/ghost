@@ -1,0 +1,16 @@
+[package]
+name = "ghost-log"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0"
+
+# One logging setup for every Ghost binary: tracing to stderr, filtered by GHOST_LOG, and
+# to a daily log file kept for a week.
+
+[dependencies]
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

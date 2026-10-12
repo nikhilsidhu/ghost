@@ -1,16 +1,10 @@
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 
 use crate::error::RelayError;
 
-pub fn now_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64
-}
+pub use ghost_wire::now_millis;
 
 pub fn decode_mailbox_id(encoded: &str) -> crate::error::Result<[u8; 32]> {
     let bytes = URL_SAFE_NO_PAD

@@ -1,7 +1,22 @@
-import { invoke } from "@tauri-apps/api/core";
-import type { Identity, Server, Channel, Member, Message, Invite, Config, AudioDevices, KeybindConfig, Device, ServerRoles, ServerPolicy, ChannelAccess } from "./types";
+import { invoke } from "./invoke";
+import type {
+  Identity, Server, Channel, Member, Message, Invite, Config, AudioDevices, KeybindConfig, Device, ServerRoles, ServerPolicy,
+  ChannelAccess, KeptOut, ChannelKind, NoiseSuppression, Agc, InputMode, OnlineStatus, LiveState, ProfileReach,
+} from "./types";
 
 export const getIdentity = () => invoke<Identity>("get_identity");
+
+/** What the session reported before the listeners were up. */
+export const liveState = () => invoke<LiveState>("live_state");
+
+/** The user acted in this window; an idle device comes back online at once. */
+export const noteActivity = () => invoke<void>("note_activity");
+
+/** The user dismissed an account alert. */
+export const dismissAccountAlert = (id: number) => invoke<void>("dismiss_alert", { id });
+
+/** Whether going idle mutes a call. */
+export const setAutoMuteOnIdle = (enabled: boolean) => invoke<void>("set_auto_mute_on_idle", { enabled });
 
 export const listServers = () => invoke<Server[]>("list_servers");
 
@@ -26,10 +41,13 @@ export const getServerOrder = () =>
 export const listMessages = (channelId: string, before?: number, limit?: number) =>
   invoke<Message[]>("list_messages", { channelId, before, limit });
 
+export const retryMessage = (messageId: string) =>
+  invoke<Message>("retry_message", { messageId });
+
 export const sendMessage = (serverId: string, channelId: string, content: string) =>
   invoke<Message>("send_message", { serverId, channelId, content });
 
-export const createChannel = (serverId: string, name: string, kind: string) =>
+export const createChannel = (serverId: string, name: string, kind: ChannelKind) =>
   invoke<Channel>("create_channel", { serverId, name, kind });
 
 export const renameChannel = (channelId: string, name: string) =>
@@ -37,12 +55,30 @@ export const renameChannel = (channelId: string, name: string) =>
 
 export const deleteChannel = (channelId: string) =>
   invoke<void>("delete_channel", { channelId });
+/** The server's channels in the order given, for everyone; needs the manage channels permission. */
+export const reorderChannels = (serverId: string, channelIds: string[]) =>
+  invoke<void>("reorder_channels", { serverId, channelIds });
 
+/** Resolves to whether the member is also kept from rejoining. */
 export const kickMember = (serverId: string, fingerprint: string) =>
   invoke<void>("kick_member", { serverId, fingerprint });
 
+export const keptOut = (serverId: string) =>
+  invoke<KeptOut[]>("kept_out", { serverId });
+
+export const letBackIn = (serverId: string, fingerprint: string) =>
+  invoke<void>("let_back_in", { serverId, fingerprint });
+
+/** Drop a server this account was removed from, or stopped following, with its history. */
+export const forgetServer = (serverId: string) =>
+  invoke<void>("forget_server", { serverId });
+
+/** Take the relay's version of a halted server after all. */
+export const acceptRelayState = (serverId: string) =>
+  invoke<void>("accept_relay_state", { serverId });
+
 /** A channel only the given roles and accounts (and channel managers) can see. */
-export const createPrivateChannel = (serverId: string, name: string, kind: string, roles: number[], accounts: string[]) =>
+export const createPrivateChannel = (serverId: string, name: string, kind: ChannelKind, roles: number[], accounts: string[]) =>
   invoke<Channel>("create_private_channel", { serverId, name, kind, roles, accounts });
 
 /** Resolves to null for a public channel. */
@@ -78,9 +114,11 @@ export const joinByInvite = (relayUrl: string, token: string, key: string, relay
 
 export const getConfig = () => invoke<Config>("get_config");
 
+/** How many of the account's servers heard the new name now; the rest hear it later. */
 export const setDisplayName = (name: string) =>
-  invoke<void>("set_display_name", { name });
+  invoke<ProfileReach>("set_display_name", { name });
 
+/** Connect to the account's home relay at another address; refused for a relay that is not the home. */
 export const setRelayUrl = (url: string) =>
   invoke<void>("set_relay_url", { url });
 
@@ -104,13 +142,13 @@ export const setOutputDevice = (name: string | null) =>
   invoke<void>("set_output_device", { name });
 
 // Voice processing
-export const setNoiseSuppression = (mode: string) =>
+export const setNoiseSuppression = (mode: NoiseSuppression) =>
   invoke<void>("set_noise_suppression", { mode });
-export const setAgc = (mode: string) =>
+export const setAgc = (mode: Agc) =>
   invoke<void>("set_agc", { mode });
 
 // Input mode
-export const setInputMode = (mode: string) =>
+export const setInputMode = (mode: InputMode) =>
   invoke<void>("set_input_mode", { mode });
 export const setPttActive = (active: boolean) =>
   invoke<void>("set_ptt_active", { active });
@@ -132,41 +170,70 @@ export const setKeybind = (action: string, shortcut: string | null) =>
   invoke<void>("set_keybind", { action, shortcut });
 
 // Online presence
-export const setStatus = (status: string) =>
+export const setStatus = (status: OnlineStatus) =>
   invoke<void>("set_status", { status });
 export const setStatusMessage = (message: string | null, expiry: number | null) =>
   invoke<void>("set_status_message", { message, expiry });
 
 // Avatars
-export const uploadAvatar = (data: number[]) =>
-  invoke<void>("upload_avatar", { data });
+/** The image bytes as the user cropped them, in any format a browser shows. */
+export const uploadAvatar = (image: Uint8Array) =>
+  invoke<ProfileReach>("upload_avatar", image);
 export const clearAvatar = () =>
-  invoke<void>("clear_avatar");
+  invoke<ProfileReach>("clear_avatar");
+/** Raw image bytes; empty when no avatar is cached. */
 export const getCachedAvatar = (fingerprintHex: string) =>
-  invoke<string | null>("get_cached_avatar", { fingerprintHex });
+  invoke<ArrayBuffer>("get_cached_avatar", { fingerprintHex });
 
 // Devices
-export const getDevices = () => invoke<Device[]>("get_devices");
-/** Resolves false when the home relay was unreachable and the revocation must be retried. */
-export const revokeDevice = (deviceKeyHex: string) =>
-  invoke<boolean>("revoke_device", { deviceKeyHex });
-export const startPairing = () => invoke<string>("start_pairing");
-export const checkPairing = () => invoke<string | null>("check_pairing");
-export const cancelPairing = () => invoke<void>("cancel_pairing");
+import type { AccountAlert, AccountStatus, DeviceList, KeyCheck, PairingStatus, RecoveryOutcome, RevokeOutcome, UnfinishedOutcome } from "./types";
+export type { AccountAlert };
 
-// Device linking (new device side)
-export const joinAsNewDevice = (pairingCode: string) =>
-  invoke<string>("join_as_new_device", { pairingCode });
-// Recovery
-export const setRecoveryPassphrase = (passphrase: string) =>
-  invoke<string>("set_recovery_passphrase", { passphrase });
-export const skipRecoverySetup = () => invoke<void>("skip_recovery_setup");
-export const getRecoveryCode = () => invoke<string>("get_recovery_code");
-export const changeRecoveryPassphrase = (currentPassphrase: string, newPassphrase: string) =>
-  invoke<void>("change_recovery_passphrase", { currentPassphrase, newPassphrase });
-export const hasRecoveryBlob = () => invoke<boolean>("has_recovery_blob");
-export const recoverAccount = (recoveryCode: string, passphrase: string, newPassphrase: string) =>
-  invoke<string>("recover_account", { recoveryCode, passphrase, newPassphrase });
+export const getDevices = () => invoke<DeviceList>("get_devices");
+export const revokeDevice = (deviceKeyHex: string) =>
+  invoke<RevokeOutcome>("revoke_device", { deviceKeyHex });
+/** Give a device of this account the label its list shows, recorded in the identity log. */
+export const renameDevice = (deviceKeyHex: string, label: string) =>
+  invoke<void>("rename_device", { deviceKeyHex, label });
+
+// Account: where this device stands, and making an account (the recovery key is shown,
+// then typed back, before anything is sent). `deviceLabel` names this device in the
+// account's device list; empty means the machine's name.
+export const getAccountStatus = () => invoke<AccountStatus>("get_account_status");
+export const beginCreateAccount = (displayName: string, relayUrl: string, deviceLabel: string) =>
+  invoke<string>("begin_create_account", { displayName, relayUrl, deviceLabel });
+export const confirmNewAccount = (typed: string) => invoke<void>("confirm_new_account", { typed });
+export const cancelCreateAccount = () => invoke<void>("cancel_create_account");
+
+// Pairing, existing device: start, poll, confirm the codes match
+export const startPairing = () => invoke<string>("start_pairing");
+export const checkPairing = () => invoke<PairingStatus>("check_pairing");
+export const confirmPairing = () => invoke<void>("confirm_pairing");
+export const cancelPairing = () => invoke<void>("cancel_pairing");
+// Pairing, new device
+export const joinAsNewDevice = (pairingCode: string, deviceLabel: string) =>
+  invoke<string>("join_as_new_device", { pairingCode, deviceLabel });
+
+// Recovery: find the account, show the new key, type it back, recover
+export const beginRecovery = (recoveryKey: string, relayUrl: string, deviceLabel: string) =>
+  invoke<string>("begin_recovery", { recoveryKey, relayUrl, deviceLabel });
+export const confirmRecovery = (typed: string) => invoke<RecoveryOutcome>("confirm_recovery", { typed });
+export const recoverThroughRelay = () => invoke<RecoveryOutcome>("recover_through_relay");
+/** Finish an account this device was making when the app last closed, if its relay holds it. */
+export const resumeUnfinishedAccount = () => invoke<UnfinishedOutcome>("resume_unfinished_account");
+export const cancelRecovery = () => invoke<void>("cancel_recovery");
+
+// Recovery key: check or replace
+export const checkRecoveryKey = (recoveryKey: string) => invoke<KeyCheck>("check_recovery_key", { recoveryKey });
+export const beginReplaceRecoveryKey = (current: string) =>
+  invoke<string>("begin_replace_recovery_key", { current });
+export const confirmNewRecoveryKey = (typed: string) => invoke<void>("confirm_new_recovery_key", { typed });
+export const cancelNewRecoveryKey = () => invoke<void>("cancel_new_recovery_key");
+
+// Home relay, and forgetting a removed device's account
+export const moveHome = (recoveryKey: string, relayUrl: string) =>
+  invoke<void>("move_home", { recoveryKey, relayUrl });
+export const resetDevice = () => invoke<void>("reset_device");
 
 // Dev testing
 export const spawnDevInstance = () => invoke<number>("spawn_dev_instance");

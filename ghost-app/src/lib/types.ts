@@ -2,6 +2,9 @@
 // (`ghost-app/src-tauri/src/bindings.rs`). Regenerate with `cargo test -p ghost-app bindings`.
 export type { Identity } from "./generated/Identity";
 export type { Server } from "./generated/Server";
+export type { Removal } from "./generated/Removal";
+export type { Halt } from "./generated/Halt";
+export type { KeptOut } from "./generated/KeptOut";
 export type { Channel } from "./generated/Channel";
 export type { Member } from "./generated/Member";
 export type { Role } from "./generated/Role";
@@ -10,12 +13,23 @@ export type { ServerPolicy } from "./generated/ServerPolicy";
 export type { ServerRoles } from "./generated/ServerRoles";
 export type { ChannelAccess } from "./generated/ChannelAccess";
 export type { Message } from "./generated/Message";
+export type { Delivery } from "./generated/Delivery";
+export type { MessageDelivery } from "./generated/MessageDelivery";
 export type { Invite } from "./generated/Invite";
 export type { Config } from "./generated/Config";
+export type { ProfileReach } from "./generated/ProfileReach";
 export type { KeybindConfig } from "./generated/KeybindConfig";
 export type { Device } from "./generated/Device";
+export type { DeviceList } from "./generated/DeviceList";
+export type { RevokeOutcome } from "./generated/RevokeOutcome";
+export type { AccountStatus } from "./generated/AccountStatus";
+export type { PairingStatus } from "./generated/PairingStatus";
+export type { RecoveryOutcome } from "./generated/RecoveryOutcome";
+export type { AccountAlert } from "./generated/AccountAlert";
 export type { AudioDevices } from "./generated/AudioDevices";
 export type { VoiceState } from "./generated/VoiceState";
+export type { CallPhase } from "./generated/CallPhase";
+export type { MediaPath } from "./generated/MediaPath";
 export type { VoiceParticipants } from "./generated/VoiceParticipants";
 export type { VoiceSpeaking } from "./generated/VoiceSpeaking";
 export type { VoiceMuteState } from "./generated/VoiceMuteState";
@@ -24,13 +38,24 @@ export type { VoiceChannelMembers } from "./generated/VoiceChannelMembers";
 export type { VoiceChannelMember } from "./generated/VoiceChannelMember";
 export type { OnlinePresenceEvent } from "./generated/OnlinePresenceEvent";
 export type { OnlinePresenceMember } from "./generated/OnlinePresenceMember";
+export type { LiveState } from "./generated/LiveState";
+export type { ChannelWaiting } from "./generated/ChannelWaiting";
+export type { Connectivity } from "./generated/Connectivity";
+export type { ErrorCode } from "./generated/ErrorCode";
+export type { NoiseSuppression } from "./generated/NoiseSuppression";
+export type { Agc } from "./generated/Agc";
+export type { InputMode } from "./generated/InputMode";
+export type { OnlineStatus } from "./generated/OnlineStatus";
+export type { PresenceStatus } from "./generated/PresenceStatus";
+export type { ChannelKind } from "./generated/ChannelKind";
+export type { ServerKind } from "./generated/ServerKind";
+export type { AccountPhase } from "./generated/AccountPhase";
+export type { PairingStage } from "./generated/PairingStage";
+export type { RecoveryOutcomeKind } from "./generated/RecoveryOutcomeKind";
+export type { AccountAlertKind } from "./generated/AccountAlertKind";
+export type { RemovedBy } from "./generated/RemovedBy";
+export type { SnapshotRestore } from "./generated/SnapshotRestore";
+export type { UnfinishedOutcome } from "./generated/UnfinishedOutcome";
+export type { KeyCheck } from "./generated/KeyCheck";
 
-/** Permission bits of a server policy; must match ghost-wire's policy module
- *  (constants are not generated, only types). */
-export const PERMISSIONS = {
-  invite: 1,
-  kick: 2,
-  manageChannels: 4,
-  manageRoles: 8,
-} as const;
-export const ALL_PERMISSIONS = 15;
+export { ALL_PERMISSIONS, MESSAGE_TYPES, PAIRING_TTL_MS, PERMISSIONS } from "./generated/constants";

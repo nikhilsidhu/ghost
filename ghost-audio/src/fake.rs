@@ -26,6 +26,8 @@ struct Tone {
 pub struct ToneDevices {
     tone: Arc<Tone>,
     recording: Arc<Mutex<Vec<f32>>>,
+    /// Set to make open devices fail with this reason at their next read.
+    failure: Arc<Mutex<Option<String>>>,
 }
 
 impl ToneDevices {
@@ -48,6 +50,11 @@ impl ToneDevices {
     pub fn recorded_len(&self) -> usize {
         self.recording.lock().unwrap().len()
     }
+
+    /// Make the open devices fail for good, as unplugged hardware does.
+    pub fn fail(&self, reason: &str) {
+        *self.failure.lock().unwrap() = Some(reason.to_string());
+    }
 }
 
 impl AudioDevices for ToneDevices {
@@ -69,6 +76,7 @@ impl AudioDevices for ToneDevices {
             .map_err(|e| format!("spawn fake playback: {e}"))?;
         Ok(Box::new(ToneStreams {
             tone: self.tone.clone(),
+            failure: self.failure.clone(),
             phase: 0.0,
             next_frame: Instant::now() + FRAME_DURATION,
             playing,
@@ -78,6 +86,7 @@ impl AudioDevices for ToneDevices {
 
 struct ToneStreams {
     tone: Arc<Tone>,
+    failure: Arc<Mutex<Option<String>>>,
     phase: f32,
     next_frame: Instant,
     playing: Arc<AtomicBool>,
@@ -91,6 +100,9 @@ impl Drop for ToneStreams {
 
 impl DeviceStreams for ToneStreams {
     fn read_frame(&mut self, frame: &mut [f32], timeout: Duration) -> CaptureRead {
+        if let Some(reason) = self.failure.lock().unwrap().clone() {
+            return CaptureRead::Failed(reason);
+        }
         let now = Instant::now();
         if self.next_frame > now + timeout {
             std::thread::sleep(timeout);

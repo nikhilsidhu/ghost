@@ -1,27 +1,24 @@
 mod common;
 
-use std::time::Duration;
-
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 
+use ghost_core::account_keys::{AccountSeed, DeviceEncryptionKey, RecoveryKey};
 use ghost_core::client::GhostClient;
 use ghost_core::crypto::keys::derive_ed25519_seed;
-use ghost_core::identity::export::{export_recovery_blob, import_recovery_blob};
+use ghost_core::error::GhostError;
+use ghost_core::identity::batch::BatchBuilder;
 use ghost_core::identity::log::{
-    create_add_device, create_genesis, create_recovery, create_revoke_device, validate_chain,
-    LogEntry,
+    create_add_device, create_device_key, create_genesis, create_revoke_device, create_rotate_root, validate_chain,
+    LogEntry, LogState,
 };
-use ghost_core::identity::{compute_delegation_sig, Identity};
-use ghost_core::relay::{RelayClient, RelayEvent};
-use ghost_core::wire::{
-    decode_mutation, encode_mutation, encode_sync_state_dump, sync_open,
-    sync_seal, SyncReceiveResult, MUTATION_SET, SYNC_KEY_SERVER_ORDER,
-};
+use ghost_core::identity::{Addition, Identity};
+use ghost_core::relay::RelayClient;
+use ghost_core::wire::{decode_mutation, encode_mutation, SyncReceiveResult, MUTATION_SET, SYNC_KEY_SERVER_ORDER};
 
-/// Create account using the real Identity::create_account flow.
-/// Returns (master_key, device_key, genesis, account_fp, seed).
-fn make_account(label: &str) -> (SigningKey, SigningKey, LogEntry, [u8; 32], [u8; 32]) {
+/// An account as clients before account keys made it: a seed-derived master key.
+/// Returns (master_key, device_key, genesis, account_fp).
+fn make_account(label: &str) -> (SigningKey, SigningKey, LogEntry, [u8; 32]) {
     let mut seed = [0u8; 32];
     rand::RngCore::fill_bytes(&mut OsRng, &mut seed);
     let ed_bytes = derive_ed25519_seed(&seed).unwrap();
@@ -29,38 +26,14 @@ fn make_account(label: &str) -> (SigningKey, SigningKey, LogEntry, [u8; 32], [u8
     let device_key = SigningKey::generate(&mut OsRng);
     let genesis = create_genesis(&master_key, &device_key, label);
     let account_fp = genesis.account_fp;
-    (master_key, device_key, genesis, account_fp, seed)
+    (master_key, device_key, genesis, account_fp)
 }
 
-async fn recv_blob(
-    events: &mut tokio::sync::mpsc::Receiver<RelayEvent>,
-    mailbox: [u8; 32],
-) -> ghost_core::relay::IncomingBlob {
-    tokio::time::timeout(Duration::from_secs(3), async {
-        loop {
-            match events.recv().await {
-                Some(RelayEvent::Blob(b)) if b.mailbox_id == mailbox => break b,
-                Some(_) => continue,
-                None => panic!("channel closed"),
-            }
-        }
-    })
-    .await
-    .expect("timed out waiting for sync blob")
-}
-
-/// Create a GhostClient from Identity::create_account, extracting fields before drop.
-fn make_ghost_client(label: &str) -> (GhostClient, [u8; 32], SigningKey, SigningKey, [u8; 32]) {
-    let acct = Identity::create_account(label).unwrap();
-    let fp = acct.identity.fingerprint;
-    let sk = acct.identity.signing_key.clone();
-    let db_key = acct.db_key;
-    let master_vk = acct.identity.master_vk;
-    let master_sk = SigningKey::from_bytes(&acct.identity.master_sk.to_bytes());
-    let delegation_sig = acct.identity.delegation_sig;
-    let identity = Identity::from_device(fp, sk.clone(), 1, master_vk, SigningKey::from_bytes(&master_sk.to_bytes()), delegation_sig);
-    drop(acct);
-    (GhostClient::open_in_memory(identity, db_key).unwrap(), fp, sk, master_sk, master_vk)
+/// A client with an identity of its own, for tests of local sync state.
+fn make_ghost_client() -> GhostClient {
+    let mut db_key = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut OsRng, &mut db_key);
+    GhostClient::open_in_memory(Identity::generate().unwrap(), db_key).unwrap()
 }
 
 /// Push a full chain to relay and validate it client-side.
@@ -82,8 +55,8 @@ async fn push_and_validate(
 #[tokio::test]
 async fn idlog_genesis_add_revoke_full_lifecycle() {
     let relay_url = common::start_relay().await;
-    let (mut relay, _) = RelayClient::new(&relay_url);
-    let (_master, device1, genesis, fp, _seed) = make_account("desktop");
+    let (relay, _) = RelayClient::new(&relay_url);
+    let (_master, device1, genesis, fp) = make_account("desktop");
     relay.set_auth(fp, device1.verifying_key().to_bytes(), device1.clone());
     let device2 = SigningKey::generate(&mut OsRng);
     let device3 = SigningKey::generate(&mut OsRng);
@@ -132,23 +105,35 @@ async fn idlog_genesis_add_revoke_full_lifecycle() {
 
 #[test]
 fn sync_set_older_timestamp_rejected() {
-    let (client, _, _, _, _) = make_ghost_client("test");
+    let client = make_ghost_client();
 
     // Set at ts=100
-    assert!(client.sync_set("read:ch1", &42u64.to_be_bytes(), 100).unwrap());
+    assert!(client.sync_set("pref:test", &42u64.to_be_bytes(), 100).unwrap());
 
     // Try to overwrite with older ts=50 — should fail
-    assert!(!client.sync_set("read:ch1", &99u64.to_be_bytes(), 50).unwrap());
+    assert!(!client.sync_set("pref:test", &99u64.to_be_bytes(), 50).unwrap());
 
     // Value unchanged
-    let (val, ts) = client.sync_get("read:ch1").unwrap().unwrap();
+    let (val, ts) = client.sync_get("pref:test").unwrap().unwrap();
     assert_eq!(ts, 100);
     assert_eq!(val.unwrap(), 42u64.to_be_bytes());
 }
 
 #[test]
+fn read_positions_merge_by_how_far_was_read_not_by_clock() {
+    let client = make_ghost_client();
+    assert!(client.sync_set("read:ch1", &500u64.to_be_bytes(), 100).unwrap());
+    // Read further on a device whose clock is behind: the further position wins.
+    assert!(client.sync_set("read:ch1", &900u64.to_be_bytes(), 50).unwrap());
+    // Read less far on a device whose clock is ahead: the channel does not go back to unread.
+    assert!(!client.sync_set("read:ch1", &700u64.to_be_bytes(), 200).unwrap());
+    let (val, _) = client.sync_get("read:ch1").unwrap().unwrap();
+    assert_eq!(val.unwrap(), 900u64.to_be_bytes());
+}
+
+#[test]
 fn sync_set_newer_timestamp_overwrites() {
-    let (client, _, _, _, _) = make_ghost_client("test");
+    let client = make_ghost_client();
 
     client.sync_set("read:ch1", &42u64.to_be_bytes(), 100).unwrap();
     assert!(client.sync_set("read:ch1", &99u64.to_be_bytes(), 200).unwrap());
@@ -160,7 +145,7 @@ fn sync_set_newer_timestamp_overwrites() {
 
 #[test]
 fn sync_remove_older_than_set_is_rejected() {
-    let (client, _, _, _, _) = make_ghost_client("test");
+    let client = make_ghost_client();
 
     client.sync_set("read:ch1", &42u64.to_be_bytes(), 100).unwrap();
 
@@ -174,7 +159,7 @@ fn sync_remove_older_than_set_is_rejected() {
 
 #[test]
 fn sync_remove_newer_than_set_creates_tombstone() {
-    let (client, _, _, _, _) = make_ghost_client("test");
+    let client = make_ghost_client();
 
     client.sync_set("read:ch1", &42u64.to_be_bytes(), 100).unwrap();
 
@@ -188,7 +173,7 @@ fn sync_remove_newer_than_set_creates_tombstone() {
 
 #[test]
 fn sync_set_cannot_overwrite_newer_tombstone() {
-    let (client, _, _, _, _) = make_ghost_client("test");
+    let client = make_ghost_client();
 
     client.sync_set("read:ch1", &1u64.to_be_bytes(), 50).unwrap();
     client.sync_remove("read:ch1", 200).unwrap(); // tombstone at 200
@@ -204,33 +189,33 @@ fn sync_set_cannot_overwrite_newer_tombstone() {
 
 #[test]
 fn sync_import_preserves_newer_local_state() {
-    let (client, _, _, _, _) = make_ghost_client("test");
+    let client = make_ghost_client();
 
     // Local state at ts=500
-    client.sync_set("read:ch1", &100u64.to_be_bytes(), 500).unwrap();
+    client.sync_set("pref:test", &100u64.to_be_bytes(), 500).unwrap();
 
     // Import older state at ts=300 — should NOT overwrite
     client
-        .sync_import(&[("read:ch1".to_string(), Some(200u64.to_be_bytes().to_vec()), 300)])
+        .sync_import(&[("pref:test".to_string(), Some(200u64.to_be_bytes().to_vec()), 300)])
         .unwrap();
 
-    let (val, ts) = client.sync_get("read:ch1").unwrap().unwrap();
+    let (val, ts) = client.sync_get("pref:test").unwrap().unwrap();
     assert_eq!(ts, 500);
     assert_eq!(val.unwrap(), 100u64.to_be_bytes());
 
     // Import newer state at ts=600 — should overwrite
     client
-        .sync_import(&[("read:ch1".to_string(), Some(300u64.to_be_bytes().to_vec()), 600)])
+        .sync_import(&[("pref:test".to_string(), Some(300u64.to_be_bytes().to_vec()), 600)])
         .unwrap();
 
-    let (val, ts) = client.sync_get("read:ch1").unwrap().unwrap();
+    let (val, ts) = client.sync_get("pref:test").unwrap().unwrap();
     assert_eq!(ts, 600);
     assert_eq!(val.unwrap(), 300u64.to_be_bytes());
 }
 
 #[test]
 fn sync_dump_import_between_clients() {
-    let (client_a, _, _, _, _) = make_ghost_client("device-a");
+    let client_a = make_ghost_client();
 
     client_a
         .sync_set(SYNC_KEY_SERVER_ORDER, b"[\"s1\",\"s2\"]", 100)
@@ -244,15 +229,15 @@ fn sync_dump_import_between_clients() {
     client_a.sync_remove("read:ch2", 400).unwrap(); // tombstone
 
     let dump = client_a.sync_dump().unwrap();
-    assert_eq!(dump.len(), 3);
+    assert_eq!(dump.entries.len(), 3);
 
     // Import into a fresh client
-    let (client_b, _, _, _, _) = make_ghost_client("device-b");
-    client_b.sync_import(&dump).unwrap();
+    let client_b = make_ghost_client();
+    client_b.sync_import(&dump.entries).unwrap();
 
     // Verify identical state
     let dump_b = client_b.sync_dump().unwrap();
-    assert_eq!(dump_b.len(), 3);
+    assert_eq!(dump_b.entries.len(), 3);
 
     let (val, ts) = client_b.sync_get(SYNC_KEY_SERVER_ORDER).unwrap().unwrap();
     assert_eq!(val.unwrap(), b"[\"s1\",\"s2\"]");
@@ -268,222 +253,143 @@ fn sync_dump_import_between_clients() {
     assert_eq!(ts, 400);
 }
 
-// ── Pairing: crypto through relay ───────────────────────────────────
+// ── Sync channel ────────────────────────────────────────────────────
 
-#[tokio::test]
-async fn pairing_offer_response_encrypted_roundtrip() {
-    let relay_url = common::start_relay().await;
-    let (mut relay_a, _) = RelayClient::new(&relay_url);
-    let (_master, device1, genesis, fp, _seed) = make_account("desktop");
-
-    // Register genesis so device1 is active on the relay
-    relay_a.put_idlog_entry(&fp, genesis.to_bytes()).await.unwrap();
-    relay_a.set_auth(fp, device1.verifying_key().to_bytes(), device1.clone());
-
-    let secret = [0x42u8; 32];
-    let token = [0x24u8; 16];
-    let offer_pt = b"relay_url|display_name|avatar_hash";
-    let offer_sealed = sync_seal(&secret, offer_pt).unwrap();
-    relay_a.post_pairing_offer(&fp, &token, offer_sealed).await.unwrap();
-
-    // No response yet
-    assert!(relay_a.get_pairing_response(&fp, &token).await.unwrap().is_none());
-
-    // The new device fetches the offer with no credentials (simulating a QR code scan)
-    let (guest, _) = RelayClient::new(&relay_url);
-    let offer_blob = guest.get_pairing_offer(&fp, &token).await.unwrap();
-    let offer_opened = sync_open(&secret, &offer_blob).unwrap();
-    assert_eq!(offer_opened, offer_pt);
-
-    // Device B responds with its key (unauthenticated — new device)
-    let device_b_key = SigningKey::generate(&mut OsRng);
-    let mut response_pt = Vec::new();
-    response_pt.extend_from_slice(&device_b_key.to_bytes());
-    response_pt.extend_from_slice(b"phone");
-    let response_sealed = sync_seal(&secret, &response_pt).unwrap();
-    guest.post_pairing_response(&fp, &token, response_sealed).await.unwrap();
-
-    // Device A decrypts response, recovers device B's key
-    let response_blob = relay_a.get_pairing_response(&fp, &token).await.unwrap().unwrap();
-    let response_opened = sync_open(&secret, &response_blob).unwrap();
-    let recovered_key: [u8; 32] = response_opened[..32].try_into().unwrap();
-    assert_eq!(recovered_key, device_b_key.to_bytes());
-    assert_eq!(&response_opened[32..], b"phone");
+/// Two devices of one account whose root has rotated: both hold the first account key
+/// generation and have the account's chain cached, all a sync message needs.
+struct TwoDevices {
+    a: GhostClient,
+    b: GhostClient,
+    a_key: SigningKey,
+    b_vk: [u8; 32],
+    chain: Vec<LogEntry>,
+    seed: AccountSeed,
 }
 
-// ── Sync MLS group ──────────────────────────────────────────────────
+fn two_devices() -> TwoDevices {
+    let genesis_key = SigningKey::generate(&mut OsRng);
+    let (a_key, b_key) = (SigningKey::generate(&mut OsRng), SigningKey::generate(&mut OsRng));
+    let (a_enc, b_enc) = (DeviceEncryptionKey::generate(), DeviceEncryptionKey::generate());
+    let recovery = RecoveryKey::generate();
 
-#[test]
-fn sync_group_produces_joinable_group_info() {
-    let (mut client_a, fp_a, _, master_sk_a, master_vk_a) = make_ghost_client("desktop");
-    assert!(!client_a.has_sync_group());
-    client_a.create_sync_group().unwrap();
+    let genesis = create_genesis(&genesis_key, &a_key, "desktop");
+    let fp = genesis.account_fp;
+    let mut batch = BatchBuilder::new(LogState::empty(fp));
+    batch.push(genesis.clone()).unwrap();
+    batch.push(create_device_key(batch.state(), &a_key, &a_key, a_enc.key_pair().unwrap().public())).unwrap();
+    let add = create_add_device(batch.state(), &a_key, &b_key, "phone");
+    batch.push(add.clone()).unwrap();
+    batch.push(create_device_key(batch.state(), &a_key, &b_key, b_enc.key_pair().unwrap().public())).unwrap();
+    let root = recovery.root().unwrap();
+    batch.push(create_rotate_root(batch.state(), &genesis_key, &root, recovery.recovery_box().unwrap().public(), &a_key)).unwrap();
+    let seed = batch.push_rekey(&a_key, None).unwrap();
+    let chain = batch.finish().entries;
 
-    // Verify the GroupInfo is valid by having another device successfully join
-    let gi = client_a.sync_group_info().unwrap();
-    assert!(!gi.is_empty());
-
-    let device_b_key = SigningKey::generate(&mut OsRng);
-    let delegation_sig = compute_delegation_sig(&master_sk_a, device_b_key.verifying_key().as_bytes(), &fp_a, 2);
-    let identity_b = Identity::from_device(fp_a, device_b_key, 2, master_vk_a, SigningKey::from_bytes(&master_sk_a.to_bytes()), delegation_sig);
-    let mut client_b = GhostClient::open_in_memory(identity_b, [0x02; 32]).unwrap();
-    let (_commit, mailbox_b) = client_b.join_sync_group(&gi).unwrap();
-    assert_eq!(mailbox_b, client_a.sync_mailbox_id().unwrap());
-}
-
-#[test]
-fn sync_group_add_device_via_external_commit() {
-    use ghost_wire::idlog::{DeviceInfo, LogState};
-    use std::collections::HashMap;
-
-    let (mut client_a, fp_a, sk_a, master_sk_a, master_vk_a) = make_ghost_client("desktop");
-    client_a.create_sync_group().unwrap();
-
-    // Export GroupInfo for pairing
-    let gi = client_a.sync_group_info().unwrap();
-
-    // Device B joins via external commit
-    let device_b_key = SigningKey::generate(&mut OsRng);
-    let b_vk = device_b_key.verifying_key().to_bytes();
-    let delegation_sig = compute_delegation_sig(&master_sk_a, &b_vk, &fp_a, 2);
-    let identity_b = Identity::from_device(fp_a, device_b_key, 2, master_vk_a, SigningKey::from_bytes(&master_sk_a.to_bytes()), delegation_sig);
-    let mut client_b = GhostClient::open_in_memory(identity_b, [0x02; 32]).unwrap();
-
-    // Cache identity log so external commit validation passes
-    let a_vk = sk_a.verifying_key().to_bytes();
-    let mut devices = HashMap::new();
-    devices.insert(a_vk, DeviceInfo { verifying_key: a_vk, label: "desktop".into(), added_at_seq: 1, revoked_at_seq: None });
-    devices.insert(b_vk, DeviceInfo { verifying_key: b_vk, label: "phone".into(), added_at_seq: 2, revoked_at_seq: None });
-    let mut log_state = LogState::empty(fp_a);
-    log_state.devices = devices;
-    log_state.head_seq = 2;
-    client_a.cache_own_identity_log(log_state);
-
-    let (commit, mailbox_b) = client_b.join_sync_group(&gi).unwrap();
-    assert_eq!(mailbox_b, client_a.sync_mailbox_id().unwrap());
-
-    // Device A processes the commit
-    match client_a.receive_sync(&commit).unwrap() {
-        SyncReceiveResult::CommitProcessed => {}
-        other => panic!("expected CommitProcessed, got {:?}", other),
+    let b_vk = b_key.verifying_key().to_bytes();
+    let mut a = GhostClient::open_in_memory(Identity::from_device(fp, a_key.clone(), a_enc, Addition::of(&genesis)), [0x01; 32]).unwrap();
+    let mut b = GhostClient::open_in_memory(Identity::from_device(fp, b_key, b_enc, Addition::of(&add)), [0x02; 32]).unwrap();
+    for client in [&mut a, &mut b] {
+        client.cache_identity_chain(&chain).unwrap();
+        client.store_account_seed(&AccountSeed::from_bytes(seed.generation(), *seed.bytes())).unwrap();
     }
+    TwoDevices { a, b, a_key, b_vk, chain, seed }
+}
 
-    // Both devices are now in the same group
-    assert_eq!(client_a.sync_mailbox_id(), client_b.sync_mailbox_id());
+fn mutation(key: &str, value: u64) -> Vec<u8> {
+    let mut payload = vec![ghost_core::wire::SyncMessageType::MutationSync as u8];
+    payload.extend_from_slice(&encode_mutation(MUTATION_SET, 9000, key, &value.to_be_bytes()));
+    payload
 }
 
 #[test]
-fn sync_mutation_encrypted_decrypted() {
-    use ghost_wire::idlog::{DeviceInfo, LogState};
-    use std::collections::HashMap;
+fn a_copy_of_a_sync_message_from_another_relay_is_seen_once() {
+    let mut devices = two_devices();
+    let outbound = devices.a.send_sync(&mutation("read:ch1", 77)).unwrap();
+    assert!(matches!(devices.b.receive_sync(&outbound.blob).unwrap(), SyncReceiveResult::Application { .. }));
+    // The same bytes from a second relay, or replayed later: nothing to open.
+    assert!(matches!(devices.b.receive_sync(&outbound.blob).unwrap(), SyncReceiveResult::Seen));
+    assert!(matches!(devices.a.receive_sync(&outbound.blob).unwrap(), SyncReceiveResult::Seen), "a device's own message back");
+}
 
-    let (mut client_a, fp_a, sk_a, master_sk_a, master_vk_a) = make_ghost_client("desktop");
-    client_a.create_sync_group().unwrap();
-    let gi = client_a.sync_group_info().unwrap();
+#[test]
+fn sync_messages_arriving_out_of_order_report_the_gap_and_open_once_each() {
+    let mut devices = two_devices();
+    let first = devices.a.send_sync(&mutation("read:ch1", 1)).unwrap();
+    let second = devices.a.send_sync(&mutation("read:ch1", 2)).unwrap();
+    let third = devices.a.send_sync(&mutation("read:ch1", 3)).unwrap();
+    match devices.b.receive_sync(&third.blob).unwrap() {
+        SyncReceiveResult::Application { gap, .. } => assert_eq!(gap, 2, "two earlier messages are missing"),
+        other => panic!("expected Application, got {other:?}"),
+    }
+    match devices.b.receive_sync(&first.blob).unwrap() {
+        SyncReceiveResult::Application { gap, .. } => assert_eq!(gap, 0),
+        other => panic!("expected Application, got {other:?}"),
+    }
+    assert!(matches!(devices.b.receive_sync(&second.blob).unwrap(), SyncReceiveResult::Application { .. }));
+    assert!(matches!(devices.b.receive_sync(&second.blob).unwrap(), SyncReceiveResult::Seen));
+}
 
-    // Device B joins
-    let device_b_key = SigningKey::generate(&mut OsRng);
-    let b_vk = device_b_key.verifying_key().to_bytes();
-    let delegation_sig = compute_delegation_sig(&master_sk_a, &b_vk, &fp_a, 2);
-    let identity_b = Identity::from_device(fp_a, device_b_key, 2, master_vk_a, SigningKey::from_bytes(&master_sk_a.to_bytes()), delegation_sig);
-    let mut client_b = GhostClient::open_in_memory(identity_b, [0x02; 32]).unwrap();
+#[test]
+fn a_message_that_could_not_be_opened_is_not_counted_as_seen() {
+    let devices = two_devices();
+    let outbound = devices.a.send_sync(&mutation("read:ch1", 1)).unwrap();
+    // B has not cached the account's log yet: the sender is unknown, and a retry after
+    // fetching the log must still open the message.
+    let mut fresh = GhostClient::open_in_memory(
+        Identity::from_device(*devices.b.fingerprint(), SigningKey::generate(&mut OsRng), DeviceEncryptionKey::generate(), Addition { seq: 3, entry_hash: [9; 32] }),
+        [0x04; 32],
+    )
+    .unwrap();
+    fresh.store_account_seed(&AccountSeed::from_bytes(devices.seed.generation(), *devices.seed.bytes())).unwrap();
+    assert!(matches!(fresh.receive_sync(&outbound.blob), Err(GhostError::IdentityLog(_))), "no log cached yet");
+    fresh.cache_identity_chain(&devices.chain).unwrap();
+    assert!(matches!(fresh.receive_sync(&outbound.blob).unwrap(), SyncReceiveResult::Application { .. }));
+}
 
-    // Cache identity log so sync credential validation passes
-    let a_vk = sk_a.verifying_key().to_bytes();
-    let mut devices = HashMap::new();
-    devices.insert(a_vk, DeviceInfo { verifying_key: a_vk, label: "desktop".into(), added_at_seq: 1, revoked_at_seq: None });
-    devices.insert(b_vk, DeviceInfo { verifying_key: b_vk, label: "phone".into(), added_at_seq: 2, revoked_at_seq: None });
-    let mut log_state = LogState::empty(fp_a);
-    log_state.devices = devices;
-    log_state.head_seq = 2;
-    client_a.cache_own_identity_log(log_state.clone());
-    client_b.cache_own_identity_log(log_state);
-
-    // Both devices share the same sync key (established during pairing)
-    let sync_key = [0x42u8; 32];
-    client_a.set_sync_key(sync_key).unwrap();
-    client_b.set_sync_key(sync_key).unwrap();
-
-    let (commit, _) = client_b.join_sync_group(&gi).unwrap();
-    client_a.receive_sync(&commit).unwrap();
-
-    // Device A sends a mutation
-    let mutation = encode_mutation(MUTATION_SET, 9000, "read:ch1", &77u64.to_be_bytes());
-    let mut payload = Vec::with_capacity(1 + mutation.len());
-    payload.push(0x04); // MutationSync
-    payload.extend_from_slice(&mutation);
-    let outbound = client_a.send_sync(&payload).unwrap();
-
-    // Device B decrypts it
-    match client_b.receive_sync(&outbound.blob).unwrap() {
-        SyncReceiveResult::Application(plaintext) => {
-            assert_eq!(plaintext[0], 0x04); // MutationSync
+#[test]
+fn sync_mutations_reach_the_accounts_other_device() {
+    let mut devices = two_devices();
+    let outbound = devices.a.send_sync(&mutation("read:ch1", 77)).unwrap();
+    match devices.b.receive_sync(&outbound.blob).unwrap() {
+        SyncReceiveResult::Application { plaintext, .. } => {
             let (op, ts, key, value) = decode_mutation(&plaintext[1..]).unwrap();
-            assert_eq!(op, MUTATION_SET);
-            assert_eq!(ts, 9000);
-            assert_eq!(key, "read:ch1");
+            assert_eq!((op, ts, key.as_str()), (MUTATION_SET, 9000, "read:ch1"));
             assert_eq!(u64::from_be_bytes(value.try_into().unwrap()), 77);
         }
-        other => panic!("expected Application, got {:?}", other),
+        other => panic!("expected Application, got {other:?}"),
     }
 }
 
 #[test]
-fn sync_revocation_prevents_decryption() {
-    use ghost_wire::idlog::{DeviceInfo, LogState};
-    use std::collections::HashMap;
+fn a_tampered_sync_message_is_refused() {
+    let mut devices = two_devices();
+    let mut outbound = devices.a.send_sync(&mutation("read:ch1", 77)).unwrap();
+    let last = outbound.blob.len() - 1;
+    outbound.blob[last] ^= 1;
+    assert!(devices.b.receive_sync(&outbound.blob).is_err());
+}
 
-    let (mut client_a, fp_a, sk_a, master_sk_a, master_vk_a) = make_ghost_client("desktop");
-    client_a.create_sync_group().unwrap();
-    let gi = client_a.sync_group_info().unwrap();
+#[test]
+fn after_a_revocation_the_revoked_device_cannot_read_the_sync_channel() {
+    let mut devices = two_devices();
 
-    // Device B joins
-    let device_b_key = SigningKey::generate(&mut OsRng);
-    let b_vk = device_b_key.verifying_key().to_bytes();
-    let delegation_sig = compute_delegation_sig(&master_sk_a, &b_vk, &fp_a, 2);
-    let identity_b = Identity::from_device(fp_a, device_b_key, 2, master_vk_a, SigningKey::from_bytes(&master_sk_a.to_bytes()), delegation_sig);
-    let mut client_b = GhostClient::open_in_memory(identity_b, [0x02; 32]).unwrap();
+    // A revokes B together with a generation that leaves B out.
+    let state = validate_chain(&devices.chain).unwrap();
+    let mut batch = BatchBuilder::new(state);
+    batch.push(create_revoke_device(batch.state(), &devices.a_key, &devices.b_vk)).unwrap();
+    let next = batch.push_rekey(&devices.a_key, Some(&devices.seed)).unwrap();
+    let chain: Vec<LogEntry> = devices.chain.iter().cloned().chain(batch.finish().entries).collect();
+    devices.a.cache_identity_chain(&chain).unwrap();
+    devices.a.store_account_seed(&next).unwrap();
 
-    // Cache identity log so sync credential validation passes
-    let a_vk = sk_a.verifying_key().to_bytes();
-    let mut devices = HashMap::new();
-    devices.insert(a_vk, DeviceInfo { verifying_key: a_vk, label: "desktop".into(), added_at_seq: 1, revoked_at_seq: None });
-    devices.insert(b_vk, DeviceInfo { verifying_key: b_vk, label: "phone".into(), added_at_seq: 2, revoked_at_seq: None });
-    let mut log_state = LogState::empty(fp_a);
-    log_state.devices = devices;
-    log_state.head_seq = 2;
-    client_a.cache_own_identity_log(log_state.clone());
-    client_b.cache_own_identity_log(log_state);
-
-    let sync_key = [0x42u8; 32];
-    client_a.set_sync_key(sync_key).unwrap();
-    client_b.set_sync_key(sync_key).unwrap();
-
-    let (commit, _) = client_b.join_sync_group(&gi).unwrap();
-    client_a.receive_sync(&commit).unwrap();
-
-    // Device A removes Device B from sync group
-    let _removal_commit = client_a.remove_device_from_sync_group(&b_vk).unwrap();
-    client_a.merge_pending_commit_for_sync().unwrap();
-
-    // Device A rotates sync key after removal
-    let new_key = client_a.rotate_sync_key().unwrap();
-    assert_ne!(new_key, sync_key);
-
-    // Device A sends a post-removal mutation (encrypted with new sync key)
-    let mutation = encode_mutation(MUTATION_SET, 10000, "read:ch2", &99u64.to_be_bytes());
-    let mut payload = Vec::with_capacity(1 + mutation.len());
-    payload.push(0x04);
-    payload.extend_from_slice(&mutation);
-    let outbound = client_a.send_sync(&payload).unwrap();
-
-    // Device B still has old sync key — cannot decrypt
-    assert!(client_b.receive_sync(&outbound.blob).is_err());
+    let outbound = devices.a.send_sync(&mutation("read:ch2", 99)).unwrap();
+    let opened = devices.b.receive_sync(&outbound.blob);
+    assert!(matches!(opened, Err(GhostError::AccountKeyUnavailable(_))), "{opened:?}");
 }
 
 #[test]
 fn sync_state_survives_dump_import_cycle() {
-    let (client_a, _, _, _, _) = make_ghost_client("desktop");
+    let client_a = make_ghost_client();
 
     // Set some sync state
     client_a.sync_set("read:ch1", &42u64.to_be_bytes(), 100).unwrap();
@@ -491,264 +397,13 @@ fn sync_state_survives_dump_import_cycle() {
 
     // Dump it
     let dump = client_a.sync_dump().unwrap();
-    assert_eq!(dump.len(), 2);
+    assert_eq!(dump.entries.len(), 2);
 
     // Import into a fresh client — all state should arrive
-    let (client_b, _, _, _, _) = make_ghost_client("phone");
-    client_b.sync_import(&dump).unwrap();
+    let client_b = make_ghost_client();
+    client_b.sync_import(&dump.entries).unwrap();
 
     let (val, ts) = client_b.sync_get("read:ch1").unwrap().unwrap();
     assert_eq!(val.unwrap(), 42u64.to_be_bytes());
     assert_eq!(ts, 100);
 }
-
-// ── Full pairing → identity log → MLS sync exchange ────────────────
-
-#[tokio::test]
-async fn full_pairing_then_sync_exchange() {
-    let relay_url = common::start_relay().await;
-
-    // 1. Device A creates account
-    let (master, device_a, genesis, fp, _seed) = make_account("desktop");
-    let master_vk = master.verifying_key().to_bytes();
-    let (mut relay_a, _) = RelayClient::new(&relay_url);
-    relay_a.set_auth(fp, device_a.verifying_key().to_bytes(), device_a.clone());
-    relay_a
-        .put_idlog_entry(&fp, genesis.to_bytes())
-        .await
-        .unwrap();
-    relay_a.set_auth(fp, device_a.verifying_key().to_bytes(), device_a.clone());
-
-    // 2. Device A creates GhostClient, sync key, and sync MLS group
-    let deleg_a = compute_delegation_sig(&master, device_a.verifying_key().as_bytes(), &fp, 1);
-    let mut client_a = GhostClient::open_in_memory(
-        Identity::from_device(fp, device_a.clone(), 1, master_vk, SigningKey::from_bytes(&master.to_bytes()), deleg_a),
-        [0x01; 32],
-    )
-    .unwrap();
-    let sync_key: [u8; 32] = {
-        let mut k = [0u8; 32];
-        rand::RngCore::fill_bytes(&mut OsRng, &mut k);
-        k
-    };
-    client_a.set_sync_key(sync_key).unwrap();
-    client_a.create_sync_group().unwrap();
-
-    // 3. Device A posts pairing offer (authenticated)
-    let secret = [0x42u8; 32];
-    let token = [0x24u8; 16];
-    let offer = sync_seal(&secret, b"offer-data").unwrap();
-    relay_a.post_pairing_offer(&fp, &token, offer).await.unwrap();
-
-    // 4. Device B responds with its key (unauthenticated)
-    let (guest, _) = RelayClient::new(&relay_url);
-    let device_b = SigningKey::generate(&mut OsRng);
-    let mut response_pt = device_b.to_bytes().to_vec();
-    response_pt.extend_from_slice(b"phone");
-    let response = sync_seal(&secret, &response_pt).unwrap();
-    guest.post_pairing_response(&fp, &token, response).await.unwrap();
-
-    // 5. Device A gets response (authenticated)
-    let resp_blob = relay_a.get_pairing_response(&fp, &token).await.unwrap().unwrap();
-    let resp_pt = sync_open(&secret, &resp_blob).unwrap();
-    let b_key_bytes: [u8; 32] = resp_pt[..32].try_into().unwrap();
-    let b_signing_key = SigningKey::from_bytes(&b_key_bytes);
-
-    // Build provision: [sync_key:32][gi_len:u32][group_info][count:u16][servers...][sync_dump]
-    let actual_sync_key = client_a.sync_key().unwrap();
-    let group_info = client_a.sync_group_info().unwrap();
-    client_a
-        .sync_set("read:ch1", &77u64.to_be_bytes(), 1000)
-        .unwrap();
-    let sync_dump = client_a.sync_dump().unwrap();
-
-    let mut provision_pt = Vec::new();
-    provision_pt.extend_from_slice(&actual_sync_key);
-    provision_pt.extend_from_slice(&(group_info.len() as u32).to_be_bytes());
-    provision_pt.extend_from_slice(&group_info);
-    provision_pt.extend_from_slice(&0u16.to_be_bytes()); // 0 servers
-    provision_pt.extend_from_slice(&encode_sync_state_dump(&sync_dump).unwrap());
-    let provision_sealed = sync_seal(&secret, &provision_pt).unwrap();
-
-    relay_a.put_provision(&fp, &token, provision_sealed).await.unwrap();
-
-    // Push AddDevice to identity log
-    let chain_state = validate_chain(&[genesis.clone()]).unwrap();
-    let add_entry = create_add_device(&chain_state, &device_a, &b_signing_key, "phone");
-    relay_a
-        .put_idlog_entry(&fp, add_entry.to_bytes())
-        .await
-        .unwrap();
-
-    // 6. Device B: validate chain, fetch provision, join sync group
-    let all_resp = relay_a.get_idlog(&fp, 0).await.unwrap();
-    let all_entries: Vec<LogEntry> = all_resp.entries.iter().map(|a| a.entry.clone()).collect();
-    let state = validate_chain(&all_entries).unwrap();
-    assert_eq!(state.active_devices().count(), 2);
-    assert!(state.is_active_device(&device_b.verifying_key().to_bytes()));
-
-    // Cache identity log in Device A so sync credential validation passes
-    client_a.cache_own_identity_log(state.clone());
-
-    let prov_blob = guest.get_provision(&fp, &token).await.unwrap().unwrap();
-    let prov_pt = sync_open(&secret, &prov_blob).unwrap();
-    let recovered_sync_key: [u8; 32] = prov_pt[..32].try_into().unwrap();
-    let gi_len = u32::from_be_bytes(prov_pt[32..36].try_into().unwrap()) as usize;
-    let recovered_gi = &prov_pt[36..36 + gi_len];
-
-    // Device B creates GhostClient, stores sync key, joins sync group
-    let deleg_b = compute_delegation_sig(&master, device_b.verifying_key().as_bytes(), &fp, 2);
-    let mut client_b = GhostClient::open_in_memory(
-        Identity::from_device(fp, device_b.clone(), 2, master_vk, SigningKey::from_bytes(&master.to_bytes()), deleg_b),
-        [0x02; 32],
-    )
-    .unwrap();
-    client_b.set_sync_key(recovered_sync_key).unwrap();
-    assert_eq!(client_b.sync_key().unwrap(), sync_key);
-    client_b.cache_own_identity_log(state);
-
-    let (commit, sync_mb) = client_b.join_sync_group(recovered_gi).unwrap();
-    assert_eq!(sync_mb, client_a.sync_mailbox_id().unwrap());
-
-    // Device A processes the join commit
-    match client_a.receive_sync(&commit).unwrap() {
-        SyncReceiveResult::CommitProcessed => {}
-        other => panic!("expected CommitProcessed, got {:?}", other),
-    }
-
-    // 7. Both subscribe to sync mailbox, A sends mutation via MLS, B receives
-    let mailbox = client_a.sync_mailbox_id().unwrap();
-    let (mut relay_a2, _events_a) = RelayClient::new(&relay_url);
-    let (mut relay_b2, mut events_b) = RelayClient::new(&relay_url);
-    relay_a2.set_auth(fp, device_a.verifying_key().to_bytes(), device_a.clone());
-    relay_b2.set_auth(fp, device_b.verifying_key().to_bytes(), device_b.clone());
-    relay_a2.subscribe(mailbox, 0);
-    relay_b2.subscribe(mailbox, 0);
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    let mutation = encode_mutation(MUTATION_SET, 9000, "read:ch1", &77u64.to_be_bytes());
-    let mut sync_payload = Vec::with_capacity(1 + mutation.len());
-    sync_payload.push(0x04); // MutationSync
-    sync_payload.extend_from_slice(&mutation);
-    let outbound = client_a.send_sync(&sync_payload).unwrap();
-    relay_a2
-        .send(&mailbox, outbound.blob)
-        .await
-        .unwrap();
-
-    let blob = recv_blob(&mut events_b, mailbox).await;
-    match client_b.receive_sync(&blob.payload).unwrap() {
-        SyncReceiveResult::Application(plaintext) => {
-            assert_eq!(plaintext[0], 0x04);
-            let (op, ts, key, value) = decode_mutation(&plaintext[1..]).unwrap();
-            assert_eq!(op, MUTATION_SET);
-            assert_eq!(ts, 9000);
-            assert_eq!(key, "read:ch1");
-            assert_eq!(u64::from_be_bytes(value.try_into().unwrap()), 77);
-        }
-        other => panic!("expected Application, got {:?}", other),
-    }
-}
-
-// ── Recovery: full flow ─────────────────────────────────────────────
-
-#[tokio::test]
-async fn recovery_full_flow() {
-    let relay_url = common::start_relay().await;
-    let (mut relay, _) = RelayClient::new(&relay_url);
-
-    // 1. Create account with 2 devices
-    let (master, device1, genesis, fp, seed) = make_account("desktop");
-    relay.set_auth(fp, device1.verifying_key().to_bytes(), device1.clone());
-    let device2 = SigningKey::generate(&mut OsRng);
-
-    relay
-        .put_idlog_entry(&fp, genesis.to_bytes())
-        .await
-        .unwrap();
-    let s1 = validate_chain(&[genesis.clone()]).unwrap();
-    let add = create_add_device(&s1, &device1, &device2, "phone");
-    relay.put_idlog_entry(&fp, add.to_bytes()).await.unwrap();
-
-    // Set auth as device1 for subsequent authenticated calls
-    relay.set_auth(fp, device1.verifying_key().to_bytes(), device1.clone());
-
-    // Both devices had a sync key
-    let old_sync_key = [0xAA; 32];
-
-    // 2. Export seed + sync_key encrypted with passphrase, store on relay
-    let recovery_blob = export_recovery_blob(&seed, &old_sync_key, "my-recovery-passphrase").unwrap();
-    let bundle = ghost_wire::recovery_bundle::RecoveryBundle {
-        generation: 1,
-        recovery_blob: recovery_blob.clone(),
-        master_blob: vec![],
-    };
-    relay.put_recovery_bundle(&fp, &bundle).await.unwrap();
-
-    // 3. All devices lost. New device fetches recovery blob.
-    let fetched = relay.get_recovery_bundle(&fp).await.unwrap().unwrap();
-    assert_eq!(fetched, bundle);
-
-    // 4. Decrypt → derive master key
-    let recovered = import_recovery_blob(&fetched.recovery_blob, "my-recovery-passphrase").unwrap();
-    assert_eq!(recovered.seed, seed);
-    assert_eq!(recovered.sync_key.unwrap(), old_sync_key);
-    let recovered_seed = recovered.seed;
-    let recovered_ed = derive_ed25519_seed(&recovered_seed).unwrap();
-    let recovered_master = SigningKey::from_bytes(&recovered_ed);
-    assert_eq!(
-        recovered_master.verifying_key().to_bytes(),
-        master.verifying_key().to_bytes()
-    );
-
-    // 5. Create Recovery entry, push to relay
-    let recovery_device = SigningKey::generate(&mut OsRng);
-    let chain_resp = relay.get_idlog(&fp, 0).await.unwrap();
-    let chain_entries: Vec<LogEntry> = chain_resp.entries.iter().map(|a| a.entry.clone()).collect();
-    let chain_state = validate_chain(&chain_entries).unwrap();
-    assert_eq!(chain_state.active_devices().count(), 2);
-
-    let recovery_entry =
-        create_recovery(&chain_state, &recovered_master, &recovery_device, "new-phone");
-    relay
-        .put_idlog_entry(&fp, recovery_entry.to_bytes())
-        .await
-        .unwrap();
-
-    // Re-auth as recovery device (device1 was revoked by recovery)
-    relay.set_auth(fp, recovery_device.verifying_key().to_bytes(), recovery_device.clone());
-
-    // 6. Validate: only recovery device is active
-    let final_resp = relay.get_idlog(&fp, 0).await.unwrap();
-    let final_entries: Vec<LogEntry> = final_resp.entries.iter().map(|a| a.entry.clone()).collect();
-    let final_state = validate_chain(&final_entries).unwrap();
-    assert_eq!(final_state.active_devices().count(), 1);
-    assert!(final_state.is_active_device(&recovery_device.verifying_key().to_bytes()));
-    assert!(!final_state.is_active_device(&device1.verifying_key().to_bytes()));
-    assert!(!final_state.is_active_device(&device2.verifying_key().to_bytes()));
-
-    // 7. Recovery device creates GhostClient with sync key + fresh sync group
-    let master_vk = recovered_master.verifying_key().to_bytes();
-    let recovery_deleg = compute_delegation_sig(&recovered_master, recovery_device.verifying_key().as_bytes(), &fp, 3);
-    let recovery_identity = Identity::from_device(fp, recovery_device.clone(), 3, master_vk, SigningKey::from_bytes(&recovered_master.to_bytes()), recovery_deleg);
-    let mut recovery_client =
-        GhostClient::open_in_memory(recovery_identity, [0x99; 32]).unwrap();
-    assert!(recovery_client.sync_key().is_none());
-    assert!(!recovery_client.has_sync_group());
-
-    recovery_client.set_sync_key(old_sync_key).unwrap();
-    recovery_client.create_sync_group().unwrap();
-    assert!(recovery_client.has_sync_group());
-    assert!(recovery_client.sync_mailbox_id().is_some());
-
-    // 8. Old sync key still works for durable snapshot decryption
-    let snapshot_data = b"server-metadata-snapshot";
-    let sealed = sync_seal(&old_sync_key, snapshot_data).unwrap();
-    assert_eq!(sync_open(&old_sync_key, &sealed).unwrap(), snapshot_data);
-
-    // 9. MLS sync group is fresh — only recovery device is a member
-    // (any future devices added via pairing will join via GroupInfo)
-    let gi = recovery_client.sync_group_info().unwrap();
-    assert!(!gi.is_empty());
-}
-

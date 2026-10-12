@@ -6,10 +6,21 @@
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use thiserror::Error;
 
+use crate::bytes::{put_prefixed16, put_prefixed32, ReadError, Reader};
+
 /// GroupContext extension carrying a server's roles (private-use range).
 pub const SERVER_POLICY_EXTENSION: u16 = 0xFF10;
 /// GroupContext extension carrying a private channel's access list.
 pub const CHANNEL_POLICY_EXTENSION: u16 = 0xFF11;
+/// GroupContext extension listing accounts removed from a server, which may not rejoin
+/// until someone who may kick lets them back in.
+pub const SERVER_REMOVALS_EXTENSION: u16 = 0xFF12;
+/// Most accounts a server's removed list holds; the oldest give way to newer ones, as in
+/// Signal. The list travels in the group state every member republishes after each
+/// change, so it stays small: about 40 bytes an entry.
+pub const MAX_REMOVED: usize = 256;
+/// How far a removal's time may run ahead of the verifier's clock.
+pub const REMOVAL_CLOCK_SKEW_MS: u64 = 10 * 60 * 1000;
 
 pub const INVITE: u32 = 1;
 pub const KICK: u32 = 1 << 1;
@@ -19,6 +30,7 @@ pub const MANAGE_ROLES: u32 = 1 << 3;
 pub const ALL_PERMISSIONS: u32 = INVITE | KICK | MANAGE_CHANNELS | MANAGE_ROLES;
 
 const POLICY_VERSION: u8 = 0x01;
+const REMOVALS_VERSION: u8 = 0x01;
 const GRANT_VERSION: u8 = 0x01;
 const GRANT_SIGN_PREFIX: &[u8] = b"ghost-invite-grant-v1:";
 
@@ -28,6 +40,9 @@ pub enum PolicyError {
     Format(String),
     #[error("not permitted: {0}")]
     Denied(String),
+    /// The account was removed from the server and has not been let back in.
+    #[error("removed from this server: someone who may kick must let them back in")]
+    Removed,
     /// A private channel commit was authorized against a server policy this verifier
     /// has not reached yet; process the server group, then retry.
     #[error("server group must reach epoch {epoch} first")]
@@ -79,12 +94,6 @@ impl ServerPolicy {
         Self { owner, everyone: INVITE, roles: Vec::new(), assignments: Vec::new() }
     }
 
-    /// Policy of a group created before policies existed: the creator owns it and
-    /// anyone may invite, which is what members could do before.
-    pub fn implicit(creator: [u8; 32]) -> Self {
-        Self::new(creator)
-    }
-
     pub fn roles_of(&self, account: &[u8; 32]) -> &[u8] {
         self.assignments
             .iter()
@@ -109,6 +118,13 @@ impl ServerPolicy {
 
     pub fn has(&self, account: &[u8; 32], permission: u32) -> bool {
         self.permissions(account) & permission == permission
+    }
+
+    /// This policy without any role assignments for `accounts`.
+    pub fn without_assignments(&self, accounts: &[[u8; 32]]) -> Self {
+        let mut policy = self.clone();
+        policy.assignments.retain(|(account, _)| !accounts.contains(account));
+        policy
     }
 
     pub fn rank(&self, account: &[u8; 32]) -> Rank {
@@ -142,8 +158,8 @@ impl ServerPolicy {
 
     pub fn from_bytes(data: &[u8]) -> Result<Self, PolicyError> {
         let mut r = Reader::new(data);
-        r.version()?;
-        let owner = r.array32()?;
+        expect_version(&mut r, POLICY_VERSION)?;
+        let owner = r.array()?;
         let everyone = r.u32()?;
         let role_count = r.u8()? as usize;
         let mut roles = Vec::with_capacity(role_count);
@@ -153,9 +169,9 @@ impl ServerPolicy {
         let assign_count = r.u16()? as usize;
         let mut assignments = Vec::with_capacity(assign_count);
         for _ in 0..assign_count {
-            let account = r.array32()?;
+            let account = r.array()?;
             let count = r.u8()? as usize;
-            assignments.push((account, r.bytes(count)?.to_vec()));
+            assignments.push((account, r.take(count)?.to_vec()));
         }
         r.finish()?;
         let policy = Self { owner, everyone, roles, assignments };
@@ -183,6 +199,79 @@ impl ServerPolicy {
     }
 }
 
+/// One account removed from a server, and when.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemovedAccount {
+    pub account: [u8; 32],
+    pub removed_at: u64,
+}
+
+/// Accounts removed from a server that may not rejoin, oldest first.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RemovedAccounts {
+    pub entries: Vec<RemovedAccount>,
+}
+
+impl RemovedAccounts {
+    pub fn contains(&self, account: &[u8; 32]) -> bool {
+        self.entries.iter().any(|e| e.account == *account)
+    }
+
+    /// This list with `account` added as removed at `removed_at`, the oldest entries
+    /// giving way when it is full.
+    pub fn with_removed(&self, account: [u8; 32], removed_at: u64) -> Self {
+        let mut entries: Vec<RemovedAccount> = self.entries.iter().filter(|e| e.account != account).copied().collect();
+        entries.push(RemovedAccount { account, removed_at });
+        entries.sort_by_key(|e| e.removed_at);
+        let excess = entries.len().saturating_sub(MAX_REMOVED);
+        entries.drain(..excess);
+        Self { entries }
+    }
+
+    /// This list with `account` let back in.
+    pub fn without(&self, account: &[u8; 32]) -> Self {
+        Self { entries: self.entries.iter().filter(|e| e.account != *account).copied().collect() }
+    }
+
+    /// `[version][count:2] count × [account:32][removed_at:8]`.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(3 + self.entries.len() * 40);
+        buf.push(REMOVALS_VERSION);
+        buf.extend_from_slice(&(self.entries.len() as u16).to_be_bytes());
+        for entry in &self.entries {
+            buf.extend_from_slice(&entry.account);
+            buf.extend_from_slice(&entry.removed_at.to_be_bytes());
+        }
+        buf
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self, PolicyError> {
+        let mut r = Reader::new(data);
+        expect_version(&mut r, REMOVALS_VERSION)?;
+        let count = r.u16()? as usize;
+        let entries = (0..count)
+            .map(|_| Ok(RemovedAccount { account: r.array()?, removed_at: r.u64()? }))
+            .collect::<Result<_, PolicyError>>()?;
+        r.finish()?;
+        let list = Self { entries };
+        list.check_well_formed()?;
+        Ok(list)
+    }
+
+    /// At most `MAX_REMOVED` entries, one per account.
+    pub fn check_well_formed(&self) -> Result<(), PolicyError> {
+        if self.entries.len() > MAX_REMOVED {
+            return Err(PolicyError::Format("removed list too long".into()));
+        }
+        for (i, entry) in self.entries.iter().enumerate() {
+            if self.entries[..i].iter().any(|e| e.account == entry.account) {
+                return Err(PolicyError::Format("account removed twice".into()));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The server group as a private channel sees it: its policy and member accounts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerView {
@@ -196,8 +285,7 @@ impl ServerView {
     pub fn to_bytes(&self) -> Vec<u8> {
         let policy = self.policy.to_bytes();
         let mut buf = Vec::with_capacity(4 + policy.len() + 2 + self.members.len() * 32);
-        buf.extend_from_slice(&(policy.len() as u32).to_be_bytes());
-        buf.extend_from_slice(&policy);
+        put_prefixed32(&mut buf, &policy);
         buf.extend_from_slice(&(self.members.len() as u16).to_be_bytes());
         for account in &self.members {
             buf.extend_from_slice(account);
@@ -207,10 +295,9 @@ impl ServerView {
 
     pub fn from_bytes(data: &[u8]) -> Result<Self, PolicyError> {
         let mut r = Reader::new(data);
-        let policy_len = r.u32()? as usize;
-        let policy = ServerPolicy::from_bytes(r.bytes(policy_len)?)?;
+        let policy = ServerPolicy::from_bytes(r.prefixed32()?)?;
         let count = r.u16()? as usize;
-        let members = (0..count).map(|_| r.array32()).collect::<Result<_, _>>()?;
+        let members = (0..count).map(|_| r.array()).collect::<Result<_, _>>()?;
         r.finish()?;
         Ok(Self { policy, members })
     }
@@ -254,15 +341,15 @@ impl ChannelPolicy {
 
     pub fn from_bytes(data: &[u8]) -> Result<Self, PolicyError> {
         let mut r = Reader::new(data);
-        r.version()?;
-        let server_mailbox = r.array32()?;
-        let channel_id = r.array32()?;
+        expect_version(&mut r, POLICY_VERSION)?;
+        let server_mailbox = r.array()?;
+        let channel_id = r.array()?;
         let role_count = r.u8()? as usize;
-        let roles = r.bytes(role_count)?.to_vec();
+        let roles = r.take(role_count)?.to_vec();
         let account_count = r.u16()? as usize;
         let mut accounts = Vec::with_capacity(account_count);
         for _ in 0..account_count {
-            accounts.push(r.array32()?);
+            accounts.push(r.array()?);
         }
         r.finish()?;
         Ok(Self { server_mailbox, channel_id, roles, accounts })
@@ -280,8 +367,7 @@ impl AdmittedChannels {
         let mut buf = (self.0.len() as u16).to_be_bytes().to_vec();
         for (mailbox, group_info) in &self.0 {
             buf.extend_from_slice(mailbox);
-            buf.extend_from_slice(&(group_info.len() as u32).to_be_bytes());
-            buf.extend_from_slice(group_info);
+            put_prefixed32(&mut buf, group_info);
         }
         buf
     }
@@ -291,9 +377,8 @@ impl AdmittedChannels {
         let count = r.u16()? as usize;
         let mut channels = Vec::with_capacity(count);
         for _ in 0..count {
-            let mailbox = r.array32()?;
-            let len = r.u32()? as usize;
-            channels.push((mailbox, r.bytes(len)?.to_vec()));
+            let mailbox = r.array()?;
+            channels.push((mailbox, r.prefixed32()?.to_vec()));
         }
         r.finish()?;
         Ok(Self(channels))
@@ -355,14 +440,14 @@ impl InviteGrant {
 
     pub fn from_bytes(data: &[u8]) -> Result<Self, PolicyError> {
         let mut r = Reader::new(data);
-        r.version()?;
+        expect_version(&mut r, POLICY_VERSION)?;
         let grant = Self {
-            server_mailbox: r.array32()?,
-            issuer_account: r.array32()?,
-            issuer_device: r.array32()?,
+            server_mailbox: r.array()?,
+            issuer_account: r.array()?,
+            issuer_device: r.array()?,
             expires_at: r.u64()?,
-            nonce: r.bytes(16)?.try_into().unwrap(),
-            signature: r.bytes(64)?.try_into().unwrap(),
+            nonce: r.array()?,
+            signature: r.array()?,
         };
         r.finish()?;
         Ok(grant)
@@ -393,8 +478,7 @@ impl CommitAad {
         let mut buf = Vec::new();
         let mut field = |tag: u8, value: &[u8]| {
             buf.push(tag);
-            buf.extend_from_slice(&(value.len() as u16).to_be_bytes());
-            buf.extend_from_slice(value);
+            put_prefixed16(&mut buf, value);
         };
         if let Some(grant) = &self.invite {
             field(AAD_INVITE, &grant.to_bytes());
@@ -408,10 +492,9 @@ impl CommitAad {
     pub fn from_bytes(data: &[u8]) -> Result<Self, PolicyError> {
         let mut aad = Self::default();
         let mut r = Reader::new(data);
-        while r.pos < data.len() {
+        while !r.is_empty() {
             let tag = r.u8()?;
-            let len = r.u16()? as usize;
-            let value = r.bytes(len)?;
+            let value = r.prefixed16()?;
             match tag {
                 AAD_INVITE => aad.invite = Some(InviteGrant::from_bytes(value)?),
                 AAD_SERVER_EPOCH => {
@@ -450,10 +533,14 @@ pub struct CommitSummary {
     /// Accounts added through Add proposals.
     pub adds: Vec<[u8; 32]>,
     pub removes: Vec<Removal>,
+    /// Accounts with no leaf left once this commit is merged.
+    pub departed: Vec<[u8; 32]>,
     /// The ServerPolicy after this commit, when the commit changes it.
     pub new_server_policy: Option<ServerPolicy>,
     /// The ChannelPolicy after this commit, when the commit changes it.
     pub new_channel_policy: Option<ChannelPolicy>,
+    /// The server's removed list after this commit, when the group carries one.
+    pub new_removed: Option<RemovedAccounts>,
 }
 
 impl CommitSummary {
@@ -472,20 +559,31 @@ pub struct GrantContext<'a> {
     pub now_millis: u64,
     /// Whether `device` is the signature key of a leaf of `account` in the group.
     pub is_member_device: &'a dyn Fn(&[u8; 32], &[u8; 32]) -> bool,
+    /// The server's removed list before the commit; empty when it carries none.
+    pub removed: &'a RemovedAccounts,
 }
 
 /// Decide whether a commit to a server group is allowed under `policy`, the policy
 /// in force before the commit.
 pub fn authorize_server_commit(policy: &ServerPolicy, commit: &CommitSummary, ctx: &GrantContext) -> Result<(), PolicyError> {
     let committer = commit.committer_account();
+    let removed_after = commit.new_removed.as_ref().unwrap_or(ctx.removed);
 
-    if let Committer::Joiner { already_member, grant, .. } = &commit.committer {
+    if let Committer::Joiner { account, already_member, grant } = &commit.committer {
         if !already_member {
+            if ctx.removed.contains(account) {
+                return Err(PolicyError::Removed);
+            }
             let grant = grant.as_ref().ok_or_else(|| deny("joining needs an invite"))?;
             check_grant(policy, grant, ctx)?;
         }
     }
 
+    // Someone with the right to let a removed account back in can re-add it in the same
+    // commit that clears it; otherwise it stays out.
+    if commit.adds.iter().any(|account| removed_after.contains(account)) {
+        return Err(PolicyError::Removed);
+    }
     if !commit.adds.is_empty() && !policy.has(&committer, INVITE) {
         return Err(deny("adding members needs the invite permission"));
     }
@@ -505,11 +603,48 @@ pub fn authorize_server_commit(policy: &ServerPolicy, commit: &CommitSummary, ct
         }
     }
 
+    if let Some(new) = &commit.new_removed {
+        authorize_removed_change(policy, ctx.removed, new, commit, &committer, ctx.now_millis)?;
+    }
     if let Some(new) = &commit.new_server_policy {
-        authorize_policy_change(policy, new, &committer)?;
+        // The roles of an account leaving with this commit, or let back in by it, go with
+        // it, so a returning member never quietly regains them.
+        let cleared = ctx.removed.entries.iter().map(|e| e.account).filter(|a| !removed_after.contains(a));
+        let gone: Vec<[u8; 32]> = commit.departed.iter().copied().chain(cleared).collect();
+        authorize_policy_change(&policy.without_assignments(&gone), new, &committer)?;
     }
     if commit.new_channel_policy.is_some() {
         return Err(deny("a server group carries no channel policy"));
+    }
+    Ok(())
+}
+
+/// A change to the removed list by `committer`: only with KICK; an account may be added
+/// only by the commit that removes it, and at a time that is not ahead of the clock.
+/// Entries may go (let back in, or dropped for room) with KICK alone.
+fn authorize_removed_change(
+    policy: &ServerPolicy,
+    old: &RemovedAccounts,
+    new: &RemovedAccounts,
+    commit: &CommitSummary,
+    committer: &[u8; 32],
+    now_millis: u64,
+) -> Result<(), PolicyError> {
+    if new == old {
+        return Ok(());
+    }
+    new.check_well_formed()?;
+    if !policy.has(committer, KICK) {
+        return Err(deny("changing who may rejoin needs the kick permission"));
+    }
+    for entry in new.entries.iter().filter(|e| !old.entries.contains(e)) {
+        let kicked = commit.removes.iter().any(|r| r.account == entry.account && !r.proposed_by_relay && r.account != *committer);
+        if !kicked || !commit.departed.contains(&entry.account) {
+            return Err(deny("only an account this commit removes can be kept from rejoining"));
+        }
+        if entry.removed_at > now_millis.saturating_add(REMOVAL_CLOCK_SKEW_MS) {
+            return Err(deny("removal time is ahead of the clock"));
+        }
     }
     Ok(())
 }
@@ -577,7 +712,12 @@ fn authorize_policy_change(old: &ServerPolicy, new: &ServerPolicy, committer: &[
                 return Err(deny("cannot assign or remove a role at or above your own rank"));
             }
         }
-        if account != *committer && !old.rank(committer).outranks(old.rank(&account)) {
+        // Nobody but the owner changes their own roles: with the manage roles permission
+        // held through `everyone`, a plain member could otherwise take the top role.
+        if account == *committer {
+            return Err(deny("cannot change your own roles"));
+        }
+        if !old.rank(committer).outranks(old.rank(&account)) {
             return Err(deny("cannot change the roles of a member of equal or higher rank"));
         }
     }
@@ -628,57 +768,17 @@ pub fn authorize_channel_commit(
     Ok(())
 }
 
-struct Reader<'a> {
-    data: &'a [u8],
-    pos: usize,
+/// The version byte a policy encoding starts with.
+fn expect_version(r: &mut Reader, expected: u8) -> Result<(), PolicyError> {
+    match r.u8()? {
+        v if v == expected => Ok(()),
+        v => Err(PolicyError::Format(format!("unknown version {v:#x}"))),
+    }
 }
 
-impl<'a> Reader<'a> {
-    fn new(data: &'a [u8]) -> Self {
-        Self { data, pos: 0 }
-    }
-
-    fn bytes(&mut self, n: usize) -> Result<&'a [u8], PolicyError> {
-        let end = self.pos.checked_add(n).filter(|end| *end <= self.data.len());
-        let end = end.ok_or_else(|| PolicyError::Format("truncated".into()))?;
-        let out = &self.data[self.pos..end];
-        self.pos = end;
-        Ok(out)
-    }
-
-    fn u8(&mut self) -> Result<u8, PolicyError> {
-        Ok(self.bytes(1)?[0])
-    }
-
-    fn u16(&mut self) -> Result<u16, PolicyError> {
-        Ok(u16::from_be_bytes(self.bytes(2)?.try_into().unwrap()))
-    }
-
-    fn u32(&mut self) -> Result<u32, PolicyError> {
-        Ok(u32::from_be_bytes(self.bytes(4)?.try_into().unwrap()))
-    }
-
-    fn u64(&mut self) -> Result<u64, PolicyError> {
-        Ok(u64::from_be_bytes(self.bytes(8)?.try_into().unwrap()))
-    }
-
-    fn array32(&mut self) -> Result<[u8; 32], PolicyError> {
-        Ok(self.bytes(32)?.try_into().unwrap())
-    }
-
-    fn version(&mut self) -> Result<(), PolicyError> {
-        match self.u8()? {
-            POLICY_VERSION => Ok(()),
-            v => Err(PolicyError::Format(format!("unknown version {v:#x}"))),
-        }
-    }
-
-    fn finish(&self) -> Result<(), PolicyError> {
-        if self.pos == self.data.len() {
-            Ok(())
-        } else {
-            Err(PolicyError::Format("trailing bytes".into()))
-        }
+impl From<ReadError> for PolicyError {
+    fn from(e: ReadError) -> Self {
+        PolicyError::Format(e.to_string())
     }
 }
 
@@ -710,19 +810,24 @@ mod tests {
             committer: Committer::Member(committer),
             adds: vec![],
             removes: vec![],
+            departed: vec![],
             new_server_policy: None,
             new_channel_policy: None,
+            new_removed: None,
         }
     }
 
     fn removing(committer: [u8; 32], target: [u8; 32]) -> CommitSummary {
         let mut c = by(committer);
         c.removes.push(Removal { account: target, proposed_by_relay: false });
+        c.departed.push(target);
         c
     }
 
+    const NONE_REMOVED: &RemovedAccounts = &RemovedAccounts { entries: Vec::new() };
+
     fn ctx<'a>(member_device: &'a dyn Fn(&[u8; 32], &[u8; 32]) -> bool) -> GrantContext<'a> {
-        GrantContext { server_mailbox: MAILBOX, now_millis: 1000, is_member_device: member_device }
+        GrantContext { server_mailbox: MAILBOX, now_millis: 1000, is_member_device: member_device, removed: NONE_REMOVED }
     }
 
     fn any_device(_: &[u8; 32], _: &[u8; 32]) -> bool {
@@ -780,7 +885,7 @@ mod tests {
         assert!(p.rank(&MOD).outranks(p.rank(&HELPER)));
         assert!(p.rank(&HELPER).outranks(p.rank(&MEMBER)));
         assert!(!p.rank(&MEMBER).outranks(p.rank(&MEMBER)));
-        assert!(ServerPolicy::implicit(OWNER).has(&MEMBER, INVITE), "legacy servers let anyone invite");
+        assert!(ServerPolicy::new(OWNER).has(&MEMBER, INVITE), "a new server lets anyone invite");
     }
 
     #[test]
@@ -884,6 +989,113 @@ mod tests {
         let mut anything = p.clone();
         anything.owner = MOD;
         change(OWNER, anything).unwrap();
+    }
+
+    #[test]
+    fn nobody_but_the_owner_changes_their_own_roles() {
+        let mut p = policy();
+        p.everyone |= MANAGE_ROLES;
+        let c = ctx(&any_device);
+        let change = |committer, new: ServerPolicy| {
+            let mut s = by(committer);
+            s.new_server_policy = Some(new);
+            authorize_server_commit(&p, &s, &c)
+        };
+        // A plain member holding manage roles through `everyone` outranks nobody, so it
+        // changes nobody's roles: not another member's, and not its own.
+        let mut grant = p.clone();
+        grant.assignments.push(([8; 32], vec![20]));
+        assert!(change(MEMBER, grant).is_err());
+        let mut promote_self = p.clone();
+        promote_self.assignments.push((MEMBER, vec![10]));
+        assert!(change(MEMBER, promote_self).is_err());
+        // Nor may a mod drop or add one of its own roles.
+        let mut demote_self = p.clone();
+        demote_self.assignments.retain(|(account, _)| *account != MOD);
+        assert!(change(MOD, demote_self).is_err());
+    }
+
+    fn removed(accounts: &[[u8; 32]]) -> RemovedAccounts {
+        accounts.iter().fold(RemovedAccounts::default(), |list, account| list.with_removed(*account, 900))
+    }
+
+    #[test]
+    fn removed_lists_round_trip_and_name_each_account_once() {
+        let list = removed(&[MEMBER, HELPER]);
+        assert_eq!(RemovedAccounts::from_bytes(&list.to_bytes()).unwrap(), list);
+        let twice = RemovedAccounts { entries: vec![RemovedAccount { account: MEMBER, removed_at: 1 }; 2] };
+        assert!(twice.check_well_formed().is_err());
+    }
+
+    #[test]
+    fn a_full_removed_list_drops_its_oldest_entry() {
+        let account = |i: usize| {
+            let mut a = [0u8; 32];
+            a[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            a
+        };
+        let full = (0..MAX_REMOVED).fold(RemovedAccounts::default(), |list, i| list.with_removed(account(i), i as u64));
+        let newer = full.with_removed([0xEE; 32], MAX_REMOVED as u64);
+        assert_eq!(newer.entries.len(), MAX_REMOVED);
+        assert!(newer.contains(&[0xEE; 32]));
+        assert!(!newer.contains(&account(0)), "the oldest gave way");
+    }
+
+    #[test]
+    fn a_kick_can_keep_only_the_account_it_removes_out() {
+        let p = policy();
+        let c = ctx(&any_device);
+        let mut kick = removing(MOD, MEMBER);
+        kick.new_removed = Some(removed(&[MEMBER]));
+        authorize_server_commit(&p, &kick, &c).unwrap();
+
+        let mut not_removed = by(MOD);
+        not_removed.new_removed = Some(removed(&[MEMBER]));
+        assert!(authorize_server_commit(&p, &not_removed, &c).is_err(), "only whom the commit removes");
+        let mut no_kick = removing(MEMBER, MEMBER);
+        no_kick.new_removed = Some(removed(&[MEMBER]));
+        assert!(authorize_server_commit(&p, &no_kick, &c).is_err(), "leaving is no kick");
+        let mut ahead = removing(MOD, MEMBER);
+        ahead.new_removed = Some(RemovedAccounts::default().with_removed(MEMBER, 1000 + REMOVAL_CLOCK_SKEW_MS + 1));
+        assert!(authorize_server_commit(&p, &ahead, &c).is_err(), "time ahead of the clock");
+    }
+
+    #[test]
+    fn a_removed_account_stays_out_until_someone_who_may_kick_lets_it_back() {
+        let p = policy();
+        let list = removed(&[[8; 32]]);
+        let c = GrantContext { removed: &list, ..ctx(&any_device) };
+        let helper_key = SigningKey::from_bytes(&[5; 32]);
+        let grant = InviteGrant::sign(MAILBOX, HELPER, 2000, [1; 16], &helper_key);
+        let join = CommitSummary { committer: Committer::Joiner { account: [8; 32], already_member: false, grant: Some(grant) }, ..by([8; 32]) };
+        assert_eq!(authorize_server_commit(&p, &join, &c), Err(PolicyError::Removed), "a valid invite is not enough");
+        let mut add = by(HELPER);
+        add.adds.push([8; 32]);
+        assert_eq!(authorize_server_commit(&p, &add, &c), Err(PolicyError::Removed));
+
+        let mut let_back_by_helper = by(HELPER);
+        let_back_by_helper.new_removed = Some(RemovedAccounts::default());
+        assert!(authorize_server_commit(&p, &let_back_by_helper, &c).is_err(), "needs the kick permission");
+        let mut let_back_and_add = by(MOD);
+        let_back_and_add.adds.push([8; 32]);
+        let_back_and_add.new_removed = Some(RemovedAccounts::default());
+        authorize_server_commit(&p, &let_back_and_add, &c).unwrap();
+    }
+
+    #[test]
+    fn a_kick_takes_the_members_roles_with_them() {
+        let mut p = policy();
+        p.roles[0].permissions = KICK;
+        let c = ctx(&any_device);
+        let mut kick = removing(MOD, HELPER);
+        kick.new_server_policy = Some(p.without_assignments(&[HELPER]));
+        authorize_server_commit(&p, &kick, &c).unwrap();
+
+        let mut and_more = removing(MOD, HELPER);
+        let mut grant = p.without_assignments(&[HELPER]);
+        grant.assignments.push((MEMBER, vec![20]));
+        and_more.new_server_policy = Some(grant);
+        assert!(authorize_server_commit(&p, &and_more, &c).is_err(), "other role changes still need manage roles");
     }
 
     #[test]

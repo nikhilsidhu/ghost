@@ -10,7 +10,6 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 # desktop Secret Service; crypto-rust encrypts them on the D-Bus session.
 keyring = { version = "3", features = ["apple-native", "windows-native", "linux-native-sync-persistent", "crypto-rust"] }
 blake3 = "1"
-argon2 = "0.5"
 hkdf = "0.12"
 sha2 = "0.10"
 aes-gcm = "0.10"
@@ -33,9 +32,11 @@ futures-util = "0.3"
 serde_json = "1"
 ghost-wire = { path = "../ghost-wire", features = ["mls"] }
 ghost-media = { path = "../ghost-media" }
+tracing = "0.1"
 
 [dev-dependencies]
 tempfile = "3"
-ghost-relay = { path = "../ghost-relay" }
+ghost-relay = { path = "../ghost-relay", features = ["test-util"] }
+ghost-log = { path = "../ghost-log" }
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

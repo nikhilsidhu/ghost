@@ -29,9 +29,11 @@ function mockBackend() {
     (received[cmd] ??= []).push(args);
     switch (cmd) {
       case "get_server_roles":
-        return { policy: structuredClone(policy), my_permissions: 15, explicit: true, members_missing_support: [] } satisfies ServerRoles;
+        return { policy: structuredClone(policy), my_permissions: 15 } satisfies ServerRoles;
       case "get_channel_access": return structuredClone(access);
       case "list_servers": case "list_channels": case "list_members": return [];
+      case "get_cached_avatar": return new ArrayBuffer(0);
+      case "live_state": return { connectivity: { home: true, any: true, relays_down: [], relays_refusing: [], catching_up: false }, online: [], voice: [], alerts: [], device_removed: null, voice_state: null, status: "online" };
       default: return null;
     }
   });

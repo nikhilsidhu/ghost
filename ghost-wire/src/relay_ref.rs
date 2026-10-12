@@ -6,6 +6,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use thiserror::Error;
 
+use crate::bytes::{put_prefixed16, ReadError, Reader};
+
 pub const RELAY_REF_VERSION: u8 = 0x01;
 /// Upper bound on the binary encoding; anything larger is rejected.
 pub const RELAY_REF_MAX_BYTES: usize = 512;
@@ -17,6 +19,12 @@ const ENDPOINT_KIND_IROH: u8 = 0x02;
 pub enum RelayRefError {
     #[error("relay ref: {0}")]
     Format(String),
+}
+
+impl From<ReadError> for RelayRefError {
+    fn from(e: ReadError) -> Self {
+        RelayRefError::Format(e.to_string())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,45 +106,29 @@ impl RelayRef {
         buf.extend_from_slice(&self.relay_vk);
         buf.push(self.endpoints.len() as u8);
         for endpoint in &self.endpoints {
-            let payload = endpoint.payload();
             buf.push(endpoint.kind());
-            buf.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-            buf.extend_from_slice(payload);
+            put_prefixed16(&mut buf, endpoint.payload());
         }
         buf
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self, RelayRefError> {
-        let err = |msg: &str| RelayRefError::Format(msg.into());
         if data.len() > RELAY_REF_MAX_BYTES {
-            return Err(err("too large"));
+            return Err(RelayRefError::Format("too large".into()));
         }
-        if data.len() < 34 {
-            return Err(err("too short"));
+        let mut r = Reader::new(data);
+        let version = r.u8()?;
+        if version != RELAY_REF_VERSION {
+            return Err(RelayRefError::Format(format!("unknown version {version:#x}")));
         }
-        if data[0] != RELAY_REF_VERSION {
-            return Err(RelayRefError::Format(format!("unknown version {:#x}", data[0])));
-        }
-        let relay_vk: [u8; 32] = data[1..33].try_into().unwrap();
-        let endpoint_count = data[33] as usize;
+        let relay_vk = r.array()?;
+        let endpoint_count = r.u8()? as usize;
         let mut endpoints = Vec::with_capacity(endpoint_count);
-        let mut pos = 34;
         for _ in 0..endpoint_count {
-            if data.len() < pos + 3 {
-                return Err(err("endpoint header truncated"));
-            }
-            let kind = data[pos];
-            let len = u16::from_be_bytes(data[pos + 1..pos + 3].try_into().unwrap()) as usize;
-            pos += 3;
-            if data.len() < pos + len {
-                return Err(err("endpoint payload truncated"));
-            }
-            endpoints.push(Endpoint::decode(kind, &data[pos..pos + len])?);
-            pos += len;
+            let kind = r.u8()?;
+            endpoints.push(Endpoint::decode(kind, r.prefixed16()?)?);
         }
-        if pos != data.len() {
-            return Err(err("trailing bytes"));
-        }
+        r.finish()?;
         Ok(Self { relay_vk, endpoints })
     }
 
@@ -151,6 +143,24 @@ impl RelayRef {
             .map_err(|_| RelayRefError::Format("invalid base64url".into()))?;
         Self::from_bytes(&bytes)
     }
+}
+
+/// Several refs in one body: each as `[len:2][ref bytes]`.
+pub fn encode_refs(refs: &[RelayRef]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    for relay_ref in refs {
+        put_prefixed16(&mut buf, &relay_ref.to_bytes());
+    }
+    buf
+}
+
+pub fn decode_refs(data: &[u8]) -> Result<Vec<RelayRef>, RelayRefError> {
+    let mut r = Reader::new(data);
+    let mut refs = Vec::new();
+    while !r.is_empty() {
+        refs.push(RelayRef::from_bytes(r.prefixed16()?)?);
+    }
+    Ok(refs)
 }
 
 #[cfg(test)]

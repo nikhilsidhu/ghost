@@ -1,27 +1,15 @@
 //! Voice keys from the MLS group: each sender's frame key (the frames themselves are
-//! sealed in `ghost_media`) and the keys of sealed voice presence.
+//! sealed in `ghost_media`) and the keys of sealed voice presence. Presence keys are per
+//! device, derived from the group and the device the relay stamps as the sender, and
+//! each seal is bound to that stamp and its channel: no member can pass presence off as
+//! another's, and a blob cannot be re-attributed or moved to another channel.
+
+use ghost_wire::presence::PresenceSender;
 
 use crate::crypto::{aead, GhostProvider, VOICE_EXPORT_LABEL, VOICE_PRESENCE_EXPORT_LABEL};
 use crate::error::{GhostError, Result};
 
 use super::group::GhostGroup;
-
-fn derive_export_key(
-    group: &GhostGroup,
-    provider: &GhostProvider,
-    label: &str,
-    channel_id: &[u8; 32],
-    sender_fp: &[u8; 32],
-) -> Result<[u8; 32]> {
-    let mut context = Vec::with_capacity(64);
-    context.extend_from_slice(channel_id);
-    context.extend_from_slice(sender_fp);
-    let secret = group.export_secret(provider, label, &context, 32)?;
-    let key: [u8; 32] = secret
-        .try_into()
-        .map_err(|_| GhostError::Crypto("export key not 32 bytes".into()))?;
-    Ok(key)
-}
 
 /// Each sender in a voice channel gets their own encryption key so nonces never collide.
 /// `device_vk` ensures two devices sharing a fingerprint derive different keys.
@@ -41,90 +29,78 @@ pub fn derive_voice_key(
     context.extend_from_slice(device_vk);
     context.extend_from_slice(voice_salt);
     let secret = group.export_secret(provider, VOICE_EXPORT_LABEL, &context, 32)?;
-    let key: [u8; 32] = secret
-        .try_into()
-        .map_err(|_| GhostError::Crypto("export key not 32 bytes".into()))?;
-    Ok(key)
+    secret.try_into().map_err(|_| GhostError::Crypto("export key not 32 bytes".into()))
 }
 
 // --- Presence blob crypto ---
 
-/// Voice presence state, encrypted inside a presence blob.
-/// Identity resolved via fingerprint lookup in member database — no display name here.
+/// A device in a voice channel: who it is, as the relay stamped it, and what it sealed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PresenceState {
     pub fingerprint: [u8; 32],
+    pub device_vk: [u8; 32],
     pub muted: bool,
     pub deafened: bool,
-    pub device_vk: [u8; 32],
     /// Random value generated per voice session, mixed into key derivation to prevent
     /// AES-GCM nonce reuse when reconnecting within the same MLS epoch.
     pub voice_salt: [u8; 32],
 }
 
+/// Sealed body: `[muted:1][deafened:1][voice_salt:32]`.
+const PRESENCE_BODY_LEN: usize = 34;
+/// Binds a voice presence seal to its sender and channel.
+const VOICE_PRESENCE_BINDING: &[u8] = b"ghost-voice-presence-v2";
+
 impl PresenceState {
-    pub fn to_bytes(&self) -> [u8; 98] {
-        let mut buf = [0u8; 98];
-        buf[0..32].copy_from_slice(&self.fingerprint);
-        buf[32] = self.muted as u8;
-        buf[33] = self.deafened as u8;
-        buf[34..66].copy_from_slice(&self.device_vk);
-        buf[66..98].copy_from_slice(&self.voice_salt);
+    /// The device's announcement for `sender`.
+    pub fn new(sender: &PresenceSender, muted: bool, deafened: bool, voice_salt: [u8; 32]) -> Self {
+        Self { fingerprint: sender.account_fp, device_vk: sender.device_vk, muted, deafened, voice_salt }
+    }
+
+    pub fn sender(&self) -> PresenceSender {
+        PresenceSender { account_fp: self.fingerprint, device_vk: self.device_vk }
+    }
+
+    fn body(&self) -> [u8; PRESENCE_BODY_LEN] {
+        let mut buf = [0u8; PRESENCE_BODY_LEN];
+        buf[0] = self.muted as u8;
+        buf[1] = self.deafened as u8;
+        buf[2..].copy_from_slice(&self.voice_salt);
         buf
     }
 
-    pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        if data.len() < 98 {
-            return Err(GhostError::Crypto("presence too short".into()));
+    fn from_body(sender: &PresenceSender, data: &[u8]) -> Result<Self> {
+        if data.len() != PRESENCE_BODY_LEN {
+            return Err(GhostError::Crypto("voice presence body has the wrong length".into()));
         }
-        let fingerprint: [u8; 32] = data[0..32].try_into().unwrap();
-        let muted = data[32] != 0;
-        let deafened = data[33] != 0;
-        let device_vk: [u8; 32] = data[34..66].try_into().unwrap();
-        let voice_salt: [u8; 32] = data[66..98].try_into().unwrap();
-        Ok(Self { fingerprint, muted, deafened, device_vk, voice_salt })
+        Ok(Self::new(sender, data[0] != 0, data[1] != 0, data[2..].try_into().unwrap()))
     }
 }
 
-/// Derive a per-sender presence encryption key for a voice channel.
+/// The key one device seals its presence in a voice channel with.
 pub fn derive_presence_key(
     group: &GhostGroup,
     provider: &GhostProvider,
     channel_id: &[u8; 32],
-    sender_fp: &[u8; 32],
+    sender: &PresenceSender,
 ) -> Result<[u8; 32]> {
-    derive_export_key(group, provider, VOICE_PRESENCE_EXPORT_LABEL, channel_id, sender_fp)
+    let context = sender.binding(&[], channel_id);
+    let secret = group.export_secret(provider, VOICE_PRESENCE_EXPORT_LABEL, &context, 32)?;
+    secret.try_into().map_err(|_| GhostError::Crypto("export key not 32 bytes".into()))
 }
 
-/// Encrypt a presence state blob. Wire format: [nonce:12][ciphertext+tag].
-pub fn seal_presence(key: &[u8; 32], state: &PresenceState) -> Result<Vec<u8>> {
-    aead::seal(key, &state.to_bytes(), "presence")
+/// Seal a device's presence in `channel_id`. Wire format: [nonce:12][ciphertext+tag].
+pub fn seal_presence(key: &[u8; 32], channel_id: &[u8; 32], state: &PresenceState) -> Result<Vec<u8>> {
+    let aad = state.sender().binding(VOICE_PRESENCE_BINDING, channel_id);
+    aead::seal_bound(key, &state.body(), &aad, "voice presence")
 }
 
-/// Decrypt a presence blob. Returns the parsed state.
-pub fn open_presence(key: &[u8; 32], blob: &[u8]) -> Result<PresenceState> {
-    let plaintext = aead::open(key, blob, "presence")?;
-    PresenceState::from_bytes(&plaintext)
-}
-
-/// Try to decrypt a presence blob by trying each member's per-sender key.
-pub fn try_open_presence(
-    member_fps: &[[u8; 32]],
-    group: &GhostGroup,
-    provider: &GhostProvider,
-    channel_id: &[u8; 32],
-    blob: &[u8],
-) -> Result<PresenceState> {
-    for fp in member_fps {
-        if let Ok(key) = derive_presence_key(group, provider, channel_id, fp) {
-            if let Ok(state) = open_presence(&key, blob) {
-                if state.fingerprint == *fp {
-                    return Ok(state);
-                }
-            }
-        }
-    }
-    Err(GhostError::Crypto("no member key decrypts this presence blob".into()))
+/// Open a blob the relay attributed to `sender` in `channel_id`; it opens only if that
+/// device sealed it for that channel.
+pub fn open_presence(key: &[u8; 32], channel_id: &[u8; 32], sender: &PresenceSender, blob: &[u8]) -> Result<PresenceState> {
+    let aad = sender.binding(VOICE_PRESENCE_BINDING, channel_id);
+    let plaintext = aead::open_bound(key, blob, &aad, "voice presence")?;
+    PresenceState::from_body(sender, &plaintext)
 }
 
 #[cfg(test)]
@@ -132,187 +108,51 @@ mod tests {
     use super::*;
     use crate::identity::Identity;
 
-    #[test]
-    fn derive_voice_key_deterministic() {
+    fn group_of(id: &Identity) -> (GhostProvider, GhostGroup) {
         let provider = GhostProvider::new_in_memory().unwrap();
+        let group = super::super::group::test_group(&provider, id, None);
+        (provider, group)
+    }
+
+    #[test]
+    fn voice_keys_differ_by_sender_device_salt_and_channel_and_are_deterministic() {
         let id = Identity::from_seed([0x01u8; 32]).unwrap();
-        let group = super::super::group::GhostGroup::create(&provider, &id, None).unwrap();
-
-        let channel_id = [0xFFu8; 32];
-        let vk = *id.verifying_key.as_bytes();
-        let salt = [0x99u8; 32];
-        let key1 = derive_voice_key(&group, &provider, &channel_id, &id.fingerprint, &vk, &salt).unwrap();
-        let key2 = derive_voice_key(&group, &provider, &channel_id, &id.fingerprint, &vk, &salt).unwrap();
-        assert_eq!(key1, key2);
+        let (provider, group) = group_of(&id);
+        let (channel, fp, vk, salt) = ([0xFF; 32], id.fingerprint, *id.verifying_key.as_bytes(), [0x99; 32]);
+        let key = derive_voice_key(&group, &provider, &channel, &fp, &vk, &salt).unwrap();
+        assert_eq!(key, derive_voice_key(&group, &provider, &channel, &fp, &vk, &salt).unwrap());
+        assert_ne!(key, derive_voice_key(&group, &provider, &channel, &[0xBB; 32], &vk, &salt).unwrap());
+        assert_ne!(key, derive_voice_key(&group, &provider, &channel, &fp, &[0xBB; 32], &salt).unwrap());
+        assert_ne!(key, derive_voice_key(&group, &provider, &channel, &fp, &vk, &[0xBB; 32]).unwrap());
+        assert_ne!(key, derive_voice_key(&group, &provider, &[0xAA; 32], &fp, &vk, &salt).unwrap());
     }
 
     #[test]
-    fn different_sender_different_key() {
-        let provider = GhostProvider::new_in_memory().unwrap();
+    fn presence_opens_only_for_the_stamped_sender_and_channel() {
         let id = Identity::from_seed([0x01u8; 32]).unwrap();
-        let group = super::super::group::GhostGroup::create(&provider, &id, None).unwrap();
+        let (provider, group) = group_of(&id);
+        let channel = [0xFF; 32];
+        let alice = PresenceSender { account_fp: id.fingerprint, device_vk: *id.verifying_key.as_bytes() };
+        let key = derive_presence_key(&group, &provider, &channel, &alice).unwrap();
+        let state = PresenceState::new(&alice, true, false, [0x11; 32]);
+        let blob = seal_presence(&key, &channel, &state).unwrap();
+        assert_eq!(open_presence(&key, &channel, &alice, &blob).unwrap(), state);
 
-        let channel_id = [0xFFu8; 32];
-        let fp_a = [0xAAu8; 32];
-        let fp_b = [0xBBu8; 32];
-        let vk = [0x00u8; 32];
-        let salt = [0x99u8; 32];
-        let key_a = derive_voice_key(&group, &provider, &channel_id, &fp_a, &vk, &salt).unwrap();
-        let key_b = derive_voice_key(&group, &provider, &channel_id, &fp_b, &vk, &salt).unwrap();
-        assert_ne!(key_a, key_b);
+        assert!(open_presence(&[0x43; 32], &channel, &alice, &blob).is_err(), "wrong key");
+        assert!(open_presence(&key, &[0xEE; 32], &alice, &blob).is_err(), "another channel");
+        let other_device = PresenceSender { device_vk: [0x99; 32], ..alice };
+        assert!(open_presence(&key, &channel, &other_device, &blob).is_err(), "stamped as another device");
+        let bob = PresenceSender { account_fp: [0xBB; 32], device_vk: [0x99; 32] };
+        let bobs_key = derive_presence_key(&group, &provider, &channel, &bob).unwrap();
+        assert_ne!(key, bobs_key);
+        assert!(open_presence(&bobs_key, &channel, &bob, &blob).is_err(), "stamped as another account");
+        assert_ne!(key, derive_voice_key(&group, &provider, &channel, &alice.account_fp, &alice.device_vk, &[0x99; 32]).unwrap());
     }
 
     #[test]
-    fn different_device_vk_different_key() {
-        let provider = GhostProvider::new_in_memory().unwrap();
-        let id = Identity::from_seed([0x01u8; 32]).unwrap();
-        let group = super::super::group::GhostGroup::create(&provider, &id, None).unwrap();
-
-        let channel_id = [0xFFu8; 32];
-        let vk_a = [0xAAu8; 32];
-        let vk_b = [0xBBu8; 32];
-        let salt = [0x99u8; 32];
-        let key_a = derive_voice_key(&group, &provider, &channel_id, &id.fingerprint, &vk_a, &salt).unwrap();
-        let key_b = derive_voice_key(&group, &provider, &channel_id, &id.fingerprint, &vk_b, &salt).unwrap();
-        assert_ne!(key_a, key_b);
-    }
-
-    #[test]
-    fn different_salt_different_key() {
-        let provider = GhostProvider::new_in_memory().unwrap();
-        let id = Identity::from_seed([0x01u8; 32]).unwrap();
-        let group = super::super::group::GhostGroup::create(&provider, &id, None).unwrap();
-
-        let channel_id = [0xFFu8; 32];
-        let vk = *id.verifying_key.as_bytes();
-        let salt_a = [0xAAu8; 32];
-        let salt_b = [0xBBu8; 32];
-        let key_a = derive_voice_key(&group, &provider, &channel_id, &id.fingerprint, &vk, &salt_a).unwrap();
-        let key_b = derive_voice_key(&group, &provider, &channel_id, &id.fingerprint, &vk, &salt_b).unwrap();
-        assert_ne!(key_a, key_b);
-    }
-
-    #[test]
-    fn presence_state_roundtrip() {
-        let state = PresenceState {
-            fingerprint: [0xAA; 32],
-            muted: true,
-            deafened: false,
-            device_vk: [0xDD; 32],
-            voice_salt: [0xEE; 32],
-        };
-        let bytes = state.to_bytes();
-        let parsed = PresenceState::from_bytes(&bytes).unwrap();
-        assert_eq!(state, parsed);
-    }
-
-    #[test]
-    fn presence_seal_open_roundtrip() {
-        let key = [0x42u8; 32];
-        let state = PresenceState {
-            fingerprint: [0xBB; 32],
-            muted: false,
-            deafened: true,
-            device_vk: [0xDD; 32],
-            voice_salt: [0xEE; 32],
-        };
-        let blob = seal_presence(&key, &state).unwrap();
-        let opened = open_presence(&key, &blob).unwrap();
-        assert_eq!(state, opened);
-    }
-
-    #[test]
-    fn presence_wrong_key_fails() {
-        let key1 = [0x42u8; 32];
-        let key2 = [0x43u8; 32];
-        let state = PresenceState {
-            fingerprint: [0xCC; 32],
-            muted: false,
-            deafened: false,
-            device_vk: [0xDD; 32],
-            voice_salt: [0xEE; 32],
-        };
-        let blob = seal_presence(&key1, &state).unwrap();
-        assert!(open_presence(&key2, &blob).is_err());
-    }
-
-    #[test]
-    fn presence_trial_decryption() {
-        let provider = GhostProvider::new_in_memory().unwrap();
-        let id = Identity::from_seed([0x01u8; 32]).unwrap();
-        let group = super::super::group::GhostGroup::create(&provider, &id, None).unwrap();
-
-        let channel_id = [0xFFu8; 32];
-        let sender_fp = id.fingerprint;
-
-        let key = derive_presence_key(&group, &provider, &channel_id, &sender_fp).unwrap();
-        let state = PresenceState {
-            fingerprint: sender_fp,
-            muted: true,
-            deafened: false,
-            device_vk: *id.verifying_key.as_bytes(),
-            voice_salt: [0x11; 32],
-        };
-        let blob = seal_presence(&key, &state).unwrap();
-
-        // Trial decryption with a list including the real sender
-        let candidates = vec![[0xAA; 32], sender_fp, [0xBB; 32]];
-        let opened = try_open_presence(&candidates, &group, &provider, &channel_id, &blob).unwrap();
-        assert_eq!(opened.fingerprint, sender_fp);
-        assert!(opened.muted);
-    }
-
-    #[test]
-    fn presence_trial_decryption_fails_no_match() {
-        let provider = GhostProvider::new_in_memory().unwrap();
-        let id = Identity::from_seed([0x01u8; 32]).unwrap();
-        let group = super::super::group::GhostGroup::create(&provider, &id, None).unwrap();
-
-        let channel_id = [0xFFu8; 32];
-        let key = derive_presence_key(&group, &provider, &channel_id, &id.fingerprint).unwrap();
-        let state = PresenceState {
-            fingerprint: id.fingerprint,
-            muted: false,
-            deafened: false,
-            device_vk: *id.verifying_key.as_bytes(),
-            voice_salt: [0x11; 32],
-        };
-        let blob = seal_presence(&key, &state).unwrap();
-
-        // No matching fingerprint in candidates
-        let candidates = vec![[0xAA; 32], [0xBB; 32]];
-        assert!(try_open_presence(&candidates, &group, &provider, &channel_id, &blob).is_err());
-    }
-
-    #[test]
-    fn different_channel_different_key() {
-        let provider = GhostProvider::new_in_memory().unwrap();
-        let id = Identity::from_seed([0x01u8; 32]).unwrap();
-        let group = super::super::group::GhostGroup::create(&provider, &id, None).unwrap();
-
-        let vk = *id.verifying_key.as_bytes();
-        let salt = [0x99u8; 32];
-        let key_a = derive_voice_key(&group, &provider, &[0xAA; 32], &id.fingerprint, &vk, &salt).unwrap();
-        let key_b = derive_voice_key(&group, &provider, &[0xBB; 32], &id.fingerprint, &vk, &salt).unwrap();
-        assert_ne!(key_a, key_b);
-    }
-
-    #[test]
-    fn presence_state_truncated_rejected() {
-        assert!(PresenceState::from_bytes(&[0x00; 10]).is_err());
-    }
-
-    #[test]
-    fn presence_key_differs_from_voice_key() {
-        let provider = GhostProvider::new_in_memory().unwrap();
-        let id = Identity::from_seed([0x01u8; 32]).unwrap();
-        let group = super::super::group::GhostGroup::create(&provider, &id, None).unwrap();
-
-        let channel_id = [0xFFu8; 32];
-        let vk = *id.verifying_key.as_bytes();
-        let salt = [0x99u8; 32];
-        let voice = derive_voice_key(&group, &provider, &channel_id, &id.fingerprint, &vk, &salt).unwrap();
-        let presence = derive_presence_key(&group, &provider, &channel_id, &id.fingerprint).unwrap();
-        assert_ne!(voice, presence);
+    fn a_presence_body_must_be_whole() {
+        let sender = PresenceSender { account_fp: [1; 32], device_vk: [2; 32] };
+        assert!(PresenceState::from_body(&sender, &[0x00; 10]).is_err());
+        assert!(PresenceState::from_body(&sender, &[0x00; PRESENCE_BODY_LEN + 1]).is_err());
     }
 }

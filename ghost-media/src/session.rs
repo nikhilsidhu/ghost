@@ -3,7 +3,8 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use ghost_wire::voice::{MediaHeader, VoiceBind};
@@ -12,9 +13,15 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::constants::{BIND_INTERVAL, BIND_RETRY_DELAYS_MS, INBOUND_QUEUE, OUTBOUND_QUEUE, UNKEYED_FRAME_LIMIT};
+use crate::constants::{
+    BIND_ANSWER_FRESH, BIND_INTERVAL, BIND_RETRY_DELAYS_MS, INBOUND_QUEUE, OUTBOUND_QUEUE, PATH_VERDICT_AFTER, UNKEYED_FRAME_LIMIT,
+};
 use crate::crypto::{FrameOpener, FrameSealer};
+use crate::track::{TrackEvent, TrackIo};
 use crate::MediaError;
+
+/// The slot a loopback session gives its one participant.
+const LOOPBACK_SLOT: u32 = 0;
 
 /// What the relay's welcome and our own key give a session.
 pub struct SessionConfig {
@@ -27,6 +34,48 @@ pub struct SessionConfig {
     /// The MLS epoch `send_key` was derived in; receivers choose their key by it.
     pub epoch: u64,
     pub send_key: [u8; 32],
+}
+
+/// Whether media reaches the relay, as its answers to our binds show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaPath {
+    /// Too early to tell: the first binds are still out.
+    Unconfirmed,
+    /// The relay answered a bind lately.
+    Open,
+    /// No answer for a while: UDP to the relay is blocked or lost.
+    Blocked,
+}
+
+/// When the binds started and when the relay last answered one.
+struct PathWatch {
+    binding_since: Mutex<Instant>,
+    answered: Mutex<Option<Instant>>,
+}
+
+impl PathWatch {
+    fn new() -> Self {
+        Self { binding_since: Mutex::new(Instant::now()), answered: Mutex::new(None) }
+    }
+
+    fn path(&self, now: Instant) -> MediaPath {
+        match *self.answered.lock().unwrap() {
+            Some(at) if now.duration_since(at) <= BIND_ANSWER_FRESH => MediaPath::Open,
+            _ if now.duration_since(*self.binding_since.lock().unwrap()) < PATH_VERDICT_AFTER => MediaPath::Unconfirmed,
+            _ => MediaPath::Blocked,
+        }
+    }
+}
+
+/// What a bind needs, kept so binding can start over.
+#[derive(Clone)]
+struct Binding {
+    socket: Arc<UdpSocket>,
+    token: [u8; 32],
+    room_id: [u8; 32],
+    slot_id: u32,
+    /// The last counter sent; each bind goes higher, across restarts too.
+    counter: Arc<AtomicU64>,
 }
 
 /// A frame another participant sent, opened.
@@ -47,9 +96,26 @@ pub enum Inbound {
     PeerLeft(u32),
 }
 
-struct PeerKey {
+/// A key and the MLS epoch it was derived in.
+struct EpochKey {
     epoch: u64,
     opener: FrameOpener,
+}
+
+/// A participant's keys: the newest, and the one before it for frames still in flight
+/// from before the participant moved epoch.
+struct PeerKey {
+    current: EpochKey,
+    previous: Option<EpochKey>,
+}
+
+impl PeerKey {
+    fn for_epoch(&self, epoch: u64) -> Option<&EpochKey> {
+        if self.current.epoch == epoch {
+            return Some(&self.current);
+        }
+        self.previous.as_ref().filter(|p| p.epoch == epoch)
+    }
 }
 
 /// A packet whose sender's key has not arrived yet.
@@ -66,14 +132,27 @@ struct Peers {
     unkeyed: HashMap<u32, VecDeque<Unkeyed>>,
 }
 
-/// Open a frame with its sender's key; `None` when it was sealed in another epoch or
-/// does not open (forged, relabeled or corrupted).
+/// Open a frame with its sender's key for the epoch it names; `None` when no key for that
+/// epoch is held or it does not open (forged, relabeled or corrupted).
 fn open(key: &PeerKey, header: &MediaHeader, sealed: &[u8], arrived: Instant) -> Option<ReceivedFrame> {
-    if header.epoch != key.epoch {
-        return None;
-    }
-    let payload = key.opener.open(header.sequence, sealed).ok()?;
+    let payload = key.for_epoch(header.epoch)?.opener.open(header.sequence, sealed).ok()?;
     Some(ReceivedFrame { slot_id: header.slot_id, sequence: header.sequence, payload, arrived })
+}
+
+/// Keep a packet whose sender's key for its epoch has not arrived yet, dropping the
+/// oldest past the limit.
+fn hold(peers: &mut Peers, header: MediaHeader, sealed: &[u8], arrived: Instant) {
+    let early = peers.unkeyed.entry(header.slot_id).or_default();
+    if early.len() >= UNKEYED_FRAME_LIMIT {
+        early.pop_front();
+    }
+    early.push_back(Unkeyed { header, sealed: sealed.to_vec(), arrived });
+}
+
+/// What this participant seals with, swapped whole when its epoch moves.
+struct SendKey {
+    epoch: u64,
+    sealer: FrameSealer,
 }
 
 /// Seals frames and queues them for the socket. Cheap to clone and callable from any
@@ -81,17 +160,24 @@ fn open(key: &PeerKey, header: &MediaHeader, sealed: &[u8], arrived: Instant) ->
 #[derive(Clone)]
 pub struct FrameSender {
     packets: mpsc::Sender<Vec<u8>>,
-    sealer: Arc<FrameSealer>,
-    /// Our room, slot and epoch; the sequence is set per frame.
-    header: MediaHeader,
+    /// The key in use and its epoch, which the header names.
+    key: Arc<RwLock<Arc<SendKey>>>,
+    room_id: [u8; 32],
+    slot_id: u32,
 }
 
 impl FrameSender {
+    fn new(packets: mpsc::Sender<Vec<u8>>, room_id: [u8; 32], slot_id: u32, epoch: u64, key: &[u8; 32]) -> Result<Self, MediaError> {
+        let key = Arc::new(SendKey { epoch, sealer: FrameSealer::new(key)? });
+        Ok(Self { packets, key: Arc::new(RwLock::new(key)), room_id, slot_id })
+    }
+
     /// Seal one frame under `sequence` and queue it. False when it was dropped: the
     /// queue is full or the session has ended.
     pub fn send(&self, sequence: u32, frame: &[u8]) -> bool {
-        let Ok(sealed) = self.sealer.seal(sequence, frame) else { return false };
-        let packet = MediaHeader { sequence, ..self.header }.packet(&sealed);
+        let key = self.key.read().unwrap().clone();
+        let Ok(sealed) = key.sealer.seal(sequence, frame) else { return false };
+        let packet = MediaHeader { room_id: self.room_id, slot_id: self.slot_id, epoch: key.epoch, sequence }.packet(&sealed);
         self.packets.try_send(packet).is_ok()
     }
 
@@ -101,17 +187,44 @@ impl FrameSender {
     }
 }
 
+impl TrackIo {
+    /// A session that plays this participant's own frames back to them, sealed and
+    /// opened as a relay round trip would be: for trying the microphone through the
+    /// whole call path. Ends when the sender is dropped; the track reports to `events`.
+    pub fn loopback(events: mpsc::UnboundedSender<TrackEvent>) -> Result<Self, MediaError> {
+        let mut key = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut key);
+        let (packets_tx, mut packets_rx) = mpsc::channel(OUTBOUND_QUEUE);
+        let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_QUEUE);
+        let sender = FrameSender::new(packets_tx, [0u8; 32], LOOPBACK_SLOT, 0, &key)?;
+        let own = PeerKey { current: EpochKey { epoch: 0, opener: FrameOpener::new(&key)? }, previous: None };
+        tokio::spawn(async move {
+            while let Some(packet) = packets_rx.recv().await {
+                let Some((header, sealed)) = MediaHeader::parse(&packet) else { continue };
+                if let Some(frame) = open(&own, &header, sealed, Instant::now()) {
+                    let _ = inbound_tx.try_send(Inbound::Frame(frame));
+                }
+            }
+        });
+        Ok(Self { sender, received: inbound_rx, events })
+    }
+}
+
 /// A running media session. Dropping it closes the socket and ends its tasks.
 pub struct MediaSession {
     peers: Arc<Mutex<Peers>>,
     inbound: mpsc::Sender<Inbound>,
     sender: FrameSender,
     local_addr: SocketAddr,
+    binding: Binding,
+    path: Arc<PathWatch>,
+    bind_task: Mutex<JoinHandle<()>>,
     tasks: Vec<JoinHandle<()>>,
 }
 
 impl Drop for MediaSession {
     fn drop(&mut self) {
+        self.bind_task.lock().unwrap().abort();
         for task in &self.tasks {
             task.abort();
         }
@@ -135,18 +248,37 @@ impl MediaSession {
         let (packets_tx, packets_rx) = mpsc::channel(OUTBOUND_QUEUE);
         let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_QUEUE);
         let peers = Arc::new(Mutex::new(Peers::default()));
-        let sender = FrameSender {
-            packets: packets_tx,
-            sealer: Arc::new(FrameSealer::new(&config.send_key)?),
-            header: MediaHeader { room_id: config.room_id, slot_id: config.slot_id, epoch: config.epoch, sequence: 0 },
+        let sender = FrameSender::new(packets_tx, config.room_id, config.slot_id, config.epoch, &config.send_key)?;
+        let binding = Binding {
+            socket: socket.clone(),
+            token: config.bind_token,
+            room_id: config.room_id,
+            slot_id: config.slot_id,
+            counter: Arc::new(AtomicU64::new(0)),
         };
+        let path = Arc::new(PathWatch::new());
 
+        let bind_task = Mutex::new(tokio::spawn(bind_loop(binding.clone())));
         let tasks = vec![
-            tokio::spawn(bind_loop(socket.clone(), config.bind_token, config.room_id, config.slot_id)),
             tokio::spawn(send_loop(socket.clone(), packets_rx)),
-            tokio::spawn(receive_loop(socket, config.slot_id, peers.clone(), inbound_tx.clone())),
+            tokio::spawn(receive_loop(binding.clone(), path.clone(), peers.clone(), inbound_tx.clone())),
         ];
-        Ok((Self { peers, inbound: inbound_tx, sender, local_addr, tasks }, inbound_rx))
+        Ok((Self { peers, inbound: inbound_tx, sender, local_addr, binding, path, bind_task, tasks }, inbound_rx))
+    }
+
+    /// Whether media reaches the relay now.
+    pub fn media_path(&self) -> MediaPath {
+        self.path.path(Instant::now())
+    }
+
+    /// Bind again at the quick pace of a new session: our address may have changed (the
+    /// signaling connection had to be reopened), and media should not wait for the next
+    /// periodic bind to find out.
+    pub fn rebind(&self) {
+        *self.path.binding_since.lock().unwrap() = Instant::now();
+        let mut task = self.bind_task.lock().unwrap();
+        task.abort();
+        *task = tokio::spawn(bind_loop(self.binding.clone()));
     }
 
     pub fn sender(&self) -> FrameSender {
@@ -158,16 +290,39 @@ impl MediaSession {
         self.local_addr
     }
 
-    /// Open `slot_id`'s frames with `key` from now on, including any that arrived
-    /// before it.
+    /// Seal what we send with `key`, derived in `epoch`, from now on: our epoch moved, and
+    /// so did our presence, which tells the others the matching key.
+    pub fn set_send_key(&self, epoch: u64, key: &[u8; 32]) -> Result<(), MediaError> {
+        let key = Arc::new(SendKey { epoch, sealer: FrameSealer::new(key)? });
+        *self.sender.key.write().unwrap() = key;
+        Ok(())
+    }
+
+    /// Open `slot_id`'s frames sealed in `epoch` with `key` from now on, including any
+    /// that arrived before it. A newer epoch keeps the participant's last key for frames
+    /// still in flight; the epoch already held, or an older one, changes nothing.
     pub fn set_peer(&self, slot_id: u32, epoch: u64, key: &[u8; 32]) -> Result<(), MediaError> {
-        let key = PeerKey { epoch, opener: FrameOpener::new(key)? };
         let early: Vec<ReceivedFrame> = {
             let mut peers = self.peers.lock().unwrap();
+            match peers.keys.get_mut(&slot_id) {
+                Some(held) if epoch <= held.current.epoch => return Ok(()),
+                Some(held) => {
+                    let newer = EpochKey { epoch, opener: FrameOpener::new(key)? };
+                    held.previous = Some(std::mem::replace(&mut held.current, newer));
+                }
+                None => {
+                    let current = EpochKey { epoch, opener: FrameOpener::new(key)? };
+                    peers.keys.insert(slot_id, PeerKey { current, previous: None });
+                }
+            }
+            // Frames from epochs still ahead wait; the rest open now or never will.
             let early = peers.unkeyed.remove(&slot_id).unwrap_or_default();
-            let opened = early.iter().filter_map(|packet| open(&key, &packet.header, &packet.sealed, packet.arrived)).collect();
-            peers.keys.insert(slot_id, key);
-            opened
+            let (ahead, due): (VecDeque<Unkeyed>, VecDeque<Unkeyed>) = early.into_iter().partition(|packet| packet.header.epoch > epoch);
+            if !ahead.is_empty() {
+                peers.unkeyed.insert(slot_id, ahead);
+            }
+            let key = &peers.keys[&slot_id];
+            due.iter().filter_map(|packet| open(key, &packet.header, &packet.sealed, packet.arrived)).collect()
         };
         for frame in early {
             let _ = self.inbound.try_send(Inbound::Frame(frame));
@@ -199,14 +354,15 @@ impl MediaSession {
 
 /// Bind our address to our slot, quickly at first, then periodically. Each bind
 /// carries a higher counter, so the relay accepts it even after our address changes.
-async fn bind_loop(socket: Arc<UdpSocket>, token: [u8; 32], room_id: [u8; 32], slot_id: u32) {
+async fn bind_loop(binding: Binding) {
     let retries = BIND_RETRY_DELAYS_MS.windows(2).map(|pair| Duration::from_millis(pair[1] - pair[0]));
     let delays = std::iter::once(Duration::ZERO).chain(retries).chain(std::iter::repeat(BIND_INTERVAL));
-    for (counter, delay) in (1u64..).zip(delays) {
+    for delay in delays {
         tokio::time::sleep(delay).await;
-        let bind = VoiceBind::sign(&token, room_id, slot_id, counter);
-        if let Err(e) = socket.send(&bind.to_bytes()).await {
-            eprintln!("media: bind send: {e}");
+        let counter = binding.counter.fetch_add(1, Ordering::Relaxed) + 1;
+        let bind = VoiceBind::sign(&binding.token, binding.room_id, binding.slot_id, counter);
+        if let Err(e) = binding.socket.send(&bind.to_bytes()).await {
+            tracing::warn!("media: bind send: {e}");
         }
     }
 }
@@ -214,22 +370,30 @@ async fn bind_loop(socket: Arc<UdpSocket>, token: [u8; 32], room_id: [u8; 32], s
 async fn send_loop(socket: Arc<UdpSocket>, mut packets: mpsc::Receiver<Vec<u8>>) {
     while let Some(packet) = packets.recv().await {
         if let Err(e) = socket.send(&packet).await {
-            eprintln!("media: send: {e}");
+            tracing::warn!("media: send: {e}");
         }
     }
 }
 
-async fn receive_loop(socket: Arc<UdpSocket>, own_slot: u32, peers: Arc<Mutex<Peers>>, inbound: mpsc::Sender<Inbound>) {
+async fn receive_loop(binding: Binding, path: Arc<PathWatch>, peers: Arc<Mutex<Peers>>, inbound: mpsc::Sender<Inbound>) {
+    let own_slot = binding.slot_id;
     let mut buf = [0u8; VOICE_MAX_PACKET];
     loop {
-        let (len, arrived) = match socket.recv(&mut buf).await {
+        let (len, arrived) = match binding.socket.recv(&mut buf).await {
             Ok(len) => (len, Instant::now()),
             // Connected UDP sockets report ICMP errors from earlier sends; keep going.
             Err(e) => {
-                eprintln!("media: receive: {e}");
+                tracing::debug!("media: receive: {e}");
                 continue;
             }
         };
+        if let Some(answer) = VoiceBind::from_bytes(&buf[..len]) {
+            let ours = answer.room_id == binding.room_id && answer.slot_id == own_slot && answer.verify_answer(&binding.token);
+            if ours {
+                *path.answered.lock().unwrap() = Some(arrived);
+            }
+            continue;
+        }
         let Some((header, sealed)) = MediaHeader::parse(&buf[..len]) else { continue };
         if header.slot_id == own_slot || sealed.is_empty() {
             continue;
@@ -237,13 +401,14 @@ async fn receive_loop(socket: Arc<UdpSocket>, own_slot: u32, peers: Arc<Mutex<Pe
         let frame = {
             let mut peers = peers.lock().unwrap();
             match peers.keys.get(&header.slot_id) {
+                // The sender moved epoch before its new presence reached us.
+                Some(key) if header.epoch > key.current.epoch => {
+                    hold(&mut peers, header, sealed, arrived);
+                    None
+                }
                 Some(key) => open(key, &header, sealed, arrived),
                 None => {
-                    let early = peers.unkeyed.entry(header.slot_id).or_default();
-                    if early.len() >= UNKEYED_FRAME_LIMIT {
-                        early.pop_front();
-                    }
-                    early.push_back(Unkeyed { header, sealed: sealed.to_vec(), arrived });
+                    hold(&mut peers, header, sealed, arrived);
                     None
                 }
             }
@@ -357,6 +522,53 @@ mod tests {
         assert_eq!(next_frame(&mut inbound).await, (2, 4, b"good".to_vec()));
     }
 
+    /// A packet from slot 2 sealed in `epoch` with `key`.
+    fn peer_packet_in(epoch: u64, key: &[u8; 32], sequence: u32, payload: &[u8]) -> Vec<u8> {
+        let sealed = FrameSealer::new(key).unwrap().seal(sequence, payload).unwrap();
+        MediaHeader { room_id: ROOM, slot_id: 2, epoch, sequence }.packet(&sealed)
+    }
+
+    #[tokio::test]
+    async fn a_participant_moving_epoch_is_heard_across_the_change() {
+        const NEXT_KEY: [u8; 32] = [5; 32];
+        let (session, mut inbound, relay) = session().await;
+        let (_, client) = relay_receive(&relay).await;
+        session.set_peer(2, EPOCH, &PEER_KEY).unwrap();
+
+        // Frames from the next epoch, before its key, wait for it.
+        relay.send_to(&peer_packet_in(EPOCH + 1, &NEXT_KEY, 20, b"ahead"), client).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(inbound.try_recv().is_err(), "a frame from an epoch not keyed yet was delivered");
+        session.set_peer(2, EPOCH + 1, &NEXT_KEY).unwrap();
+        assert_eq!(next_frame(&mut inbound).await, (2, 20, b"ahead".to_vec()));
+
+        // A frame still in flight from the epoch before opens with the key kept for it.
+        relay.send_to(&peer_packet_in(EPOCH, &PEER_KEY, 19, b"late"), client).await.unwrap();
+        assert_eq!(next_frame(&mut inbound).await, (2, 19, b"late".to_vec()));
+
+        // Setting the epoch already held changes nothing.
+        session.set_peer(2, EPOCH + 1, &NEXT_KEY).unwrap();
+        relay.send_to(&peer_packet_in(EPOCH + 1, &NEXT_KEY, 21, b"same"), client).await.unwrap();
+        assert_eq!(next_frame(&mut inbound).await, (2, 21, b"same".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn our_send_key_moves_with_our_epoch() {
+        const NEXT_KEY: [u8; 32] = [6; 32];
+        let (session, _inbound, relay) = session().await;
+        session.set_send_key(EPOCH + 1, &NEXT_KEY).unwrap();
+        assert!(session.sender().send(41, b"next"));
+        let packet = loop {
+            let (packet, _) = relay_receive(&relay).await;
+            if VoiceBind::from_bytes(&packet).is_none() {
+                break packet;
+            }
+        };
+        let (header, sealed) = MediaHeader::parse(&packet).unwrap();
+        assert_eq!(header.epoch, EPOCH + 1);
+        assert_eq!(FrameOpener::new(&NEXT_KEY).unwrap().open(41, sealed).unwrap(), b"next");
+    }
+
     #[tokio::test]
     async fn departures_reach_the_track() {
         let (session, mut inbound, _relay) = session().await;
@@ -366,6 +578,54 @@ mod tests {
         assert_eq!(next(&mut inbound).await, Inbound::PeerLeft(2));
         session.retain_peers(&HashSet::from([2]));
         assert_eq!(next(&mut inbound).await, Inbound::PeerLeft(3));
+    }
+
+    #[test]
+    fn a_path_is_unconfirmed_then_blocked_until_an_answer_comes() {
+        let watch = PathWatch::new();
+        let start = *watch.binding_since.lock().unwrap();
+        assert_eq!(watch.path(start + Duration::from_secs(1)), MediaPath::Unconfirmed);
+        assert_eq!(watch.path(start + PATH_VERDICT_AFTER), MediaPath::Blocked);
+        let answered = start + Duration::from_secs(6);
+        *watch.answered.lock().unwrap() = Some(answered);
+        assert_eq!(watch.path(answered + Duration::from_secs(1)), MediaPath::Open);
+        assert_eq!(watch.path(answered + BIND_ANSWER_FRESH + Duration::from_secs(1)), MediaPath::Blocked, "answers stopped");
+    }
+
+    #[tokio::test]
+    async fn the_relays_answer_opens_the_path_and_a_reflected_bind_does_not() {
+        let (session, _inbound, relay) = session().await;
+        let (first, client) = relay_receive(&relay).await;
+        let bind = VoiceBind::from_bytes(&first).unwrap();
+        relay.send_to(&first, client).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(session.media_path(), MediaPath::Unconfirmed, "our own bind sent back opened the path");
+
+        relay.send_to(&bind.answer(&TOKEN).to_bytes(), client).await.unwrap();
+        tokio::time::timeout(WAIT, async {
+            while session.media_path() != MediaPath::Open {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the relay's answer did not open the path");
+    }
+
+    #[tokio::test]
+    async fn rebinding_starts_the_quick_binds_again_with_higher_counters() {
+        let (session, _inbound, relay) = session().await;
+        let mut last = 0;
+        for _ in BIND_RETRY_DELAYS_MS {
+            let (packet, _) = relay_receive(&relay).await;
+            last = VoiceBind::from_bytes(&packet).unwrap().counter;
+        }
+        session.rebind();
+        let started = Instant::now();
+        let (packet, _) = relay_receive(&relay).await;
+        let bind = VoiceBind::from_bytes(&packet).unwrap();
+        assert!(started.elapsed() < Duration::from_millis(500), "a rebind waited for the periodic bind");
+        assert_eq!(bind.counter, last + 1, "counters keep climbing across a rebind");
+        assert!(bind.verify(&TOKEN));
     }
 
     #[tokio::test]

@@ -1,4 +1,5 @@
 use ghost_wire::anchor::AnchoredEntry;
+use super::db;
 use ghost_wire::idlog::LogState;
 use ghost_wire::relay_ref::RelayRef;
 
@@ -10,7 +11,6 @@ use super::GhostStore;
 pub struct CachedIdLogState {
     pub head_seq: u64,
     pub head_hash: [u8; 32],
-    pub master_vk: Option<[u8; 32]>,
     pub home_relay_vk: Option<[u8; 32]>,
     pub home_set_at_seq: u64,
 }
@@ -30,49 +30,44 @@ impl GhostStore {
         account_fp: &[u8; 32],
         entries: &[AnchoredEntry],
     ) -> Result<()> {
-        let tx = self.conn().unchecked_transaction()
-            .map_err(|e| GhostError::Database(format!("idlog cache tx: {e}")))?;
-        {
-            let mut stmt = tx
+        self.write_whole(|| {
+            let mut stmt = self
+                .conn()
                 .prepare_cached(
                     "INSERT OR IGNORE INTO idlog_cache (account_fp, seq, payload, anchored) VALUES (?1, ?2, ?3, 1)",
                 )
-                .map_err(|e| GhostError::Database(format!("idlog cache insert: {e}")))?;
+                .map_err(db("idlog cache insert"))?;
             for anchored in entries {
                 stmt.execute(rusqlite::params![
                     account_fp.as_slice(),
                     anchored.entry.seq as i64,
                     anchored.to_bytes(),
                 ])
-                .map_err(|e| GhostError::Database(format!("idlog cache insert: {e}")))?;
+                .map_err(db("idlog cache insert"))?;
             }
-        }
-        tx.commit()
-            .map_err(|e| GhostError::Database(format!("idlog cache commit: {e}")))?;
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Save the validated identity log state summary for an account.
     pub fn upsert_idlog_state(&self, account_fp: &[u8; 32], state: &LogState) -> Result<()> {
-        let master_vk = state.master_verifying_key.as_ref().map(|k| k.as_slice());
         let home_relay_vk = state.home_relay_vk.as_ref().map(|k| k.as_slice());
         let home_relay_ref = state.home_relay_ref.as_ref().map(RelayRef::to_bytes);
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO idlog_state
-                     (account_fp, head_seq, head_hash, master_vk, home_relay_vk, home_relay_ref, home_set_at_seq)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                     (account_fp, head_seq, head_hash, home_relay_vk, home_relay_ref, home_set_at_seq)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 rusqlite::params![
                     account_fp.as_slice(),
                     state.head_seq as i64,
                     state.head_hash.as_slice(),
-                    master_vk,
                     home_relay_vk,
                     home_relay_ref,
                     state.home_set_at_seq as i64,
                 ],
             )
-            .map_err(|e| GhostError::Database(format!("upsert idlog state: {e}")))?;
+            .map_err(db("upsert idlog state"))?;
         Ok(())
     }
 
@@ -84,18 +79,17 @@ impl GhostStore {
         let mut stmt = self
             .conn
             .prepare_cached(
-                "SELECT head_seq, head_hash, master_vk, home_relay_vk, home_set_at_seq
+                "SELECT head_seq, head_hash, home_relay_vk, home_set_at_seq
                  FROM idlog_state WHERE account_fp = ?1",
             )
-            .map_err(|e| GhostError::Database(format!("get idlog state: {e}")))?;
+            .map_err(db("get idlog state"))?;
 
         let result = stmt.query_row(rusqlite::params![account_fp.as_slice()], |row| {
             let head_seq: i64 = row.get(0)?;
             let head_hash: Vec<u8> = row.get(1)?;
-            let master_vk: Option<Vec<u8>> = row.get(2)?;
-            let home_relay_vk: Option<Vec<u8>> = row.get(3)?;
-            let home_set_at_seq: i64 = row.get(4)?;
-            Ok((head_seq as u64, head_hash, master_vk, home_relay_vk, home_set_at_seq as u64))
+            let home_relay_vk: Option<Vec<u8>> = row.get(2)?;
+            let home_set_at_seq: i64 = row.get(3)?;
+            Ok((head_seq as u64, head_hash, home_relay_vk, home_set_at_seq as u64))
         });
 
         let to_key = |v: Vec<u8>, what: &str| -> Result<[u8; 32]> {
@@ -103,11 +97,10 @@ impl GhostStore {
                 .map_err(|_| GhostError::Database(format!("idlog state: bad {what} length")))
         };
         match result {
-            Ok((head_seq, head_hash, master_vk, home_relay_vk, home_set_at_seq)) => {
+            Ok((head_seq, head_hash, home_relay_vk, home_set_at_seq)) => {
                 Ok(Some(CachedIdLogState {
                     head_seq,
                     head_hash: to_key(head_hash, "head_hash")?,
-                    master_vk: master_vk.map(|v| to_key(v, "master_vk")).transpose()?,
                     home_relay_vk: home_relay_vk.map(|v| to_key(v, "home_relay_vk")).transpose()?,
                     home_set_at_seq,
                 }))
@@ -117,19 +110,6 @@ impl GhostStore {
         }
     }
 
-    /// Get the highest cached sequence number for an account (0 if none).
-    pub fn get_cached_head_seq(&self, account_fp: &[u8; 32]) -> Result<u64> {
-        let seq: Option<i64> = self
-            .conn
-            .query_row(
-                "SELECT MAX(seq) FROM idlog_cache WHERE account_fp = ?1",
-                rusqlite::params![account_fp.as_slice()],
-                |row| row.get(0),
-            )
-            .map_err(|e| GhostError::Database(format!("get head seq: {e}")))?;
-        Ok(seq.unwrap_or(0) as u64)
-    }
-
     /// Load all cached entries for an account, ordered by seq.
     pub fn get_cached_idlog_entries(&self, account_fp: &[u8; 32]) -> Result<Vec<CachedIdLogEntry>> {
         let mut stmt = self
@@ -137,7 +117,7 @@ impl GhostStore {
             .prepare_cached(
                 "SELECT seq, payload, anchored FROM idlog_cache WHERE account_fp = ?1 ORDER BY seq",
             )
-            .map_err(|e| GhostError::Database(format!("get idlog entries: {e}")))?;
+            .map_err(db("get idlog entries"))?;
         let rows = stmt
             .query_map(rusqlite::params![account_fp.as_slice()], |row| {
                 let seq: i64 = row.get(0)?;
@@ -145,10 +125,10 @@ impl GhostStore {
                 let anchored: i64 = row.get(2)?;
                 Ok(CachedIdLogEntry { seq: seq as u64, payload, anchored: anchored == 1 })
             })
-            .map_err(|e| GhostError::Database(format!("get idlog entries: {e}")))?;
+            .map_err(db("get idlog entries"))?;
         let mut entries = Vec::new();
         for row in rows {
-            entries.push(row.map_err(|e| GhostError::Database(format!("read idlog entry: {e}")))?);
+            entries.push(row.map_err(db("read idlog entry"))?);
         }
         Ok(entries)
     }
@@ -172,6 +152,17 @@ impl GhostStore {
             .collect()
     }
 
+    /// Drop cached entries from `seq` on, which a fork's winning branch replaces.
+    pub fn delete_cached_idlog_from(&self, account_fp: &[u8; 32], seq: u64) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM idlog_cache WHERE account_fp = ?1 AND seq >= ?2",
+                rusqlite::params![account_fp.as_slice(), seq as i64],
+            )
+            .map_err(db("drop replaced idlog entries"))?;
+        Ok(())
+    }
+
     /// Remove all cached identity log data for an account.
     pub fn clear_idlog_cache(&self, account_fp: &[u8; 32]) -> Result<()> {
         self.conn
@@ -179,13 +170,13 @@ impl GhostStore {
                 "DELETE FROM idlog_cache WHERE account_fp = ?1",
                 rusqlite::params![account_fp.as_slice()],
             )
-            .map_err(|e| GhostError::Database(format!("clear idlog cache: {e}")))?;
+            .map_err(db("clear idlog cache"))?;
         self.conn
             .execute(
                 "DELETE FROM idlog_state WHERE account_fp = ?1",
                 rusqlite::params![account_fp.as_slice()],
             )
-            .map_err(|e| GhostError::Database(format!("clear idlog state: {e}")))?;
+            .map_err(db("clear idlog state"))?;
         Ok(())
     }
 }
@@ -220,16 +211,7 @@ mod tests {
     }
 
     fn state_for(fp: [u8; 32], head_seq: u64, head_hash: [u8; 32]) -> LogState {
-        LogState {
-            account_fp: fp,
-            master_verifying_key: None,
-            devices: Default::default(),
-            head_seq,
-            head_hash,
-            home_relay_vk: None,
-            home_relay_ref: None,
-            home_set_at_seq: 0,
-        }
+        LogState { head_seq, head_hash, ..LogState::empty(fp) }
     }
 
     #[test]
@@ -284,7 +266,6 @@ mod tests {
         let store = test_store();
         let fp = [0x33u8; 32];
         let mut state = state_for(fp, 5, [0xEE; 32]);
-        state.master_verifying_key = Some([0xDD; 32]);
         state.home_relay_vk = Some([0x77; 32]);
         state.home_relay_ref = Some(RelayRef::key_only([0x77; 32]));
         state.home_set_at_seq = 2;
@@ -293,25 +274,19 @@ mod tests {
         let cached = store.get_cached_idlog_state(&fp).unwrap().unwrap();
         assert_eq!(cached.head_seq, 5);
         assert_eq!(cached.head_hash, [0xEE; 32]);
-        assert_eq!(cached.master_vk.unwrap(), [0xDD; 32]);
         assert_eq!(cached.home_relay_vk.unwrap(), [0x77; 32]);
         assert_eq!(cached.home_set_at_seq, 2);
     }
 
     #[test]
-    fn get_cached_head_seq_empty() {
+    fn deleting_from_a_seq_keeps_the_prefix() {
         let store = test_store();
-        assert_eq!(store.get_cached_head_seq(&[0xFF; 32]).unwrap(), 0);
-    }
-
-    #[test]
-    fn get_cached_head_seq_returns_max() {
-        let store = test_store();
-        let fp = [0x44u8; 32];
-        store
-            .cache_anchored_entries(&fp, &[dummy_anchored(fp, 3, 0xAA), dummy_anchored(fp, 7, 0xBB)])
-            .unwrap();
-        assert_eq!(store.get_cached_head_seq(&fp).unwrap(), 7);
+        let fp = [0x34u8; 32];
+        let entries: Vec<_> = (1..=4).map(|seq| dummy_anchored(fp, seq, seq as u8)).collect();
+        store.cache_anchored_entries(&fp, &entries).unwrap();
+        store.delete_cached_idlog_from(&fp, 3).unwrap();
+        let kept: Vec<u64> = store.get_cached_idlog_entries(&fp).unwrap().iter().map(|r| r.seq).collect();
+        assert_eq!(kept, vec![1, 2]);
     }
 
     #[test]
@@ -327,12 +302,11 @@ mod tests {
     }
 
     #[test]
-    fn state_without_master_vk_or_home() {
+    fn state_without_home() {
         let store = test_store();
         let fp = [0x66u8; 32];
         store.upsert_idlog_state(&fp, &state_for(fp, 1, [0xCC; 32])).unwrap();
         let cached = store.get_cached_idlog_state(&fp).unwrap().unwrap();
-        assert!(cached.master_vk.is_none());
         assert!(cached.home_relay_vk.is_none());
         assert_eq!(cached.home_set_at_seq, 0);
     }

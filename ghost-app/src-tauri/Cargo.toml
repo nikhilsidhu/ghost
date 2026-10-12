@@ -11,12 +11,14 @@ serde_json = "1"
 ghost-core = { path = "../../ghost-core" }
 ghost-wire = { path = "../../ghost-wire" }
 ghost-audio = { path = "../../ghost-audio" }
+ghost-log = { path = "../../ghost-log" }
+tracing = "0.1"
 ed25519-dalek = "2"
 dirs = "6"
+gethostname = "1"
 hex = "0.4"
 rand = "0.8"
 tokio = { version = "1", features = ["sync"] }
-base64 = "0.22"
 url = "2"
 toml = "0.8"
 # Not used directly: enables TLS for ghost-core's WebSocket connections (wss relays).
@@ -26,7 +28,6 @@ rubato = "0.16"
 ringbuf = "0.4"
 tauri-plugin-global-shortcut = "2"
 user-idle = "0.6.0"
-aes-gcm = "0.10"
 blake3 = "1"
 zeroize = "1.8.2"
 

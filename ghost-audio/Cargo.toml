@@ -13,6 +13,7 @@ ghost-media = { path = "../ghost-media" }
 opus = "0.3"
 nnnoiseless = "0.5"
 tokio = { version = "1", features = ["sync"] }
+tracing = "0.1"
 
 [features]
 # Synthetic devices: a tone generator for capture and a recorder for playback.

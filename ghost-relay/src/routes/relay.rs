@@ -8,8 +8,9 @@ use serde::Serialize;
 use crate::error::Result;
 use crate::state::AppState;
 
-/// Protocol generation this relay speaks; 2 adds anchored logs and multi-relay accounts.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// Protocol generation this relay speaks; 2 adds anchored logs and multi-relay accounts,
+/// 3 enforces servers' removed lists, 4 adds account keys.
+pub const PROTOCOL_VERSION: u32 = ghost_wire::RELAY_PROTOCOL_ACCOUNT_KEYS;
 
 #[derive(Serialize)]
 pub struct RelayInfo {
@@ -27,7 +28,7 @@ pub async fn get(State(state): State<AppState>) -> Result<Json<RelayInfo>> {
         Some(url) => RelayRef::https(state.relay_vk, url),
         None => RelayRef::key_only(state.relay_vk),
     };
-    let kt_head = state.storage.kt_load_checkpoint()?.map(|cp| B64.encode(cp));
+    let kt_head = state.storage.kt_load_checkpoint().await?.map(|cp| B64.encode(cp));
     Ok(Json(RelayInfo {
         relay_vk: hex::encode(state.relay_vk),
         protocol: PROTOCOL_VERSION,

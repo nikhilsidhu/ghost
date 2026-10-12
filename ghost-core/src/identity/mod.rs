@@ -1,47 +1,45 @@
-pub mod export;
+pub mod batch;
 pub mod keyring_store;
 pub mod log;
 
-use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
+use ed25519_dalek::{SigningKey, VerifyingKey};
+use ghost_wire::batch::LogBatch;
+use ghost_wire::idlog::{LogEntry, LogState};
+use ghost_wire::relay_ref::RelayRef;
 use rand::rngs::OsRng;
 use zeroize::Zeroize;
 
+use crate::account_keys::{AccountSeed, DeviceEncryptionKey, RecoveryKey};
 use crate::crypto::keys::derive_ed25519_seed;
 use crate::crypto::FINGERPRINT_SHORT_BYTES;
 use crate::error::Result;
-use crate::identity::log::{create_genesis, LogEntry};
+use crate::identity::batch::BatchBuilder;
+use crate::identity::log::{
+    counter_sign, create_device_key, create_genesis, create_rotate_root, create_set_home_relay, entry_hash, sign_entry,
+};
 
-/// Domain separator for delegation signatures, preventing cross-protocol attacks.
-pub const DELEGATION_DOMAIN: &[u8] = b"ghost-delegation-v1:";
-
-/// Sign a delegation: master_sk authorizes device_vk for this account at this idlog sequence.
-pub fn compute_delegation_sig(
-    master_sk: &SigningKey,
-    device_vk: &[u8; 32],
-    account_fp: &[u8; 32],
-    idlog_seq: u64,
-) -> [u8; 64] {
-    let mut msg = Vec::with_capacity(DELEGATION_DOMAIN.len() + 32 + 32 + 8);
-    msg.extend_from_slice(DELEGATION_DOMAIN);
-    msg.extend_from_slice(device_vk);
-    msg.extend_from_slice(account_fp);
-    msg.extend_from_slice(&idlog_seq.to_be_bytes());
-    master_sk.sign(&msg).to_bytes()
+/// The identity log entry that added a device, which its credential names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Addition {
+    pub seq: u64,
+    pub entry_hash: [u8; 32],
 }
 
-/// Everything returned from account creation. Seed is zeroized on drop.
-pub struct AccountCreation {
+impl Addition {
+    pub fn of(entry: &LogEntry) -> Self {
+        Self { seq: entry.seq, entry_hash: entry_hash(entry) }
+    }
+}
+
+/// A new account and its first device, ready to publish.
+pub struct NewAccount {
     pub identity: Identity,
-    pub genesis_entry: LogEntry,
-    pub seed: [u8; 32],
+    /// Genesis, the home relay, the device's encryption key, the rotation to the
+    /// recovery key's root and the first account key, published together.
+    pub batch: LogBatch,
+    pub account_seed: AccountSeed,
     pub db_key: [u8; 32],
     pub mls_db_key: [u8; 32],
-}
-
-impl Drop for AccountCreation {
-    fn drop(&mut self) {
-        self.seed.zeroize();
-    }
 }
 
 impl std::fmt::Debug for Identity {
@@ -56,20 +54,16 @@ impl std::fmt::Debug for Identity {
 pub struct Identity {
     pub signing_key: SigningKey,
     pub verifying_key: VerifyingKey,
+    /// Opens this device's copies of the account key.
+    pub encryption_key: DeviceEncryptionKey,
     pub fingerprint: [u8; 32],
     pub display_name: String,
-    /// Sequence number in the identity log that authorized this device key.
-    pub idlog_seq: u64,
-    /// Account master verifying key (blake3 of this == fingerprint).
-    pub master_vk: [u8; 32],
-    /// Account master signing key — needed to authorize new devices during pairing.
-    pub master_sk: SigningKey,
-    /// Delegation signature: master_sk authorized this device_vk.
-    pub delegation_sig: [u8; 64],
+    pub added_at: Addition,
 }
 
 impl Identity {
-    /// Generate a random identity (single-device convenience for tests).
+    /// A random identity with no identity log behind it, for tests that exercise MLS
+    /// without relays.
     pub fn generate() -> Result<Self> {
         let mut seed = [0u8; 32];
         rand::RngCore::fill_bytes(&mut OsRng, &mut seed);
@@ -78,85 +72,67 @@ impl Identity {
         Ok(id)
     }
 
-    /// Derive identity from seed. Signing key = seed-derived master key.
-    /// In production multi-device, use `from_device` instead — this is mainly for tests
-    /// and single-device flows where the seed-derived key IS the device key.
+    /// A deterministic one-device identity whose own key is also its account's genesis
+    /// key, for tests that exercise MLS without relays. [`Identity::own_genesis`] is
+    /// the log entry that added it.
     pub fn from_seed(seed: [u8; 32]) -> Result<Self> {
         let ed25519_bytes = derive_ed25519_seed(&seed)?;
         let signing_key = SigningKey::from_bytes(&ed25519_bytes);
-        let verifying_key = signing_key.verifying_key();
-        let master_vk: [u8; 32] = verifying_key.to_bytes();
-        let fingerprint: [u8; 32] = blake3::hash(&master_vk).into();
-
-        let fp_hex = hex::encode(&fingerprint[..FINGERPRINT_SHORT_BYTES]);
-        let display_name = format!("ghost-{fp_hex}");
-
-        // In test/single-device mode, master key == device key — self-sign delegation
-        let delegation_sig = compute_delegation_sig(
-            &signing_key, &master_vk, &fingerprint, 0,
-        );
-
-        let master_sk = SigningKey::from_bytes(&ed25519_bytes);
-        Ok(Self { signing_key, verifying_key, fingerprint, display_name, idlog_seq: 0, master_vk, master_sk, delegation_sig })
+        let genesis = standalone_genesis(&signing_key);
+        Ok(Self::from_device(genesis.account_fp, signing_key, DeviceEncryptionKey::from_seed(seed), Addition::of(&genesis)))
     }
 
-    /// Restore a device identity from stored components.
-    /// `fingerprint` is the account-level fingerprint (Blake3 of master verifying key).
-    /// `signing_key` is this device's random Ed25519 key.
+    /// For identities from [`Identity::generate`] and [`Identity::from_seed`]: the
+    /// genesis that added the device, which tests put in a client's identity log cache.
+    pub fn own_genesis(&self) -> LogEntry {
+        standalone_genesis(&self.signing_key)
+    }
+
+    /// A device identity from stored parts. `fingerprint` is the account's.
     pub fn from_device(
         fingerprint: [u8; 32],
         signing_key: SigningKey,
-        idlog_seq: u64,
-        master_vk: [u8; 32],
-        master_sk: SigningKey,
-        delegation_sig: [u8; 64],
+        encryption_key: DeviceEncryptionKey,
+        added_at: Addition,
     ) -> Self {
         let verifying_key = signing_key.verifying_key();
         let fp_hex = hex::encode(&fingerprint[..FINGERPRINT_SHORT_BYTES]);
         let display_name = format!("ghost-{fp_hex}");
-        Self { signing_key, verifying_key, fingerprint, display_name, idlog_seq, master_vk, master_sk, delegation_sig }
+        Self { signing_key, verifying_key, encryption_key, fingerprint, display_name, added_at }
     }
 
-    /// Create a new account: derive master key from random seed, generate device key,
-    /// create genesis identity log entry. Returns everything needed to persist and display.
-    pub fn create_account(device_label: &str) -> Result<AccountCreation> {
-        // Random seed → master key → fingerprint
-        let mut seed = [0u8; 32];
-        rand::RngCore::fill_bytes(&mut OsRng, &mut seed);
-        let ed25519_bytes = derive_ed25519_seed(&seed)?;
-        let master_key = SigningKey::from_bytes(&ed25519_bytes);
-        let master_vk: [u8; 32] = master_key.verifying_key().to_bytes();
-        let fingerprint: [u8; 32] = blake3::hash(&master_vk).into();
-
-        // Random device key
+    /// Create an account homed at `home`, whose root is `recovery_key`'s. The user
+    /// must have saved the key first: the genesis key that fixes the fingerprint is
+    /// discarded here, and nothing else can act as the account's root.
+    pub fn create_account(home: &RelayRef, device_label: &str, recovery_key: &RecoveryKey) -> Result<NewAccount> {
+        let genesis_key = SigningKey::generate(&mut OsRng);
         let device_key = SigningKey::generate(&mut OsRng);
-        let device_vk = device_key.verifying_key();
-        let genesis = create_genesis(&master_key, &device_key, device_label);
+        let encryption_key = DeviceEncryptionKey::generate();
+        let root = recovery_key.root()?;
+        let recovery_box = recovery_key.recovery_box()?;
 
-        // Delegation: master key authorizes this device key
-        let delegation_sig = compute_delegation_sig(
-            &master_key, device_vk.as_bytes(), &fingerprint, 1,
-        );
+        let genesis = create_genesis(&genesis_key, &device_key, device_label);
+        let account_fp = genesis.account_fp;
+        let added_at = Addition::of(&genesis);
+        let mut batch = BatchBuilder::new(LogState::empty(account_fp));
+        batch.push(genesis)?;
+        batch.push(create_set_home_relay(batch.state(), &device_key, home.clone()))?;
+        batch.push(create_device_key(batch.state(), &device_key, &device_key, encryption_key.key_pair()?.public()))?;
+        batch.push(create_rotate_root(batch.state(), &genesis_key, &root, recovery_box.public(), &device_key))?;
+        let account_seed = batch.push_rekey(&device_key, None)?;
 
-        // Random DB encryption keys
         let mut db_key = [0u8; 32];
         let mut mls_db_key = [0u8; 32];
         rand::RngCore::fill_bytes(&mut OsRng, &mut db_key);
         rand::RngCore::fill_bytes(&mut OsRng, &mut mls_db_key);
 
-        let fp_hex = hex::encode(&fingerprint[..FINGERPRINT_SHORT_BYTES]);
-        let identity = Identity {
-            signing_key: device_key,
-            verifying_key: device_vk,
-            fingerprint,
-            display_name: format!("ghost-{fp_hex}"),
-            idlog_seq: 1,
-            master_vk,
-            master_sk: master_key,
-            delegation_sig,
-        };
-
-        Ok(AccountCreation { identity, genesis_entry: genesis, seed, db_key, mls_db_key })
+        Ok(NewAccount {
+            identity: Self::from_device(account_fp, device_key, encryption_key, added_at),
+            batch: batch.finish(),
+            account_seed,
+            db_key,
+            mls_db_key,
+        })
     }
 
     /// First 16 hex chars of fingerprint.
@@ -165,9 +141,20 @@ impl Identity {
     }
 }
 
+/// The genesis of a one-device account whose genesis key is the device's own key,
+/// stamped at time zero so the same key always yields the same entry.
+fn standalone_genesis(key: &SigningKey) -> LogEntry {
+    let mut entry = create_genesis(key, key, "test");
+    entry.timestamp = 0;
+    sign_entry(key, &mut entry);
+    counter_sign(key, &mut entry);
+    entry
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ghost_wire::batch::apply_batch;
 
     #[test]
     fn generate_produces_unique_identities() {
@@ -199,26 +186,25 @@ mod tests {
     }
 
     #[test]
-    fn fingerprint_is_blake3_of_verifying_key() {
-        let id = Identity::from_seed([0xAAu8; 32]).unwrap();
-        let expected: [u8; 32] = blake3::hash(id.verifying_key.as_bytes()).into();
-        assert_eq!(id.fingerprint, expected);
-    }
-
-    #[test]
     fn fingerprint_short_is_16_hex_chars() {
         let id = Identity::generate().unwrap();
         assert_eq!(id.fingerprint_short().len(), 16);
     }
 
     #[test]
-    fn from_device_uses_provided_fingerprint() {
-        let master = SigningKey::generate(&mut OsRng);
-        let master_vk: [u8; 32] = master.verifying_key().to_bytes();
-        let fp: [u8; 32] = blake3::hash(&master_vk).into();
-        let device = SigningKey::generate(&mut OsRng);
-        let sig = compute_delegation_sig(&master, device.verifying_key().as_bytes(), &fp, 1);
-        let id = Identity::from_device(fp, device, 1, master_vk, master, sig);
-        assert_eq!(id.fingerprint, fp);
+    fn a_new_account_is_rotated_covered_and_rooted_in_its_recovery_key() {
+        let recovery_key = RecoveryKey::generate();
+        let home = RelayRef::key_only([0x77; 32]);
+        let account = Identity::create_account(&home, "laptop", &recovery_key).unwrap();
+        let state = apply_batch(&LogState::empty(account.identity.fingerprint), &account.batch.entries, &account.batch.key_sets).unwrap();
+
+        assert!(state.root_rotated());
+        assert!(!state.rekey_needed());
+        assert_eq!(state.root_verifying_key, Some(recovery_key.root().unwrap().verifying_key().to_bytes()));
+        assert_eq!(state.recovery_box_key, Some(recovery_key.recovery_box().unwrap().public()));
+        assert_eq!(state.home_relay_vk, Some([0x77; 32]));
+        assert!(state.is_active_device(&account.identity.verifying_key.to_bytes()));
+        assert_eq!(account.identity.added_at, Addition::of(&account.batch.entries[0]));
+        assert!(account.account_seed.matches(state.account_key().unwrap()).unwrap());
     }
 }

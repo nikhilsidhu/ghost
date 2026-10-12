@@ -1,4 +1,5 @@
 use ghost_wire::policy::ServerView;
+use super::db;
 use rusqlite::OptionalExtension;
 
 use crate::error::{GhostError, Result};
@@ -17,7 +18,7 @@ impl GhostStore {
                 "INSERT OR REPLACE INTO server_views (server_id, epoch, view) VALUES (?1, ?2, ?3)",
                 rusqlite::params![server_id.as_slice(), epoch as i64, view.to_bytes()],
             )
-            .map_err(|e| GhostError::Database(format!("record server view: {e}")))?;
+            .map_err(db("record server view"))?;
         Ok(())
     }
 
@@ -31,7 +32,7 @@ impl GhostStore {
                 |row| row.get(0),
             )
             .optional()
-            .map_err(|e| GhostError::Database(format!("server view: {e}")))?;
+            .map_err(db("server view"))?;
         bytes
             .map(|b| ServerView::from_bytes(&b).map_err(|e| GhostError::Format(format!("stored server view: {e}"))))
             .transpose()
@@ -50,7 +51,7 @@ mod tests {
         let server_id = [0x05; 32];
         let store = GhostStore::open_in_memory(&[0xAB; 32]).unwrap();
         store
-            .insert_server(&Server { server_id, name: "s".into(), kind: ServerKind::Server, creator_fp: [0x01; 32], created_at: 1 })
+            .insert_server(&Server { server_id, name: "s".into(), kind: ServerKind::Server, created_at: 1 }, crate::storage::OnConflict::Fail)
             .unwrap();
         let first = ServerView { policy: ServerPolicy::new([1; 32]), members: vec![[1; 32]] };
         let second = ServerView { members: vec![[1; 32], [2; 32]], ..first.clone() };

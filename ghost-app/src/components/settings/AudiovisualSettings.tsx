@@ -1,31 +1,52 @@
-import { createSignal, createEffect, on, onMount, Show } from "solid-js";
+import { createSignal, createEffect, on, onCleanup, onMount, Show } from "solid-js";
 import { listen } from "@tauri-apps/api/event";
-import { startMicTest, stopMicTest, playTestTone, listAudioDevices, setInputDevice, setOutputDevice, setNoiseSuppression, setAgc, setInputMode, setVadThreshold, setInputGain, getConfig, getKeybinds } from "../../lib/api";
+import { startMicTest, stopMicTest, playTestTone, listAudioDevices, setInputDevice, setOutputDevice, setNoiseSuppression, setAgc, setInputMode, setVadThreshold, setInputGain, setAutoMuteOnIdle, getConfig, getKeybinds } from "../../lib/api";
 import { settingsOpen, settingsCategory, setSettingsCategory, setIsPttMode } from "../../lib/store";
 import { setInputMode as setKeybindInputMode } from "../../lib/keybinds";
-import { SettingGroup, SettingSelect, SettingSegmented, SettingSlider } from "./controls";
+import { SettingGroup, SettingSelect, SettingSegmented, SettingSlider, SettingToggle } from "./controls";
 import { cn } from "../../lib/cn";
+import type { Agc, Config, InputMode, NoiseSuppression } from "../../lib/types";
 
 const VAD_DEBOUNCE_MS = 200;
 
 export default function AudiovisualSettings() {
   const [micTesting, setMicTesting] = createSignal(false);
   const [micLevel, setMicLevel] = createSignal(0);
+  /** Why the last mic test ended on its own, if its devices failed. */
+  const [micTestFailure, setMicTestFailure] = createSignal<string | null>(null);
   const [tonePlaying, setTonePlaying] = createSignal(false);
 
   const [inputDevices, setInputDevices] = createSignal<{ value: string; label: string }[]>([]);
   const [outputDevices, setOutputDevices] = createSignal<{ value: string; label: string }[]>([]);
   const [selectedInput, setSelectedInput] = createSignal("default");
   const [selectedOutput, setSelectedOutput] = createSignal("default");
-  const [selectedNs, setSelectedNs] = createSignal("nnnoiseless");
-  const [selectedAgc, setSelectedAgc] = createSignal("auto");
-  const [selectedInputMode, setSelectedInputMode] = createSignal("voice_activity");
+  const [selectedNs, setSelectedNs] = createSignal<NoiseSuppression>("nnnoiseless");
+  const [selectedAgc, setSelectedAgc] = createSignal<Agc>("auto");
+  const [autoMuteOnIdle, setAutoMuteOnIdleLocal] = createSignal(true);
+  const [selectedInputMode, setSelectedInputMode] = createSignal<InputMode>("voice_activity");
   const [pttKeyBound, setPttKeyBound] = createSignal(false);
   const [vadThreshold, setVadThresholdLocal] = createSignal(0.85);
   const [inputGainLocal, setInputGainLocal] = createSignal(1.0);
 
   let vadTimer: ReturnType<typeof setTimeout> | null = null;
   let gainTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const showConfig = (config: Config) => {
+    setSelectedInput(config.input_device ?? "default");
+    setSelectedOutput(config.output_device ?? "default");
+    setSelectedNs(config.noise_suppression);
+    setSelectedAgc(config.agc);
+    setAutoMuteOnIdleLocal(config.auto_mute_on_idle);
+    setSelectedInputMode(config.input_mode);
+    setVadThresholdLocal(config.vad_threshold);
+    setInputGainLocal(config.input_gain);
+  };
+
+  // A setting another device changed shows here at once.
+  onMount(() => {
+    const synced = listen<string>("sync-pref", () => { getConfig().then(showConfig).catch(() => {}); });
+    onCleanup(() => { synced.then((stop) => stop()); });
+  });
 
   onMount(async () => {
     const [devices, config, keybinds] = await Promise.all([listAudioDevices(), getConfig(), getKeybinds()]);
@@ -42,29 +63,37 @@ export default function AudiovisualSettings() {
       ...devices.outputs.map((name) => ({ value: name, label: name })),
     ]);
 
-    setSelectedInput(config.input_device ?? "default");
-    setSelectedOutput(config.output_device ?? "default");
-    setSelectedNs(config.noise_suppression);
-    setSelectedAgc(config.agc);
-    setSelectedInputMode(config.input_mode);
+    showConfig(config);
     setPttKeyBound(!!keybinds.push_to_talk);
-    setVadThresholdLocal(config.vad_threshold);
-    setInputGainLocal(config.input_gain);
   });
 
   let unlisten: (() => void) | null = null;
 
+  const micTestOver = () => {
+    setMicTesting(false);
+    setMicLevel(0);
+    if (unlisten) { unlisten(); unlisten = null; }
+  };
+
+  // The test ends on its own when a call takes the microphone or its devices fail.
+  onMount(() => {
+    const ended = listen<string | null>("mic-test-ended", (e) => {
+      micTestOver();
+      setMicTestFailure(e.payload);
+    });
+    onCleanup(() => { ended.then((stop) => stop()); });
+  });
+
   const toggleMicTest = async () => {
     if (micTesting()) {
       await stopMicTest();
-      setMicTesting(false);
-      setMicLevel(0);
-      if (unlisten) { unlisten(); unlisten = null; }
+      micTestOver();
     } else {
       const unsub = await listen<number>("mic-level", (e) => {
         setMicLevel(e.payload);
       });
       unlisten = unsub;
+      setMicTestFailure(null);
       setMicTesting(true);
       await startMicTest();
     }
@@ -86,9 +115,7 @@ export default function AudiovisualSettings() {
     (active) => {
       if (!active && micTesting()) {
         stopMicTest().catch(() => {});
-        setMicTesting(false);
-        setMicLevel(0);
-        if (unlisten) { unlisten(); unlisten = null; }
+        micTestOver();
       }
     },
     { defer: true },
@@ -104,17 +131,17 @@ export default function AudiovisualSettings() {
     await setOutputDevice(v === "default" ? null : v);
   };
 
-  const handleNsChange = async (v: string) => {
+  const handleNsChange = async (v: NoiseSuppression) => {
     setSelectedNs(v);
     await setNoiseSuppression(v);
   };
 
-  const handleAgcChange = async (v: string) => {
+  const handleAgcChange = async (v: Agc) => {
     setSelectedAgc(v);
     await setAgc(v);
   };
 
-  const handleInputModeChange = async (v: string) => {
+  const handleInputModeChange = async (v: InputMode) => {
     setSelectedInputMode(v);
     setIsPttMode(v === "push_to_talk");
     setKeybindInputMode(v);
@@ -219,6 +246,15 @@ export default function AudiovisualSettings() {
           ]}
           onChange={handleAgcChange}
         />
+        <SettingToggle
+          label="mute when idle"
+          description="mute the microphone after ten minutes without keyboard or mouse input"
+          checked={autoMuteOnIdle()}
+          onChange={(v) => {
+            setAutoMuteOnIdleLocal(v);
+            setAutoMuteOnIdle(v).catch(() => {});
+          }}
+        />
       </SettingGroup>
 
       <SettingGroup label="microphone">
@@ -243,6 +279,9 @@ export default function AudiovisualSettings() {
               {micTesting() ? "stop" : "test"}
             </button>
           </div>
+          <Show when={micTestFailure()}>
+            <div role="alert" class="mt-2 text-xs text-[var(--red-400)] break-words">{micTestFailure()}</div>
+          </Show>
           <Show when={micTesting()}>
             <div class="mt-3 h-2 rounded-full bg-[var(--neutral-800)] overflow-hidden">
               <div

@@ -28,6 +28,19 @@ pub struct PlayoutStats {
 }
 
 impl PlayoutStats {
+    /// What was counted since `earlier`, an earlier copy of these counts.
+    pub fn since(&self, earlier: &PlayoutStats) -> PlayoutStats {
+        PlayoutStats {
+            played: self.played - earlier.played,
+            recovered: self.recovered - earlier.recovered,
+            concealed: self.concealed - earlier.concealed,
+            waited: self.waited - earlier.waited,
+            dropped_late: self.dropped_late - earlier.dropped_late,
+            shortened: self.shortened - earlier.shortened,
+            lengthened: self.lengthened - earlier.lengthened,
+        }
+    }
+
     pub fn add(&mut self, other: &PlayoutStats) {
         self.played += other.played;
         self.recovered += other.recovered;
@@ -65,7 +78,10 @@ pub(crate) struct Receiver {
     last_high_water: u32,
     window_ticks: u32,
     cooldown: u32,
+    /// Over the receiver's life.
     pub(crate) stats: PlayoutStats,
+    /// `stats` as of the last quality reading.
+    pub(crate) reported: PlayoutStats,
     decoded: Vec<f32>,
     stretched: Vec<f32>,
 }
@@ -88,6 +104,7 @@ impl Receiver {
             window_ticks: 0,
             cooldown: 0,
             stats: PlayoutStats::default(),
+            reported: PlayoutStats::default(),
             decoded: vec![0.0; FRAME_SAMPLES],
             stretched: Vec::with_capacity(FRAME_SAMPLES * 2),
         })

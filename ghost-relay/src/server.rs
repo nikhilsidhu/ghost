@@ -51,12 +51,13 @@ impl RunningRelay {
 
 /// Start a relay on `bind` (port 0 picks a free port).
 pub async fn start(config: Config, storage: Storage, bind: SocketAddr) -> std::io::Result<RunningRelay> {
-    let state = state::new_state(config, storage);
+    let state = state::new_state(config, storage).await.map_err(std::io::Error::other)?;
     let listener = TcpListener::bind(bind).await?;
     let addr = listener.local_addr()?;
 
     let mut voice_port_rx = state.voice_udp_port_rx.clone();
-    let app = routes::router(state.clone());
+    // Handlers see each connection's peer address, for the per-address limits.
+    let app = routes::router(state.clone()).into_make_service_with_connect_info::<SocketAddr>();
     let tasks = vec![
         tokio::spawn(async move {
             if let Err(e) = axum::serve(listener, app).await {

@@ -1,26 +1,40 @@
 //! Linking a new device to an existing account through a relay rendezvous.
 //!
-//! The existing device (A) posts a sealed offer, the new device (B) answers with its
-//! signing key, A uploads a sealed provision blob and appends `AddDevice` to the
-//! identity log, and B waits for that entry before fetching the provision.
-//! All rendezvous payloads are AES-256-GCM sealed with a secret that only travels
+//! The existing device (A) posts a sealed offer. The new device (B) answers with its
+//! public keys, and both screens show a code from the pairing secret and B's keys,
+//! which A's user compares before anything is signed. A posts a draft `AddDevice`, B
+//! counter-signs it, and A appends the addition, B's encryption key and a new account
+//! key generation as one batch after uploading the provision. B never sends a private
+//! key. All rendezvous payloads are AES-256-GCM sealed with a secret that only travels
 //! inside the pairing code.
 
-use ed25519_dalek::SigningKey;
-use ghost_wire::idlog::LogState;
+use ed25519_dalek::{Signer, SigningKey};
+use ghost_wire::idlog::{EntryBody, LogEntry, LogState};
 
+use crate::account_keys::DeviceEncryptionKey;
 use crate::crypto::aead;
 use crate::error::{GhostError, Result};
-use crate::identity::log::create_add_device;
-use crate::identity::{compute_delegation_sig, Identity};
+use crate::identity::batch::BatchBuilder;
+use crate::identity::log::{create_device_key_with_signature, device_key_signature, draft_add_device, sign_message};
+use crate::identity::{Addition, Identity};
 use crate::relay::{PairingToken, RelayClient};
 use zeroize::Zeroize;
 
-use super::idlog;
 use super::provision::ProvisionBlob;
-use super::{SharedClient, SharedRelay};
+use super::{account, account_keys, idlog, SharedClient};
 
 const SEAL_CONTEXT: &str = "pairing";
+
+/// How long after the session's end the new device still waits to find itself in the log:
+/// the existing device's batch lands moments after its last write to the session.
+const NEW_DEVICE_GRACE_MS: u64 = 60 * 1000;
+
+/// How long the new device waits for the existing one to add it: the session's whole life
+/// and the grace after, so it never gives up on a link the other side can still make.
+pub const NEW_DEVICE_WAIT: std::time::Duration = std::time::Duration::from_millis(ghost_wire::PAIRING_TTL_MS + NEW_DEVICE_GRACE_MS);
+
+/// Domain separator for the code both screens show.
+const COMPARISON_CODE_LABEL: &[u8] = b"ghost-pairing-code-v1";
 
 /// What the new device needs to find and open the rendezvous:
 /// `relay_url#account_fp_hex#secret_hex#token_hex`. The token addresses the session on
@@ -65,6 +79,14 @@ impl PairingCode {
         let account_fp = parse_32(parts[2], "pairing code fingerprint")?;
         Ok(Self { relay_url: parts[3].to_string(), account_fp, secret, token })
     }
+
+    fn seal(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
+        aead::seal(&self.secret, plaintext, SEAL_CONTEXT)
+    }
+
+    fn open(&self, sealed: &[u8]) -> Result<Vec<u8>> {
+        aead::open(&self.secret, sealed, SEAL_CONTEXT)
+    }
 }
 
 fn parse_32(hex_str: &str, what: &str) -> Result<[u8; 32]> {
@@ -72,51 +94,85 @@ fn parse_32(hex_str: &str, what: &str) -> Result<[u8; 32]> {
     bytes.try_into().map_err(|_| GhostError::Format(format!("{what}: must be 32 bytes")))
 }
 
-/// Account presentation the new device adopts, sealed inside the offer.
+/// The six digits both screens show, from the pairing secret and the new device's
+/// keys, as Bluetooth's Numeric Comparison does. Someone who answered the code first
+/// has one chance in a million of matching what the real new device shows.
+pub fn comparison_code(secret: &[u8; 32], device_vk: &[u8; 32], encryption_key: &[u8; 32]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(COMPARISON_CODE_LABEL);
+    hasher.update(secret);
+    hasher.update(device_vk);
+    hasher.update(encryption_key);
+    let value = u32::from_be_bytes(hasher.finalize().as_bytes()[..4].try_into().unwrap()) % 1_000_000;
+    format!("{:03} {:03}", value / 1000, value % 1000)
+}
+
+/// Account presentation the new device adopts, sealed inside the offer. The status
+/// message is not in it: the provision's sync state carries it with its expiry.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct PairingOffer {
     pub relay_url: String,
     pub display_name: String,
-    /// Hex-encoded avatar hash, kept as text for compatibility with existing offers.
+    /// The account's avatar, hash and key in hex, which the new device announces too.
     pub avatar_hash: Option<String>,
-    pub status_message: Option<String>,
+    pub avatar_key: Option<String>,
 }
 
 impl PairingOffer {
-    pub fn avatar_hash_bytes(&self) -> Option<[u8; 32]> {
-        self.avatar_hash.as_deref().and_then(|h| parse_32(h, "avatar hash").ok())
+    pub fn avatar(&self) -> Option<crate::mls::presence::AvatarRef> {
+        let hash = parse_32(self.avatar_hash.as_deref()?, "avatar hash").ok()?;
+        let key = parse_32(self.avatar_key.as_deref()?, "avatar key").ok()?;
+        Some(crate::mls::presence::AvatarRef { hash, key })
     }
 }
 
-/// The new device's answer: `[device_sk:32][label utf-8]`.
+/// The new device's answer, its public keys only:
+/// `[device_vk:32][encryption_key:32][device_key_signature:64][label utf-8]`.
 pub struct PairingResponse {
-    pub device_sk: [u8; 32],
+    pub device_vk: [u8; 32],
+    pub encryption_key: [u8; 32],
+    /// The new device's consent to publishing `encryption_key`, as its `DeviceKey`
+    /// entry carries it.
+    pub device_key_signature: [u8; 64],
     pub label: String,
 }
 
 impl PairingResponse {
     fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(32 + self.label.len());
-        buf.extend_from_slice(&self.device_sk);
+        let mut buf = Vec::with_capacity(128 + self.label.len());
+        buf.extend_from_slice(&self.device_vk);
+        buf.extend_from_slice(&self.encryption_key);
+        buf.extend_from_slice(&self.device_key_signature);
         buf.extend_from_slice(self.label.as_bytes());
         buf
     }
 
     fn from_bytes(data: &[u8]) -> Result<Self> {
-        if data.len() < 33 {
+        if data.len() < 129 {
             return Err(GhostError::Format("pairing response too short".into()));
         }
-        let device_sk: [u8; 32] = data[..32].try_into().unwrap();
-        let label = String::from_utf8(data[32..].to_vec())
+        let label = String::from_utf8(data[128..].to_vec())
             .map_err(|_| GhostError::Format("pairing response label is not UTF-8".into()))?;
-        Ok(Self { device_sk, label })
+        Ok(Self {
+            device_vk: data[..32].try_into().unwrap(),
+            encryption_key: data[32..64].try_into().unwrap(),
+            device_key_signature: data[64..128].try_into().unwrap(),
+            label,
+        })
     }
+}
+
+/// A new device that has answered and waits for the user to compare codes.
+pub struct PendingDevice {
+    pub response: PairingResponse,
+    /// What both screens should show.
+    pub code: String,
 }
 
 // ── Existing device (A) ─────────────────────────────────────────────
 
 /// Post a sealed offer and return the pairing code to show the new device.
-pub async fn start(client: &SharedClient, relay: &SharedRelay, offer: &PairingOffer) -> Result<PairingCode> {
+pub async fn start(client: &SharedClient, relay: &RelayClient, offer: &PairingOffer) -> Result<PairingCode> {
     let mut secret = [0u8; 32];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut secret);
     let mut token: PairingToken = [0u8; 16];
@@ -129,98 +185,115 @@ pub async fn start(client: &SharedClient, relay: &SharedRelay, offer: &PairingOf
         let c = client.lock().await;
         *c.fingerprint()
     };
-    let relay_url = {
-        let r = relay.lock().await;
-        r.post_pairing_offer(&account_fp, &token, sealed).await?;
-        r.base_url().to_string()
-    };
+    relay.post_pairing_offer(&account_fp, &token, sealed).await?;
+    let relay_url = relay.base_url();
     let code = PairingCode { relay_url, account_fp, secret, token };
     secret.zeroize();
     Ok(code)
 }
 
-/// Poll for the new device's response on the session `code` names. When it has arrived:
-/// upload the provision blob, then append `AddDevice` at the home relay. Returns the new
-/// device's label, or `None` while still waiting. `relay` is the home relay; `rendezvous`
-/// is the relay the code names (the same client when pairing at the home). `genesis_entry`
-/// lets the flow re-push the account's genesis if the home has lost the identity log.
-pub async fn check(
-    client: &SharedClient,
-    relay: &SharedRelay,
-    rendezvous: &SharedRelay,
-    code: &PairingCode,
-    genesis_entry: Option<&[u8]>,
-) -> Result<Option<String>> {
-    let account_fp = {
-        let c = client.lock().await;
-        *c.fingerprint()
-    };
-
-    let sealed = {
-        let r = rendezvous.lock().await;
-        r.get_pairing_response(&account_fp, &code.token).await?
-    };
+/// Poll the rendezvous `code` names for the new device's answer. `None` while waiting;
+/// once it arrives, show `PendingDevice::code` and go on only if the user confirms
+/// the new device shows the same.
+pub async fn await_response(rendezvous: &RelayClient, code: &PairingCode) -> Result<Option<PendingDevice>> {
+    let sealed = rendezvous.get_pairing_response(&code.account_fp, &code.token).await?;
     let Some(sealed) = sealed else { return Ok(None) };
-    let response = PairingResponse::from_bytes(&aead::open(&code.secret, &sealed, SEAL_CONTEXT)?)?;
-    let new_device_key = SigningKey::from_bytes(&response.device_sk);
+    let response = PairingResponse::from_bytes(&code.open(&sealed)?)?;
+    let shown = comparison_code(&code.secret, &response.device_vk, &response.encryption_key);
+    Ok(Some(PendingDevice { response, code: shown }))
+}
 
-    let log_state = idlog::fetch_own_log_or_republish(client, relay, &account_fp, genesis_entry).await?;
-
-    // The provision goes up first: the new device starts fetching it the moment it sees
-    // AddDevice in the identity log.
-    let (blob, authorizer_key) = {
-        let mut c = client.lock().await;
-        let sync_key = c
-            .sync_key()
-            .ok_or_else(|| GhostError::Crypto("sync key not set; account not initialized".into()))?;
-        if !c.has_sync_group() {
-            c.create_sync_group()?;
-        }
-        let sync_group_info = c.sync_group_info()?;
-        let mut servers = Vec::new();
-        for (server_id, _) in c.server_mailboxes() {
-            if let Ok(payload) = c.export_provision_payload(&server_id) {
-                servers.push(payload);
-            }
-        }
-        let new_device_seq = log_state.head_seq + 1;
-        let identity = c.identity();
-        let delegation_sig = compute_delegation_sig(
-            &identity.master_sk,
-            new_device_key.verifying_key().as_bytes(),
-            &account_fp,
-            new_device_seq,
-        );
-        let blob = ProvisionBlob {
-            master_sk: identity.master_sk.to_bytes(),
-            master_vk: identity.master_vk,
-            delegation_sig,
-            sync_key,
-            sync_group_info,
-            servers,
-            sync_entries: c.sync_dump().unwrap_or_default(),
-        };
-        (blob, c.signing_key_clone())
+/// After the user confirmed the codes match: draft the `AddDevice` at the log's head
+/// and post it for the new device to counter-sign. Returns the draft.
+pub async fn post_draft(
+    client: &SharedClient,
+    home: &RelayClient,
+    rendezvous: &RelayClient,
+    code: &PairingCode,
+    device: &PendingDevice,
+) -> Result<LogEntry> {
+    let state = idlog::fetch_and_verify(client, home, &code.account_fp).await?;
+    let draft = {
+        let c = client.lock().await;
+        draft_add_device(&state, &c.signing_key_clone(), device.response.device_vk, &device.response.label)
     };
-    let sealed_provision = aead::seal(&code.secret, &blob.to_bytes()?, SEAL_CONTEXT)?;
+    let sealed = code.seal(&draft.to_bytes())?;
+    rendezvous.put_pairing_draft(&code.account_fp, &code.token, sealed).await?;
+    Ok(draft)
+}
 
-    // The relay needs the sync group's state before it will accept the new device's join commit.
-    super::publish_sync_group_info(client, relay).await?;
+/// Poll for the new device's counter-signature on `draft`. When it arrives, upload the
+/// provision and append the addition, the new device's key and a new account key
+/// generation as one batch. Returns the new device's label when linked, `None` while
+/// waiting. If the log's head moved since the draft, a fresh draft replaces `draft`
+/// and the new device signs again.
+pub async fn complete(
+    client: &SharedClient,
+    home: &RelayClient,
+    rendezvous: &RelayClient,
+    code: &PairingCode,
+    device: &PendingDevice,
+    draft: &mut LogEntry,
+) -> Result<Option<String>> {
+    let sealed = rendezvous.get_pairing_signatures(&code.account_fp, &code.token).await?;
+    let Some(sealed) = sealed else { return Ok(None) };
+    let signature: [u8; 64] = code
+        .open(&sealed)?
+        .try_into()
+        .map_err(|_| GhostError::Format("pairing signature must be 64 bytes".into()))?;
 
-    let add_entry = create_add_device(&log_state, &authorizer_key, &new_device_key, &response.label);
-    {
-        let r = rendezvous.lock().await;
-        r.put_provision(&account_fp, &code.token, sealed_provision).await?;
+    let state = idlog::fetch_and_verify(client, home, &code.account_fp).await?;
+    if draft.seq != state.head_seq + 1 || draft.prev_hash != state.head_hash {
+        *draft = post_draft(client, home, rendezvous, code, device).await?;
+        return Ok(None);
     }
-    {
-        let r = relay.lock().await;
-        r.put_idlog_entry(&account_fp, add_entry.to_bytes()).await?;
+    let mut signed = draft.clone();
+    signed.counter_signature = Some(signature);
+
+    account_keys::open_missing(client, home, &state).await?;
+    let (batch, seed, provision) = {
+        let c = client.lock().await;
+        let key = c.signing_key_clone();
+        let previous = account_keys::newest_held(&c, &state)?;
+        let mut batch = BatchBuilder::new(state);
+        batch
+            .push(signed)
+            .map_err(|e| GhostError::IdentityLog(format!("the new device's signature does not check: {e}")))?;
+        let response = &device.response;
+        batch.push(create_device_key_with_signature(
+            batch.state(),
+            &key,
+            response.device_vk,
+            response.encryption_key,
+            response.device_key_signature,
+        ))?;
+        let seed = if batch.state().root_rotated() { Some(batch.push_rekey(&key, previous.as_ref())?) } else { None };
+
+        let servers = c
+            .server_mailboxes()
+            .into_iter()
+            .filter_map(|(server_id, _)| c.export_provision_payload(&server_id).ok())
+            .collect();
+        let provision = ProvisionBlob { servers, sync_dump: c.sync_dump()? };
+        (batch.finish(), seed, provision)
+    };
+
+    // The provision must be up before the device sees itself in the log.
+    rendezvous.put_provision(&code.account_fp, &code.token, code.seal(&provision.to_bytes()?)?).await?;
+    match account::publish_batch(client, home, &batch).await {
+        Ok(_) => {}
+        Err(GhostError::RelayStatus { status: 409, .. }) => {
+            *draft = post_draft(client, home, rendezvous, code, device).await?;
+            return Ok(None);
+        }
+        Err(e) => return Err(e),
     }
-    // The new device rejoins servers on their own relays, which must know its key first.
-    for (relay_vk, e) in super::account::replicate_own_log(client, relay).await? {
-        eprintln!("pairing: relay {} not updated yet: {e}", hex::encode(&relay_vk[..8]));
+    if let Some(seed) = seed {
+        let c = client.lock().await;
+        c.store_account_seed(&seed)?;
     }
-    Ok(Some(response.label))
+    account::announce_change(client, home).await;
+    Ok(Some(device.response.label.clone()))
 }
 
 // ── New device (B) ──────────────────────────────────────────────────
@@ -228,39 +301,100 @@ pub async fn check(
 /// Fetch and open the offer behind a pairing code. `relay` is unauthenticated.
 pub async fn fetch_offer(relay: &RelayClient, code: &PairingCode) -> Result<PairingOffer> {
     let sealed = relay.get_pairing_offer(&code.account_fp, &code.token).await?;
-    let plaintext = aead::open(&code.secret, &sealed, SEAL_CONTEXT)?;
-    serde_json::from_slice(&plaintext).map_err(|e| GhostError::Format(format!("offer decode: {e}")))
+    serde_json::from_slice(&code.open(&sealed)?).map_err(|e| GhostError::Format(format!("offer decode: {e}")))
 }
 
-/// Send this device's new signing key and label to the existing device.
-pub async fn respond(relay: &RelayClient, code: &PairingCode, device_key: &SigningKey, label: &str) -> Result<()> {
-    let response = PairingResponse { device_sk: device_key.to_bytes(), label: label.to_string() };
-    let sealed = aead::seal(&code.secret, &response.to_bytes(), SEAL_CONTEXT)?;
-    relay.post_pairing_response(&code.account_fp, &code.token, sealed).await
+/// Answer with this device's public keys and label. Returns the code to show, which
+/// the existing device's user compares with theirs.
+pub async fn respond(
+    relay: &RelayClient,
+    code: &PairingCode,
+    device_key: &SigningKey,
+    encryption_key: &DeviceEncryptionKey,
+    label: &str,
+) -> Result<String> {
+    let encryption_public = encryption_key.key_pair()?.public();
+    let response = PairingResponse {
+        device_vk: device_key.verifying_key().to_bytes(),
+        encryption_key: encryption_public,
+        device_key_signature: device_key_signature(&code.account_fp, device_key, &encryption_public),
+        label: label.to_string(),
+    };
+    relay.post_pairing_response(&code.account_fp, &code.token, code.seal(&response.to_bytes())?).await?;
+    Ok(comparison_code(&code.secret, &response.device_vk, &response.encryption_key))
 }
 
-/// Poll the identity log until this device's key is active, or the attempts run out.
-/// Reads are signed with the new device key, which the relay accepts only once the
-/// existing device has added it, so until then a poll is refused like a missing entry.
+/// Counter-sign the existing device's current draft, if it names this device and
+/// differs from the last one signed. Returns whether a signature was posted.
+async fn sign_draft(relay: &RelayClient, code: &PairingCode, device_key: &SigningKey, label: &str, signed: &mut Option<Vec<u8>>) -> Result<bool> {
+    let Some(sealed) = relay.get_pairing_draft(&code.account_fp, &code.token).await? else { return Ok(false) };
+    let bytes = code.open(&sealed)?;
+    if signed.as_deref() == Some(bytes.as_slice()) {
+        return Ok(false);
+    }
+    let draft = LogEntry::from_bytes(&bytes)?;
+    let names_this_device = matches!(
+        &draft.body,
+        EntryBody::AddDevice { device_verifying_key, device_label, .. }
+            if *device_verifying_key == device_key.verifying_key().to_bytes() && device_label == label
+    );
+    if draft.account_fp != code.account_fp || !names_this_device {
+        return Err(GhostError::IdentityLog("the pairing draft does not add this device".into()));
+    }
+    let signature = device_key.sign(&sign_message(&draft)).to_bytes();
+    relay.post_pairing_signatures(&code.account_fp, &code.token, code.seal(&signature)?).await?;
+    *signed = Some(bytes);
+    Ok(true)
+}
+
+/// Poll until this device is active in the account's log, counter-signing each draft
+/// the existing device posts meanwhile. Reads are signed with the new device key,
+/// which the relay accepts only once the device is added, so until then a poll is
+/// refused like a missing entry. Returns the log and the entry that added the device.
+/// Ends early when the existing device ended the session (or it expired), or posts a
+/// draft that does not add this device.
 pub async fn wait_for_device(
     relay: &RelayClient,
-    account_fp: &[u8; 32],
+    code: &PairingCode,
     device_key: &SigningKey,
+    label: &str,
     attempts: usize,
     interval: std::time::Duration,
-) -> Result<LogState> {
+) -> Result<(LogState, Addition)> {
     let device_vk = device_key.verifying_key().to_bytes();
-    let mut reader = relay.at(relay.base_url());
-    reader.set_auth(*account_fp, device_vk, device_key.clone());
+    let reader = relay.at(&relay.base_url());
+    reader.set_auth(code.account_fp, device_vk, device_key.clone());
+    let mut signed = None;
     for _ in 0..attempts {
         tokio::time::sleep(interval).await;
-        match idlog::fetch_chain(&reader, account_fp).await {
-            Ok((_, state)) if state.is_active_device(&device_vk) => return Ok(state),
+        match sign_draft(relay, code, device_key, label, &mut signed).await {
             Ok(_) => {}
-            Err(e) => eprintln!("pairing: identity log not ready: {e}"),
+            Err(GhostError::RelayStatus { status: 404, .. }) => {
+                return Err(GhostError::RelayStatus {
+                    status: 404,
+                    context: "pairing".into(),
+                    message: "the other device ended the pairing, or it expired".into(),
+                })
+            }
+            // Not a draft for this device: nothing waiting longer changes that.
+            Err(e @ (GhostError::IdentityLog(_) | GhostError::Crypto(_) | GhostError::Format(_))) => return Err(e),
+            Err(e) => tracing::warn!("pairing: draft not signed: {e}"),
+        }
+        match idlog::fetch_chain(&reader, &code.account_fp).await {
+            Ok((log, state)) if state.is_active_device(&device_vk) => {
+                let added_at = state.devices[&device_vk].added_at_seq;
+                let entry = log
+                    .entries
+                    .iter()
+                    .find(|a| a.entry.seq == added_at)
+                    .ok_or_else(|| GhostError::IdentityLog("the entry that added this device is missing".into()))?;
+                return Ok((state, Addition::of(&entry.entry)));
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!("pairing: identity log not ready: {e}"),
         }
     }
-    Err(GhostError::IdentityLog("timed out waiting for the device to be added".into()))
+    Err(GhostError::TimedOut("waiting for the other device to add this one".into()))
 }
 
 /// Fetch and open the provision blob, retrying while the existing device is still uploading it.
@@ -276,10 +410,7 @@ pub async fn fetch_provision(
             tokio::time::sleep(interval).await;
         }
         match relay.get_provision(&code.account_fp, &code.token).await {
-            Ok(Some(sealed)) => {
-                let plaintext = aead::open(&code.secret, &sealed, SEAL_CONTEXT)?;
-                return ProvisionBlob::from_bytes(&plaintext);
-            }
+            Ok(Some(sealed)) => return ProvisionBlob::from_bytes(&code.open(&sealed)?),
             Ok(None) => last_err = GhostError::Network("provision blob not uploaded yet".into()),
             Err(e) => last_err = e,
         }
@@ -287,23 +418,9 @@ pub async fn fetch_provision(
     Err(last_err)
 }
 
-/// Build the linked device's identity from the validated log and the provision blob.
-pub fn linked_identity(
-    account_fp: [u8; 32],
-    device_key: SigningKey,
-    log_state: &LogState,
-    blob: &ProvisionBlob,
-) -> Identity {
-    let device_vk = device_key.verifying_key().to_bytes();
-    let idlog_seq = log_state.devices.get(&device_vk).map(|d| d.added_at_seq).unwrap_or(0);
-    Identity::from_device(
-        account_fp,
-        device_key,
-        idlog_seq,
-        blob.master_vk,
-        SigningKey::from_bytes(&blob.master_sk),
-        blob.delegation_sig,
-    )
+/// The linked device's identity.
+pub fn linked_identity(account_fp: [u8; 32], device_key: SigningKey, encryption_key: DeviceEncryptionKey, added_at: Addition) -> Identity {
+    Identity::from_device(account_fp, device_key, encryption_key, added_at)
 }
 
 #[cfg(test)]
@@ -336,15 +453,24 @@ mod tests {
     }
 
     #[test]
-    fn pairing_response_roundtrip() {
-        let r = PairingResponse { device_sk: [7u8; 32], label: "phone".into() };
-        let parsed = PairingResponse::from_bytes(&r.to_bytes()).unwrap();
-        assert_eq!(parsed.device_sk, [7u8; 32]);
+    fn pairing_response_carries_no_private_key() {
+        let r = PairingResponse { device_vk: [1; 32], encryption_key: [2; 32], device_key_signature: [3; 64], label: "phone".into() };
+        let bytes = r.to_bytes();
+        assert_eq!(bytes.len(), 128 + 5);
+        let parsed = PairingResponse::from_bytes(&bytes).unwrap();
+        assert_eq!(parsed.device_vk, [1; 32]);
+        assert_eq!(parsed.encryption_key, [2; 32]);
+        assert_eq!(parsed.device_key_signature, [3; 64]);
         assert_eq!(parsed.label, "phone");
+        assert!(PairingResponse::from_bytes(&[0u8; 128]).is_err());
     }
 
     #[test]
-    fn pairing_response_too_short() {
-        assert!(PairingResponse::from_bytes(&[0u8; 32]).is_err());
+    fn comparison_codes_are_six_digits_bound_to_the_keys() {
+        let code = comparison_code(&[1; 32], &[2; 32], &[3; 32]);
+        assert_eq!(code.len(), 7);
+        assert!(code.chars().filter(|c| *c != ' ').all(|c| c.is_ascii_digit()));
+        assert_eq!(code, comparison_code(&[1; 32], &[2; 32], &[3; 32]));
+        assert_ne!(code, comparison_code(&[1; 32], &[9; 32], &[3; 32]), "another device's key gives another code");
     }
 }

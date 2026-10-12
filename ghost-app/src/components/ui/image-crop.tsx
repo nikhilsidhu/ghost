@@ -1,5 +1,6 @@
 import { createSignal } from "solid-js";
 import { cropGif } from "../../lib/gif";
+import { Button } from "./button";
 
 const CROP_SIZE = 220;
 const CROP_RADIUS = CROP_SIZE / 2;
@@ -12,7 +13,7 @@ interface ImageCropProps {
   image: HTMLImageElement;
   gifBytes?: Uint8Array;
   uploading: boolean;
-  onConfirm: (bytes: number[]) => void;
+  onConfirm: (bytes: Uint8Array) => void;
   onCancel: () => void;
 }
 
@@ -84,7 +85,7 @@ export function ImageCrop(props: ImageCropProps) {
 
     if (props.gifBytes) {
       const cropped = cropGif(props.gifBytes, sx, sy, sSize, OUTPUT_SIZE);
-      props.onConfirm(Array.from(cropped));
+      props.onConfirm(cropped);
       return;
     }
 
@@ -97,8 +98,7 @@ export function ImageCrop(props: ImageCropProps) {
     const blob = await new Promise<Blob>((resolve) =>
       canvas.toBlob((b) => resolve(b!), "image/webp", 0.85),
     );
-    const bytes = Array.from(new Uint8Array(await blob.arrayBuffer()));
-    props.onConfirm(bytes);
+    props.onConfirm(new Uint8Array(await blob.arrayBuffer()));
   };
 
   return (
@@ -129,20 +129,12 @@ export function ImageCrop(props: ImageCropProps) {
         />
       </div>
       <div class="flex gap-2">
-        <button
-          class="px-4 py-1.5 rounded-md text-xs font-medium text-[var(--neutral-300)] bg-[var(--neutral-800)] hover:bg-[var(--neutral-700)] cursor-pointer"
-          onClick={props.onCancel}
-          disabled={props.uploading}
-        >
+        <Button variant="outline" size="sm" onClick={props.onCancel} disabled={props.uploading}>
           cancel
-        </button>
-        <button
-          class="px-4 py-1.5 rounded-md text-xs font-medium text-[var(--neutral-100)] bg-[var(--purple-600)] hover:bg-[var(--purple-500)] cursor-pointer disabled:opacity-50"
-          onClick={confirm}
-          disabled={props.uploading}
-        >
+        </Button>
+        <Button size="sm" onClick={confirm} disabled={props.uploading}>
           {props.uploading ? "uploading..." : "save"}
-        </button>
+        </Button>
       </div>
     </div>
   );

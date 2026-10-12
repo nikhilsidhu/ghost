@@ -1,44 +1,31 @@
-//! Roles and permissions: replacing a server's policy.
+//! Roles and permissions: replacing a server's policy, and naming its roles.
 
 use ghost_wire::policy::ServerPolicy;
 
 use crate::error::Result;
+use crate::wire::derive_default_channel_id;
 
 use super::channels::post_and_merge;
-use super::{SharedClient, SharedRelay};
+use super::{post_op, SharedClient};
+use crate::relay::RelayClient;
 
 /// Replace the server's policy: create, change, delete or assign roles, change what
 /// everyone may do, or hand over ownership. Checked locally first; the relay and every
 /// member check it against the current policy. The relay then removes members from
 /// private channels the new policy no longer admits them to.
-pub async fn set_server_policy(client: &SharedClient, relay: &SharedRelay, server_id: &[u8; 32], policy: &ServerPolicy) -> Result<()> {
+pub async fn set_server_policy(client: &SharedClient, relay: &RelayClient, server_id: &[u8; 32], policy: &ServerPolicy) -> Result<()> {
     let out = client.lock().await.stage_server_policy(server_id, policy)?;
     post_and_merge(client, relay, out).await
 }
 
-/// Bring groups made before policies existed under one: update this device's leaf in
-/// every such group to advertise policy support, then, for servers this account owns
-/// whose every leaf now supports it, commit the explicit policy matching the implicit
-/// one. Run at start; members who have not upgraded hold the second step back.
-pub async fn migrate(client: &SharedClient, relay: &SharedRelay) {
-    let pending = client.lock().await.channels_needing_capability_update();
-    for channel_id in pending {
-        let staged = client.lock().await.stage_capabilities_update(&channel_id);
-        let result = match staged {
-            Ok(out) => post_and_merge(client, relay, out).await,
-            Err(e) => Err(e),
-        };
-        if let Err(e) = result {
-            eprintln!("policy migration: capabilities for {}: {e}", hex::encode(&channel_id[..8]));
-        }
+/// Give the server's roles the names members see, in one message, stored here once the
+/// relay took it. Names are shown, never trusted: the policy alone decides what a role
+/// may do.
+pub async fn name_roles(client: &SharedClient, relay: &RelayClient, server_id: &[u8; 32], names: &[(u8, String)]) -> Result<()> {
+    post_op(client, relay, &derive_default_channel_id(server_id), |c| Ok((c.name_roles(server_id, names)?, ()))).await?;
+    let c = client.lock().await;
+    for (role_id, name) in names {
+        c.store().set_role_name(server_id, *role_id, name)?;
     }
-    let (ready, own) = {
-        let c = client.lock().await;
-        (c.servers_ready_for_policy(), *c.fingerprint())
-    };
-    for server_id in ready {
-        if let Err(e) = set_server_policy(client, relay, &server_id, &ServerPolicy::new(own)).await {
-            eprintln!("policy migration: policy for {}: {e}", hex::encode(&server_id[..8]));
-        }
-    }
+    Ok(())
 }

@@ -1,385 +1,311 @@
-//! Account recovery from a passphrase-protected blob when every device is lost.
+//! Recovering an account when every device is lost, with the recovery key the user
+//! saved. Every recovery replaces that key in the same batch, so whoever held the old
+//! one is locked out at once.
 
 use ed25519_dalek::SigningKey;
-use zeroize::{Zeroize, Zeroizing};
-
+use ghost_wire::account_key::AccountKeySet;
 use ghost_wire::anchor::ImportRequest;
-use ghost_wire::idlog::{validate_entry, LogState};
-use ghost_wire::recovery_bundle::RecoveryBundle;
+use ghost_wire::batch::LogBatch;
+use ghost_wire::idlog::{LogState, Recipient};
+use ghost_wire::relay_ref::RelayRef;
 
-use crate::crypto::keys::derive_ed25519_seed;
+use crate::account_keys::{open_back_link, open_copy, AccountSeed, BoxKeyPair, DeviceEncryptionKey, RecoveryKey};
 use crate::error::{GhostError, Result};
-use crate::identity::export::{export_recovery_blob, import_recovery_blob};
-use crate::identity::log::{create_recovery, create_set_home_relay};
-use crate::identity::{compute_delegation_sig, Identity};
-use crate::relay::RelayClient;
-use crate::wire::{decode_sync_state_dump, sync_open};
+use crate::identity::batch::BatchBuilder;
+use crate::identity::log::{create_device_key, create_recovery, create_rotate_root, create_set_home_relay};
+use crate::identity::{Addition, Identity};
+use crate::relay::{RelayClient, RootLookup};
 
-use super::{account, devices, idlog, next_generation, provision, sync, SharedClient, SharedRelay};
+use super::{devices, idlog, provision, sync, SharedClient};
 
-pub const MIN_PASSPHRASE_CHARS: usize = 12;
-
-/// `relay_url#account_fp_hex`: where the recovery blob lives.
-pub struct RecoveryCode {
-    pub relay_url: String,
-    pub account_fp: [u8; 32],
-}
-
-impl RecoveryCode {
-    pub fn encode(&self) -> String {
-        format!("{}#{}", self.relay_url, hex::encode(self.account_fp))
-    }
-
-    pub fn parse(code: &str) -> Result<Self> {
-        let parts: Vec<&str> = code.splitn(2, '#').collect();
-        if parts.len() != 2 {
-            return Err(GhostError::Format("invalid recovery code".into()));
-        }
-        let bytes = hex::decode(parts[1]).map_err(|e| GhostError::Format(format!("recovery code fingerprint: {e}")))?;
-        let account_fp = bytes
-            .try_into()
-            .map_err(|_| GhostError::Format("recovery code fingerprint must be 32 bytes".into()))?;
-        Ok(Self { relay_url: parts[0].to_string(), account_fp })
-    }
-}
-
-fn check_passphrase(passphrase: &str) -> Result<()> {
-    if passphrase.chars().count() < MIN_PASSPHRASE_CHARS {
-        return Err(GhostError::Format(format!("passphrase must be at least {MIN_PASSPHRASE_CHARS} characters")));
-    }
-    Ok(())
-}
-
-/// Store a recovery bundle on the home relay, then copy it to every relay that
-/// hosts one of the account's servers so recovery survives losing the home.
-/// The home write must succeed; member copies are best effort.
-async fn store_bundle(client: &SharedClient, home: &SharedRelay, bundle: &RecoveryBundle) -> Result<()> {
-    let account_fp = {
-        let c = client.lock().await;
-        *c.fingerprint()
-    };
-    {
-        let r = home.lock().await;
-        r.put_recovery_bundle(&account_fp, bundle).await?;
-    }
-    let home_vk = account::home_relay_vk(client, home).await?;
-    for (relay_vk, member) in account::member_relay_clients(client, home, &home_vk).await? {
-        if let Err(e) = member.put_recovery_bundle(&account_fp, bundle).await {
-            eprintln!("recovery bundle: relay {} not updated: {e}", hex::encode(&relay_vk[..8]));
-        }
-    }
-    Ok(())
-}
-
-/// Encrypt the seed and sync key under the passphrase and store the bundle on every relay the account uses.
-pub async fn set_passphrase(
-    client: &SharedClient,
-    relay: &SharedRelay,
-    seed: &[u8; 32],
-    passphrase: &str,
-) -> Result<RecoveryCode> {
-    check_passphrase(passphrase)?;
-    let (sync_key, account_fp) = {
-        let c = client.lock().await;
-        let key = c.sync_key().ok_or_else(|| GhostError::Crypto("sync key not set".into()))?;
-        (key, *c.fingerprint())
-    };
-    let bundle = RecoveryBundle {
-        generation: next_generation(None),
-        recovery_blob: export_recovery_blob(seed, &sync_key, passphrase)?,
-        master_blob: Vec::new(),
-    };
-    store_bundle(client, relay, &bundle).await?;
-    let r = relay.lock().await;
-    Ok(RecoveryCode { relay_url: r.base_url().to_string(), account_fp })
-}
-
-/// Re-encrypt the stored recovery bundle under a new passphrase.
-pub async fn change_passphrase(
-    client: &SharedClient,
-    relay: &SharedRelay,
-    current: &str,
-    new: &str,
-) -> Result<()> {
-    check_passphrase(new)?;
-    let account_fp = {
-        let c = client.lock().await;
-        *c.fingerprint()
-    };
-    let stored = {
-        let r = relay.lock().await;
-        r.get_recovery_bundle(&account_fp)
-            .await?
-            .ok_or_else(|| GhostError::Format("no recovery blob found".into()))?
-    };
-    let recovered = import_recovery_blob(&stored.recovery_blob, current)?;
-    let sync_key = match recovered.sync_key {
-        Some(k) => k,
-        None => {
-            let c = client.lock().await;
-            c.sync_key().ok_or_else(|| GhostError::Crypto("sync key not set".into()))?
-        }
-    };
-    let bundle = RecoveryBundle {
-        generation: next_generation(Some(stored.generation)),
-        recovery_blob: export_recovery_blob(&recovered.seed, &sync_key, new)?,
-        master_blob: stored.master_blob,
-    };
-    drop(recovered);
-    store_bundle(client, relay, &bundle).await
-}
-
-pub async fn has_blob(client: &SharedClient, relay: &SharedRelay) -> Result<bool> {
-    let account_fp = {
-        let c = client.lock().await;
-        *c.fingerprint()
-    };
-    let r = relay.lock().await;
-    Ok(r.get_recovery_bundle(&account_fp).await?.is_some())
-}
-
-/// Everything [`begin`] established before the application replaces its local identity.
+/// Everything recovery established before the application opens the recovered device.
 pub struct RecoveryMaterial {
     pub account_fp: [u8; 32],
-    pub seed: Zeroizing<[u8; 32]>,
-    /// Absent for v1 blobs; the application generates a fresh sync key in that case.
-    pub sync_key: Option<[u8; 32]>,
-    master_key: SigningKey,
-    new_device_key: SigningKey,
-    pub recovery_seq: u64,
-    delegation_sig: [u8; 64],
+    pub device_key: SigningKey,
+    pub encryption_key: DeviceEncryptionKey,
+    pub added_at: Addition,
+    /// Generations opened through the recovery copy and back-links, and the new one.
+    pub seeds: Vec<AccountSeed>,
     /// Devices that were active before the Recovery entry revoked them.
     pub prior_devices: Vec<[u8; 32]>,
-    /// Generation of the bundle recovered from, so the re-encrypted one supersedes it.
-    pub bundle_generation: u64,
-    /// The account's sealed sync snapshot, fetched once this device was active.
-    sealed_snapshot: Option<Vec<u8>>,
+    /// The account's sealed sync snapshot, fetched once this device was active; the
+    /// error when the relay could not be asked.
+    sealed_snapshot: std::result::Result<Option<Vec<u8>>, String>,
+}
+
+/// What a recovery made of the account's sync snapshot, which lists its servers and
+/// holds its settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotRestore {
+    Restored,
+    /// The relay recovered through holds none, so there was nothing to restore.
+    Missing,
+    /// It is sealed under an account key the recovery key does not reach, or damaged: no
+    /// device of the account can open it any more, and this device's state replaces it.
+    Unreadable,
+    /// The relay did not answer; the running session takes it in when it does.
+    NotReached,
+}
+
+/// A finished recovery: the settings restored, and what became of the snapshot.
+#[derive(Debug)]
+pub struct Finished {
+    pub settings: sync::SyncSettings,
+    pub snapshot: SnapshotRestore,
 }
 
 impl RecoveryMaterial {
     /// Identity of the recovered device, for opening a new client.
     pub fn identity(&self) -> Identity {
-        Identity::from_device(
-            self.account_fp,
-            SigningKey::from_bytes(&self.new_device_key.to_bytes()),
-            self.recovery_seq,
-            self.master_key.verifying_key().to_bytes(),
-            SigningKey::from_bytes(&self.master_key.to_bytes()),
-            self.delegation_sig,
-        )
-    }
-
-    pub fn device_key(&self) -> &SigningKey {
-        &self.new_device_key
-    }
-
-    pub fn master_key(&self) -> &SigningKey {
-        &self.master_key
-    }
-
-    pub fn delegation_sig(&self) -> [u8; 64] {
-        self.delegation_sig
+        Identity::from_device(self.account_fp, self.device_key.clone(), self.encryption_key.clone(), self.added_at)
     }
 }
 
-/// What the passphrase unlocks, before any identity log change.
-struct OpenedBundle {
-    generation: u64,
-    seed: Zeroizing<[u8; 32]>,
-    sync_key: Option<[u8; 32]>,
-    master_key: SigningKey,
+/// The recovering device and what its batch produced.
+struct Recovered {
+    device_key: SigningKey,
+    encryption_key: DeviceEncryptionKey,
+    added_at: Addition,
+    seed: AccountSeed,
 }
 
-/// Fetch and decrypt the recovery bundle from `relay` and prove it belongs to the account.
-async fn open_bundle(relay: &RelayClient, account_fp: [u8; 32], passphrase: &str) -> Result<OpenedBundle> {
-    let bundle = relay
-        .get_recovery_bundle(&account_fp)
-        .await?
-        .ok_or_else(|| GhostError::Format("no recovery blob for this account".into()))?;
-    let recovered = import_recovery_blob(&bundle.recovery_blob, passphrase)?;
-    let seed = Zeroizing::new(recovered.seed);
-
-    let mut ed_bytes = derive_ed25519_seed(&seed)?;
-    let master_key = SigningKey::from_bytes(&ed_bytes);
-    ed_bytes.zeroize();
-    let expected_fp: [u8; 32] = blake3::hash(master_key.verifying_key().as_bytes()).into();
-    if expected_fp != account_fp {
-        return Err(GhostError::AuthenticationFailed);
-    }
-    Ok(OpenedBundle { generation: bundle.generation, seed, sync_key: recovered.sync_key, master_key })
+/// Find the account `recovery_key` is the root of, through `relay`. `None` if that
+/// relay holds no account with it as the current root.
+pub async fn find_account(relay: &RelayClient, recovery_key: &RecoveryKey) -> Result<Option<RootLookup>> {
+    relay.find_account_by_root(&recovery_key.root()?).await
 }
 
-/// A client for `relay` that signs with the account's master key, which relays
-/// accept for reading the account's own log before any of its devices is active.
-fn master_reader(relay: &RelayClient, account_fp: [u8; 32], opened: &OpenedBundle) -> RelayClient {
-    let mut reader = relay.at(relay.base_url());
-    reader.set_auth(account_fp, opened.master_key.verifying_key().to_bytes(), opened.master_key.clone());
+/// An account found by its recovery key, and where its home is.
+pub struct Located {
+    pub account_fp: [u8; 32],
+    /// The home as the account's log names it; `None` for a log from before homes.
+    pub home: Option<RelayRef>,
+    /// Whether `relay` itself is the home.
+    pub relay_is_home: bool,
+}
+
+/// Find the account through `relay` and read where it lives, so recovery can go to the
+/// home when it answers and know what moving away from it means when it does not.
+pub async fn locate(relay: &RelayClient, recovery_key: &RecoveryKey) -> Result<Option<Located>> {
+    let Some(found) = find_account(relay, recovery_key).await? else { return Ok(None) };
+    let root = recovery_key.root()?;
+    let (_, state) = idlog::fetch_chain(&root_reader(relay, found.account_fp, &root), &found.account_fp).await?;
+    let relay_vk = relay.get_relay_info().await?.relay_vk;
+    Ok(Some(Located { account_fp: found.account_fp, home: state.home_relay_ref.clone(), relay_is_home: found.home_relay_vk == relay_vk }))
+}
+
+/// A client for `relay` that signs with the account's root in the device headers,
+/// which relays accept for reading the account's log and key sets.
+fn root_reader(relay: &RelayClient, account_fp: [u8; 32], root: &SigningKey) -> RelayClient {
+    let reader = relay.at(&relay.base_url());
+    reader.set_auth(account_fp, root.verifying_key().to_bytes(), root.clone());
     reader
 }
 
-/// Read the sealed sync snapshot from `relay_url` as the newly recovered device.
-/// Missing or unreachable snapshots are not fatal: recovery then restores no servers.
-async fn fetch_snapshot(relay_url: &str, account_fp: [u8; 32], device_key: &SigningKey) -> Option<Vec<u8>> {
-    let (mut relay, _events) = RelayClient::new(relay_url);
-    relay.set_auth(account_fp, device_key.verifying_key().to_bytes(), device_key.clone());
-    match relay.get_sync_state(&account_fp).await {
-        Ok(found) => found.map(|(_generation, sealed)| sealed),
-        Err(e) => {
-            eprintln!("recovery: sync snapshot unavailable: {e}");
-            None
+/// Open the recovery copy of the newest generation that has one for `recovery_box`,
+/// then every older generation the back-links reach.
+fn open_with_recovery_box(state: &LogState, sets: &[AccountKeySet], recovery_box: &BoxKeyPair) -> Result<Vec<AccountSeed>> {
+    let me = Recipient::recovery(recovery_box.public());
+    let mut opened: Vec<AccountSeed> = Vec::new();
+    for key in state.account_keys.iter().rev() {
+        let Some(set) = sets.iter().find(|set| set.matches(&state.account_fp, key)) else { continue };
+        let seed = match opened.iter().position(|s| s.generation() == key.generation) {
+            Some(index) => opened.remove(index),
+            None if set.copy_for(&me).is_some() => open_copy(set, &me, recovery_box, key)?,
+            None => continue,
+        };
+        if let Some(link) = &set.back_link {
+            if !opened.iter().any(|s| s.generation() == link.generation) {
+                if let Some(previous) = state.account_keys.iter().find(|k| k.generation == link.generation) {
+                    opened.push(open_back_link(set, &seed, previous)?);
+                }
+            }
         }
+        opened.push(seed);
     }
+    Ok(opened)
 }
 
-fn material(
-    account_fp: [u8; 32],
-    opened: OpenedBundle,
-    new_device_key: SigningKey,
-    log_state: &LogState,
-    sealed_snapshot: Option<Vec<u8>>,
+/// The recovery batch for a new device: (a root-signed home move first, when given)
+/// Recovery, the device's encryption key, the root rotating to `new_key`'s, and an
+/// account key generation for the device and the new recovery key, linking back to
+/// `previous`.
+fn recovery_batch(
+    state: LogState,
+    root: &SigningKey,
+    new_key: &RecoveryKey,
+    label: &str,
+    previous: Option<&AccountSeed>,
+    new_home: Option<RelayRef>,
+) -> Result<(LogBatch, Recovered)> {
+    let device_key = SigningKey::generate(&mut rand::rngs::OsRng);
+    let encryption_key = DeviceEncryptionKey::generate();
+    let mut batch = BatchBuilder::new(state);
+    if let Some(home) = new_home {
+        batch.push(create_set_home_relay(batch.state(), root, home))?;
+    }
+    let recovery = create_recovery(batch.state(), root, &device_key, label);
+    let added_at = Addition::of(&recovery);
+    batch.push(recovery)?;
+    batch.push(create_device_key(batch.state(), &device_key, &device_key, encryption_key.key_pair()?.public()))?;
+    batch.push(create_rotate_root(batch.state(), root, &new_key.root()?, new_key.recovery_box()?.public(), &device_key))?;
+    let seed = batch.push_rekey(&device_key, previous)?;
+    Ok((batch.finish(), Recovered { device_key, encryption_key, added_at, seed }))
+}
+
+/// Read the sealed sync snapshot from `relay_url` as the newly recovered device. A
+/// failure is not fatal: `finish` asks again.
+async fn fetch_snapshot(relay_url: &str, account_fp: [u8; 32], device_key: &SigningKey) -> std::result::Result<Option<Vec<u8>>, String> {
+    let (relay, _events) = RelayClient::new(relay_url);
+    relay.set_auth(account_fp, device_key.verifying_key().to_bytes(), device_key.clone());
+    relay.get_sync_state(&account_fp).await.map(|found| found.map(|(_generation, sealed)| sealed)).map_err(|e| e.to_string())
+}
+
+async fn material(
+    relay: &RelayClient,
+    state: &LogState,
+    mut seeds: Vec<AccountSeed>,
+    recovered: Recovered,
 ) -> RecoveryMaterial {
-    let recovery_seq = log_state.head_seq + 1;
-    let delegation_sig = compute_delegation_sig(
-        &opened.master_key,
-        new_device_key.verifying_key().as_bytes(),
-        &account_fp,
-        recovery_seq,
-    );
-    let prior_devices = log_state.devices.values().filter(|d| d.is_active()).map(|d| d.verifying_key).collect();
+    let prior_devices = state.active_devices().map(|d| d.verifying_key).collect();
+    let sealed_snapshot = fetch_snapshot(&relay.base_url(), state.account_fp, &recovered.device_key).await;
+    seeds.push(recovered.seed);
     RecoveryMaterial {
-        account_fp,
-        seed: opened.seed,
-        sync_key: opened.sync_key,
-        master_key: opened.master_key,
-        new_device_key,
-        recovery_seq,
-        delegation_sig,
+        account_fp: state.account_fp,
+        device_key: recovered.device_key,
+        encryption_key: recovered.encryption_key,
+        added_at: recovered.added_at,
+        seeds,
         prior_devices,
-        bundle_generation: opened.generation,
         sealed_snapshot,
     }
 }
 
-/// Recover through a reachable home relay: decrypt the bundle, prove the passphrase
-/// matches the account, and append a master-signed Recovery entry at the home that
-/// revokes every previous device. `relay` is the home, unauthenticated because the
-/// recovering device has no identity yet.
-pub async fn begin(
-    relay: &RelayClient,
-    account_fp: [u8; 32],
-    passphrase: &str,
-    device_label: &str,
-) -> Result<RecoveryMaterial> {
-    let opened = open_bundle(relay, account_fp, passphrase).await?;
-    let (_log, log_state) = idlog::fetch_chain(&master_reader(relay, account_fp, &opened), &account_fp).await?;
-
-    let new_device_key = SigningKey::generate(&mut rand::rngs::OsRng);
-    let recovery_entry = create_recovery(&log_state, &opened.master_key, &new_device_key, device_label);
-    relay.put_idlog_entry(&account_fp, recovery_entry.to_bytes()).await?;
-
-    let sealed_snapshot = fetch_snapshot(relay.base_url(), account_fp, &new_device_key).await;
-    Ok(material(account_fp, opened, new_device_key, &log_state, sealed_snapshot))
+/// What a recovering device reads with the root: the account's chain, its key sets and
+/// the generations the recovery copy opens.
+struct ReadWithRoot {
+    log: crate::relay::AnchoredLog,
+    state: LogState,
+    sets: Vec<AccountKeySet>,
+    seeds: Vec<AccountSeed>,
 }
 
-/// Recover when the home relay is gone. `source` is any relay that mirrors the account
-/// (it holds the replicated bundle, snapshot and anchored log); `new_home` becomes the
-/// account's home. The new home imports the chain followed by a master-signed
-/// `SetHomeRelay` naming it and then the Recovery entry, so both are anchored by the
-/// relay that is home when they apply. `source` then learns both, which revokes the old
-/// devices there and admits this one. Both relays are used unauthenticated.
+async fn read_with_root(relay: &RelayClient, account_fp: [u8; 32], recovery_key: &RecoveryKey) -> Result<ReadWithRoot> {
+    let root = recovery_key.root()?;
+    let reader = root_reader(relay, account_fp, &root);
+    let (log, state) = idlog::fetch_chain(&reader, &account_fp).await?;
+    if state.root_verifying_key != Some(root.verifying_key().to_bytes()) {
+        return Err(GhostError::AuthenticationFailed);
+    }
+    let first = state.account_keys.first().map_or(1, |k| k.generation);
+    let sets = reader.get_key_sets(&account_fp, first).await?;
+    let seeds = open_with_recovery_box(&state, &sets, &recovery_key.recovery_box()?)?;
+    Ok(ReadWithRoot { log, state, sets, seeds })
+}
+
+/// Recover through the account's home with `recovery_key`, replacing it with `new_key`,
+/// which the user has saved. `relay` is the home, used unauthenticated: the batch opens
+/// with the root-signed Recovery.
+pub async fn begin(relay: &RelayClient, account_fp: [u8; 32], recovery_key: &RecoveryKey, new_key: &RecoveryKey, label: &str) -> Result<RecoveryMaterial> {
+    let ReadWithRoot { state, seeds, .. } = read_with_root(relay, account_fp, recovery_key).await?;
+    let previous = seeds.iter().max_by_key(|s| s.generation());
+    let (batch, recovered) = recovery_batch(state.clone(), &recovery_key.root()?, new_key, label, previous, None)?;
+    relay.post_idlog_batch(&account_fp, &batch).await?;
+    Ok(material(relay, &state, seeds, recovered).await)
+}
+
+/// Recover when the home is gone. `source` is any relay that mirrors the account (it
+/// holds the anchored log, key sets and snapshot); `new_home` becomes the account's home.
+/// The new home imports the chain followed by the root-signed move naming it and the
+/// rest of the recovery batch, so each is anchored by the relay that is home when it
+/// applies. `source` then learns the new entries, which revokes the old devices there.
 pub async fn begin_with_new_home(
     source: &RelayClient,
     new_home: &RelayClient,
     account_fp: [u8; 32],
-    passphrase: &str,
-    device_label: &str,
+    recovery_key: &RecoveryKey,
+    new_key: &RecoveryKey,
+    label: &str,
 ) -> Result<RecoveryMaterial> {
-    let opened = open_bundle(source, account_fp, passphrase).await?;
-    let (log, log_state) = idlog::fetch_chain(&master_reader(source, account_fp, &opened), &account_fp).await?;
-
+    let ReadWithRoot { log, state, sets, seeds } = read_with_root(source, account_fp, recovery_key).await?;
+    let previous = seeds.iter().max_by_key(|s| s.generation());
     let new_home_ref = new_home.get_relay_info().await?.relay_ref;
-    let move_entry = create_set_home_relay(&log_state, &opened.master_key, new_home_ref);
-    let mut moved_state = log_state.clone();
-    validate_entry(&mut moved_state, &move_entry)?;
-    let new_device_key = SigningKey::generate(&mut rand::rngs::OsRng);
-    let recovery_entry = create_recovery(&moved_state, &opened.master_key, &new_device_key, device_label);
+    let (batch, recovered) = recovery_batch(state.clone(), &recovery_key.root()?, new_key, label, previous, Some(new_home_ref))?;
 
-    let request = ImportRequest { prefix: log.entries, new_entries: vec![move_entry, recovery_entry] };
+    let request = ImportRequest { prefix: log.entries, new_entries: batch.entries, key_sets: batch.key_sets.clone() };
     new_home.import_account(&account_fp, &request).await?;
-
-    let chain = master_reader(new_home, account_fp, &opened).get_idlog(&account_fp, 0).await?.entries;
-    source.put_anchored_entries(&account_fp, &chain, None).await?;
-
-    let sealed_snapshot = fetch_snapshot(source.base_url(), account_fp, &new_device_key).await;
-    Ok(material(account_fp, opened, new_device_key, &moved_state, sealed_snapshot))
-}
-
-/// Complete recovery once the application runs the recovered identity: restore the sync
-/// snapshot, rejoin every server it lists, remove the old devices' MLS leaves, store a
-/// recovery blob under the new passphrase, and push the merged snapshot. `sync_key` is
-/// the key the new client was opened with. Returns the restored settings.
-pub async fn finish(
-    client: &SharedClient,
-    relay: &SharedRelay,
-    material: &RecoveryMaterial,
-    sync_key: [u8; 32],
-    new_passphrase: &str,
-) -> Result<sync::SyncSettings> {
-    check_passphrase(new_passphrase)?;
-
-    let mut settings = sync::SyncSettings::default();
-    if let (Some(_), Some(sealed)) = (material.sync_key, &material.sealed_snapshot) {
-        match sync_open(&sync_key, sealed).and_then(|d| decode_sync_state_dump(&d)) {
-            Ok(entries) => settings = sync::import_entries(client, &entries).await?,
-            Err(e) => eprintln!("recovery: sync snapshot unreadable: {e}"),
+    // From here the account is recovered, and this device is its only one: what follows
+    // is replication the relays repeat among themselves, so a failure is noted, never
+    // allowed to lose the recovered device.
+    // The import carries only the new generation's set; the home serves every one.
+    if !sets.is_empty() {
+        if let Err(e) = new_home.put_key_sets(&account_fp, &sets).await {
+            tracing::warn!("recovery: older key sets not copied to the new home: {e}");
         }
     }
+    let new_root = new_key.root()?;
+    match root_reader(new_home, account_fp, &new_root).get_idlog(&account_fp, 0).await {
+        Ok(chain) => {
+            if let Err(e) = source.put_anchored_entries(&account_fp, &chain.entries, None).await {
+                tracing::warn!("recovery: the relay recovered through does not have the new chain yet: {e}");
+            }
+        }
+        Err(e) => tracing::warn!("recovery: the new home's chain not read back: {e}"),
+    }
+    if let Err(e) = source.put_key_sets(&account_fp, &batch.key_sets).await {
+        tracing::warn!("recovery: the relay recovered through has no new key set yet: {e}");
+    }
+    Ok(material(source, &state, seeds, recovered).await)
+}
 
-    // The recovered device starts a new sync group under the account's fixed sync mailbox;
-    // the relay must drop the revoked devices' group state before it accepts the new one.
-    super::reset_sync_mailbox(client, relay).await?;
+/// Complete recovery once the application runs the recovered identity: keep the opened
+/// account keys, restore the sync snapshot, rejoin every server it lists, remove the
+/// old devices' MLS leaves, and push the merged snapshot under the new generation.
+/// Returns the restored settings and what became of the snapshot.
+pub async fn finish(client: &SharedClient, relay: &RelayClient, material: &RecoveryMaterial) -> Result<Finished> {
+    idlog::fetch_and_verify(client, relay, &material.account_fp).await?;
+    let fetched = match &material.sealed_snapshot {
+        Ok(found) => Ok(found.clone()),
+        // Not fetched while recovering: asked again now that this device runs.
+        Err(_) => relay.get_sync_state(&material.account_fp).await.map(|found| found.map(|(_generation, sealed)| sealed)),
+    };
+    let (entries, snapshot) = {
+        let c = client.lock().await;
+        for seed in &material.seeds {
+            c.store_account_seed(seed)?;
+        }
+        match fetched {
+            Ok(Some(sealed)) => match sync::open_snapshot(&c, &sealed) {
+                Ok(dump) => {
+                    let _ = c.cover_sync(&dump.covered);
+                    (dump.entries, SnapshotRestore::Restored)
+                }
+                Err(e) => {
+                    tracing::warn!("recovery: sync snapshot unreadable: {e}");
+                    (Vec::new(), SnapshotRestore::Unreadable)
+                }
+            },
+            Ok(None) => (Vec::new(), SnapshotRestore::Missing),
+            Err(e) => {
+                tracing::warn!("recovery: sync snapshot not fetched: {e}");
+                (Vec::new(), SnapshotRestore::NotReached)
+            }
+        }
+    };
+    let mut settings =
+        if entries.is_empty() { sync::SyncSettings::default() } else { sync::import_entries(client, &entries).await? };
 
     // Rejoining a server on a foreign relay first pushes the chain there, so that
     // relay applies the Recovery entry (old devices out, this one in) before the commit.
     let server_entries = std::mem::take(&mut settings.server_entries);
     provision::rejoin_from_sync(client, relay, &server_entries, super::now_millis()).await;
 
-    for device_vk in &material.prior_devices {
-        devices::remove_device_leaves(client, relay, device_vk).await;
+    devices::remove_devices_leaves(client, relay, &material.prior_devices).await;
+    // Each relay's copy is read before this device writes over it, which may list
+    // servers the snapshot above did not.
+    if let Some(mut merged) = sync::push_snapshot(client, relay).await {
+        provision::rejoin_from_sync(client, relay, &std::mem::take(&mut merged.server_entries), super::now_millis()).await;
+        settings.absorb(merged);
     }
-
-    let bundle = RecoveryBundle {
-        generation: next_generation(Some(material.bundle_generation)),
-        recovery_blob: export_recovery_blob(&material.seed, &sync_key, new_passphrase)?,
-        master_blob: Vec::new(),
-    };
-    store_bundle(client, relay, &bundle).await?;
-    sync::push_snapshot(client, relay).await;
-
-    Ok(settings)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn recovery_code_roundtrip() {
-        let code = RecoveryCode { relay_url: "http://relay:7700".into(), account_fp: [0x5A; 32] };
-        let parsed = RecoveryCode::parse(&code.encode()).unwrap();
-        assert_eq!(parsed.relay_url, "http://relay:7700");
-        assert_eq!(parsed.account_fp, [0x5A; 32]);
-    }
-
-    #[test]
-    fn recovery_code_rejects_malformed() {
-        assert!(RecoveryCode::parse("http://relay").is_err());
-        assert!(RecoveryCode::parse("http://relay#notHex").is_err());
-    }
-
-    #[test]
-    fn short_passphrase_rejected() {
-        assert!(check_passphrase("short").is_err());
-        assert!(check_passphrase("twelve chars").is_ok());
-    }
+    Ok(Finished { settings, snapshot })
 }

@@ -1,55 +1,65 @@
+//! OpenMLS public group state over the relay's SQLite store. A value lives as long
+//! as the borrowed connection: the writer job that validates a commit, or the
+//! connection that loads groups at startup.
+
 use openmls_traits::public_storage::PublicStorageProvider;
 use openmls_traits::storage::traits as mls_traits;
 use openmls_traits::storage::CURRENT_VERSION;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
-use std::sync::Mutex;
 
 #[derive(Debug, thiserror::Error)]
 #[error("MLS storage error: {0}")]
 pub struct MlsStorageError(String);
 
 pub struct MlsPublicStorage<'a> {
-    conn: &'a Mutex<Connection>,
+    conn: &'a Connection,
 }
 
 impl<'a> MlsPublicStorage<'a> {
-    pub fn new(conn: &'a Mutex<Connection>) -> Self {
+    pub fn new(conn: &'a Connection) -> Self {
         Self { conn }
     }
 
     fn write_component(&self, group_id: &[u8], component: &str, data: &[u8]) -> Result<(), MlsStorageError> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO mls_public_group (group_id, component, data)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT (group_id, component) DO UPDATE SET data = ?3",
-            params![group_id, component, data],
-        )
-        .map_err(|e| MlsStorageError(e.to_string()))?;
+        self.conn
+            .execute(
+                "INSERT INTO mls_public_group (group_id, component, data)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT (group_id, component) DO UPDATE SET data = ?3",
+                params![group_id, component, data],
+            )
+            .map_err(|e| MlsStorageError(e.to_string()))?;
         Ok(())
     }
 
     fn read_component(&self, group_id: &[u8], component: &str) -> Result<Option<Vec<u8>>, MlsStorageError> {
-        let conn = self.conn.lock().unwrap();
-        conn.query_row(
-            "SELECT data FROM mls_public_group WHERE group_id = ?1 AND component = ?2",
-            params![group_id, component],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|e| MlsStorageError(e.to_string()))
+        self.conn
+            .query_row(
+                "SELECT data FROM mls_public_group WHERE group_id = ?1 AND component = ?2",
+                params![group_id, component],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| MlsStorageError(e.to_string()))
     }
 
     fn delete_component(&self, group_id: &[u8], component: &str) -> Result<(), MlsStorageError> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "DELETE FROM mls_public_group WHERE group_id = ?1 AND component = ?2",
-            params![group_id, component],
-        )
-        .map_err(|e| MlsStorageError(e.to_string()))?;
+        self.conn
+            .execute(
+                "DELETE FROM mls_public_group WHERE group_id = ?1 AND component = ?2",
+                params![group_id, component],
+            )
+            .map_err(|e| MlsStorageError(e.to_string()))?;
         Ok(())
+    }
+
+    fn read_deserialized<T: DeserializeOwned>(&self, group_id: &[u8], component: &str) -> Result<Option<T>, MlsStorageError> {
+        match self.read_component(group_id, component)? {
+            Some(bytes) => Ok(Some(deser(&bytes)?)),
+            None => Ok(None),
+        }
     }
 }
 
@@ -120,14 +130,14 @@ impl<'a> PublicStorageProvider<CURRENT_VERSION> for MlsPublicStorage<'a> {
         proposal_ref: &ProposalRef,
         proposal: &QueuedProposal,
     ) -> Result<(), Self::PublicError> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO mls_proposals (group_id, proposal_ref, data)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT (group_id, proposal_ref) DO UPDATE SET data = ?3",
-            params![ser(group_id)?, ser(proposal_ref)?, ser(proposal)?],
-        )
-        .map_err(|e| MlsStorageError(e.to_string()))?;
+        self.conn
+            .execute(
+                "INSERT INTO mls_proposals (group_id, proposal_ref, data)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT (group_id, proposal_ref) DO UPDATE SET data = ?3",
+                params![ser(group_id)?, ser(proposal_ref)?, ser(proposal)?],
+            )
+            .map_err(|e| MlsStorageError(e.to_string()))?;
         Ok(())
     }
 
@@ -142,17 +152,13 @@ impl<'a> PublicStorageProvider<CURRENT_VERSION> for MlsPublicStorage<'a> {
         group_id: &GroupId,
     ) -> Result<Vec<(ProposalRef, QueuedProposal)>, Self::PublicError> {
         let gid = ser(group_id)?;
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare_cached(
-                "SELECT proposal_ref, data FROM mls_proposals WHERE group_id = ?1",
-            )
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT proposal_ref, data FROM mls_proposals WHERE group_id = ?1")
             .map_err(|e| MlsStorageError(e.to_string()))?;
 
         let rows: Vec<(Vec<u8>, Vec<u8>)> = stmt
-            .query_map(params![gid], |row| {
-                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
-            })
+            .query_map(params![gid], |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)))
             .map_err(|e| MlsStorageError(e.to_string()))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| MlsStorageError(e.to_string()))?;
@@ -171,10 +177,7 @@ impl<'a> PublicStorageProvider<CURRENT_VERSION> for MlsPublicStorage<'a> {
         &self,
         group_id: &GroupId,
     ) -> Result<Option<TreeSync>, Self::PublicError> {
-        match self.read_component(&ser(group_id)?, "tree")? {
-            Some(bytes) => Ok(Some(deser(&bytes)?)),
-            None => Ok(None),
-        }
+        self.read_deserialized(&ser(group_id)?, "tree")
     }
 
     fn group_context<
@@ -184,10 +187,7 @@ impl<'a> PublicStorageProvider<CURRENT_VERSION> for MlsPublicStorage<'a> {
         &self,
         group_id: &GroupId,
     ) -> Result<Option<GroupContext>, Self::PublicError> {
-        match self.read_component(&ser(group_id)?, "context")? {
-            Some(bytes) => Ok(Some(deser(&bytes)?)),
-            None => Ok(None),
-        }
+        self.read_deserialized(&ser(group_id)?, "context")
     }
 
     fn interim_transcript_hash<
@@ -197,10 +197,7 @@ impl<'a> PublicStorageProvider<CURRENT_VERSION> for MlsPublicStorage<'a> {
         &self,
         group_id: &GroupId,
     ) -> Result<Option<InterimTranscriptHash>, Self::PublicError> {
-        match self.read_component(&ser(group_id)?, "interim_transcript_hash")? {
-            Some(bytes) => Ok(Some(deser(&bytes)?)),
-            None => Ok(None),
-        }
+        self.read_deserialized(&ser(group_id)?, "interim_transcript_hash")
     }
 
     fn confirmation_tag<
@@ -210,10 +207,7 @@ impl<'a> PublicStorageProvider<CURRENT_VERSION> for MlsPublicStorage<'a> {
         &self,
         group_id: &GroupId,
     ) -> Result<Option<ConfirmationTag>, Self::PublicError> {
-        match self.read_component(&ser(group_id)?, "confirmation_tag")? {
-            Some(bytes) => Ok(Some(deser(&bytes)?)),
-            None => Ok(None),
-        }
+        self.read_deserialized(&ser(group_id)?, "confirmation_tag")
     }
 
     // --- Deleters ---
@@ -254,12 +248,12 @@ impl<'a> PublicStorageProvider<CURRENT_VERSION> for MlsPublicStorage<'a> {
         group_id: &GroupId,
         proposal_ref: &ProposalRef,
     ) -> Result<(), Self::PublicError> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "DELETE FROM mls_proposals WHERE group_id = ?1 AND proposal_ref = ?2",
-            params![ser(group_id)?, ser(proposal_ref)?],
-        )
-        .map_err(|e| MlsStorageError(e.to_string()))?;
+        self.conn
+            .execute(
+                "DELETE FROM mls_proposals WHERE group_id = ?1 AND proposal_ref = ?2",
+                params![ser(group_id)?, ser(proposal_ref)?],
+            )
+            .map_err(|e| MlsStorageError(e.to_string()))?;
         Ok(())
     }
 
@@ -270,12 +264,9 @@ impl<'a> PublicStorageProvider<CURRENT_VERSION> for MlsPublicStorage<'a> {
         &self,
         group_id: &GroupId,
     ) -> Result<(), Self::PublicError> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "DELETE FROM mls_proposals WHERE group_id = ?1",
-            params![ser(group_id)?],
-        )
-        .map_err(|e| MlsStorageError(e.to_string()))?;
+        self.conn
+            .execute("DELETE FROM mls_proposals WHERE group_id = ?1", params![ser(group_id)?])
+            .map_err(|e| MlsStorageError(e.to_string()))?;
         Ok(())
     }
 }

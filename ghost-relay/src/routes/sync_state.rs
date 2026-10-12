@@ -32,7 +32,7 @@ pub async fn put(
         return Err(RelayError::PayloadTooLarge);
     }
     let generation = u64::from_be_bytes(body[..SNAPSHOT_GENERATION_LEN].try_into().unwrap());
-    state.storage.put_sync_state(&account_fp, generation, &body[SNAPSHOT_GENERATION_LEN..])?;
+    state.storage.put_sync_state(account_fp, generation, body[SNAPSHOT_GENERATION_LEN..].to_vec()).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -46,7 +46,7 @@ pub async fn get(
     if auth.account_fp != account_fp {
         return Err(RelayError::Unauthorized("account mismatch".into()));
     }
-    match state.storage.get_sync_state(&account_fp)? {
+    match state.storage.get_sync_state(account_fp).await? {
         Some((generation, data)) => {
             let mut body = Vec::with_capacity(SNAPSHOT_GENERATION_LEN + data.len());
             body.extend_from_slice(&generation.to_be_bytes());

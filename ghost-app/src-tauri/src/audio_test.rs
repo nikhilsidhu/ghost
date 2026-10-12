@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, StreamTrait};
 use cpal::SampleFormat;
-use ringbuf::{traits::*, HeapRb};
+use ghost_audio::{TrackEvent, TrackIo, VoiceAudio};
 use tauri::{AppHandle, Emitter};
 
 use crate::audio::resolve_device;
@@ -39,166 +39,74 @@ fn pick_test_config(
     best.map(|c| c.config()).ok_or_else(|| "no f32 audio config".into())
 }
 
-static MIC_TESTING: AtomicBool = AtomicBool::new(false);
+/// The mic test running now, by its number; 0 when none runs. A test stopped and one
+/// started right after never mix: the first's thread sees it is no longer current.
+static MIC_TEST: AtomicU64 = AtomicU64::new(0);
+/// Numbers the mic tests.
+static MIC_TESTS: AtomicU64 = AtomicU64::new(0);
 static TONE_PLAYING: AtomicBool = AtomicBool::new(false);
 
 const MIC_POLL_MS: u64 = 50;
+/// Speech sits well under full scale; this makes normal speech nearly fill the meter.
+const METER_GAIN: f32 = 10.0;
 const TONE_DURATION: Duration = Duration::from_secs(2);
 const TONE_FREQ: f32 = 440.0;
 const TONE_VOLUME: f32 = 0.3;
-const LOOPBACK_BUF_SIZE: usize = 12_000;
-const LOOPBACK_PREFILL_MS: u64 = 150;
 
-pub fn start_mic_test(
-    app: AppHandle,
-    input_device_name: Option<String>,
-    output_device_name: Option<String>,
-) -> Result<(), String> {
-    if MIC_TESTING.swap(true, Ordering::SeqCst) {
+/// Hear the microphone through the call's own audio path, with its processing and the
+/// chosen devices, and see its level: the voice audio runs a track whose frames come
+/// straight back. Ends with `stop_mic_test` (a call joining calls it too), or when its
+/// devices fail; `mic-test-ended` says so, with the failure if there was one. Only the
+/// test's own track is stopped, so a call that took the microphone keeps it.
+pub fn start_mic_test(app: AppHandle, audio: Arc<VoiceAudio>) -> Result<(), String> {
+    let test = MIC_TESTS.fetch_add(1, Ordering::SeqCst) + 1;
+    if MIC_TEST.compare_exchange(0, test, Ordering::SeqCst, Ordering::SeqCst).is_err() {
         return Ok(());
     }
-
-    std::thread::Builder::new()
-        .name("mic-test".into())
-        .spawn(move || {
-            if let Err(e) = run_mic_test(&app, input_device_name, output_device_name) {
-                eprintln!("mic test error: {e}");
+    let (events, mut reports) = tokio::sync::mpsc::unbounded_channel();
+    let started = TrackIo::loopback(events).map_err(|e| format!("loopback track: {e}")).and_then(|io| audio.start_run(io));
+    let run = match started {
+        Ok(run) => run,
+        Err(e) => {
+            let _ = MIC_TEST.compare_exchange(test, 0, Ordering::SeqCst, Ordering::SeqCst);
+            return Err(e);
+        }
+    };
+    let spawned = std::thread::Builder::new().name("mic-test".into()).spawn({
+        let audio = audio.clone();
+        move || {
+            let mut failure = None;
+            while MIC_TEST.load(Ordering::SeqCst) == test {
+                std::thread::sleep(Duration::from_millis(MIC_POLL_MS));
+                match reports.try_recv() {
+                    Ok(TrackEvent::Failed(e)) => {
+                        failure = Some(e);
+                        break;
+                    }
+                    Ok(TrackEvent::Notice(notice)) => tracing::warn!("mic test: {notice}"),
+                    Err(_) => {}
+                }
+                let _ = app.emit("mic-level", (audio.input_level() * METER_GAIN).min(1.0));
             }
-            MIC_TESTING.store(false, Ordering::SeqCst);
-        })
-        .map_err(|e| format!("spawn mic test: {e}"))?;
-
+            // Still this test's to report, unless a newer test already took over.
+            let current = MIC_TEST.compare_exchange(test, 0, Ordering::SeqCst, Ordering::SeqCst).is_ok() || MIC_TEST.load(Ordering::SeqCst) == 0;
+            audio.stop_run(run);
+            if current {
+                let _ = app.emit("mic-level", 0.0f32);
+                let _ = app.emit("mic-test-ended", failure);
+            }
+        }
+    });
+    if let Err(e) = spawned {
+        audio.stop_run(run);
+        let _ = MIC_TEST.compare_exchange(test, 0, Ordering::SeqCst, Ordering::SeqCst);
+        return Err(format!("spawn mic test: {e}"));
+    }
     Ok(())
 }
 
 pub fn stop_mic_test() {
-    MIC_TESTING.store(false, Ordering::SeqCst);
-}
-
-fn run_mic_test(
-    app: &AppHandle,
-    input_device_name: Option<String>,
-    output_device_name: Option<String>,
-) -> Result<(), String> {
-    let host = cpal::default_host();
-
-    let input_device = resolve_device(&host, &input_device_name, "input")?;
-    let in_config = pick_test_config(
-        input_device.supported_input_configs().map_err(|e| format!("input configs: {e}"))?,
-        48_000,
-    )?;
-    let in_channels = in_config.channels as usize;
-    let in_rate = in_config.sample_rate.0;
-
-    let output_device = resolve_device(&host, &output_device_name, "output")?;
-    let out_config = pick_test_config(
-        output_device.supported_output_configs().map_err(|e| format!("output configs: {e}"))?,
-        in_rate,
-    )?;
-    let out_channels = out_config.channels as usize;
-    let out_rate = out_config.sample_rate.0;
-
-    eprintln!(
-        "mic test: capture \"{}\" @ {}Hz {}ch, playback \"{}\" @ {}Hz {}ch",
-        input_device.name().unwrap_or_default(), in_rate, in_channels,
-        output_device.name().unwrap_or_default(), out_rate, out_channels,
-    );
-
-    let level = Arc::new(std::sync::Mutex::new(0.0f32));
-    let level_w = level.clone();
-
-    // Diagnostics: track underruns and overruns in the ring buffer
-    let overruns = Arc::new(AtomicU64::new(0));
-    let underruns = Arc::new(AtomicU64::new(0));
-    let overruns_w = overruns.clone();
-    let underruns_r = underruns.clone();
-
-    let ring = HeapRb::<f32>::new(LOOPBACK_BUF_SIZE);
-    let (mut loopback_prod, mut loopback_cons) = ring.split();
-
-    let input_stream = input_device
-        .build_input_stream(
-            &in_config,
-            move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                let rms = (data.iter().map(|s| s * s).sum::<f32>() / data.len() as f32).sqrt();
-                *level_w.lock().unwrap() = rms;
-                for frame in data.chunks(in_channels) {
-                    let mono = frame.iter().sum::<f32>() / in_channels as f32;
-                    if loopback_prod.try_push(mono).is_err() {
-                        overruns_w.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            },
-            |err| eprintln!("mic test capture error: {err}"),
-            None,
-        )
-        .map_err(|e| format!("build input: {e}"))?;
-
-    // Base consumption ratio. Adjusted at runtime by drift compensation below.
-    let base_step = in_rate as f32 / out_rate as f32;
-    let buf_cap = LOOPBACK_BUF_SIZE;
-    let target_fill = buf_cap / 2;
-    let mut accum = 0.0f32;
-    let mut last_sample = 0.0f32;
-
-    let output_stream = output_device
-        .build_output_stream(
-            &out_config,
-            move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                // Drift compensation: speed up/slow down consumption based on buffer fill.
-                // Bluetooth input (AirPods HFP) delivers data in bursts — this keeps
-                // the buffer centered at 50% so neither underruns nor overruns accumulate.
-                let fill = loopback_cons.occupied_len();
-                let drift = (fill as f32 - target_fill as f32) / buf_cap as f32;
-                let step = base_step * (1.0 + drift);
-
-                for frame in data.chunks_mut(out_channels) {
-                    accum += step;
-                    while accum >= 1.0 {
-                        accum -= 1.0;
-                        match loopback_cons.try_pop() {
-                            Some(s) => last_sample = s,
-                            None => { underruns_r.fetch_add(1, Ordering::Relaxed); }
-                        }
-                    }
-                    for s in frame.iter_mut() {
-                        *s = last_sample;
-                    }
-                }
-            },
-            |err| eprintln!("mic test playback error: {err}"),
-            None,
-        )
-        .map_err(|e| format!("build output: {e}"))?;
-
-    // Pre-fill the ring before starting output — absorbs Bluetooth callback jitter
-    input_stream
-        .play()
-        .map_err(|e| format!("start capture: {e}"))?;
-    std::thread::sleep(Duration::from_millis(LOOPBACK_PREFILL_MS));
-    output_stream
-        .play()
-        .map_err(|e| format!("start playback: {e}"))?;
-
-    let mut ticks = 0u32;
-    while MIC_TESTING.load(Ordering::SeqCst) {
-        std::thread::sleep(Duration::from_millis(MIC_POLL_MS));
-        let rms = *level.lock().unwrap();
-        let normalized = (rms * 10.0).min(1.0);
-        let _ = app.emit("mic-level", normalized);
-
-        ticks += 1;
-        if ticks % 40 == 0 {
-            let over = overruns.swap(0, Ordering::Relaxed);
-            let under = underruns.swap(0, Ordering::Relaxed);
-            if over > 0 || under > 0 {
-                eprintln!("mic test: overruns={over} underruns={under} (last 2s)");
-            }
-        }
-    }
-
-    let _ = app.emit("mic-level", 0.0f32);
-    Ok(())
+    MIC_TEST.store(0, Ordering::SeqCst);
 }
 
 pub fn play_test_tone(output_device_name: Option<String>) -> Result<(), String> {
@@ -210,7 +118,7 @@ pub fn play_test_tone(output_device_name: Option<String>) -> Result<(), String> 
         .name("test-tone".into())
         .spawn(move || {
             if let Err(e) = run_test_tone(output_device_name) {
-                eprintln!("test tone error: {e}");
+                tracing::warn!("test tone error: {e}");
             }
             TONE_PLAYING.store(false, Ordering::SeqCst);
         })
@@ -245,7 +153,7 @@ fn run_test_tone(output_device_name: Option<String>) -> Result<(), String> {
                     phase = (phase + phase_inc) % 1.0;
                 }
             },
-            |err| eprintln!("test tone error: {err}"),
+            |err| tracing::warn!("test tone error: {err}"),
             None,
         )
         .map_err(|e| format!("build output: {e}"))?;

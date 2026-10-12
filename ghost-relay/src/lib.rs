@@ -1,10 +1,14 @@
+pub mod anchoring;
 pub mod auth;
 pub mod config;
 pub mod constants;
 pub mod error;
 pub mod federation;
+pub mod group_state;
 pub mod mailbox;
 pub mod mls_storage;
+#[cfg(feature = "test-util")]
+pub mod outage;
 pub mod rate_limit;
 pub mod routes;
 pub mod server;

@@ -6,6 +6,9 @@
 use ed25519_dalek::VerifyingKey;
 use thiserror::Error;
 
+use crate::account_key::AccountKeySet;
+use crate::batch::{put_entries, put_key_sets, read_entries, read_key_sets, BatchError};
+use crate::bytes::{put_prefixed16, put_prefixed32, ReadError, Reader};
 use crate::idlog::{validate_entry, IdlogError, LogEntry, LogState};
 use crate::merkle::{leaf_hash, Checkpoint, InclusionProof, CHECKPOINT_TOTAL_LEN};
 
@@ -27,6 +30,12 @@ pub enum AnchorError {
     CheckpointRegression,
 }
 
+impl From<ReadError> for AnchorError {
+    fn from(e: ReadError) -> Self {
+        AnchorError::Format(e.to_string())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AnchoredEntry {
     pub entry: LogEntry,
@@ -37,48 +46,28 @@ pub struct AnchoredEntry {
 impl AnchoredEntry {
     /// `[entry_len:4][entry][proof_len:2][inclusion_proof][checkpoint:116]`
     pub fn to_bytes(&self) -> Vec<u8> {
-        let entry = self.entry.to_bytes();
-        let proof = self.inclusion_proof.to_bytes();
-        let mut buf = Vec::with_capacity(6 + entry.len() + proof.len() + CHECKPOINT_TOTAL_LEN);
-        buf.extend_from_slice(&(entry.len() as u32).to_be_bytes());
-        buf.extend_from_slice(&entry);
-        buf.extend_from_slice(&(proof.len() as u16).to_be_bytes());
-        buf.extend_from_slice(&proof);
+        let mut buf = Vec::new();
+        put_prefixed32(&mut buf, &self.entry.to_bytes());
+        put_prefixed16(&mut buf, &self.inclusion_proof.to_bytes());
         buf.extend_from_slice(&self.checkpoint.to_bytes());
         buf
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self, AnchorError> {
-        let (anchored, used) = Self::parse_prefix(data)?;
-        if used != data.len() {
-            return Err(AnchorError::Format(format!("{} trailing bytes", data.len() - used)));
-        }
+        let mut r = Reader::new(data);
+        let anchored = Self::read(&mut r)?;
+        r.finish()?;
         Ok(anchored)
     }
 
-    /// Parse one anchored entry from the front of `data`; returns bytes consumed.
-    fn parse_prefix(data: &[u8]) -> Result<(Self, usize), AnchorError> {
-        let err = |msg: &str| AnchorError::Format(msg.into());
-        if data.len() < 4 {
-            return Err(err("too short"));
-        }
-        let entry_len = u32::from_be_bytes(data[..4].try_into().unwrap()) as usize;
-        let entry_end = 4 + entry_len;
-        if data.len() < entry_end + 2 {
-            return Err(err("entry truncated"));
-        }
-        let entry = LogEntry::from_bytes(&data[4..entry_end])?;
-        let proof_len = u16::from_be_bytes(data[entry_end..entry_end + 2].try_into().unwrap()) as usize;
-        let proof_end = entry_end + 2 + proof_len;
-        let end = proof_end + CHECKPOINT_TOTAL_LEN;
-        if data.len() < end {
-            return Err(err("proof or checkpoint truncated"));
-        }
-        let inclusion_proof = InclusionProof::from_bytes(&data[entry_end + 2..proof_end])
+    /// One anchored entry from the front of what `r` has left.
+    fn read(r: &mut Reader) -> Result<Self, AnchorError> {
+        let entry = LogEntry::from_bytes(r.prefixed32()?)?;
+        let inclusion_proof = InclusionProof::from_bytes(r.prefixed16()?)
             .map_err(|e| AnchorError::Format(format!("inclusion proof: {e}")))?;
-        let checkpoint = Checkpoint::from_bytes(&data[proof_end..end])
+        let checkpoint = Checkpoint::from_bytes(r.take(CHECKPOINT_TOTAL_LEN)?)
             .map_err(|e| AnchorError::Format(format!("checkpoint: {e}")))?;
-        Ok((Self { entry, inclusion_proof, checkpoint }, end))
+        Ok(Self { entry, inclusion_proof, checkpoint })
     }
 
     /// Check the anchor alone: checkpoint signed by `home_relay_vk`, proof
@@ -123,79 +112,58 @@ pub fn encode_sequence(entries: &[AnchoredEntry]) -> Vec<u8> {
 }
 
 pub fn decode_sequence(data: &[u8]) -> Result<Vec<AnchoredEntry>, AnchorError> {
+    let mut r = Reader::new(data);
     let mut entries = Vec::new();
-    let mut pos = 0;
-    while pos < data.len() {
-        let (anchored, used) = AnchoredEntry::parse_prefix(&data[pos..])?;
-        entries.push(anchored);
-        pos += used;
+    while !r.is_empty() {
+        entries.push(AnchoredEntry::read(&mut r)?);
     }
     Ok(entries)
 }
 
-pub const IMPORT_REQUEST_VERSION: u8 = 0x01;
+pub const IMPORT_REQUEST_VERSION: u8 = 0x02;
 
 /// Ask a relay to become an account's home: the existing chain with its
 /// current anchors, then the raw entries the new home sequences (a
-/// `SetHomeRelay` naming the new home, then optionally a `Recovery`).
+/// `SetHomeRelay` naming the new home, then for a recovery the rest of the
+/// recovery batch), with the key sets those entries commit to.
 #[derive(Debug, Clone)]
 pub struct ImportRequest {
     pub prefix: Vec<AnchoredEntry>,
     pub new_entries: Vec<LogEntry>,
+    pub key_sets: Vec<AccountKeySet>,
 }
 
 impl ImportRequest {
-    /// `[version:1][prefix_count:2] AnchoredEntry… [new_count:1] ([len:4][LogEntry])…`
+    /// `[version:1][prefix_count:2] AnchoredEntry… [new_count:1] ([len:4][LogEntry])…
+    ///  [sets:1] ([len:4][AccountKeySet])…`
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = vec![IMPORT_REQUEST_VERSION];
         buf.extend_from_slice(&(self.prefix.len() as u16).to_be_bytes());
         for anchored in &self.prefix {
             buf.extend_from_slice(&anchored.to_bytes());
         }
-        buf.push(self.new_entries.len() as u8);
-        for entry in &self.new_entries {
-            let bytes = entry.to_bytes();
-            buf.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
-            buf.extend_from_slice(&bytes);
-        }
+        put_entries(&mut buf, &self.new_entries);
+        put_key_sets(&mut buf, &self.key_sets);
         buf
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self, AnchorError> {
         let err = |msg: &str| AnchorError::Format(format!("import request: {msg}"));
-        if data.len() < 3 {
-            return Err(err("too short"));
-        }
-        if data[0] != IMPORT_REQUEST_VERSION {
+        let batch_err = |e: BatchError| AnchorError::Format(format!("import request: {e}"));
+        let mut r = Reader::new(data);
+        let version = r.u8()?;
+        if version != IMPORT_REQUEST_VERSION {
             return Err(err("unknown version"));
         }
-        let prefix_count = u16::from_be_bytes(data[1..3].try_into().unwrap()) as usize;
-        let mut pos = 3;
+        let prefix_count = r.u16()? as usize;
         let mut prefix = Vec::with_capacity(prefix_count);
         for _ in 0..prefix_count {
-            let (anchored, used) = AnchoredEntry::parse_prefix(&data[pos..])?;
-            prefix.push(anchored);
-            pos += used;
+            prefix.push(AnchoredEntry::read(&mut r)?);
         }
-        let new_count = *data.get(pos).ok_or_else(|| err("missing new entry count"))? as usize;
-        pos += 1;
-        let mut new_entries = Vec::with_capacity(new_count);
-        for _ in 0..new_count {
-            if data.len() < pos + 4 {
-                return Err(err("entry length truncated"));
-            }
-            let len = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
-            pos += 4;
-            if data.len() < pos + len {
-                return Err(err("entry truncated"));
-            }
-            new_entries.push(LogEntry::from_bytes(&data[pos..pos + len])?);
-            pos += len;
-        }
-        if pos != data.len() {
-            return Err(err("trailing bytes"));
-        }
-        Ok(Self { prefix, new_entries })
+        let new_entries = read_entries(&mut r).map_err(batch_err)?;
+        let key_sets = read_key_sets(&mut r).map_err(batch_err)?;
+        r.finish().map_err(|e| err(&e.to_string()))?;
+        Ok(Self { prefix, new_entries, key_sets })
     }
 }
 
@@ -227,55 +195,18 @@ pub fn validate_anchored_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::idlog::{sign_message, EntryBody, EntryType};
     use crate::merkle::MerkleTree;
     use crate::relay_ref::RelayRef;
-    use ed25519_dalek::{Signer, SigningKey};
-    use rand::Rng;
-
-    fn random_key() -> SigningKey {
-        let secret: [u8; 32] = rand::thread_rng().gen();
-        SigningKey::from_bytes(&secret)
-    }
+    use crate::log_entries::{create_genesis, create_set_home_relay};
+    use crate::test_support::random_key;
+    use ed25519_dalek::SigningKey;
 
     fn genesis(mk: &SigningKey, dk: &SigningKey) -> LogEntry {
-        let master_vk = mk.verifying_key().to_bytes();
-        let mut entry = LogEntry {
-            seq: 1,
-            prev_hash: [0u8; 32],
-            account_fp: blake3::hash(&master_vk).into(),
-            entry_type: EntryType::Genesis,
-            timestamp: 1,
-            body: EntryBody::Genesis {
-                master_verifying_key: master_vk,
-                device_verifying_key: dk.verifying_key().to_bytes(),
-                device_label: "d1".into(),
-            },
-            signature: [0u8; 64],
-            counter_signature: None,
-        };
-        entry.signature = mk.sign(&sign_message(&entry)).to_bytes();
-        entry.counter_signature = Some(dk.sign(&sign_message(&entry)).to_bytes());
-        entry
+        create_genesis(mk, dk, "d1")
     }
 
     fn set_home(state: &LogState, dk: &SigningKey, relay_vk: [u8; 32]) -> LogEntry {
-        let mut entry = LogEntry {
-            seq: state.head_seq + 1,
-            prev_hash: state.head_hash,
-            account_fp: state.account_fp,
-            entry_type: EntryType::SetHomeRelay,
-            timestamp: 2,
-            body: EntryBody::SetHomeRelay {
-                relay_vk,
-                authorizer_key: dk.verifying_key().to_bytes(),
-                relay_ref: RelayRef::key_only(relay_vk),
-            },
-            signature: [0u8; 64],
-            counter_signature: None,
-        };
-        entry.signature = dk.sign(&sign_message(&entry)).to_bytes();
-        entry
+        create_set_home_relay(state, dk, RelayRef::key_only(relay_vk))
     }
 
     /// A relay's KT tree: append entries, return (anchors, final checkpoint).
@@ -346,7 +277,7 @@ mod tests {
         let a1 = home.anchor(&g);
         validate_anchored_entry(&mut state, &a1, Some(&home.vk()), |_| None).unwrap();
         let move_entry = set_home(&state, &dk, [0x42; 32]);
-        let request = ImportRequest { prefix: vec![a1.clone()], new_entries: vec![move_entry.clone()] };
+        let request = ImportRequest { prefix: vec![a1.clone()], new_entries: vec![move_entry.clone()], key_sets: Vec::new() };
 
         let mut bytes = request.to_bytes();
         let decoded = ImportRequest::from_bytes(&bytes).unwrap();

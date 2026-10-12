@@ -27,6 +27,12 @@ function persist() {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(cache));
 }
 
+/** Forget every use: the account they were made in is gone from this device. */
+export function forgetUsage() {
+  cache = {};
+  localStorage.removeItem(STORAGE_KEY);
+}
+
 export function recordUsage(id: string) {
   const store = getStore();
   const entry = store[id] ?? { count: 0, lastUsed: 0 };

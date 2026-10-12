@@ -31,6 +31,9 @@ pub enum CaptureRead {
     /// The devices were reopened (the default device changed); capture continues but
     /// is not continuous with what came before.
     Restarted,
+    /// The chosen device is not available and another took its place, as the message
+    /// says; capture continues, as after `Restarted`.
+    Substituted(String),
     /// The devices are gone for good; the call's audio ends.
     Failed(String),
 }

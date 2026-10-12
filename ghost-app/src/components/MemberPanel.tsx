@@ -1,16 +1,25 @@
-import { createSignal, For, Show, onCleanup } from "solid-js";
+import { createEffect, createSignal, For, on, Show, onCleanup } from "solid-js";
 import { Portal } from "solid-js/web";
 import { ScrollArea } from "./ui/scroll-area";
 import { Avatar } from "./ui/avatar";
+import { Button } from "./ui/button";
 import type { AvatarStatus } from "./ui/avatar";
 import { identity, members, selectedServerId, selectedServer, serverRoles, onlinePresence } from "../lib/store";
-import { kickMember } from "../lib/api";
+import { keptOut, kickMember, letBackIn } from "../lib/api";
 import { PERMISSIONS } from "../lib/types";
+import type { KeptOut } from "../lib/types";
+
+/** Characters of a fingerprint shown for someone whose name this device never saw. */
+const FINGERPRINT_SHOWN = 16;
+/** How long a note about the last kick stays. */
+const KICK_NOTE_MS = 6000;
 
 const STATUS_ORDER: Record<string, number> = { online: 0, idle: 1, away: 2 };
 
 export function MemberPanel() {
-  const [ctxMenu, setCtxMenu] = createSignal<{ x: number; y: number; fingerprint: string } | null>(null);
+  const [ctxMenu, setCtxMenu] = createSignal<{ x: number; y: number; fingerprint: string; confirming: boolean } | null>(null);
+  const [kept, setKept] = createSignal<KeptOut[]>([]);
+  const [kickNote, setKickNote] = createSignal<string | null>(null);
 
   const ownerFp = () => selectedServer()?.owner_fp;
   const canKick = () => ((selectedServer()?.permissions ?? 0) & PERMISSIONS.kick) !== 0;
@@ -18,7 +27,11 @@ export function MemberPanel() {
   /** What to show under a member: owner, else the name of their highest role. */
   const memberLabel = (fp: string, roles: number[]) =>
     fp === ownerFp() ? "owner" : roles.length > 0 ? roleName(roles[0]) || "role" : undefined;
-  const memberStatus = (fp: string) => onlinePresence().get(fp)?.status as AvatarStatus | undefined;
+  // An offline or invisible member shows no status dot.
+  const memberStatus = (fp: string): AvatarStatus | undefined => {
+    const status = onlinePresence().get(fp)?.status;
+    return status === "online" || status === "idle" || status === "away" ? status : undefined;
+  };
   const memberStatusMessage = (fp: string) => onlinePresence().get(fp)?.status_message;
 
   const sortedMembers = () => {
@@ -36,21 +49,47 @@ export function MemberPanel() {
   const onRightClick = (fingerprint: string, e: MouseEvent) => {
     if (!canKick() || fingerprint === ownerFp() || fingerprint === identity()?.fingerprint) return;
     e.preventDefault();
-    const menuW = 140, menuH = 40;
+    const menuW = 220, menuH = 80;
     const x = Math.min(e.clientX, window.innerWidth - menuW);
     const y = Math.min(e.clientY, window.innerHeight - menuH);
-    setCtxMenu({ x, y, fingerprint });
+    setCtxMenu({ x, y, fingerprint, confirming: false });
   };
 
+  // Who the server keeps out, for those who may let them back; refreshed as the member list changes.
+  createEffect(
+    on([selectedServerId, canKick, members], ([sid, can]) => {
+      if (!sid || !can) return setKept([]);
+      keptOut(sid).then(setKept, () => setKept([]));
+    }),
+  );
+
+  const showKickNote = (note: string) => {
+    setKickNote(note);
+    setTimeout(() => setKickNote(null), KICK_NOTE_MS);
+  };
+
+  // The first click asks; the second kicks.
   const handleKick = async () => {
     const menu = ctxMenu();
     const sid = selectedServerId();
     if (!menu || !sid) return;
+    if (!menu.confirming) return setCtxMenu({ ...menu, confirming: true });
     setCtxMenu(null);
     try {
       await kickMember(sid, menu.fingerprint);
     } catch (e) {
-      console.error("kick failed:", e);
+      showKickNote(String(e));
+    }
+  };
+
+  const handleLetBackIn = async (fingerprint: string) => {
+    const sid = selectedServerId();
+    if (!sid) return;
+    try {
+      await letBackIn(sid, fingerprint);
+      setKept((list) => list.filter((k) => k.fingerprint !== fingerprint));
+    } catch (e) {
+      showKickNote(String(e));
     }
   };
 
@@ -70,11 +109,6 @@ export function MemberPanel() {
           members — {members().length}
         </span>
       </div>
-      <Show when={serverRoles() && !serverRoles()!.explicit && serverRoles()!.members_missing_support.length > 0}>
-        <div class="px-3 pb-2 text-[11px] text-[var(--neutral-500)] leading-tight">
-          roles are available once {serverRoles()!.members_missing_support.length} member(s) update ghost
-        </div>
-      </Show>
       <ScrollArea class="flex-1">
         <div class="px-2 py-1">
           <For each={sortedMembers()}>
@@ -105,6 +139,24 @@ export function MemberPanel() {
               </div>
             )}
           </For>
+          <Show when={kickNote()}>
+            <div role="status" class="px-2 py-1.5 text-[11px] text-[var(--amber-400)] leading-snug">{kickNote()}</div>
+          </Show>
+          <Show when={kept().length > 0}>
+            <div class="px-2 pt-4 pb-1 text-sm font-medium text-[var(--neutral-500)]">kept out — {kept().length}</div>
+            <For each={kept()}>
+              {(k) => (
+                <div class="flex items-center gap-2 px-2 py-1 rounded-md">
+                  <span class="flex-1 min-w-0 truncate text-sm text-[var(--neutral-400)]">
+                    {k.display_name ?? k.fingerprint.slice(0, FINGERPRINT_SHOWN)}
+                  </span>
+                  <Button variant="ghost" size="sm" onClick={() => handleLetBackIn(k.fingerprint)}>
+                    let back in
+                  </Button>
+                </div>
+              )}
+            </For>
+          </Show>
         </div>
       </ScrollArea>
 
@@ -124,8 +176,13 @@ export function MemberPanel() {
                 class="w-full px-3 py-1.5 text-left text-sm text-red-400 hover:bg-[var(--neutral-700)] cursor-pointer"
                 onClick={handleKick}
               >
-                Kick
+                {menu().confirming ? "Kick them out" : "Kick"}
               </button>
+              <Show when={menu().confirming}>
+                <div class="px-3 pb-1.5 text-[11px] text-[var(--neutral-400)] leading-snug">
+                  They can't rejoin until someone who can kick lets them back in.
+                </div>
+              </Show>
             </div>
           )}
         </Show>

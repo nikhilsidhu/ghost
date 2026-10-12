@@ -9,8 +9,8 @@ pub mod netem;
 pub mod session;
 pub mod track;
 
-pub use session::{FrameSender, Inbound, MediaSession, ReceivedFrame, SessionConfig};
-pub use track::{AudioTrack, TrackIo, TrackQuality};
+pub use session::{FrameSender, Inbound, MediaPath, MediaSession, ReceivedFrame, SessionConfig};
+pub use track::{AudioTrack, TrackEvent, TrackIo, TrackQuality};
 
 #[derive(Debug, thiserror::Error)]
 pub enum MediaError {

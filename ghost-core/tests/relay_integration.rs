@@ -7,20 +7,39 @@ use ghost_core::identity::Identity;
 use ghost_core::relay::{IncomingBlob, RelayClient, RelayEvent};
 use ghost_core::storage::ServerKind;
 use ghost_core::wire::{derive_default_channel_id, derive_mls_group_id, mls_group_mailbox_id};
-use openmls::key_packages::KeyPackageIn;
-use openmls::prelude::tls_codec::{Deserialize as TlsDeserialize, Serialize as TlsSerialize};
-use openmls::prelude::ProtocolVersion;
-use openmls_rust_crypto::RustCrypto;
+
+#[tokio::test]
+async fn sends_to_a_relay_that_is_down_queue_then_refuse_without_blocking() {
+    let relay = common::start_switched_relay().await;
+    let s = setup_two_clients([0x01; 32], [0x02; 32]);
+    let (send_relay, _) = RelayClient::new(&relay.url());
+    common::setup_relay_auth(&relay.url(), &send_relay, &s.sender).await;
+    send_relay.subscribe(s.mailbox_id, 0);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // The connection holds what is sent while the relay is down, up to a limit; past it
+    // a send is refused at once, because a waiting send would hold up every caller
+    // sharing the client.
+    relay.go_down();
+    let accepted = tokio::time::timeout(Duration::from_secs(5), async {
+        (0..5000).filter(|_| send_relay.send(&s.mailbox_id, vec![0u8; 16]).is_ok()).count()
+    })
+    .await
+    .expect("sending to an unreachable relay never waits");
+    assert!(accepted > 0, "messages queue for the reconnect");
+    assert!(accepted < 5000, "the queue is bounded");
+}
 
 #[tokio::test]
 async fn message_metadata_preserved_through_relay() {
     let relay_url = common::start_relay().await;
     let mut s = setup_two_clients([0x01; 32], [0x02; 32]);
 
-    let (mut send_relay, _) = RelayClient::new(&relay_url);
-    let (mut recv_relay, mut events) = RelayClient::new(&relay_url);
-    common::setup_relay_auth(&relay_url, &mut send_relay, &s.sender).await;
-    common::setup_relay_auth(&relay_url, &mut recv_relay, &s.receiver).await;
+    let (send_relay, _) = RelayClient::new(&relay_url);
+    let (recv_relay, mut events) = RelayClient::new(&relay_url);
+    common::setup_relay_auth(&relay_url, &send_relay, &s.sender).await;
+    common::setup_relay_auth(&relay_url, &recv_relay, &s.receiver).await;
+    publish_group(&send_relay, &s).await;
     send_relay.subscribe(s.mailbox_id, 0);
     recv_relay.subscribe(s.mailbox_id, 0);
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -37,7 +56,7 @@ async fn message_metadata_preserved_through_relay() {
             2000,
         )
         .unwrap();
-    send_relay.send(&s.mailbox_id, outbound.blob).await.unwrap();
+    send_relay.send(&s.mailbox_id, outbound.blob).unwrap();
 
     let incoming = recv_blob(&mut events).await;
     let msg = s
@@ -79,23 +98,14 @@ struct TwoClientSetup {
     channel_id: [u8; 32],
 }
 
+/// Tell the relay the group's state, as creating a server does, so it knows the epoch
+/// posts must name.
+async fn publish_group(relay: &RelayClient, s: &TwoClientSetup) {
+    relay.put_server_info(&s.mailbox_id, s.sender.export_server_info(&s.server_id).unwrap()).await.unwrap();
+}
+
 fn register_identity_in_cache(client: &mut GhostClient, identity: &Identity) {
-    use ghost_wire::idlog::{DeviceInfo, LogState};
-    use std::collections::HashMap;
-    let mut devices = HashMap::new();
-    devices.insert(
-        identity.verifying_key.to_bytes(),
-        DeviceInfo {
-            verifying_key: identity.verifying_key.to_bytes(),
-            label: "test".to_string(),
-            added_at_seq: 1,
-            revoked_at_seq: None,
-        },
-    );
-    let mut state = LogState::empty(identity.fingerprint);
-    state.devices = devices;
-    state.head_seq = 1;
-    client.cache_own_identity_log(state);
+    client.cache_identity_chain(&[identity.own_genesis()]).unwrap();
 }
 
 fn setup_two_clients(sender_seed: [u8; 32], receiver_seed: [u8; 32]) -> TwoClientSetup {
@@ -111,20 +121,19 @@ fn setup_two_clients(sender_seed: [u8; 32], receiver_seed: [u8; 32]) -> TwoClien
     // Register each other's identities for credential validation
     register_identity_in_cache(&mut sender, &id_receiver);
     register_identity_in_cache(&mut receiver, &id_sender);
+    // Groups name a relay as external sender; these tests need no proposals from it.
+    sender.set_relay_vk([0x7E; 32]);
 
     let server_id = sender
         .create_server("test", ServerKind::Server, 1000)
         .unwrap();
-    let kp = receiver.generate_key_package().unwrap();
-    let recv_fp = *receiver.fingerprint();
-    let recv_name = receiver.identity().display_name.clone();
-    let (_, welcome_bytes) = sender
-        .invite_member(&server_id, kp, recv_fp, &recv_name, 1000)
-        .unwrap();
-    sender.merge_pending_commit_for_server(&server_id).unwrap();
-    receiver
-        .join_server(&server_id, &welcome_bytes, "test", ServerKind::Server, 1000)
-        .unwrap();
+    // The receiver joins by external commit on the sender's group state, as invites work.
+    let invite = sender.create_invite(&server_id, u64::MAX).unwrap();
+    let payload = receiver.open_invite(&invite.sealed_payload, &invite.key).unwrap();
+    let group_info = sender.export_server_info(&server_id).unwrap();
+    let (_, channel_results, _) = receiver.join_by_invite(payload, group_info, 1000).unwrap();
+    let (channel_id, commit, _) = &channel_results[0];
+    sender.receive_any(channel_id, commit, Some(1000)).unwrap();
 
     let mls_gid = derive_mls_group_id(&server_id, &derive_default_channel_id(&server_id));
     let mailbox_id = mls_group_mailbox_id(&mls_gid);
@@ -144,10 +153,11 @@ async fn multiple_messages_in_order() {
     let relay_url = common::start_relay().await;
     let mut s = setup_two_clients([0x10; 32], [0x11; 32]);
 
-    let (mut send_relay, _) = RelayClient::new(&relay_url);
-    let (mut recv_relay, mut events) = RelayClient::new(&relay_url);
-    common::setup_relay_auth(&relay_url, &mut send_relay, &s.sender).await;
-    common::setup_relay_auth(&relay_url, &mut recv_relay, &s.receiver).await;
+    let (send_relay, _) = RelayClient::new(&relay_url);
+    let (recv_relay, mut events) = RelayClient::new(&relay_url);
+    common::setup_relay_auth(&relay_url, &send_relay, &s.sender).await;
+    common::setup_relay_auth(&relay_url, &recv_relay, &s.receiver).await;
+    publish_group(&send_relay, &s).await;
     send_relay.subscribe(s.mailbox_id, 0);
     recv_relay.subscribe(s.mailbox_id, 0);
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -168,7 +178,6 @@ async fn multiple_messages_in_order() {
             .unwrap();
         send_relay
             .send(&s.mailbox_id, outbound.blob)
-            .await
             .unwrap();
     }
 
@@ -190,10 +199,11 @@ async fn bidirectional_messaging() {
     let mut s = setup_two_clients([0x20; 32], [0x21; 32]);
 
     // Both sides share one relay connection each, both subscribe
-    let (mut relay_a, mut events_a) = RelayClient::new(&relay_url);
-    let (mut relay_b, mut events_b) = RelayClient::new(&relay_url);
-    common::setup_relay_auth(&relay_url, &mut relay_a, &s.sender).await;
-    common::setup_relay_auth(&relay_url, &mut relay_b, &s.receiver).await;
+    let (relay_a, mut events_a) = RelayClient::new(&relay_url);
+    let (relay_b, mut events_b) = RelayClient::new(&relay_url);
+    common::setup_relay_auth(&relay_url, &relay_a, &s.sender).await;
+    common::setup_relay_auth(&relay_url, &relay_b, &s.receiver).await;
+    publish_group(&relay_a, &s).await;
     relay_a.subscribe(s.mailbox_id, 0);
     relay_b.subscribe(s.mailbox_id, 0);
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -209,7 +219,7 @@ async fn bidirectional_messaging() {
             3000,
         )
         .unwrap();
-    relay_a.send(&s.mailbox_id, out_a.blob).await.unwrap();
+    relay_a.send(&s.mailbox_id, out_a.blob).unwrap();
 
     let incoming_b = recv_blob(&mut events_b).await;
     let msg_at_b = s
@@ -230,7 +240,7 @@ async fn bidirectional_messaging() {
             3001,
         )
         .unwrap();
-    relay_b.send(&s.mailbox_id, out_b.blob).await.unwrap();
+    relay_b.send(&s.mailbox_id, out_b.blob).unwrap();
 
     let incoming_a = recv_blob(&mut events_a).await;
     let msg_at_a = s
@@ -248,9 +258,10 @@ async fn self_message_not_echoed_as_new() {
 
     // The relay skips echoing a blob back on the same WS connection that sent it.
     // Use a separate connection to send vs receive so the blob is delivered.
-    let (mut send_relay, _) = RelayClient::new(&relay_url);
-    let (mut listen_relay, mut events) = RelayClient::new(&relay_url);
-    common::setup_relay_auth(&relay_url, &mut send_relay, &s.sender).await;
+    let (send_relay, _) = RelayClient::new(&relay_url);
+    let (listen_relay, mut events) = RelayClient::new(&relay_url);
+    common::setup_relay_auth(&relay_url, &send_relay, &s.sender).await;
+    publish_group(&send_relay, &s).await;
     // Same identity — genesis already pushed, just set auth on the second connection
     listen_relay.set_auth(
         *s.sender.fingerprint(),
@@ -273,7 +284,6 @@ async fn self_message_not_echoed_as_new() {
         .unwrap();
     send_relay
         .send(&s.mailbox_id, outbound.blob)
-        .await
         .unwrap();
 
     // The listen connection receives the blob (different WS conn, so relay delivers it)
@@ -291,110 +301,140 @@ async fn self_message_not_echoed_as_new() {
 }
 
 #[tokio::test]
-async fn invite_with_real_key_package() {
+async fn a_silent_connection_is_dropped_and_reopened() {
+    // A relay that never pings: the only thing keeping the connection alive is the
+    // client noticing the silence.
+    let mut config = common::relay_config(30);
+    config.ws_ping_secs = 3600;
+    let relay = common::start_relay_with(config).await;
+    let s = setup_two_clients([0x01; 32], [0x02; 32]);
+    let (client, mut events) = RelayClient::new(&relay.url());
+    common::setup_relay_auth(&relay.url(), &client, &s.sender).await;
+    client.set_ws_silence_limit(Duration::from_millis(300));
+    client.subscribe(s.mailbox_id, 0);
+
+    let mut seen = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while seen != [true, false, true] {
+        let event = tokio::time::timeout_at(deadline, events.recv()).await.expect("the connection reopened after going quiet");
+        if let Some(RelayEvent::ConnectionState { connected, .. }) = event {
+            seen.push(connected);
+        }
+    }
+}
+
+/// A stand-in relay that completes the WebSocket handshake, reads the resume point and
+/// then does only what it is told: `talks` sends a frame every 50 ms, `listens` reads
+/// whatever the client sends. Each new connection is served the same way.
+async fn bare_relay(talks: bool, listens: bool) -> String {
+    use futures_util::{SinkExt, StreamExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let Ok(ws) = tokio_tungstenite::accept_async(socket).await else { return };
+                let (mut sink, mut stream) = ws.split();
+                let _resume_point = stream.next().await;
+                let reader = async {
+                    if listens {
+                        while stream.next().await.is_some() {}
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                };
+                let talker = async {
+                    if !talks {
+                        return std::future::pending::<()>().await;
+                    }
+                    while sink.send(tokio_tungstenite::tungstenite::Message::text("{}")).await.is_ok() {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                };
+                tokio::select! {
+                    _ = reader => {}
+                    _ = talker => {}
+                }
+            });
+        }
+    });
+    format!("http://{addr}")
+}
+
+/// Waits for the connection to come up, drop and come up again.
+async fn reopened(events: &mut tokio::sync::mpsc::Receiver<RelayEvent>, within: Duration, what: &str) {
+    let mut seen = Vec::new();
+    let deadline = tokio::time::Instant::now() + within;
+    while seen != [true, false, true] {
+        let event = tokio::time::timeout_at(deadline, events.recv()).await.unwrap_or_else(|_| panic!("{what}"));
+        if let Some(RelayEvent::ConnectionState { connected, .. }) = event {
+            seen.push(connected);
+        }
+    }
+}
+
+/// A relay that keeps talking but takes nothing: the client's writes stall, and the
+/// connection is reopened rather than left stuck with its outbox filling behind it.
+#[tokio::test]
+async fn a_connection_whose_writes_stall_is_reopened() {
+    let url = bare_relay(true, false).await;
+    let (client, mut events) = RelayClient::new(&url);
+    client.set_ws_silence_limit(Duration::from_millis(300));
+    let mailbox_id = [0x31; 32];
+    client.subscribe(mailbox_id, 0);
+    // Far more than the socket buffers hold; what the connection holds goes out once it is up.
+    let chunk = "x".repeat(64 * 1024);
+    for _ in 0..400 {
+        client.send_text(&mailbox_id, chunk.clone()).unwrap();
+    }
+    reopened(&mut events, Duration::from_secs(10), "a stalled connection was never reopened").await;
+}
+
+/// A relay gone quiet is noticed however often the client sends: silence counts from the
+/// last frame heard.
+#[tokio::test]
+async fn a_quiet_relay_is_noticed_while_the_client_keeps_sending() {
+    let url = bare_relay(false, true).await;
+    let (client, mut events) = RelayClient::new(&url);
+    let client = std::sync::Arc::new(client);
+    client.set_ws_silence_limit(Duration::from_millis(300));
+    let mailbox_id = [0x32; 32];
+    client.subscribe(mailbox_id, 0);
+    let sender = client.clone();
+    let chatter = tokio::spawn(async move {
+        loop {
+            let _ = sender.send_text(&mailbox_id, "{}".into());
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    });
+    reopened(&mut events, Duration::from_secs(3), "a quiet relay was not noticed while the client kept sending").await;
+    chatter.abort();
+}
+
+/// A relay that answers but does not admit this device to a mailbox is reported once per
+/// run of refusals, not on every retry.
+#[tokio::test]
+async fn a_mailbox_the_relay_refuses_is_reported_once() {
     let relay_url = common::start_relay().await;
+    let s = setup_two_clients([0x01; 32], [0x02; 32]);
+    let (sender_relay, _) = RelayClient::new(&relay_url);
+    common::setup_relay_auth(&relay_url, &sender_relay, &s.sender).await;
+    publish_group(&sender_relay, &s).await;
 
-    let id_inviter = Identity::from_seed([0x40; 32]).unwrap();
-    let id_joiner = Identity::from_seed([0x41; 32]).unwrap();
-    let mut inviter =
-        GhostClient::open_in_memory(Identity::from_seed([0x40; 32]).unwrap(), [0x40; 32]).unwrap();
-    let mut joiner =
-        GhostClient::open_in_memory(Identity::from_seed([0x41; 32]).unwrap(), [0x41; 32]).unwrap();
+    // A third account the relay knows, but the group does not list.
+    let outsider = GhostClient::open_in_memory(Identity::from_seed([0x03; 32]).unwrap(), [0x03; 32]).unwrap();
+    let (outsider_relay, mut events) = RelayClient::new(&relay_url);
+    common::setup_relay_auth(&relay_url, &outsider_relay, &outsider).await;
+    outsider_relay.subscribe(s.mailbox_id, 0);
 
-    // Register identities for credential validation
-    register_identity_in_cache(&mut inviter, &id_joiner);
-    register_identity_in_cache(&mut joiner, &id_inviter);
-
-    // Inviter creates a server
-    let server_id = inviter
-        .create_server("real-invite", ServerKind::Server, 1000)
-        .unwrap();
-
-    // Joiner generates a real MLS key package and serializes it
-    let kp = joiner.generate_key_package().unwrap();
-    let kp_bytes = kp.tls_serialize_detached().unwrap();
-
-    let token = "real-invite-token";
-    let (mut relay_inviter, _) = RelayClient::new(&relay_url);
-    let (mut relay_joiner, _) = RelayClient::new(&relay_url);
-    common::setup_relay_auth(&relay_url, &mut relay_inviter, &inviter).await;
-    common::setup_relay_auth(&relay_url, &mut relay_joiner, &joiner).await;
-
-    // Relay invite flow: register, post key package, retrieve it
-    relay_inviter
-        .register_invite(token, u64::MAX)
-        .await
-        .unwrap();
-    relay_joiner
-        .put_invite_payload(token, 0, kp_bytes.clone())
-        .await
-        .unwrap();
-
-    let (seq, retrieved_kp_bytes) = relay_inviter.get_invite_payload(token).await.unwrap().unwrap();
-    assert_eq!(seq, 1);
-    assert_eq!(retrieved_kp_bytes, kp_bytes);
-
-    // Deserialize and validate the key package on the inviter side
-    let kp_in = KeyPackageIn::tls_deserialize_exact(&retrieved_kp_bytes).unwrap();
-    let crypto = RustCrypto::default();
-    let validated_kp = kp_in.validate(&crypto, ProtocolVersion::Mls10).unwrap();
-
-    // Inviter adds the joiner using the real key package
-    let joiner_fp = *joiner.fingerprint();
-    let joiner_name = joiner.identity().display_name.clone();
-    let (_, welcome_bytes) = inviter
-        .invite_member(&server_id, validated_kp, joiner_fp, &joiner_name, 2000)
-        .unwrap();
-    inviter.merge_pending_commit_for_server(&server_id).unwrap();
-
-    // Send welcome bytes back through the relay
-    relay_inviter
-        .post_accept(token, welcome_bytes.clone())
-        .await
-        .unwrap();
-    let retrieved_welcome = relay_joiner.get_accept(token).await.unwrap();
-    assert_eq!(retrieved_welcome, welcome_bytes);
-
-    // Joiner processes the welcome
-    joiner
-        .join_server(
-            &server_id,
-            &retrieved_welcome,
-            "real-invite",
-            ServerKind::Server,
-            2000,
-        )
-        .unwrap();
-
-    // Verify both can exchange encrypted messages through the relay
-    let mls_gid = derive_mls_group_id(&server_id, &derive_default_channel_id(&server_id));
-    let mailbox_id = mls_group_mailbox_id(&mls_gid);
-    let channel_id = derive_default_channel_id(&server_id);
-
-    let (mut inv_relay, _) = RelayClient::new(&relay_url);
-    let (mut join_relay, mut join_events) = RelayClient::new(&relay_url);
-    // Genesis already pushed above — just set auth
-    inv_relay.set_auth(*inviter.fingerprint(), inviter.verifying_key_bytes(), inviter.signing_key_clone());
-    join_relay.set_auth(*joiner.fingerprint(), joiner.verifying_key_bytes(), joiner.signing_key_clone());
-    inv_relay.subscribe(mailbox_id, 0);
-    join_relay.subscribe(mailbox_id, 0);
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    let (outbound, _) = inviter
-        .send_message(
-            &server_id,
-            &channel_id,
-            b"welcome aboard".to_vec(),
-            vec![],
-            3000,
-        )
-        .unwrap();
-    inv_relay.send(&mailbox_id, outbound.blob).await.unwrap();
-
-    let incoming = recv_blob(&mut join_events).await;
-    let msg = joiner
-        .receive_blob(&channel_id, &incoming.payload, Some(incoming.received_at))
-        .unwrap();
-    assert_eq!(msg.content, b"welcome aboard");
-    assert_eq!(msg.sender_fp, *inviter.fingerprint());
+    let mut refusals = 0;
+    let until = tokio::time::Instant::now() + Duration::from_secs(4);
+    while let Ok(Some(event)) = tokio::time::timeout_at(until, events.recv()).await {
+        match event {
+            RelayEvent::Refused { mailbox_id, .. } if mailbox_id == s.mailbox_id => refusals += 1,
+            RelayEvent::ConnectionState { connected: true, .. } => panic!("the relay admitted an outsider"),
+            _ => {}
+        }
+    }
+    assert_eq!(refusals, 1, "a refusal is reported once, however often the connection retries");
 }

@@ -1,4 +1,5 @@
 import { createSignal, createEffect, createMemo, For, Show, onMount, onCleanup, batch } from "solid-js";
+import { notify } from "../lib/notices";
 import { Dialog as KDialog } from "@kobalte/core/dialog";
 import { X } from "lucide-solid";
 import { cn } from "../lib/cn";
@@ -74,13 +75,15 @@ export function CommandPalette() {
     return cmd.args[argPills().length] ?? null;
   });
 
+  // The palette has closed by the time a command fails, so the failure is shown as a notice.
   const runCommand = (cmd: CommandDef, args: Record<string, string>) => {
     recordUsage(cmd.id);
+    const failed = (e: unknown) => notify(`${cmd.command}: ${String(e)}`);
     try {
       const result = cmd.execute(args);
-      if (result instanceof Promise) result.catch((e) => console.error(`command "${cmd.command}" failed:`, e));
+      if (result instanceof Promise) result.catch(failed);
     } catch (e) {
-      console.error(`command "${cmd.command}" failed:`, e);
+      failed(e);
     }
   };
 

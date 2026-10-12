@@ -6,6 +6,7 @@
 
 use std::path::PathBuf;
 
+use ghost_core::account_keys::RecoveryKey;
 use ghost_core::session::{ClientEvent, ServerScope};
 use ghost_core::voice::VoiceEvent;
 use ghost_node::Device;
@@ -35,6 +36,9 @@ enum Command {
     /// What the synthetic microphone hears: a tone, or silence at amplitude 0.
     Tone { frequency: f32, amplitude: f32 },
 }
+
+/// Daily log files, inside the data directory.
+const LOG_DIR: &str = "logs";
 
 struct Args {
     data_dir: PathBuf,
@@ -77,7 +81,10 @@ fn event_json(event: &ClientEvent) -> Value {
         ClientEvent::ServerChanged(ServerScope::One(id)) => json!({ "event": "server_changed", "server": hex::encode(id) }),
         ClientEvent::ServerChanged(ServerScope::All) => json!({ "event": "server_changed", "server": "all" }),
         ClientEvent::Kicked(id) => json!({ "event": "kicked", "server": hex::encode(id) }),
-        ClientEvent::RelayConnectivity(connected) => json!({ "event": "relay_connectivity", "connected": connected }),
+        ClientEvent::ServerHalted { server_id, reason } => json!({ "event": "server_halted", "server": hex::encode(server_id), "reason": reason }),
+        ClientEvent::RelayConnectivity(c) => {
+            json!({ "event": "relay_connectivity", "home": c.home, "any": c.any, "relays_down": c.relays_down, "relays_refusing": c.relays_refusing })
+        }
         ClientEvent::Voice(VoiceEvent::State(state)) => json!({
             "event": "voice_state",
             "connected": state.connected,
@@ -89,6 +96,13 @@ fn event_json(event: &ClientEvent) -> Value {
             json!({ "event": "voice_participants", "participants": everyone.iter().map(hex::encode).collect::<Vec<_>>() })
         }
         ClientEvent::Voice(VoiceEvent::Error(message)) => json!({ "event": "voice_error", "message": message }),
+        ClientEvent::MessageDelivered { message_id } => json!({ "event": "message_delivered", "message": hex::encode(message_id) }),
+        ClientEvent::MessageFailed { message_id, reason } => {
+            json!({ "event": "message_failed", "message": hex::encode(message_id), "reason": reason })
+        }
+        ClientEvent::SplitView { server_id, account_fp } => {
+            json!({ "event": "split_view", "server": hex::encode(server_id), "account": hex::encode(account_fp) })
+        }
         other => json!({ "event": "other", "debug": format!("{other:?}") }),
     }
 }
@@ -109,13 +123,13 @@ async fn run(device: &Device, command: Command) -> Result<Value, String> {
             let server_id = device.join(&token, &id32(&key)?).await.map_err(fail)?;
             Ok(json!({ "server": hex::encode(server_id) }))
         }
-        Command::Say { server, channel, text } => {
-            device.say(&id32(&server)?, &id32(&channel)?, &text).await.map_err(fail)?;
-            Ok(json!({}))
-        }
+        Command::Say { server, channel, text } => match device.say(&id32(&server)?, &id32(&channel)?, &text).await.map_err(fail)? {
+            ghost_core::flows::messages::Landed::Delivered { seq } => Ok(json!({ "delivered": seq })),
+            ghost_core::flows::messages::Landed::Queued => Ok(json!({ "queued": true })),
+        },
         Command::Kick { server, member } => {
-            let accepted = device.kick(&id32(&server)?, &id32(&member)?).await.map_err(fail)?;
-            Ok(json!({ "accepted": accepted }))
+            device.kick(&id32(&server)?, &id32(&member)?).await.map_err(fail)?;
+            Ok(json!({}))
         }
         Command::JoinVoice { server, channel } => {
             device.voice().join(id32(&server)?, id32(&channel)?, false, false).await.map_err(fail)?;
@@ -145,14 +159,18 @@ async fn main() {
             std::process::exit(2);
         }
     };
-    let device = match &args.create {
-        Some(label) => Device::create(&args.data_dir, &args.relay, label).await,
-        None => Device::open(&args.data_dir, &args.relay),
+    let _log = ghost_log::init(Some(ghost_log::LogFile { dir: args.data_dir.join(LOG_DIR), stem: "ghost-node" }));
+    // A new account's recovery key goes to whoever started the device, once, in the
+    // ready line; the device keeps no copy.
+    let created_key = args.create.as_ref().map(|_| RecoveryKey::generate());
+    let device = match (&args.create, &created_key) {
+        (Some(label), Some(key)) => Device::create(&args.data_dir, &args.relay, label, key).await,
+        _ => Device::open(&args.data_dir, &args.relay),
     };
     let mut device = match device {
         Ok(device) => device,
         Err(e) => {
-            eprintln!("ghost-node: {e}");
+            tracing::error!("the device did not open: {e}");
             std::process::exit(1);
         }
     };
@@ -179,7 +197,11 @@ async fn main() {
     });
 
     device.start();
-    let _ = out_tx.send(json!({ "event": "ready", "fingerprint": hex::encode(device.fingerprint().await) }));
+    let mut ready = json!({ "event": "ready", "fingerprint": hex::encode(device.fingerprint().await) });
+    if let Some(key) = &created_key {
+        ready["recovery_key"] = json!(key.encode());
+    }
+    let _ = out_tx.send(ready);
 
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     while let Ok(Some(line)) = lines.next_line().await {

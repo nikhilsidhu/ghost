@@ -1,15 +1,36 @@
 import { createSignal, createMemo, For, Show, onMount, onCleanup, type Component } from "solid-js";
-import { getDevices, revokeDevice, startPairing, checkPairing, cancelPairing, getRecoveryCode, hasRecoveryBlob, changeRecoveryPassphrase } from "../../lib/api";
+import {
+  getDevices, revokeDevice, startPairing, checkPairing, confirmPairing, cancelPairing,
+  checkRecoveryKey, beginReplaceRecoveryKey, confirmNewRecoveryKey, cancelNewRecoveryKey, moveHome, getAccountStatus, renameDevice,
+} from "../../lib/api";
 import { SettingGroup } from "./controls";
 import { cn } from "../../lib/cn";
-import { KeySquare, Check, Monitor, Smartphone, Plus, X, Loader, QrCode, Link2, Copy, ShieldAlert } from "lucide-solid";
+import { KeySquare, Check, Monitor, Smartphone, Plus, X, Loader, QrCode, Link2, Pencil } from "lucide-solid";
+import { Button } from "../ui/button";
 import { Tooltip } from "../ui/tooltip";
 import { encode } from "uqr";
-import type { Device } from "../../lib/types";
+import type { Device, PairingStatus, RevokeOutcome } from "../../lib/types";
+import { PAIRING_TTL_MS } from "../../lib/types";
+import { RecoveryKeySteps } from "../RecoveryKeySteps";
+import { connectivity } from "../../lib/store";
+import { errorCode } from "../../lib/invoke";
+
+/** What became of a removal, when there is more to say than that it is done. */
+const describeRevoke = (outcome: RevokeOutcome): string | null => {
+  switch (outcome.outcome) {
+    case "leaves_left":
+      return `removed. ${outcome.servers.join(", ") || "some servers"} still hold it until their relays take it out, which they do on their own.`;
+    case "log_pending":
+      return "your home relay can't be reached, so the removal waits for it. it finishes, and sync resumes, once it is back.";
+    default:
+      return null;
+  }
+};
 
 const FLASH_MS = 1200;
-const POLL_INTERVAL = 3000;
-const PAIRING_TIMEOUT = 5 * 60 * 1000; // 5 minutes
+const POLL_INTERVAL = 2000;
+// The relay ends the session then, and the new device waits at least as long.
+const PAIRING_TIMEOUT = PAIRING_TTL_MS;
 
 function deviceIcon(label: string): Component<{ size: number }> {
   const lower = label.toLowerCase();
@@ -39,42 +60,61 @@ function PairingQr(props: { data: string; size: number }) {
   );
 }
 
+const inputClass = "w-full h-8 rounded px-3 text-xs bg-[var(--neutral-800)] text-[var(--neutral-100)] placeholder:text-[var(--neutral-600)] border border-[var(--neutral-700)] focus:border-[var(--purple-500)] outline-none";
+
 export default function DevicesSettings() {
   const [devices, setDevices] = createSignal<Device[]>([]);
+  // Whether the list is the home's word now, rather than as this device last saw it.
+  const [listCurrent, setListCurrent] = createSignal(true);
+  const [notice, setNotice] = createSignal<string | null>(null);
   const [loading, setLoading] = createSignal(true);
   const [error, setError] = createSignal<string | null>(null);
+  const homeDown = () => !connectivity().home;
   const [revoking, setRevoking] = createSignal<string | null>(null);
   const [copiedKey, setCopiedKey] = createSignal<string | null>(null);
-
-  // Recovery state
-  const [hasRecovery, setHasRecovery] = createSignal<boolean | null>(null);
-  const [recCode, setRecCode] = createSignal<string | null>(null);
-  const [recCodeCopied, setRecCodeCopied] = createSignal(false);
-  const [changingPassphrase, setChangingPassphrase] = createSignal(false);
-  const [currentPp, setCurrentPp] = createSignal("");
-  const [newPp, setNewPp] = createSignal("");
-  const [confirmPp, setConfirmPp] = createSignal("");
-  const [changeError, setChangeError] = createSignal<string | null>(null);
-  const [changeLoading, setChangeLoading] = createSignal(false);
-  const [changeSuccess, setChangeSuccess] = createSignal(false);
+  // The device whose label is being edited, and the label as typed so far.
+  const [renaming, setRenaming] = createSignal<string | null>(null);
+  const [newLabel, setNewLabel] = createSignal("");
+  const [homeRelay, setHomeRelay] = createSignal("");
 
   // Pairing state
   const [pairingCode, setPairingCode] = createSignal<string | null>(null);
-  const [pairingStatus, setPairingStatus] = createSignal<string>("waiting for new device…");
+  const [pairing, setPairing] = createSignal<PairingStatus | null>(null);
   const [pairingError, setPairingError] = createSignal<string | null>(null);
+  const [linkedLabel, setLinkedLabel] = createSignal<string | null>(null);
   const [showQr, setShowQr] = createSignal(false);
   const [linkCopied, setLinkCopied] = createSignal(false);
   const [pairingStarting, setPairingStarting] = createSignal(false);
   let pollTimer: ReturnType<typeof setInterval> | undefined;
   let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
 
+  // Recovery key state
+  const [keyToCheck, setKeyToCheck] = createSignal("");
+  const [checkResult, setCheckResult] = createSignal<"current" | "not" | null>(null);
+  // Whether the check read the home's log now, rather than this device's last look.
+  const [checkedNow, setCheckedNow] = createSignal(true);
+  const [replacing, setReplacing] = createSignal(false);
+  const [currentForReplace, setCurrentForReplace] = createSignal("");
+  const [shownNewKey, setShownNewKey] = createSignal<string | null>(null);
+  const [keyError, setKeyError] = createSignal<string | null>(null);
+  const [keyBusy, setKeyBusy] = createSignal(false);
+  const [replaced, setReplaced] = createSignal(false);
+
+  // Home relay state
+  const [moving, setMoving] = createSignal(false);
+  const [moveKey, setMoveKey] = createSignal("");
+  const [moveRelay, setMoveRelay] = createSignal("");
+  const [moveError, setMoveError] = createSignal<string | null>(null);
+  const [moveBusy, setMoveBusy] = createSignal(false);
+
   const load = async () => {
     setLoading(true);
     setError(null);
     try {
       const list = await getDevices();
-      list.sort((a, b) => a.added_at_seq - b.added_at_seq);
-      setDevices(list);
+      list.devices.sort((a, b) => a.added_at_seq - b.added_at_seq);
+      setDevices(list.devices);
+      setListCurrent(list.current);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -84,9 +124,7 @@ export default function DevicesSettings() {
 
   onMount(() => {
     load();
-    // Load recovery status
-    hasRecoveryBlob().then(setHasRecovery).catch(() => setHasRecovery(false));
-    getRecoveryCode().then(setRecCode).catch((e) => console.error("getRecoveryCode:", e));
+    getAccountStatus().then((s) => setHomeRelay(s.relay_url)).catch(() => {});
   });
 
   onCleanup(() => {
@@ -102,17 +140,32 @@ export default function DevicesSettings() {
 
   const [revokeLoading, setRevokeLoading] = createSignal(false);
 
+  const startRename = (device: Device) => {
+    setNewLabel(device.label);
+    setRenaming(device.device_key);
+  };
+
+  const finishRename = async (device: Device) => {
+    const label = newLabel().trim();
+    setRenaming(null);
+    if (!label || label === device.label) return;
+    try {
+      await renameDevice(device.device_key, label);
+      await load();
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
   const handleRevoke = async (key: string) => {
     if (revoking() === key) {
       if (revokeLoading()) return;
       setRevokeLoading(true);
       try {
-        const complete = await revokeDevice(key);
+        const outcome = await revokeDevice(key);
         setRevoking(null);
         await load();
-        if (!complete) {
-          setError("Device removed from all servers, but the home relay is unreachable. Revoke again once it is back to finish.");
-        }
+        setNotice(describeRevoke(outcome));
       } catch (e) {
         setError(String(e));
       } finally {
@@ -123,51 +176,64 @@ export default function DevicesSettings() {
     }
   };
 
+  // ── Pairing ──
+
   const stopPairing = () => {
     if (pollTimer) { clearInterval(pollTimer); pollTimer = undefined; }
     if (timeoutTimer) { clearTimeout(timeoutTimer); timeoutTimer = undefined; }
   };
 
+  const endPairing = (err: string | null) => {
+    stopPairing();
+    setPairingCode(null);
+    setPairing(null);
+    setShowQr(false);
+    setPairingError(err);
+  };
+
+  const pollPairing = async () => {
+    try {
+      const status = await checkPairing();
+      setPairing(status);
+      if (status.stage === "linked") {
+        stopPairing();
+        setLinkedLabel(status.label);
+        setPairingCode(null);
+        setPairing(null);
+        setPairingError(null);
+        await load();
+      }
+    } catch (e) {
+      switch (errorCode(e)) {
+        // The pairing was ended here.
+        case "wrong_state":
+          endPairing(null);
+          break;
+        // The relay's session is gone: nothing more can come of it.
+        case "not_found":
+          endPairing(String(e));
+          break;
+        default:
+          setPairingError(String(e));
+      }
+    }
+  };
+
   const handleStartPairing = async () => {
-    if (pairingCode()) return; // already active
+    if (pairingCode()) return;
     setPairingStarting(true);
     setPairingError(null);
-    setPairingStatus("waiting for new device…");
+    setLinkedLabel(null);
     try {
       const code = await startPairing();
       setPairingCode(code);
+      setPairing({ stage: "waiting", code: null, label: null });
       setShowQr(false);
-
-      // 5-minute timeout
       timeoutTimer = setTimeout(() => {
-        stopPairing();
-        setPairingCode(null);
-        setPairingError("pairing session expired. try again.");
+        endPairing("pairing timed out. start again on both devices.");
         cancelPairing().catch(() => {});
       }, PAIRING_TIMEOUT);
-
-      pollTimer = setInterval(async () => {
-        try {
-          const label = await checkPairing();
-          if (label) {
-            stopPairing();
-            setPairingStatus("device linked!");
-            setPairingCode(null);
-            setPairingError(null);
-            await load();
-          }
-        } catch (e) {
-          const msg = String(e);
-          // "no active pairing session" means we already completed or cancelled
-          if (msg.includes("no active pairing")) {
-            stopPairing();
-            setPairingCode(null);
-          } else {
-            // transient error — keep polling, show error
-            setPairingError(msg);
-          }
-        }
-      }, POLL_INTERVAL);
+      pollTimer = setInterval(pollPairing, POLL_INTERVAL);
     } catch (e) {
       setPairingError(String(e));
     } finally {
@@ -175,51 +241,19 @@ export default function DevicesSettings() {
     }
   };
 
-  const handleCancelPairing = async () => {
-    stopPairing();
-    setPairingCode(null);
-    setPairingError(null);
-    setShowQr(false);
-    await cancelPairing().catch(() => {});
-  };
-
-  const copyRecoveryCode = () => {
-    const code = recCode();
-    if (!code) return;
-    navigator.clipboard.writeText(code).catch(() => {});
-    setRecCodeCopied(true);
-    setTimeout(() => setRecCodeCopied(false), FLASH_MS);
-  };
-
-  const newPpLongEnough = () => newPp().length >= 12;
-  const newPpMatch = () => confirmPp().length === 0 || newPp() === confirmPp();
-  const changePpReady = () => currentPp().length > 0 && newPpLongEnough() && confirmPp().length > 0 && newPpMatch();
-
-  const handleChangePassphrase = async () => {
-    if (!changePpReady()) return;
-    setChangeLoading(true);
-    setChangeError(null);
+  const handleCodesMatch = async () => {
     try {
-      await changeRecoveryPassphrase(currentPp(), newPp());
-      setChangingPassphrase(false);
-      setCurrentPp("");
-      setNewPp("");
-      setConfirmPp("");
-      setChangeSuccess(true);
-      setTimeout(() => setChangeSuccess(false), FLASH_MS);
-    } catch (e: any) {
-      const msg = String(e).toLowerCase();
-      if (msg.includes("decrypt") || msg.includes("aead") || msg.includes("passphrase")) {
-        setChangeError("wrong current passphrase");
-      } else {
-        setChangeError(String(e));
-      }
-    } finally {
-      setChangeLoading(false);
+      await confirmPairing();
+      setPairing((p) => (p ? { ...p, stage: "signing" } : p));
+    } catch (e) {
+      setPairingError(String(e));
     }
   };
 
-  const inputClass = "w-full h-8 rounded px-3 text-xs bg-[var(--neutral-800)] text-[var(--neutral-100)] placeholder:text-[var(--neutral-600)] border border-[var(--neutral-700)] focus:border-[var(--purple-500)] outline-none";
+  const handleCancelPairing = async () => {
+    endPairing(null);
+    await cancelPairing().catch(() => {});
+  };
 
   const copyLink = () => {
     const code = pairingCode();
@@ -229,9 +263,90 @@ export default function DevicesSettings() {
     setTimeout(() => setLinkCopied(false), FLASH_MS);
   };
 
+  // ── Recovery key ──
+
+  const handleCheckKey = async () => {
+    const key = keyToCheck().trim();
+    if (!key) return;
+    setKeyBusy(true);
+    setKeyError(null);
+    setCheckResult(null);
+    try {
+      const check = await checkRecoveryKey(key);
+      setCheckResult(check.matches ? "current" : "not");
+      setCheckedNow(check.current);
+    } catch (e) {
+      setKeyError(String(e));
+    } finally {
+      setKeyBusy(false);
+    }
+  };
+
+  const handleBeginReplace = async () => {
+    const current = currentForReplace().trim();
+    if (!current) return;
+    setKeyBusy(true);
+    setKeyError(null);
+    try {
+      setShownNewKey(await beginReplaceRecoveryKey(current));
+      setCurrentForReplace("");
+    } catch (e) {
+      setKeyError(String(e));
+    } finally {
+      setKeyBusy(false);
+    }
+  };
+
+  const confirmReplacement = async (typed: string) => {
+    await confirmNewRecoveryKey(typed);
+    setShownNewKey(null);
+    setReplacing(false);
+    setReplaced(true);
+    setTimeout(() => setReplaced(false), 3000);
+  };
+
+  const cancelReplacement = async () => {
+    await cancelNewRecoveryKey().catch(() => {});
+    setShownNewKey(null);
+    setReplacing(false);
+    setKeyError(null);
+  };
+
+  // ── Home relay ──
+
+  const handleMoveHome = async () => {
+    const key = moveKey().trim();
+    const relay = moveRelay().trim();
+    if (!key || !relay) return;
+    setMoveBusy(true);
+    setMoveError(null);
+    try {
+      await moveHome(key, relay);
+      setHomeRelay(relay);
+      setMoving(false);
+      setMoveKey("");
+      setMoveRelay("");
+    } catch (e) {
+      setMoveError(String(e));
+    } finally {
+      setMoveBusy(false);
+    }
+  };
+
   return (
     <div class="pb-4">
       <SettingGroup label="linked devices">
+        <Show when={homeDown()}>
+          <div class="py-2 text-xs text-[var(--amber-400)]">
+            your home relay can't be reached. linking a device waits for it, and a removal is recorded once it is back.
+          </div>
+        </Show>
+        <Show when={!loading() && !listCurrent()}>
+          <div class="py-2 text-xs text-[var(--neutral-500)]">this is your device list as this device last saw it.</div>
+        </Show>
+        <Show when={notice()}>
+          <div class="py-2 text-xs text-[var(--neutral-400)]">{notice()}</div>
+        </Show>
         <Show when={loading()}>
           <div class="py-3 text-xs text-[var(--neutral-500)]">loading…</div>
         </Show>
@@ -253,7 +368,23 @@ export default function DevicesSettings() {
                     </div>
                     <div class="min-w-0">
                       <div class="flex items-center gap-2">
-                        <span class="text-sm text-[var(--neutral-200)]">{device.label}</span>
+                        <Show
+                          when={renaming() === device.device_key}
+                          fallback={<span class="text-sm text-[var(--neutral-200)]">{device.label}</span>}
+                        >
+                          <input
+                            class={cn(inputClass, "h-7 w-44")}
+                            value={newLabel()}
+                            maxLength={64}
+                            autofocus
+                            onInput={(e) => setNewLabel(e.currentTarget.value)}
+                            onBlur={() => finishRename(device)}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter") finishRename(device);
+                              if (e.key === "Escape") setRenaming(null);
+                            }}
+                          />
+                        </Show>
                         <Show when={device.is_current}>
                           <span class="text-[10px] px-1.5 py-0.5 rounded bg-[var(--purple-500)]/20 text-[var(--purple-400)]">
                             this device
@@ -261,13 +392,33 @@ export default function DevicesSettings() {
                         </Show>
                         <Show when={!device.is_active}>
                           <span class="text-[10px] px-1.5 py-0.5 rounded bg-[var(--red-500)]/20 text-[var(--red-400)]">
-                            revoked
+                            removed
+                          </span>
+                        </Show>
+                        <Show when={device.removal_pending}>
+                          <span class="text-[10px] px-1.5 py-0.5 rounded bg-[var(--amber-500)]/20 text-[var(--amber-400)]">
+                            removal waiting
                           </span>
                         </Show>
                       </div>
+                      <Show when={device.removal_refused}>
+                        <p class="text-xs text-[var(--red-400)] mt-0.5">
+                          your home relay refused to record its removal: {device.removal_refused}. sync stays paused until one of your devices records it.
+                        </p>
+                      </Show>
                     </div>
                   </div>
                   <div class="flex items-center gap-2 flex-shrink-0">
+                    <Show when={device.is_active && renaming() !== device.device_key}>
+                      <Tooltip label="rename" placement="top">
+                        <button
+                          class="flex items-center justify-center text-[var(--neutral-500)] hover:text-[var(--neutral-400)] cursor-pointer"
+                          onClick={() => startRename(device)}
+                        >
+                          <Pencil size={14} />
+                        </button>
+                      </Tooltip>
+                    </Show>
                     <Tooltip label="copy device key" placement="top">
                       <button
                         class="flex items-center justify-center text-[var(--neutral-500)] hover:text-[var(--neutral-400)] cursor-pointer"
@@ -278,7 +429,7 @@ export default function DevicesSettings() {
                           : <KeySquare size={14} />}
                       </button>
                     </Tooltip>
-                    <Show when={device.is_active && !device.is_current}>
+                    <Show when={device.is_active && !device.is_current && !device.removal_pending}>
                       <button
                         class={cn(
                           "text-xs px-2.5 py-1 rounded cursor-pointer transition-colors duration-150",
@@ -289,7 +440,7 @@ export default function DevicesSettings() {
                         onClick={() => handleRevoke(device.device_key)}
                         onMouseLeave={() => setRevoking(null)}
                       >
-                        {revoking() === device.device_key ? "confirm revoke" : "revoke"}
+                        {revoking() === device.device_key ? "confirm removal" : "remove"}
                       </button>
                     </Show>
                   </div>
@@ -305,23 +456,25 @@ export default function DevicesSettings() {
         <Show when={pairingError() && !pairingCode()}>
           <div class="py-3 flex items-center gap-2">
             <p class="text-xs text-[var(--red-400)] flex-1">{pairingError()}</p>
-            <button
-              class="text-xs px-2.5 py-1 rounded cursor-pointer text-[var(--neutral-300)] hover:text-[var(--neutral-100)] border border-[var(--neutral-700)] hover:border-[var(--neutral-600)] transition-colors duration-150"
-              onClick={() => { setPairingError(null); handleStartPairing(); }}
-            >
+            <Button variant="outline" size="sm" onClick={() => { setPairingError(null); handleStartPairing(); }}>
               retry
-            </button>
+            </Button>
           </div>
+        </Show>
+        <Show when={linkedLabel() && !pairingCode()}>
+          <p class="py-3 text-xs text-[var(--emerald-400)]">{linkedLabel()} is linked.</p>
         </Show>
         <Show when={!pairingCode() && !pairingError()} fallback={
           <Show when={pairingCode()}>
             <div class="py-3">
               <div class="flex items-center justify-between mb-3">
                 <div class="flex flex-col gap-1">
-                  <div class="flex items-center gap-1.5 text-xs text-[var(--neutral-500)]">
-                    <Loader size={12} class="animate-spin" />
-                    <span>{pairingStatus()}</span>
-                  </div>
+                  <Show when={pairing()?.stage !== "confirm"}>
+                    <div class="flex items-center gap-1.5 text-xs text-[var(--neutral-500)]">
+                      <Loader size={12} class="animate-spin" />
+                      <span>{pairing()?.stage === "signing" ? "waiting for the new device to sign…" : "waiting for the new device…"}</span>
+                    </div>
+                  </Show>
                   <Show when={pairingError()}>
                     <p class="text-xs text-[var(--red-400)]">{pairingError()}</p>
                   </Show>
@@ -340,7 +493,7 @@ export default function DevicesSettings() {
                       <QrCode size={14} />
                     </button>
                   </Tooltip>
-                  <Tooltip label="copy link" placement="top">
+                  <Tooltip label="copy code" placement="top">
                     <button
                       class="flex items-center justify-center text-[var(--neutral-500)] hover:text-[var(--neutral-400)] cursor-pointer transition-colors duration-150"
                       onClick={copyLink}
@@ -360,6 +513,17 @@ export default function DevicesSettings() {
                   </Tooltip>
                 </div>
               </div>
+              <Show when={pairing()?.stage === "confirm"}>
+                <div class="flex flex-col gap-2 p-3 mb-3 rounded bg-[var(--neutral-800)] border border-[var(--neutral-700)]">
+                  <p class="text-xs text-[var(--neutral-400)]">the new device shows a code. does it match this one?</p>
+                  <p class="text-2xl text-center font-mono tracking-widest text-[var(--neutral-100)]">{pairing()?.code}</p>
+                  <div class="flex gap-2">
+                    <Button size="sm" class="flex-1" onClick={handleCodesMatch}>they match</Button>
+                    <Button size="sm" variant="outline" class="flex-1" onClick={handleCancelPairing}>they don't</Button>
+                  </div>
+                  <p class="text-xs text-[var(--neutral-600)]">a different code means someone else answered your pairing code. cancel and start again.</p>
+                </div>
+              </Show>
               <Show when={showQr()}>
                 <div class="flex justify-center mb-3">
                   <PairingQr data={pairingCode()!} size={180} />
@@ -369,128 +533,129 @@ export default function DevicesSettings() {
           </Show>
         }>
           <div class="py-3">
-            <button
-              class={cn(
-                "flex items-center gap-1.5 text-xs px-3 py-1.5 rounded cursor-pointer transition-colors duration-150",
-                "text-[var(--neutral-300)] hover:text-[var(--neutral-100)]",
-                "border border-[var(--neutral-700)] hover:border-[var(--neutral-600)]",
-              )}
-              onClick={handleStartPairing}
-              disabled={pairingStarting()}
-            >
+            <Button variant="outline" size="sm" onClick={handleStartPairing} disabled={pairingStarting() || homeDown()}>
               <Plus size={12} />
               {pairingStarting() ? "starting…" : "link new device"}
-            </button>
+            </Button>
           </div>
         </Show>
       </SettingGroup>
 
-      {/* Recovery section */}
-      <SettingGroup label="account recovery">
-        <Show when={hasRecovery() === null}>
-          <div class="py-3 text-xs text-[var(--neutral-500)]">checking recovery status…</div>
-        </Show>
-        <Show when={hasRecovery() === false}>
-          <div class="py-3 flex items-center gap-2">
-            <ShieldAlert size={14} class="text-[var(--red-400)] flex-shrink-0" />
-            <p class="text-xs text-[var(--red-400)]">recovery not configured — account cannot be recovered if all devices are lost</p>
-          </div>
-        </Show>
-        <Show when={hasRecovery() === true}>
-          <div class="py-3 flex flex-col gap-3">
-            <Show when={recCode()}>
-              <div>
-                <label class="text-xs text-[var(--neutral-400)] mb-1 block">recovery code</label>
-                <div class="flex items-center gap-2 p-2 rounded bg-[var(--neutral-800)] border border-[var(--neutral-700)]">
-                  <span class="text-xs text-[var(--neutral-200)] font-mono break-all flex-1">{recCode()}</span>
-                  <button
-                    class="flex-shrink-0 text-[var(--neutral-500)] hover:text-[var(--neutral-400)] cursor-pointer"
-                    onClick={copyRecoveryCode}
-                  >
-                    {recCodeCopied() ? <Check size={14} class="text-[var(--emerald-400)]" /> : <Copy size={14} />}
-                  </button>
-                </div>
-              </div>
-            </Show>
-
-            <Show when={!changingPassphrase()}>
-              <div class="flex items-center gap-2">
-                <button
-                  class={cn(
-                    "flex items-center gap-1.5 text-xs px-3 py-1.5 rounded cursor-pointer transition-colors duration-150 w-fit",
-                    "text-[var(--neutral-300)] hover:text-[var(--neutral-100)]",
-                    "border border-[var(--neutral-700)] hover:border-[var(--neutral-600)]",
-                  )}
-                  onClick={() => setChangingPassphrase(true)}
-                >
-                  change passphrase
-                </button>
-                <Show when={changeSuccess()}>
-                  <span class="text-xs text-emerald-400 flex items-center gap-1">
-                    <Check size={12} /> passphrase updated
-                  </span>
-                </Show>
-              </div>
-            </Show>
-
-            <Show when={changingPassphrase()}>
-              <div class="flex flex-col gap-2">
+      {/* Recovery key section */}
+      <SettingGroup label="recovery key">
+        <div class="py-3 flex flex-col gap-3">
+          <p class="text-xs text-[var(--neutral-400)]">
+            your recovery key is the only way back into your account if you lose every device. nobody stores it for you.
+            replacing it needs the current one.
+          </p>
+          <Show when={!replacing()}>
+            <div class="flex flex-col gap-2">
+              <label class="text-xs text-[var(--neutral-400)]">check a key against this account</label>
+              <div class="flex gap-2">
                 <input
-                  class={inputClass}
-                  type="password"
-                  placeholder="current passphrase"
-                  value={currentPp()}
-                  onInput={(e) => setCurrentPp(e.currentTarget.value)}
+                  class={`${inputClass} font-mono`}
+                  placeholder="XXXX-XXXX-XXXX-…"
+                  value={keyToCheck()}
+                  onInput={(e) => { setKeyToCheck(e.currentTarget.value); setCheckResult(null); }}
+                  onKeyDown={(e) => { if (e.key === "Enter") handleCheckKey(); }}
                 />
-                <div>
-                  <input
-                    class={inputClass}
-                    type="password"
-                    placeholder="new passphrase (at least 12 characters)"
-                    value={newPp()}
-                    onInput={(e) => setNewPp(e.currentTarget.value)}
-                  />
-                  <Show when={newPp().length > 0}>
-                    <p class={`text-[10px] mt-0.5 ${newPpLongEnough() ? "text-[var(--emerald-400)]" : "text-[var(--neutral-600)]"}`}>
-                      {newPp().length} / 12 characters
-                    </p>
-                  </Show>
-                </div>
-                <div>
-                  <input
-                    class={inputClass}
-                    type="password"
-                    placeholder="confirm new passphrase"
-                    value={confirmPp()}
-                    onInput={(e) => setConfirmPp(e.currentTarget.value)}
-                    onKeyDown={(e) => { if (e.key === "Enter") handleChangePassphrase(); }}
-                  />
-                  <Show when={confirmPp().length > 0 && !newPpMatch()}>
-                    <p class="text-[10px] mt-0.5 text-[var(--red-400)]">passphrases don't match</p>
-                  </Show>
-                </div>
-                <Show when={changeError()}>
-                  <p class="text-xs text-[var(--red-400)]">{changeError()}</p>
-                </Show>
-                <div class="flex gap-2">
-                  <button
-                    class="text-xs px-3 py-1.5 rounded cursor-pointer bg-[var(--purple-600)] text-white hover:bg-[var(--purple-500)] disabled:opacity-50 disabled:cursor-default"
-                    onClick={handleChangePassphrase}
-                    disabled={!changePpReady() || changeLoading()}
-                  >
-                    {changeLoading() ? "saving…" : "save"}
-                  </button>
-                  <button
-                    class="text-xs px-3 py-1.5 rounded cursor-pointer text-[var(--neutral-400)] hover:text-[var(--neutral-200)] border border-[var(--neutral-700)]"
-                    onClick={() => { setChangingPassphrase(false); setChangeError(null); setCurrentPp(""); setNewPp(""); setConfirmPp(""); }}
-                  >
-                    cancel
-                  </button>
-                </div>
+                <Button size="sm" variant="outline" onClick={handleCheckKey} disabled={!keyToCheck().trim() || keyBusy()}>check</Button>
               </div>
-            </Show>
-          </div>
-        </Show>
+              <Show when={checkResult() === "current"}>
+                <p class="text-xs text-[var(--emerald-400)] flex items-center gap-1"><Check size={12} /> that is this account's current recovery key</p>
+              </Show>
+              <Show when={checkResult() === "not"}>
+                <p class="text-xs text-[var(--red-400)]">that key does not open this account</p>
+              </Show>
+              <Show when={checkResult() && !checkedNow()}>
+                <p class="text-xs text-[var(--neutral-500)]">your home relay can't be reached, so this is as of this device's last look at your account.</p>
+              </Show>
+            </div>
+            <div class="flex items-center gap-2">
+              <Button variant="outline" size="sm" onClick={() => { setReplacing(true); setKeyError(null); }}>
+                replace recovery key
+              </Button>
+              <Show when={replaced()}>
+                <span class="text-xs text-[var(--emerald-400)] flex items-center gap-1"><Check size={12} /> key replaced</span>
+              </Show>
+            </div>
+          </Show>
+          <Show when={replacing() && !shownNewKey()}>
+            <div class="flex flex-col gap-2">
+              <label class="text-xs text-[var(--neutral-400)]">current recovery key</label>
+              <input
+                class={`${inputClass} font-mono`}
+                placeholder="XXXX-XXXX-XXXX-…"
+                value={currentForReplace()}
+                onInput={(e) => setCurrentForReplace(e.currentTarget.value)}
+                onKeyDown={(e) => { if (e.key === "Enter") handleBeginReplace(); }}
+                autofocus
+              />
+              <div class="flex gap-2">
+                <Button size="sm" onClick={handleBeginReplace} disabled={!currentForReplace().trim() || keyBusy()}>
+                  {keyBusy() ? "checking…" : "continue"}
+                </Button>
+                <Button variant="outline" size="sm" onClick={cancelReplacement}>cancel</Button>
+              </div>
+            </div>
+          </Show>
+          <Show when={shownNewKey()}>
+            {(key) => (
+              <RecoveryKeySteps
+                shown={key()}
+                purpose="this is your new recovery key. the old one stops working once you confirm it."
+                confirm={confirmReplacement}
+                onCancel={cancelReplacement}
+                confirmLabel="replace key"
+              />
+            )}
+          </Show>
+          <Show when={keyError()}>
+            <p class="text-xs text-[var(--red-400)]">{keyError()}</p>
+          </Show>
+        </div>
+      </SettingGroup>
+
+      {/* Home relay section */}
+      <SettingGroup label="home relay">
+        <div class="py-3 flex flex-col gap-3">
+          <p class="text-xs text-[var(--neutral-400)]">
+            your account lives on <span class="font-mono text-[var(--neutral-300)]">{homeRelay() || "…"}</span>. it records your devices and
+            carries sync between them. moving it needs your recovery key; servers you made there stay on it.
+          </p>
+          <Show when={!moving()}>
+            <div>
+              <Button variant="outline" size="sm" onClick={() => setMoving(true)}>move home relay</Button>
+            </div>
+          </Show>
+          <Show when={moving()}>
+            <div class="flex flex-col gap-2">
+              <input
+                class={inputClass}
+                placeholder="new relay url, e.g. http://relay:7700"
+                value={moveRelay()}
+                onInput={(e) => setMoveRelay(e.currentTarget.value)}
+                autofocus
+              />
+              <input
+                class={`${inputClass} font-mono`}
+                placeholder="recovery key"
+                value={moveKey()}
+                onInput={(e) => setMoveKey(e.currentTarget.value)}
+                onKeyDown={(e) => { if (e.key === "Enter") handleMoveHome(); }}
+              />
+              <Show when={moveError()}>
+                <p class="text-xs text-[var(--red-400)]">{moveError()}</p>
+              </Show>
+              <div class="flex gap-2">
+                <Button size="sm" onClick={handleMoveHome} disabled={!moveKey().trim() || !moveRelay().trim() || moveBusy()}>
+                  {moveBusy() ? "moving…" : "move"}
+                </Button>
+                <Button variant="outline" size="sm" onClick={() => { setMoving(false); setMoveError(null); setMoveKey(""); }}>cancel</Button>
+              </div>
+            </div>
+          </Show>
+        </div>
       </SettingGroup>
     </div>
   );

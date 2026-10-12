@@ -6,12 +6,26 @@ use tokio::sync::mpsc;
 
 use crate::session::{FrameSender, Inbound};
 
-/// The two ends of the media session a running track uses.
+/// The two ends of the media session a running track uses, and where it reports to the
+/// call.
 pub struct TrackIo {
     /// Where encoded frames go, each with its sequence number.
     pub sender: FrameSender,
     /// Decrypted frames from the other participants, and their departures.
     pub received: mpsc::Receiver<Inbound>,
+    /// What the call must know about the track; usable from the track's own threads.
+    pub events: mpsc::UnboundedSender<TrackEvent>,
+}
+
+/// What a running track tells the call about itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrackEvent {
+    /// Worth telling the user while the track runs on: a device went away and another
+    /// took its place.
+    Notice(String),
+    /// The track stopped for good (its devices failed to open, or failed for good); the
+    /// call has no audio.
+    Failed(String),
 }
 
 /// How playback is going, for the call quality indicator.

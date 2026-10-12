@@ -1,5 +1,9 @@
-pub const INVITE_EXPIRY_MS: u64 = 7 * 24 * 3600 * 1000;
 pub const DEFAULT_PAGE_SIZE: u32 = 50;
+/// The most the microphone gain may amplify.
+pub const INPUT_GAIN_MAX: f32 = 2.0;
+/// How long quitting waits for the relay connections to close, so relays show this
+/// device offline at once rather than after their grace period.
+pub const EXIT_CLOSE_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
 
 // Audio devices
 pub const AUDIO_CHANNELS: u16 = 1; // mono
@@ -11,3 +15,9 @@ pub const RING_CAPACITY: usize = 48_000;
 
 // Resampler sub-chunks (lower = less latency)
 pub const RESAMPLE_SUB_CHUNKS: usize = 2;
+
+/// Times a call's devices may be reopened after losing a device within
+/// `DEVICE_LOSS_WINDOW` before they count as failed for good: a device that errors as
+/// soon as it opens would otherwise be reopened every frame.
+pub const DEVICE_LOSS_LIMIT: usize = 3;
+pub const DEVICE_LOSS_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);

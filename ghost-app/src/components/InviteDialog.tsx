@@ -6,9 +6,25 @@ import { Button } from "./ui/button";
 interface Props {
   link: string | null;
   onClose: () => void;
-  /** Defaults describe an invite; a server move link passes its own. */
+  /** Defaults to an invite's title; a server move link passes its own. */
   title?: string;
-  note?: string;
+  /** What to know about the link, such as when it ends. */
+  note: string;
+}
+
+const MINUTE_MS = 60_000;
+const HOUR_MS = 60 * MINUTE_MS;
+const DAY_MS = 24 * HOUR_MS;
+
+const count = (n: number, unit: string) => `${n} ${unit}${n === 1 ? "" : "s"}`;
+
+/** When an invite ending at `expiresAt` ends, seen at `now`, in the largest whole unit. */
+export function expiryNote(expiresAt: number, now: number): string {
+  const left = expiresAt - now;
+  if (left <= 0) return "Expired";
+  if (left >= DAY_MS) return `Expires in ${count(Math.floor(left / DAY_MS), "day")}`;
+  if (left >= HOUR_MS) return `Expires in ${count(Math.floor(left / HOUR_MS), "hour")}`;
+  return `Expires in ${count(Math.max(1, Math.floor(left / MINUTE_MS)), "minute")}`;
 }
 
 function QrCode(props: { data: string; size: number }) {
@@ -70,7 +86,7 @@ export function InviteDialog(props: Props) {
           </div>
 
           <p class="text-xs" style={{ color: "var(--neutral-500)" }}>
-            {props.note ?? "Expires in 7 days"}
+            {props.note}
           </p>
         </div>
       </DialogContent>

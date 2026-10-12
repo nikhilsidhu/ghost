@@ -2,6 +2,7 @@ import { createSignal, createEffect, For, Show } from "solid-js";
 import type { JSX } from "solid-js";
 import type { Channel, VoiceQuality } from "../lib/types";
 import { Avatar } from "./ui/avatar";
+import { floatingClass, floatingStyle } from "./ui/popover";
 import { Tooltip } from "./ui/tooltip";
 import { HoverCard as KHoverCard } from "@kobalte/core/hover-card";
 import { cn } from "../lib/cn";
@@ -11,7 +12,7 @@ import {
 import {
   isInCall, isMuted, isDeafened, isPttMode, isPttKeyHeld, pttMuteAttempt, toggleMute, toggleDeafen, endCall,
   voiceParticipants, members, isSpeaking, voiceMuteStates, voiceQuality, identity,
-  isInVoiceChannel, voiceChannelMembers,
+  isInVoiceChannel, voiceChannelMembers, voiceError, voicePhase, voiceMediaPath,
 } from "../lib/store";
 import {
   createSortable,
@@ -151,31 +152,55 @@ export function VoiceChannelItem(props: {
   channel: Channel;
   active: boolean;
   onToggle: () => void;
+  /// Whether this member may drag it into a new position.
+  draggable: boolean;
 }) {
   const sortable = createSortable(props.channel.channel_id);
+  const shown = () => (voiceError()?.channelId === props.channel.channel_id ? voiceError() : null);
+  // How the call in this channel is doing, when it is not simply live.
+  const status = () => {
+    if (!props.active) return null;
+    if (voicePhase() === "joining") return "connecting…";
+    if (voicePhase() === "reconnecting") return "reconnecting…";
+    if (voiceMediaPath() === "blocked") return "no voice traffic reaches the voice server";
+    return null;
+  };
 
   return (
-    <button
-      ref={sortable.ref}
-      class={cn(
-        "w-full flex items-center gap-2 px-2 py-1.5 rounded-md text-sm text-left cursor-pointer",
-        props.active
-          ? "bg-[var(--active)] text-[var(--emerald-400)]"
-          : "text-[var(--neutral-400)] hover:bg-[var(--hover)]",
-      )}
-      style={transformStyle(sortable.transform)}
-      {...sortable.dragActivators}
-      onClick={props.onToggle}
-    >
-      <AudioLines size={14} class={cn(
-        "flex-shrink-0",
-        props.active ? "text-[var(--emerald-400)]" : "text-[var(--neutral-500)]",
-      )} />
-      <span class="flex-1 truncate">{props.channel.name}</span>
-      <Show when={props.active && voiceQuality()}>
-        <CallQualityIndicator />
+    <>
+      <button
+        ref={sortable.ref}
+        class={cn(
+          "w-full flex items-center gap-2 px-2 py-1.5 rounded-md text-sm text-left cursor-pointer",
+          props.active
+            ? "bg-[var(--active)] text-[var(--emerald-400)]"
+            : "text-[var(--neutral-400)] hover:bg-[var(--hover)]",
+        )}
+        style={transformStyle(sortable.transform)}
+        {...(props.draggable ? sortable.dragActivators : {})}
+        onClick={props.onToggle}
+      >
+        <AudioLines size={14} class={cn(
+          "flex-shrink-0",
+          props.active ? "text-[var(--emerald-400)]" : "text-[var(--neutral-500)]",
+        )} />
+        <span class="flex-1 truncate">{props.channel.name}</span>
+        <Show when={props.active && voiceQuality()}>
+          <CallQualityIndicator />
+        </Show>
+      </button>
+      <Show when={status()}>
+        <div role="status" class="px-2 py-1 text-xs text-[var(--amber-400)] break-words">{status()}</div>
       </Show>
-    </button>
+      <Show when={shown()}>
+        <div
+          role={shown()!.notice ? "status" : "alert"}
+          class={cn("px-2 py-1 text-xs break-words", shown()!.notice ? "text-[var(--amber-400)]" : "text-[var(--red-400)]")}
+        >
+          {shown()!.message}
+        </div>
+      </Show>
+    </>
   );
 }
 
@@ -242,14 +267,7 @@ export function CallQualityIndicator(props: { size?: number }) {
         <Signal size={sz()} />
       </KHoverCard.Trigger>
       <KHoverCard.Portal>
-        <KHoverCard.Content
-          class={cn(
-            "z-50 px-2.5 py-1.5 rounded-md text-xs",
-            "text-[var(--neutral-100)] border border-[var(--neutral-700)]",
-            "animate-[tooltip-in_120ms_ease-out]",
-          )}
-          style={{ background: "var(--neutral-800)", "box-shadow": "var(--shadow-float)" }}
-        >
+        <KHoverCard.Content class={cn(floatingClass, "px-2.5 py-1.5 text-xs animate-[tooltip-in_120ms_ease-out]")} style={floatingStyle}>
           <div class="flex flex-col gap-0.5 min-w-[120px]">
             <div class="flex justify-between gap-4">
               <span class="text-[var(--neutral-500)]">Quality</span>

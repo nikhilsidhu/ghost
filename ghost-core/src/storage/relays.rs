@@ -3,7 +3,7 @@ use rusqlite::OptionalExtension;
 
 use crate::error::{GhostError, Result};
 
-use super::{blob32, GhostStore};
+use super::{blob32, db, GhostStore};
 
 impl GhostStore {
     /// Remember how to reach a relay; a newer ref for the same key replaces the old one.
@@ -14,7 +14,7 @@ impl GhostStore {
                  ON CONFLICT (relay_vk) DO UPDATE SET ref_bytes = ?2, last_seen = ?3",
                 rusqlite::params![relay_ref.relay_vk.as_slice(), relay_ref.to_bytes(), now as i64],
             )
-            .map_err(|e| GhostError::Database(format!("upsert relay: {e}")))?;
+            .map_err(db("upsert relay"))?;
         Ok(())
     }
 
@@ -27,7 +27,7 @@ impl GhostStore {
                 |row| row.get(0),
             )
             .optional()
-            .map_err(|e| GhostError::Database(format!("get relay: {e}")))?;
+            .map_err(db("get relay"))?;
         bytes
             .map(|b| RelayRef::from_bytes(&b).map_err(|e| GhostError::Database(format!("stored relay ref: {e}"))))
             .transpose()
@@ -41,7 +41,7 @@ impl GhostStore {
                 "UPDATE servers SET relay_vk = ?2 WHERE server_id = ?1",
                 rusqlite::params![server_id.as_slice(), relay_vk.as_slice()],
             )
-            .map_err(|e| GhostError::Database(format!("set server relay: {e}")))?;
+            .map_err(db("set server relay"))?;
         if updated == 0 {
             return Err(GhostError::Database("server not found".into()));
         }
@@ -59,7 +59,7 @@ impl GhostStore {
                 |row| row.get(0),
             )
             .optional()
-            .map_err(|e| GhostError::Database(format!("server relay: {e}")))?;
+            .map_err(db("server relay"))?;
         match vk.flatten() {
             Some(bytes) => bytes
                 .try_into()
@@ -78,7 +78,7 @@ impl GhostStore {
                 |row| row.get::<_, i64>(0),
             )
             .map(|g| g as u64)
-            .map_err(|e| GhostError::Database(format!("server location generation: {e}")))
+            .map_err(db("server location generation"))
     }
 
     pub fn set_server_location_generation(&self, server_id: &[u8; 32], generation: u64) -> Result<()> {
@@ -88,7 +88,7 @@ impl GhostStore {
                 "UPDATE servers SET location_generation = ?2 WHERE server_id = ?1",
                 rusqlite::params![server_id.as_slice(), generation as i64],
             )
-            .map_err(|e| GhostError::Database(format!("set server location generation: {e}")))?;
+            .map_err(db("set server location generation"))?;
         if updated == 0 {
             return Err(GhostError::Database("server not found".into()));
         }
@@ -104,13 +104,13 @@ impl GhostStore {
                  WHERE r.relay_vk IN (SELECT relay_vk FROM servers WHERE relay_vk IS NOT NULL)
                  ORDER BY r.relay_vk",
             )
-            .map_err(|e| GhostError::Database(format!("server relays: {e}")))?;
+            .map_err(db("server relays"))?;
         let rows = stmt
             .query_map([], |row| Ok((blob32(row, 0)?, row.get::<_, Vec<u8>>(1)?)))
-            .map_err(|e| GhostError::Database(format!("server relays: {e}")))?;
+            .map_err(db("server relays"))?;
         let mut refs = Vec::new();
         for row in rows {
-            let (_vk, bytes) = row.map_err(|e| GhostError::Database(format!("server relay row: {e}")))?;
+            let (_vk, bytes) = row.map_err(db("server relay row"))?;
             refs.push(RelayRef::from_bytes(&bytes).map_err(|e| GhostError::Database(format!("stored relay ref: {e}")))?);
         }
         Ok(refs)
@@ -129,9 +129,8 @@ mod tests {
                 server_id,
                 name: "s".into(),
                 kind: ServerKind::Server,
-                creator_fp: [0x01; 32],
                 created_at: 1,
-            })
+            }, crate::storage::OnConflict::Fail)
             .unwrap();
         store
     }

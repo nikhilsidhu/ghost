@@ -19,8 +19,8 @@ pub async fn list(
 ) -> Result<(StatusCode, Vec<u8>)> {
     let server_mailbox = decode_mailbox_id(&server_mailbox)?;
     let mut listing = AdmittedChannels::default();
-    for mailbox in state.admitted_channels(&server_mailbox, &auth.account_fp).await? {
-        if let Some(group_info) = state.storage.get_server_info(&mailbox)? {
+    for mailbox in state.admitted_channels(&server_mailbox, &auth.account_fp)? {
+        if let Some(group_info) = state.storage.get_server_info(mailbox).await? {
             listing.0.push((mailbox, group_info));
         }
     }

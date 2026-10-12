@@ -1,11 +1,14 @@
 import { createSignal, createEffect, on, onMount, onCleanup, For, Show } from "solid-js";
 import type { JSX } from "solid-js";
 import type { Server, Channel } from "../lib/types";
+import { PERMISSIONS } from "../lib/types";
 import { hashGradient } from "../lib/gradients";
 import { Avatar } from "./ui/avatar";
 import type { AvatarStatus } from "./ui/avatar";
 import { Tooltip } from "./ui/tooltip";
 import { ScrollArea } from "./ui/scroll-area";
+import { NavItem } from "./ui/nav-item";
+import { NavSection } from "./ui/nav-section";
 import { cn } from "../lib/cn";
 import { Settings, X, Mailbox, UserPen } from "lucide-solid";
 import { channelPrefix, slideDuration } from "../lib/constants";
@@ -13,15 +16,17 @@ import {
   identity, servers, selectedServerId, channels, selectedChannelId,
   selectedServer, selectServer, selectChannel,
   settingsOpen, settingsCategory, setSettingsCategory, toggleSettings,
-  profileOpen, toggleProfile, relayConnected, ownStatus, INVISIBLE,
+  profileOpen, toggleProfile, relayConnected, connectivity, ownStatus, INVISIBLE,
   joinVoiceChannel, isInVoiceChannel, endCall,
   voiceChannelMembers,
   dmViewActive, dms, serverList, activateDmView, selectDm,
+  refreshChannels,
 } from "../lib/store";
 import { sections } from "../lib/settings-registry";
 import "../lib/settings";
 import { handleCreateChannel, handleCreateDm } from "../lib/commands";
-import { saveServerOrder, getServerOrder } from "../lib/api";
+import { saveServerOrder, getServerOrder, reorderChannels } from "../lib/api";
+import { notify } from "../lib/notices";
 import { listen } from "@tauri-apps/api/event";
 import { SettingsPanel } from "./SettingsPanel";
 import { ProfilePanel } from "./ProfilePanel";
@@ -37,6 +42,17 @@ import {
 } from "@thisbeyond/solid-dnd";
 import type { DragEvent } from "@thisbeyond/solid-dnd";
 
+/** What the connections are doing, for the status dot's tooltip: the home first, then
+ * relays that answer but refuse this device a server, then a catch-up still running. */
+const connectionNote = (): string | undefined => {
+  const c = connectivity();
+  const notes: string[] = [];
+  if (relayConnected() && !c.home) notes.push("home relay unreachable");
+  if (c.relays_refusing.length) notes.push(`refused by ${c.relays_refusing.join(", ")}`);
+  if (c.catching_up) notes.push("catching up on what was missed");
+  return notes.length ? notes.join("; ") : undefined;
+};
+
 export function Sidebar() {
   const onEscape = (e: KeyboardEvent) => { if (e.key === "Escape" && settingsOpen()) toggleSettings(); };
   window.addEventListener("keydown", onEscape);
@@ -45,7 +61,6 @@ export function Sidebar() {
   const [textCollapsed, setTextCollapsed] = createSignal(false);
   const [voiceCollapsed, setVoiceCollapsed] = createSignal(false);
   const [serverOrder, setServerOrder] = createSignal<string[]>([]);
-  const [channelOrder, setChannelOrder] = createSignal<string[]>([]);
   const [activeServerId, setActiveServerId] = createSignal<string | null>(null);
   const [activeChannelId, setActiveChannelId] = createSignal<string | null>(null);
   const [orderLoaded, setOrderLoaded] = createSignal(false);
@@ -78,16 +93,6 @@ export function Sidebar() {
     }
   }));
 
-  createEffect(on(channels, (chs) => {
-    const current = channelOrder();
-    const ids = chs.map((c) => c.channel_id);
-    const ordered = current.filter((id) => ids.includes(id));
-    const newIds = ids.filter((id) => !ordered.includes(id));
-    if (newIds.length > 0 || ordered.length !== current.length) {
-      setChannelOrder([...ordered, ...newIds]);
-    }
-  }));
-
   const orderedServers = () => {
     const order = serverOrder();
     const list = serverList();
@@ -95,19 +100,11 @@ export function Sidebar() {
     return order.map((id) => map.get(id)).filter((g): g is Server => g !== undefined);
   };
 
-  const textChannels = () => {
-    const order = channelOrder();
-    const text = channels().filter((c) => c.kind === "text");
-    const map = new Map(text.map((c) => [c.channel_id, c]));
-    return order.map((id) => map.get(id)).filter((c): c is Channel => c !== undefined && c.kind === "text");
-  };
-
-  const voiceChannels = () => {
-    const order = channelOrder();
-    const voice = channels().filter((c) => c.kind === "voice");
-    const map = new Map(voice.map((c) => [c.channel_id, c]));
-    return order.map((id) => map.get(id)).filter((c): c is Channel => c !== undefined && c.kind === "voice");
-  };
+  // Channel order is the server's, shared by every member, kept as each channel's position.
+  const byPosition = (a: Channel, b: Channel) => a.position - b.position;
+  const textChannels = () => channels().filter((c) => c.kind === "text").sort(byPosition);
+  const voiceChannels = () => channels().filter((c) => c.kind === "voice").sort(byPosition);
+  const canManageChannels = () => ((selectedServer()?.permissions ?? 0) & PERMISSIONS.manageChannels) !== 0;
 
   const handleServerClick = (serverId: string) => {
     if (serverId === selectedServerId() && !dmViewActive()) {
@@ -140,20 +137,22 @@ export function Sidebar() {
   const onChannelDragStart = (e: DragEvent) => setActiveChannelId(String(e.draggable.id));
   const onChannelDragEnd = (e: DragEvent) => {
     setActiveChannelId(null);
-    if (e.draggable && e.droppable) {
-      const from = String(e.draggable.id);
-      const to = String(e.droppable.id);
-      if (from !== to) {
-        const order = [...channelOrder()];
-        const fromIdx = order.indexOf(from);
-        const toIdx = order.indexOf(to);
-        if (fromIdx >= 0 && toIdx >= 0) {
-          order.splice(fromIdx, 1);
-          order.splice(toIdx, 0, from);
-          setChannelOrder(order);
-        }
-      }
-    }
+    const sid = selectedServerId();
+    if (!e.draggable || !e.droppable || !sid || !canManageChannels()) return;
+    const from = String(e.draggable.id);
+    const to = String(e.droppable.id);
+    const kind = channels().find((c) => c.channel_id === from)?.kind;
+    if (from === to || !kind) return;
+    const moved = (kind === "text" ? textChannels() : voiceChannels()).map((c) => c.channel_id);
+    const fromIdx = moved.indexOf(from);
+    const toIdx = moved.indexOf(to);
+    if (fromIdx < 0 || toIdx < 0) return;
+    moved.splice(fromIdx, 1);
+    moved.splice(toIdx, 0, from);
+    // Positions run across the server: text channels first, then voice, each as shown.
+    const ids = (list: Channel[]) => list.map((c) => c.channel_id);
+    const order = kind === "text" ? [...moved, ...ids(voiceChannels())] : [...ids(textChannels()), ...moved];
+    reorderChannels(sid, order).then(refreshChannels).catch((err) => notify(`channels not reordered: ${err}`));
   };
 
   return (
@@ -298,6 +297,7 @@ export function Sidebar() {
                         "absolute inset-0 flex items-center justify-center transition-all duration-[var(--duration-fast)]",
                         profileOpen() ? "opacity-0 pointer-events-none" : "brightness-75 group-hover/ab:brightness-100",
                       )}
+                      title={connectionNote()}
                     >
                       <Avatar
                         hashKey={id().fingerprint}
@@ -409,86 +409,64 @@ export function Sidebar() {
                 >
                   <DragDropSensors />
                   <ScrollArea class="flex-1">
-                    <div class="pt-2">
-                      <div class="flex items-center justify-between px-3 py-1">
-                        <button
-                          class="flex items-center gap-1 text-sm font-medium text-[var(--neutral-500)] cursor-pointer hover:text-[var(--neutral-400)]"
-                          onClick={() => setTextCollapsed((v) => !v)}
-                        >
-                          <span class="text-[10px]">{textCollapsed() ? "\u25b8" : "\u25be"}</span>
-                          text channels
-                        </button>
-                        <button
-                          class="w-6 h-6 flex items-center justify-center rounded-md text-sm leading-none text-[var(--neutral-500)] hover:text-[var(--neutral-200)] cursor-pointer hover:bg-[var(--hover)]"
-                          onClick={() => handleCreateChannel("text")}
-                        >
-                          +
-                        </button>
-                      </div>
-                      <Show when={!textCollapsed()}>
-                        <div class="px-2">
-                          <SortableProvider ids={textChannels().map((c) => c.channel_id)}>
-                            <For each={textChannels()}>
-                              {(ch) => (
-                                <ChannelItem
-                                  channel={ch}
-                                  isSelected={ch.channel_id === selectedChannelId()}
-                                  onSelect={selectChannel}
-                                  icon={<span class="text-[var(--neutral-500)]">#</span>}
-                                />
-                              )}
-                            </For>
-                          </SortableProvider>
-                        </div>
-                      </Show>
-                    </div>
+                    <NavSection
+                      class="pt-2"
+                      label="text channels"
+                      collapsed={textCollapsed()}
+                      onToggle={() => setTextCollapsed((v) => !v)}
+                      onAdd={() => handleCreateChannel("text")}
+                      addLabel="Create a text channel"
+                    >
+                      <SortableProvider ids={textChannels().map((c) => c.channel_id)}>
+                        <For each={textChannels()}>
+                          {(ch) => (
+                            <ChannelItem
+                              channel={ch}
+                              isSelected={ch.channel_id === selectedChannelId()}
+                              onSelect={selectChannel}
+                              icon={<span class="text-[var(--neutral-500)]">#</span>}
+                              draggable={canManageChannels()}
+                            />
+                          )}
+                        </For>
+                      </SortableProvider>
+                    </NavSection>
 
-                    <div class="mt-2">
-                      <div class="flex items-center justify-between px-3 py-1">
-                        <button
-                          class="flex items-center gap-1 text-sm font-medium text-[var(--neutral-500)] cursor-pointer hover:text-[var(--neutral-400)]"
-                          onClick={() => setVoiceCollapsed((v) => !v)}
-                        >
-                          <span class="text-[10px]">{voiceCollapsed() ? "\u25b8" : "\u25be"}</span>
-                          voice channels
-                        </button>
-                        <button
-                          class="w-6 h-6 flex items-center justify-center rounded-md text-sm leading-none text-[var(--neutral-500)] hover:text-[var(--neutral-200)] cursor-pointer hover:bg-[var(--hover)]"
-                          onClick={() => handleCreateChannel("voice")}
-                        >
-                          +
-                        </button>
-                      </div>
-                      <Show when={!voiceCollapsed()}>
-                        <div class="px-2">
-                          <SortableProvider ids={voiceChannels().map((c) => c.channel_id)}>
-                            <For each={voiceChannels()}>
-                              {(ch) => {
-                                const active = () => isInVoiceChannel(ch.channel_id);
-                                return (
-                                  <>
-                                    <VoiceChannelItem
-                                      channel={ch}
-                                      active={active()}
-                                      onToggle={() => {
-                                        if (active()) endCall();
-                                        else {
-                                          const sid = selectedServerId();
-                                          if (sid) joinVoiceChannel(sid, ch.channel_id);
-                                        }
-                                      }}
-                                    />
-                                    <Show when={active() || voiceChannelMembers().has(ch.channel_id)}>
-                                      <VoiceParticipantList channelId={ch.channel_id} />
-                                    </Show>
-                                  </>
-                                );
-                              }}
-                            </For>
-                          </SortableProvider>
-                        </div>
-                      </Show>
-                    </div>
+                    <NavSection
+                      class="mt-2"
+                      label="voice channels"
+                      collapsed={voiceCollapsed()}
+                      onToggle={() => setVoiceCollapsed((v) => !v)}
+                      onAdd={() => handleCreateChannel("voice")}
+                      addLabel="Create a voice channel"
+                    >
+                      <SortableProvider ids={voiceChannels().map((c) => c.channel_id)}>
+                        <For each={voiceChannels()}>
+                          {(ch) => {
+                            const active = () => isInVoiceChannel(ch.channel_id);
+                            return (
+                              <>
+                                <VoiceChannelItem
+                                  channel={ch}
+                                  active={active()}
+                                  draggable={canManageChannels()}
+                                  onToggle={() => {
+                                    if (active()) endCall();
+                                    else {
+                                      const sid = selectedServerId();
+                                      if (sid) joinVoiceChannel(sid, ch.channel_id);
+                                    }
+                                  }}
+                                />
+                                <Show when={active() || voiceChannelMembers().has(ch.channel_id)}>
+                                  <VoiceParticipantList channelId={ch.channel_id} />
+                                </Show>
+                              </>
+                            );
+                          }}
+                        </For>
+                      </SortableProvider>
+                    </NavSection>
                   </ScrollArea>
                   <DragOverlay>
                     {(() => {
@@ -540,6 +518,7 @@ function ServerIcon(props: { server: Server; isActive: boolean; onClick: (id: st
       />
       <Tooltip label={props.server.name}>
         <button
+          aria-label={props.server.name}
           class="w-[var(--size-lg)] h-[var(--size-lg)] flex items-center justify-center cursor-pointer"
           onClick={() => props.onClick(props.server.server_id)}
         >
@@ -585,22 +564,18 @@ function ChannelItem(props: {
   isSelected: boolean;
   onSelect: (id: string) => void;
   icon: JSX.Element;
+  /// Whether this member may drag it into a new position.
+  draggable: boolean;
 }) {
   const sortable = createSortable(props.channel.channel_id);
 
   return (
-    <button
+    <NavItem
       ref={sortable.ref}
-      class={cn(
-        "w-full flex items-center gap-2 px-2 py-1.5 rounded-md text-sm text-left cursor-pointer",
-        props.isSelected
-          ? "bg-[var(--active)] text-[var(--neutral-100)]"
-          : props.channel.unread_count > 0
-            ? "text-[var(--neutral-100)] font-medium hover:bg-[var(--hover)]"
-            : "text-[var(--neutral-400)] hover:bg-[var(--hover)]",
-      )}
+      selected={props.isSelected}
+      emphasis={props.channel.unread_count > 0}
       style={transformStyle(sortable.transform)}
-      {...sortable.dragActivators}
+      {...(props.draggable ? sortable.dragActivators : {})}
       onClick={() => props.onSelect(props.channel.channel_id)}
     >
       {props.icon}
@@ -616,7 +591,7 @@ function ChannelItem(props: {
           </span>
         </Show>
       </span>
-    </button>
+    </NavItem>
   );
 }
 
@@ -710,17 +685,7 @@ function DmPanel() {
 
 function DmItem(props: { dm: Server; isSelected: boolean; onSelect: (id: string) => void }) {
   return (
-    <button
-      class={cn(
-        "w-full flex items-center gap-2 px-2 py-1.5 rounded-md text-sm text-left cursor-pointer",
-        props.isSelected
-          ? "bg-[var(--active)] text-[var(--neutral-100)]"
-          : props.dm.has_unread
-            ? "text-[var(--neutral-100)] font-medium hover:bg-[var(--hover)]"
-            : "text-[var(--neutral-400)] hover:bg-[var(--hover)]",
-      )}
-      onClick={() => props.onSelect(props.dm.server_id)}
-    >
+    <NavItem selected={props.isSelected} emphasis={props.dm.has_unread} onClick={() => props.onSelect(props.dm.server_id)}>
       <Avatar
         hashKey={props.dm.server_id}
         label={props.dm.name}
@@ -733,7 +698,7 @@ function DmItem(props: { dm: Server; isSelected: boolean; onSelect: (id: string)
           style={{ background: "var(--neutral-100)" }}
         />
       </Show>
-    </button>
+    </NavItem>
   );
 }
 

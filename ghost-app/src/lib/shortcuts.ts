@@ -1,6 +1,10 @@
 const isMac = navigator.userAgent.includes("Mac");
 const mod = isMac ? "Cmd" : "Ctrl";
 
+/** Whether `e` is the letter `letter`. Shift and Caps Lock make `key` uppercase on
+ *  Linux and Windows, so letters compare case-insensitively. */
+const isKey = (e: KeyboardEvent, letter: string) => e.key.toLowerCase() === letter;
+
 export interface ShortcutDef {
   id: string;
   keys: string[];
@@ -13,13 +17,13 @@ export const shortcuts: ShortcutDef[] = [
     id: "search",
     keys: [mod, "K"],
     label: "Search servers",
-    match: (e) => (e.metaKey || e.ctrlKey) && e.key === "k" && !e.shiftKey,
+    match: (e) => (e.metaKey || e.ctrlKey) && isKey(e, "k") && !e.shiftKey,
   },
   {
     id: "commands",
     keys: [mod, "\u21e7", "K"],
     label: "Command palette",
-    match: (e) => (e.metaKey || e.ctrlKey) && e.key === "k" && e.shiftKey,
+    match: (e) => (e.metaKey || e.ctrlKey) && isKey(e, "k") && e.shiftKey,
   },
   {
     id: "shortcuts",

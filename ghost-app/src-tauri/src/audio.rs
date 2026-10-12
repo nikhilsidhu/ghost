@@ -1,7 +1,11 @@
 //! The real audio devices behind voice calls: cpal capture and playback, converted
-//! to and from the engine's 48 kHz mono, and reopened when the default device changes.
+//! to and from the engine's 48 kHz mono, and reopened when the default device changes,
+//! when the user chooses other devices, and when a device goes away. A chosen device
+//! that is not there gives way to the system default, and the call is told.
 
-use std::sync::Mutex;
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -11,7 +15,7 @@ use ghost_audio::{AudioDevices, CaptureRead, DeviceStreams, Playback};
 use ringbuf::{traits::*, HeapRb};
 use rubato::Resampler as _;
 
-use crate::constants::{AUDIO_CHANNELS, DEVICE_BUFFER_SAMPLES, RESAMPLE_SUB_CHUNKS, RING_CAPACITY};
+use crate::constants::{AUDIO_CHANNELS, DEVICE_BUFFER_SAMPLES, DEVICE_LOSS_LIMIT, DEVICE_LOSS_WINDOW, RESAMPLE_SUB_CHUNKS, RING_CAPACITY};
 use crate::device_watcher::DeviceWatcher;
 
 /// How often capture is checked while waiting for a frame.
@@ -136,27 +140,59 @@ pub struct DeviceChoice {
     pub output: Option<String>,
 }
 
-/// The machine's audio devices, as the user chose them.
+/// The machine's audio devices, as the user chose them. A new choice reaches a call
+/// already running, whose devices reopen on it.
 #[derive(Default)]
 pub struct CpalDevices {
-    choice: Mutex<DeviceChoice>,
+    choice: Arc<Mutex<DeviceChoice>>,
+    /// Counts the choices made, so open devices notice a new one.
+    choices: Arc<AtomicU64>,
 }
 
 impl CpalDevices {
-    /// Use these devices from the next call on.
+    /// Use these devices from now on, in a call already running too.
     pub fn choose(&self, choice: DeviceChoice) {
-        *self.choice.lock().unwrap() = choice;
+        let mut current = self.choice.lock().unwrap();
+        if *current != choice {
+            *current = choice;
+            self.choices.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
 impl AudioDevices for CpalDevices {
     fn open(&self, playback: Playback) -> Result<Box<dyn DeviceStreams>, String> {
+        let seen_choice = self.choices.load(Ordering::Relaxed);
         let choice = self.choice.lock().unwrap().clone();
         let watcher = DeviceWatcher::new().map_err(|e| format!("device watcher: {e}"))?;
         let host = cpal::default_host();
-        let streams = OpenStreams::open(&host, &choice, playback.clone())?;
+        let (streams, notice) = open_or_default(&host, &choice, playback.clone())?;
         let capture = Capture::new(streams.input_rate)?;
-        Ok(Box::new(CpalStreams { host, choice, playback, watcher, streams, capture }))
+        Ok(Box::new(CpalStreams {
+            host,
+            choice: self.choice.clone(),
+            choices: self.choices.clone(),
+            seen_choice,
+            playback,
+            watcher,
+            streams,
+            capture,
+            notice,
+            losses: VecDeque::new(),
+        }))
+    }
+}
+
+/// Open the chosen devices; when they are not available, the system default's instead,
+/// with the notice to give.
+fn open_or_default(host: &cpal::Host, choice: &DeviceChoice, playback: Playback) -> Result<(OpenStreams, Option<String>), String> {
+    match OpenStreams::open(host, choice, playback.clone()) {
+        Ok(streams) => Ok((streams, None)),
+        Err(e) if *choice != DeviceChoice::default() => {
+            let streams = OpenStreams::open(host, &DeviceChoice::default(), playback)?;
+            Ok((streams, Some(format!("{e}; using the system default instead"))))
+        }
+        Err(e) => Err(e),
     }
 }
 
@@ -166,10 +202,22 @@ struct OpenStreams {
     _playback: cpal::Stream,
     capture_cons: ringbuf::HeapCons<f32>,
     input_rate: u32,
+    /// Set by either stream when its device goes away.
+    device_lost: Arc<AtomicBool>,
 }
 
 impl OpenStreams {
     fn open(host: &cpal::Host, choice: &DeviceChoice, playback: Playback) -> Result<Self, String> {
+        let device_lost = Arc::new(AtomicBool::new(false));
+        let lost_by = |what: &'static str| {
+            let device_lost = device_lost.clone();
+            move |err: cpal::StreamError| {
+                tracing::warn!("voice {what} error: {err}");
+                if matches!(err, cpal::StreamError::DeviceNotAvailable) {
+                    device_lost.store(true, Ordering::Relaxed);
+                }
+            }
+        };
         let input_device = resolve_device(host, &choice.input, "input")?;
         let input_config = pick_config(
             input_device.supported_input_configs().map_err(|e| format!("input configs: {e}"))?,
@@ -183,7 +231,7 @@ impl OpenStreams {
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
                     capture_prod.push_slice(data);
                 },
-                move |err| { eprintln!("voice capture error: {err}"); },
+                lost_by("capture"),
                 None,
             )
             .map_err(|e| format!("build input stream: {e}"))?;
@@ -217,7 +265,7 @@ impl OpenStreams {
                         residual.drain(..data.len());
                     }
                 },
-                move |err| { eprintln!("voice playback error: {err}"); },
+                lost_by("playback"),
                 None,
             )
             .map_err(|e| format!("build output stream: {e}"))?;
@@ -225,7 +273,7 @@ impl OpenStreams {
         capture_stream.play().map_err(|e| format!("start capture: {e}"))?;
         playback_stream.play().map_err(|e| format!("start playback: {e}"))?;
 
-        eprintln!(
+        tracing::info!(
             "voice: capture \"{}\" @ {}Hz, playback \"{}\" @ {}Hz",
             input_device.name().unwrap_or_default(),
             input_rate,
@@ -233,7 +281,7 @@ impl OpenStreams {
             output_rate,
         );
 
-        Ok(Self { _capture: capture_stream, _playback: playback_stream, capture_cons, input_rate })
+        Ok(Self { _capture: capture_stream, _playback: playback_stream, capture_cons, input_rate, device_lost })
     }
 }
 
@@ -266,30 +314,66 @@ impl Capture {
 
 struct CpalStreams {
     host: cpal::Host,
-    choice: DeviceChoice,
+    choice: Arc<Mutex<DeviceChoice>>,
+    choices: Arc<AtomicU64>,
+    /// The choice these streams were opened on.
+    seen_choice: u64,
     playback: Playback,
     watcher: DeviceWatcher,
     streams: OpenStreams,
     capture: Capture,
+    /// What to tell the call at the next read: the chosen devices gave way to others.
+    notice: Option<String>,
+    /// When devices were lost lately, oldest first.
+    losses: VecDeque<Instant>,
+}
+
+impl CpalStreams {
+    /// Open the devices again, on the choice as it is now.
+    fn reopen(&mut self) -> CaptureRead {
+        let choice = self.choice.lock().unwrap().clone();
+        let reopened = open_or_default(&self.host, &choice, self.playback.clone())
+            .and_then(|(streams, notice)| Ok((Capture::new(streams.input_rate)?, streams, notice)));
+        match reopened {
+            Ok((capture, streams, notice)) => {
+                self.streams = streams;
+                self.capture = capture;
+                notice.map_or(CaptureRead::Restarted, CaptureRead::Substituted)
+            }
+            Err(e) => CaptureRead::Failed(format!("failed to open audio devices: {e}")),
+        }
+    }
 }
 
 impl DeviceStreams for CpalStreams {
     fn read_frame(&mut self, frame: &mut [f32], timeout: Duration) -> CaptureRead {
+        if let Some(notice) = self.notice.take() {
+            return CaptureRead::Substituted(notice);
+        }
+        // A device went away under the streams: reopen, unless devices keep going.
+        if self.streams.device_lost.load(Ordering::Relaxed) {
+            let now = Instant::now();
+            self.losses.retain(|at| now.duration_since(*at) < DEVICE_LOSS_WINDOW);
+            if self.losses.len() >= DEVICE_LOSS_LIMIT {
+                return CaptureRead::Failed("audio devices keep going away".into());
+            }
+            self.losses.push_back(now);
+            tracing::info!("voice: an audio device went away, reopening");
+            return self.reopen();
+        }
+        // The user chose other devices.
+        let choices = self.choices.load(Ordering::Relaxed);
+        if choices != self.seen_choice {
+            self.seen_choice = choices;
+            tracing::info!("voice: other audio devices chosen, switching");
+            return self.reopen();
+        }
         // The OS says the default device changed: reopen on the new one.
         if self.watcher.try_recv().is_some() {
             // Input and output changes often arrive together.
             while self.watcher.try_recv().is_some() {}
-            eprintln!("voice: audio device changed, switching...");
-            let reopened = OpenStreams::open(&self.host, &self.choice, self.playback.clone())
-                .and_then(|streams| Ok((Capture::new(streams.input_rate)?, streams)));
-            return match reopened {
-                Ok((capture, streams)) => {
-                    self.streams = streams;
-                    self.capture = capture;
-                    CaptureRead::Restarted
-                }
-                Err(e) => CaptureRead::Failed(format!("failed to open new device: {e}")),
-            };
+            tracing::info!("voice: audio device changed, switching...");
+            return self.reopen();
         }
 
         let deadline = Instant::now() + timeout;

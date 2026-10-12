@@ -1,9 +1,30 @@
 @import "tailwindcss";
 
+/* Ioskeley Mono (an Iosevka build, SIL Open Font License; see assets/fonts/OFL.txt),
+   bundled so every platform renders the same. Regular also covers the body's 450. */
 @font-face {
-  font-family: 'Iosevka';
-  src: local('Iosevka'), local('Iosevka Term');
-  font-weight: 100 900;
+  font-family: 'Ioskeley Mono';
+  src: url('./assets/fonts/IoskeleyMono-Regular.woff2') format('woff2');
+  font-weight: 400 450;
+  font-display: block;
+}
+@font-face {
+  font-family: 'Ioskeley Mono';
+  src: url('./assets/fonts/IoskeleyMono-Medium.woff2') format('woff2');
+  font-weight: 500;
+  font-display: block;
+}
+@font-face {
+  font-family: 'Ioskeley Mono';
+  src: url('./assets/fonts/IoskeleyMono-SemiBold.woff2') format('woff2');
+  font-weight: 600;
+  font-display: block;
+}
+@font-face {
+  font-family: 'Ioskeley Mono';
+  src: url('./assets/fonts/IoskeleyMono-Bold.woff2') format('woff2');
+  font-weight: 700;
+  font-display: block;
 }
 
 :root {
@@ -148,7 +169,7 @@
     0 0 80px -16px var(--palette-glow),
     inset 0 1px 0 rgba(255, 255, 255, 0.06);
 
-  --font-mono: 'Iosevka', 'SF Mono', 'Fira Code', 'JetBrains Mono', monospace;
+  --font-mono: 'Ioskeley Mono', 'Iosevka', 'SF Mono', 'Fira Code', 'JetBrains Mono', monospace;
 
   /* Element sizing — 4px grid */
   --grid: 4px;

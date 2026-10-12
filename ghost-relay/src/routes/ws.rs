@@ -1,23 +1,32 @@
+use std::sync::atomic::Ordering::Relaxed;
+use std::sync::Arc;
+use std::time::Duration;
+
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::response::{IntoResponse, Response};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
+use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
-use std::sync::atomic::Ordering::Relaxed;
-use std::time::Duration;
+use tokio::sync::broadcast;
+use tokio::sync::broadcast::error::RecvError;
 
-use ghost_wire::{WS_FRAME_HEADER_SIZE, WS_SIGNAL_CHANNELS, WS_SIGNAL_EPOCH_MISMATCH, WS_SIGNAL_GAP};
+use ghost_wire::presence::{OnlineStateMsg, PresenceSender, VoiceStateMsg};
+use ghost_wire::{short_id, WS_ERROR_PREFIX, WS_SIGNAL_CHANNELS, WS_SIGNAL_GAP};
 
 use crate::auth::DeviceAuth;
-use crate::constants::{MAX_PRESENCE_BLOB_SIZE, WS_MAX_FANOUT_BATCH, WS_PING_INTERVAL_SECS};
-use crate::mailbox::Mailbox;
-use crate::state::{AppState, OpEntry, VpEntry};
-use crate::util::decode_mailbox_id;
+use crate::constants::{MAX_PRESENCE_BLOB_SIZE, WS_CATCHUP_PAGE, WS_MISSED_PONGS};
+use crate::mailbox::{Frame, Mailbox, OnlinePresence, VoicePresence};
+use crate::state::AppState;
+use crate::util::{decode_mailbox_id, now_millis};
 
 const HANDSHAKE_TIMEOUT_SECS: u64 = 5;
 
+type Sink = SplitSink<WebSocket, Message>;
+
+/// A voice state announcement as a client sends it; the relay adds who sent it.
 #[derive(Deserialize)]
 struct VsMsg {
     vs: VsInner,
@@ -30,6 +39,7 @@ struct VsInner {
     leave: Option<bool>,
 }
 
+/// An online presence announcement as a client sends it; the relay adds who sent it.
 #[derive(Deserialize)]
 struct PsMsg {
     ps: PsInner,
@@ -51,259 +61,287 @@ pub async fn ws_upgrade(
         Ok(id) => id,
         Err(e) => return e.into_response(),
     };
-    let read_limit = match state.read_limit(&id, &auth.account_fp) {
+    let read_limit = match state.read_limit(id, auth.account_fp).await {
         Ok(limit) => limit,
         Err(e) => return e.into_response(),
     };
     ws.on_upgrade(move |socket| ws_connection(socket, id, state, auth, read_limit))
 }
 
+/// The receiving ends of a mailbox's live state, taken before the handshake so nothing
+/// committed during catch-up is missed.
+struct Subscriptions {
+    frames: broadcast::Receiver<Arc<Frame>>,
+    voice: broadcast::Receiver<(u64, String)>,
+    presence: broadcast::Receiver<(u64, String)>,
+    channels: broadcast::Receiver<[u8; 32]>,
+}
+
+impl Subscriptions {
+    fn to(mailbox: &Mailbox) -> Self {
+        Self {
+            frames: mailbox.frames.subscribe(),
+            voice: mailbox.voice_tx.subscribe(),
+            presence: mailbox.presence_tx.subscribe(),
+            channels: mailbox.channels_tx.subscribe(),
+        }
+    }
+}
+
+/// Where the connection stands in the mailbox's log.
+struct Cursor {
+    last_seen: u64,
+    /// For an account removed from the group: the last entry it may read, after which
+    /// the connection closes. Set at connect, or by a removal while connected.
+    read_limit: Option<u64>,
+    /// Entries this connection posted itself and was acked for, not to be echoed.
+    own_seqs: Vec<u64>,
+}
+
+/// Why the connection's delivery ended.
+enum Stop {
+    /// The account's read limit was reached; close as removed.
+    Removed,
+    /// The socket or the store failed; just end.
+    Lost,
+}
+
 /// `read_limit` is set for an account removed from the group: it gets the entries up
 /// to its removal and the connection ends. A removal while connected sets it too.
-async fn ws_connection(socket: WebSocket, mailbox_id: [u8; 32], state: AppState, auth: DeviceAuth, mut read_limit: Option<u64>) {
+async fn ws_connection(socket: WebSocket, mailbox_id: [u8; 32], state: AppState, auth: DeviceAuth, read_limit: Option<u64>) {
     let (mut sink, mut stream) = socket.split();
     let conn_id = state.next_conn_id.fetch_add(1, Relaxed);
+    let from = PresenceSender { account_fp: auth.account_fp, device_vk: auth.device_vk };
+    let mut subs = state.subscribe(mailbox_id, Subscriptions::to);
 
-    // Subscribe before handshake so we don't miss blobs during replay
-    let (mut seq_rx, mut voice_rx, mut presence_rx, mut channels_rx) = {
-        let mut map = state.mailboxes.write().await;
-        let mailbox = map.entry(mailbox_id).or_insert_with(Mailbox::new);
-        (mailbox.seq_tx.subscribe(), mailbox.voice_tx.subscribe(), mailbox.presence_tx.subscribe(), mailbox.channels_tx.subscribe())
-    };
-
-    // Handshake: first binary frame is 8-byte BE last_seen_seq
+    // Handshake: first binary frame is 8-byte BE last_seen_seq. Without it the
+    // connection is closed with a frame, so the client reconnects at once rather than
+    // waiting out its silence limit.
     let timeout = Duration::from_secs(HANDSHAKE_TIMEOUT_SECS);
-    let mut last_seen: u64 = match tokio::time::timeout(timeout, stream.next()).await {
-        Ok(Some(Ok(Message::Binary(data)))) if data.len() == 8 => {
-            u64::from_be_bytes(data[..8].try_into().unwrap())
+    let last_seen: u64 = match tokio::time::timeout(timeout, stream.next()).await {
+        Ok(Some(Ok(Message::Binary(data)))) if data.len() == 8 => u64::from_be_bytes(data[..8].try_into().unwrap()),
+        _ => {
+            let close = axum::extract::ws::CloseFrame { code: axum::extract::ws::close_code::PROTOCOL, reason: "no resume point sent".into() };
+            let _ = sink.send(Message::Close(Some(close))).await;
+            return;
         }
-        _ => return,
     };
+    let mut cursor = Cursor { last_seen, read_limit, own_seqs: Vec::new() };
 
-    // Detect gap: client asked for entries that have already been swept
-    let mut has_gap = false;
-    if last_seen > 0 {
-        has_gap = match state.storage.min_seq(&mailbox_id) {
-            Ok(Some(min)) => last_seen + 1 < min,
-            Ok(None) => true,
-            Err(_) => false,
-        };
-        if has_gap {
-            if sink.send(Message::text(WS_SIGNAL_GAP)).await.is_err() {
-                return;
-            }
+    // A client asking for entries already swept has a gap: it must rebuild its group
+    // state, and the entries it missed are unprocessable after that. The cursor moves to
+    // the head and the client is told where, so it resumes there; only new entries are
+    // delivered. A client past the end of the log saw a log that started over since (the
+    // relay was reset): everything held now is newer, and it is served from the start.
+    // A store that cannot say serves from the cursor, as if neither.
+    let (past_end, has_gap) = match state.storage.log_position(mailbox_id).await {
+        Ok(log) => {
+            let past_end = cursor.last_seen > log.head;
+            let missed_swept = cursor.last_seen < log.head && log.first.is_none_or(|first| cursor.last_seen + 1 < first);
+            (past_end, missed_swept)
         }
+        Err(_) => (false, false),
+    };
+    tracing::debug!(
+        "ws {}: device {} of {} subscribed after seq {last_seen}{}",
+        short_id(&mailbox_id),
+        short_id(&auth.device_vk),
+        short_id(&auth.account_fp),
+        if has_gap { ", past a gap" } else if past_end { ", past the log's end" } else { "" }
+    );
+    if past_end {
+        cursor.last_seen = 0;
     }
-
     if has_gap {
-        // Don't replay old entries — client will do gap recovery (external commit)
-        // and those old entries are unprocessable after MLS state is rebuilt.
-        // Advance last_seen to HEAD so the live loop only delivers new entries.
-        loop {
-            let entries = match state.storage.read_from(&mailbox_id, last_seen, WS_MAX_FANOUT_BATCH) {
-                Ok(e) => e,
-                Err(_) => break,
-            };
-            if entries.is_empty() {
-                break;
-            }
-            last_seen = entries.last().unwrap().seq;
+        if skip_to_head(&state, mailbox_id, &mut cursor).await.is_err() {
+            return;
         }
-    } else {
-        // Replay missed entries
-        loop {
-            let entries = match state.storage.read_from(&mailbox_id, last_seen, WS_MAX_FANOUT_BATCH) {
-                Ok(e) => e,
-                Err(_) => break,
-            };
-            if entries.is_empty() {
-                break;
-            }
-            for entry in &entries {
-                if read_limit.is_some_and(|last| entry.seq > last) {
-                    return;
-                }
-                last_seen = entry.seq;
-                let frame = encode_frame(entry.seq, entry.received_at, &entry.payload);
-                if sink.send(Message::binary(frame)).await.is_err() {
-                    return;
-                }
-            }
+        if sink.send(Message::text(format!("{WS_SIGNAL_GAP}{}", cursor.last_seen))).await.is_err() {
+            return;
         }
+    } else if let Err(stop) = catch_up(&state, mailbox_id, &mut cursor, &mut sink).await {
+        if matches!(stop, Stop::Removed) {
+            close_removed(&mut sink).await;
+        }
+        return;
     }
-    if read_limit.is_some() {
+    if cursor.read_limit.is_some() {
+        close_removed(&mut sink).await;
+        return;
+    }
+    if sink.send(Message::text(ghost_wire::WS_SIGNAL_CAUGHT_UP)).await.is_err() {
         return;
     }
 
-    // Voice state snapshot: send current voice presence for this mailbox
-    {
-        let vp = state.voice_presence.read().await;
-        let entries: Vec<serde_json::Value> = vp
-            .iter()
-            .filter(|e| e.mailbox_id == mailbox_id)
-            .map(|e| {
-                serde_json::json!({
-                    "ch": B64.encode(e.channel_id),
-                    "p": B64.encode(&e.blob),
-                })
-            })
-            .collect();
-        // Always send snapshot (even empty) so client clears stale voice state
-        let snap = serde_json::json!({ "vs_snap": entries });
-        if sink.send(Message::text(snap.to_string())).await.is_err() {
-            return;
-        }
+    let (voice, online) = state.subscribe(mailbox_id, |mailbox| (voice_snapshot(mailbox, &mut subs.voice), online_snapshot(mailbox, &mut subs.presence)));
+    if sink.send(Message::text(voice)).await.is_err() || sink.send(Message::text(online)).await.is_err() {
+        return;
     }
 
-    // Online presence snapshot
-    {
-        let op = state.online_presence.read().await;
-        let entries: Vec<serde_json::Value> = op
-            .iter()
-            .filter(|e| e.mailbox_id == mailbox_id)
-            .map(|e| serde_json::json!({ "p": B64.encode(&e.blob) }))
-            .collect();
-        let snap = serde_json::json!({ "ps_snap": entries });
-        if sink.send(Message::text(snap.to_string())).await.is_err() {
-            return;
-        }
-    }
-
-    let ping_interval_dur = Duration::from_secs(WS_PING_INTERVAL_SECS);
-    let mut ping_interval = tokio::time::interval(ping_interval_dur);
-    let mut own_seqs: Vec<u64> = Vec::new();
+    let ping_every = Duration::from_secs(state.config.ws_ping_secs.max(1));
+    let mut ping_interval = tokio::time::interval(ping_every);
+    let mut last_pong = tokio::time::Instant::now();
+    // The device said goodbye, or the relay closed the connection because the device may
+    // not come back to this mailbox: its presence goes at once. Anything else may be a
+    // blip, which the grace rides out.
+    let mut withdraw_at_once = false;
     let mut revoke_rx = state.revocation_tx.subscribe();
     let mut departure_rx = state.departure_tx.subscribe();
+    let mut readmission_rx = state.readmission_tx.subscribe();
 
     loop {
         tokio::select! {
             msg = stream.next() => {
                 match msg {
                     Some(Ok(Message::Binary(data))) => {
-                        match state.store_blob(&mailbox_id, &data).await {
-                            Ok((seq, epoch_mismatch)) => {
-                                own_seqs.push(seq);
-                                let ack = if epoch_mismatch {
-                                    Message::text(format!("{seq} {WS_SIGNAL_EPOCH_MISMATCH}"))
-                                } else {
-                                    Message::text(seq.to_string())
-                                };
-                                if sink.send(ack).await.is_err() {
-                                    break;
-                                }
+                        // Answered in order, so the sender can tell which post each reply is for.
+                        let reply = match state.accept_post(mailbox_id, auth.account_fp, data.to_vec()).await {
+                            Ok(stored) => {
+                                cursor.own_seqs.push(stored.seq);
+                                Message::text(stored.seq.to_string())
                             }
-                            Err(e) => {
-                                let _ = sink.send(Message::text(format!("error: {e}"))).await;
-                            }
+                            Err(e) => Message::text(format!("{WS_ERROR_PREFIX}{} {e}", e.status().as_u16())),
+                        };
+                        if sink.send(reply).await.is_err() {
+                            break;
                         }
                     }
                     Some(Ok(Message::Text(text))) => {
                         let s = text.as_str();
                         if let Ok(vs) = serde_json::from_str::<VsMsg>(s) {
-                            handle_voice_state(&state, &mailbox_id, conn_id, vs.vs).await;
+                            handle_voice_state(&state, &mailbox_id, conn_id, &from, vs.vs);
                         } else if let Ok(ps) = serde_json::from_str::<PsMsg>(s) {
-                            handle_online_presence(&state, &mailbox_id, conn_id, ps.ps).await;
+                            handle_online_presence(&state, &mailbox_id, conn_id, &from, ps.ps);
                         }
                     }
-                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(Message::Pong(_))) => last_pong = tokio::time::Instant::now(),
+                    Some(Ok(Message::Close(_))) => {
+                        withdraw_at_once = true;
+                        break;
+                    }
+                    None => break,
                     _ => {}
                 }
             }
-            _ = seq_rx.changed() => {
-                let entries = match state.storage.read_from(&mailbox_id, last_seen, WS_MAX_FANOUT_BATCH) {
-                    Ok(entries) => entries,
-                    Err(_) => continue,
+            frame = subs.frames.recv() => {
+                let delivered = match frame {
+                    Ok(frame) => deliver_frame(&state, mailbox_id, &mut cursor, &frame, &mut sink).await,
+                    // Behind the fan-out: the log has everything that was missed.
+                    Err(RecvError::Lagged(_)) => catch_up(&state, mailbox_id, &mut cursor, &mut sink).await,
+                    Err(RecvError::Closed) => break,
                 };
-                for entry in entries.iter().take_while(|e| read_limit.is_none_or(|last| e.seq <= last)) {
-                    last_seen = entry.seq;
-                    if let Some(pos) = own_seqs.iter().position(|&s| s == entry.seq) {
-                        own_seqs.swap_remove(pos);
-                        continue;
+                match delivered {
+                    Ok(()) => {}
+                    Err(Stop::Removed) => {
+                        close_removed(&mut sink).await;
+                        withdraw_at_once = true;
+                        break;
                     }
-                    let frame = encode_frame(entry.seq, entry.received_at, &entry.payload);
-                    if sink.send(Message::binary(frame)).await.is_err() {
-                        return;
-                    }
-                }
-                if read_limit.is_some_and(|last| last_seen >= last) {
-                    close_removed(&mut sink).await;
-                    break;
+                    Err(Stop::Lost) => break,
                 }
             }
             departure = departure_rx.recv() => {
                 match departure {
                     Ok(d) if d.mailbox_id == mailbox_id && d.account_fp == auth.account_fp => {
-                        // Deliver up to the removing commit, which the seq branch may not
-                        // have reached yet, then close.
-                        read_limit = Some(d.seq);
-                        if last_seen >= d.seq {
+                        // Deliver up to the removing commit, which the frame branch may
+                        // not have reached yet, then close.
+                        cursor.read_limit = Some(d.seq);
+                        if cursor.last_seen >= d.seq {
                             close_removed(&mut sink).await;
+                            withdraw_at_once = true;
                             break;
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        if let Ok(limit) = state.read_limit(&mailbox_id, &auth.account_fp) {
-                            read_limit = limit;
+                    Err(RecvError::Lagged(_)) => {
+                        if let Ok(limit) = state.read_limit(mailbox_id, auth.account_fp).await {
+                            cursor.read_limit = limit;
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    Err(RecvError::Closed) => break,
                     _ => {}
                 }
             }
-            voice_event = voice_rx.recv() => {
-                match voice_event {
-                    Ok((sender_conn_id, json)) if sender_conn_id != conn_id => {
-                        if sink.send(Message::text(json)).await.is_err() {
-                            break;
-                        }
+            voice_event = subs.voice.recv() => {
+                let forward = match voice_event {
+                    Ok((sender_conn_id, json)) => (sender_conn_id != conn_id).then_some(json),
+                    // Behind the fan-out: the snapshot says who is in which channel now.
+                    Err(RecvError::Lagged(_)) => Some(state.subscribe(mailbox_id, |mailbox| voice_snapshot(mailbox, &mut subs.voice))),
+                    Err(RecvError::Closed) => break,
+                };
+                if let Some(json) = forward {
+                    if sink.send(Message::text(json)).await.is_err() {
+                        break;
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    _ => {} // own message or lagged
                 }
             }
-            admitted = channels_rx.recv() => {
+            admitted = subs.channels.recv() => {
                 match admitted {
                     Ok(account_fp) if account_fp == auth.account_fp => {
                         if sink.send(Message::text(WS_SIGNAL_CHANNELS)).await.is_err() {
                             break;
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    Err(RecvError::Closed) => break,
                     _ => {}
                 }
             }
-            presence_event = presence_rx.recv() => {
-                match presence_event {
-                    Ok((sender_conn_id, json)) if sender_conn_id != conn_id => {
-                        if sink.send(Message::text(json)).await.is_err() {
-                            break;
-                        }
+            presence_event = subs.presence.recv() => {
+                let forward = match presence_event {
+                    Ok((sender_conn_id, json)) => (sender_conn_id != conn_id).then_some(json),
+                    // Behind the fan-out: the snapshot says who is online now.
+                    Err(RecvError::Lagged(_)) => Some(state.subscribe(mailbox_id, |mailbox| online_snapshot(mailbox, &mut subs.presence))),
+                    Err(RecvError::Closed) => break,
+                };
+                if let Some(json) = forward {
+                    if sink.send(Message::text(json)).await.is_err() {
+                        break;
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    _ => {}
                 }
             }
             revoke_event = revoke_rx.recv() => {
                 let revoked = match revoke_event {
                     Ok((afp, dvk)) => afp == auth.account_fp && dvk == auth.device_vk,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        // Missed events — check storage to see if we've been revoked
-                        !state.storage.is_active_device(&auth.account_fp, &auth.device_vk)
-                            .unwrap_or(false)
+                    // Missed events: ask the store whether this device still stands.
+                    Err(RecvError::Lagged(_)) => {
+                        !state.storage.is_active_device(auth.account_fp, auth.device_vk).await.unwrap_or(false)
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    Err(RecvError::Closed) => break,
                 };
                 if revoked {
+                    let _ = sink.send(Message::Close(Some(revoked_close(&state, &auth).await))).await;
+                    withdraw_at_once = true;
+                    break;
+                }
+            }
+            readmission = readmission_rx.recv() => {
+                let recheck = match readmission {
+                    Ok(account_fp) => account_fp == auth.account_fp,
+                    Err(RecvError::Lagged(_)) => true,
+                    Err(RecvError::Closed) => break,
+                };
+                // Admitted when it connected is not admitted now: the device learns why
+                // from the refusal its reconnect gets.
+                if recheck && !still_admitted(&state, &auth).await {
                     let _ = sink.send(Message::Close(Some(
                         axum::extract::ws::CloseFrame {
-                            code: ghost_wire::WS_CLOSE_DEVICE_REVOKED,
-                            reason: "device revoked".into(),
+                            code: ghost_wire::WS_CLOSE_ADMISSION_CHANGED,
+                            reason: "no longer admitted".into(),
                         },
                     ))).await;
+                    withdraw_at_once = true;
                     break;
                 }
             }
             _ = ping_interval.tick() => {
+                if last_pong.elapsed() > ping_every * WS_MISSED_PONGS {
+                    tracing::debug!(
+                        "ws {}: device {} answered no ping for {:?}; dropping the connection",
+                        short_id(&mailbox_id),
+                        short_id(&auth.device_vk),
+                        last_pong.elapsed()
+                    );
+                    break;
+                }
                 if sink.send(Message::Ping(bytes::Bytes::new())).await.is_err() {
                     break;
                 }
@@ -311,195 +349,225 @@ async fn ws_connection(socket: WebSocket, mailbox_id: [u8; 32], state: AppState,
         }
     }
 
-    // Cleanup: remove voice presence entries for this connection and broadcast leaves
-    let removed = {
-        let mut vp = state.voice_presence.write().await;
-        let mut removed = Vec::new();
-        vp.retain(|e| {
-            if e.conn_id == conn_id && e.mailbox_id == mailbox_id {
-                removed.push((e.channel_id, e.blob.clone()));
-                false
-            } else {
-                true
-            }
-        });
-        removed
-    };
-    if !removed.is_empty() {
-        let map = state.mailboxes.read().await;
-        if let Some(mailbox) = map.get(&mailbox_id) {
-            for (channel_id, blob) in removed {
-                let leave_json = serde_json::json!({
-                    "vs": {
-                        "ch": B64.encode(channel_id),
-                        "leave": true,
-                        "p": B64.encode(&blob),
-                    }
-                });
-                let _ = mailbox.voice_tx.send((conn_id, leave_json.to_string()));
-            }
-        }
-    }
+    withdraw_presence(&state, mailbox_id, conn_id, withdraw_at_once);
+}
 
-    // Cleanup: remove online presence entries for this connection and broadcast leaves
-    let removed_op = {
-        let mut op = state.online_presence.write().await;
-        let mut removed = Vec::new();
-        op.retain(|e| {
-            if e.conn_id == conn_id && e.mailbox_id == mailbox_id {
-                removed.push(e.blob.clone());
-                false
-            } else {
-                true
-            }
-        });
-        removed
-    };
-    if !removed_op.is_empty() {
-        let map = state.mailboxes.read().await;
-        if let Some(mailbox) = map.get(&mailbox_id) {
-            for blob in removed_op {
-                let leave_json = serde_json::json!({
-                    "ps": { "leave": true, "p": B64.encode(&blob) }
-                });
-                let _ = mailbox.presence_tx.send((conn_id, leave_json.to_string()));
-            }
+/// The close for a device the account's log revoked; its reason says what revoked it,
+/// when the log tells.
+pub(crate) async fn revoked_close(state: &AppState, auth: &DeviceAuth) -> axum::extract::ws::CloseFrame {
+    let cause = state.storage.revocation_cause(auth.account_fp, auth.device_vk).await.ok().flatten();
+    axum::extract::ws::CloseFrame {
+        code: ghost_wire::WS_CLOSE_DEVICE_REVOKED,
+        reason: cause.map_or_else(|| "device revoked".to_string(), |c| c.encode()).into(),
+    }
+}
+
+/// Whether the relay would still admit the connection's device. A store that cannot
+/// answer keeps the connection: a reconnect would be judged by the same store.
+async fn still_admitted(state: &AppState, auth: &DeviceAuth) -> bool {
+    state.storage.may_authenticate(auth.account_fp, auth.device_vk, now_millis()).await.map_or(true, |admission| admission.is_some())
+}
+
+/// Deliver one frame from the fan-out. A frame already delivered is skipped; one that
+/// is not the next in the log means the fan-out skipped ahead, and the log fills in.
+async fn deliver_frame(state: &AppState, mailbox_id: [u8; 32], cursor: &mut Cursor, frame: &Frame, sink: &mut Sink) -> Result<(), Stop> {
+    if frame.seq <= cursor.last_seen {
+        return Ok(());
+    }
+    if frame.seq != cursor.last_seen + 1 {
+        return catch_up(state, mailbox_id, cursor, sink).await;
+    }
+    send_entry(cursor, frame.seq, &frame.encoded, sink).await
+}
+
+/// Send everything in the log after the cursor, a page at a time.
+async fn catch_up(state: &AppState, mailbox_id: [u8; 32], cursor: &mut Cursor, sink: &mut Sink) -> Result<(), Stop> {
+    loop {
+        let entries = state.storage.read_from(mailbox_id, cursor.last_seen, WS_CATCHUP_PAGE).await.map_err(|_| Stop::Lost)?;
+        if entries.is_empty() {
+            return Ok(());
+        }
+        for entry in &entries {
+            let frame = Frame::new(entry.seq, entry.received_at, &entry.payload);
+            send_entry(cursor, entry.seq, &frame.encoded, sink).await?;
         }
     }
 }
 
-async fn handle_voice_state(
-    state: &AppState,
-    mailbox_id: &[u8; 32],
-    conn_id: u64,
-    vs: VsInner,
-) {
+/// Send one entry, unless it is past the read limit or the connection's own.
+async fn send_entry(cursor: &mut Cursor, seq: u64, encoded: &[u8], sink: &mut Sink) -> Result<(), Stop> {
+    if cursor.read_limit.is_some_and(|last| seq > last) {
+        return Err(Stop::Removed);
+    }
+    cursor.last_seen = seq;
+    if let Some(pos) = cursor.own_seqs.iter().position(|&s| s == seq) {
+        cursor.own_seqs.swap_remove(pos);
+        return Ok(());
+    }
+    sink.send(Message::binary(encoded.to_vec())).await.map_err(|_| Stop::Lost)?;
+    tracing::debug!("ws: sent seq={seq} ({} bytes)", encoded.len());
+    if cursor.read_limit.is_some_and(|last| seq >= last) {
+        return Err(Stop::Removed);
+    }
+    Ok(())
+}
+
+/// Move the cursor past everything in the log without delivering it.
+async fn skip_to_head(state: &AppState, mailbox_id: [u8; 32], cursor: &mut Cursor) -> Result<(), Stop> {
+    loop {
+        let entries = state.storage.read_from(mailbox_id, cursor.last_seen, WS_CATCHUP_PAGE).await.map_err(|_| Stop::Lost)?;
+        let Some(last) = entries.last() else { return Ok(()) };
+        cursor.last_seen = last.seq;
+    }
+}
+
+/// Who is in which voice channel of the mailbox, each stamped with the device that said
+/// so, as `vs_snap`; sent even when empty, so the client clears what it remembered. The
+/// connection's voice fan-out restarts under the same lock, so it carries exactly the
+/// announcements that came after.
+fn voice_snapshot(mailbox: &Mailbox, fanout: &mut broadcast::Receiver<(u64, String)>) -> String {
+    let voice_presence = mailbox.voice_presence.lock().unwrap();
+    *fanout = mailbox.voice_tx.subscribe();
+    let entries: Vec<VoiceStateMsg> = voice_presence
+        .iter()
+        .map(|e| VoiceStateMsg { ch: B64.encode(e.channel_id), p: Some(B64.encode(&e.blob)), leave: None, from: e.from })
+        .collect();
+    serde_json::json!({ "vs_snap": entries }).to_string()
+}
+
+/// Who is online on the mailbox, as `ps_snap`, restarting the connection's online
+/// fan-out the same way.
+fn online_snapshot(mailbox: &Mailbox, fanout: &mut broadcast::Receiver<(u64, String)>) -> String {
+    let online_presence = mailbox.online_presence.lock().unwrap();
+    *fanout = mailbox.presence_tx.subscribe();
+    let entries: Vec<OnlineStateMsg> =
+        online_presence.iter().map(|e| OnlineStateMsg { p: Some(B64.encode(&e.blob)), leave: None, from: e.from }).collect();
+    serde_json::json!({ "ps_snap": entries }).to_string()
+}
+
+/// A presence blob as announced: base64, non-empty, within the size cap.
+fn decode_presence(encoded: &str) -> Option<Vec<u8>> {
+    match B64.decode(encoded) {
+        Ok(blob) if !blob.is_empty() && blob.len() <= MAX_PRESENCE_BLOB_SIZE => Some(blob),
+        _ => None,
+    }
+}
+
+/// A voice state announcement for the mailbox's other connections, from `from`.
+fn voice_announcement(channel_id: &[u8; 32], presence: Option<String>, from: PresenceSender) -> String {
+    let leave = presence.is_none().then_some(true);
+    serde_json::json!({ "vs": VoiceStateMsg { ch: B64.encode(channel_id), p: presence, leave, from } }).to_string()
+}
+
+/// An online presence announcement for the mailbox's other connections, from `from`.
+fn online_announcement(presence: Option<String>, from: PresenceSender) -> String {
+    let leave = presence.is_none().then_some(true);
+    serde_json::json!({ "ps": OnlineStateMsg { p: presence, leave, from } }).to_string()
+}
+
+/// A device announcing a voice channel is in that call and no other: its entries for
+/// other channels go, with a leave for each. Its entry for the channel moves to this
+/// connection, so a device back after a blip takes over what its earlier connection held.
+fn handle_voice_state(state: &AppState, mailbox_id: &[u8; 32], conn_id: u64, from: &PresenceSender, vs: VsInner) {
     let channel_id: [u8; 32] = match B64.decode(&vs.ch) {
         Ok(b) if b.len() == 32 => b.try_into().unwrap(),
         _ => return,
     };
+    let mailboxes = state.mailboxes.read().unwrap();
+    let Some(mailbox) = mailboxes.get(mailbox_id) else { return };
+    let mut voice_presence = mailbox.voice_presence.lock().unwrap();
 
     if vs.leave == Some(true) {
-        // Remove this connection's entry for this channel
-        let removed_blob = {
-            let mut vp = state.voice_presence.write().await;
-            let pos = vp.iter().position(|e| {
-                e.conn_id == conn_id && e.mailbox_id == *mailbox_id && e.channel_id == channel_id
-            });
-            pos.map(|i| vp.remove(i).blob)
-        };
-        if let Some(blob) = removed_blob {
-            let leave_json = serde_json::json!({
-                "vs": {
-                    "ch": vs.ch,
-                    "leave": true,
-                    "p": B64.encode(&blob),
-                }
-            });
-            let map = state.mailboxes.read().await;
-            if let Some(mailbox) = map.get(mailbox_id) {
-                let _ = mailbox.voice_tx.send((conn_id, leave_json.to_string()));
-            }
+        if let Some(pos) = voice_presence.iter().position(|e| e.from == *from && e.channel_id == channel_id) {
+            voice_presence.remove(pos);
+            let _ = mailbox.voice_tx.send((conn_id, voice_announcement(&channel_id, None, *from)));
         }
     } else if let Some(p_b64) = vs.p {
-        let blob = match B64.decode(&p_b64) {
-            Ok(b) if !b.is_empty() && b.len() <= MAX_PRESENCE_BLOB_SIZE => b,
-            _ => return,
-        };
-        // Upsert in voice_presence
-        {
-            let mut vp = state.voice_presence.write().await;
-            if let Some(entry) = vp.iter_mut().find(|e| {
-                e.conn_id == conn_id && e.mailbox_id == *mailbox_id && e.channel_id == channel_id
-            }) {
-                entry.blob = blob.clone();
-            } else {
-                vp.push(VpEntry {
-                    mailbox_id: *mailbox_id,
-                    channel_id,
-                    conn_id,
-                    blob: blob.clone(),
-                });
+        let Some(blob) = decode_presence(&p_b64) else { return };
+        let (elsewhere, kept): (Vec<_>, Vec<_>) =
+            voice_presence.drain(..).partition(|e| e.from == *from && e.channel_id != channel_id);
+        *voice_presence = kept;
+        for entry in elsewhere {
+            let _ = mailbox.voice_tx.send((conn_id, voice_announcement(&entry.channel_id, None, *from)));
+        }
+        match voice_presence.iter_mut().find(|e| e.from == *from) {
+            Some(entry) => {
+                entry.conn_id = conn_id;
+                entry.blob = blob;
             }
+            None => voice_presence.push(VoicePresence { channel_id, conn_id, from: *from, blob }),
         }
-        // Broadcast to all mailbox subscribers
-        let broadcast_json = serde_json::json!({
-            "vs": { "ch": vs.ch, "p": p_b64 }
-        });
-        let map = state.mailboxes.read().await;
-        if let Some(mailbox) = map.get(mailbox_id) {
-            let _ = mailbox.voice_tx.send((conn_id, broadcast_json.to_string()));
-        }
+        let _ = mailbox.voice_tx.send((conn_id, voice_announcement(&channel_id, Some(p_b64), *from)));
     }
 }
 
-async fn handle_online_presence(
-    state: &AppState,
-    mailbox_id: &[u8; 32],
-    conn_id: u64,
-    ps: PsInner,
-) {
+/// One entry per device: an announcement replaces the device's entry and moves it to
+/// this connection, and a leave (the device went invisible) removes it whichever
+/// connection announced it.
+fn handle_online_presence(state: &AppState, mailbox_id: &[u8; 32], conn_id: u64, from: &PresenceSender, ps: PsInner) {
+    let mailboxes = state.mailboxes.read().unwrap();
+    let Some(mailbox) = mailboxes.get(mailbox_id) else { return };
+    let mut online_presence = mailbox.online_presence.lock().unwrap();
+
     if ps.leave == Some(true) {
-        // Remove this connection's online presence entry
-        let removed_blob = {
-            let mut op = state.online_presence.write().await;
-            let pos = op.iter().position(|e| {
-                e.conn_id == conn_id && e.mailbox_id == *mailbox_id
-            });
-            pos.map(|i| op.remove(i).blob)
-        };
-        if let Some(blob) = removed_blob {
-            let leave_json = serde_json::json!({
-                "ps": { "leave": true, "p": B64.encode(&blob) }
-            });
-            let map = state.mailboxes.read().await;
-            if let Some(mailbox) = map.get(mailbox_id) {
-                let _ = mailbox.presence_tx.send((conn_id, leave_json.to_string()));
-            }
+        if let Some(pos) = online_presence.iter().position(|e| e.from == *from) {
+            online_presence.remove(pos);
+            let _ = mailbox.presence_tx.send((conn_id, online_announcement(None, *from)));
         }
     } else if let Some(p_b64) = ps.p {
-        let blob = match B64.decode(&p_b64) {
-            Ok(b) if !b.is_empty() && b.len() <= MAX_PRESENCE_BLOB_SIZE => b,
-            _ => return,
-        };
-        // Upsert in online_presence (one entry per connection per mailbox)
-        {
-            let mut op = state.online_presence.write().await;
-            if let Some(entry) = op.iter_mut().find(|e| {
-                e.conn_id == conn_id && e.mailbox_id == *mailbox_id
-            }) {
-                entry.blob = blob.clone();
-            } else {
-                op.push(OpEntry {
-                    mailbox_id: *mailbox_id,
-                    conn_id,
-                    blob: blob.clone(),
-                });
+        let Some(blob) = decode_presence(&p_b64) else { return };
+        match online_presence.iter_mut().find(|e| e.from == *from) {
+            Some(entry) => {
+                entry.conn_id = conn_id;
+                entry.blob = blob;
             }
+            None => online_presence.push(OnlinePresence { conn_id, from: *from, blob }),
         }
-        let broadcast_json = serde_json::json!({
-            "ps": { "p": p_b64 }
-        });
-        let map = state.mailboxes.read().await;
-        if let Some(mailbox) = map.get(mailbox_id) {
-            let _ = mailbox.presence_tx.send((conn_id, broadcast_json.to_string()));
-        }
+        let _ = mailbox.presence_tx.send((conn_id, online_announcement(Some(p_b64), *from)));
     }
 }
 
-async fn close_removed(sink: &mut futures_util::stream::SplitSink<WebSocket, Message>) {
+/// A connection that ended takes the presence it holds with it: at once, or once the
+/// grace period passes. A device back meanwhile has moved its entries to its new
+/// connection by announcing again, so nothing is withdrawn and the others hear nothing.
+fn withdraw_presence(state: &AppState, mailbox_id: [u8; 32], conn_id: u64, at_once: bool) {
+    if at_once {
+        withdraw_now(state, &mailbox_id, conn_id);
+        return;
+    }
+    let state = state.clone();
+    let grace = Duration::from_secs(state.config.presence_grace_secs);
+    tokio::spawn(async move {
+        tokio::time::sleep(grace).await;
+        withdraw_now(&state, &mailbox_id, conn_id);
+    });
+}
+
+/// Drop the entries the connection still holds, with a leave for each.
+fn withdraw_now(state: &AppState, mailbox_id: &[u8; 32], conn_id: u64) {
+    let mailboxes = state.mailboxes.read().unwrap();
+    let Some(mailbox) = mailboxes.get(mailbox_id) else { return };
+    {
+        let mut voice_presence = mailbox.voice_presence.lock().unwrap();
+        let (gone, kept): (Vec<_>, Vec<_>) = voice_presence.drain(..).partition(|e| e.conn_id == conn_id);
+        *voice_presence = kept;
+        for entry in gone {
+            let _ = mailbox.voice_tx.send((conn_id, voice_announcement(&entry.channel_id, None, entry.from)));
+        }
+    }
+    let mut online_presence = mailbox.online_presence.lock().unwrap();
+    let (gone, kept): (Vec<_>, Vec<_>) = online_presence.drain(..).partition(|e| e.conn_id == conn_id);
+    *online_presence = kept;
+    for entry in gone {
+        let _ = mailbox.presence_tx.send((conn_id, online_announcement(None, entry.from)));
+    }
+}
+
+async fn close_removed(sink: &mut Sink) {
     let _ = sink
         .send(Message::Close(Some(axum::extract::ws::CloseFrame {
             code: ghost_wire::WS_CLOSE_REMOVED,
             reason: "removed from the group".into(),
         })))
         .await;
-}
-
-fn encode_frame(seq: u64, received_at: u64, payload: &[u8]) -> Vec<u8> {
-    let mut frame = Vec::with_capacity(WS_FRAME_HEADER_SIZE + payload.len());
-    frame.extend_from_slice(&seq.to_be_bytes());
-    frame.extend_from_slice(&received_at.to_be_bytes());
-    frame.extend_from_slice(payload);
-    frame
 }

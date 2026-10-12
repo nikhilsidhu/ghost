@@ -1,9 +1,10 @@
 import {
   servers, selectedServerId, channels, allChannels, members, serverRoles,
-  desiredChannelKind, contacts,
-  selectServer, selectChannel, selectDm, refreshServers, refreshChannels, refreshAllMembers, refreshRoles,
-  updateIdentity, setInviteLink, setMoveLink, setShowInfo, setDesiredChannelKind,
+  desiredChannelKind, contacts, loadContacts, invalidateContacts,
+  selectServer, selectChannel, selectDm, refreshServers, refreshChannels, refreshRoles,
+  updateIdentity, setInvite, setMoveLink, setShowInfo, setDesiredChannelKind,
 } from "./store";
+import type { ChannelKind } from "./types";
 import {
   createServer, createDm, createChannel, renameChannel, deleteChannel,
   createInvite, joinByInvite, setDisplayName, moveServer, followServerMove,
@@ -38,7 +39,12 @@ const typeCompleter = (_q: string, _collected: Record<string, string>) => [
   { label: "voice", value: "voice" },
 ];
 
+/** The channel kind an argument names; anything but voice is a text channel. */
+const channelKindArg = (value: string): ChannelKind => (value === "voice" ? "voice" : "text");
+
 const contactCompleter = (q: string, _collected: Record<string, string>) => {
+  // Contacts are fetched on first use; the list fills in as they arrive.
+  loadContacts();
   const lq = q.toLowerCase();
   return contacts()
     .filter((c) => !lq || c.display_name.toLowerCase().includes(lq))
@@ -90,7 +96,8 @@ const updatePolicy = async (serverId: string, change: (policy: ServerPolicy) => 
   const { policy } = await getServerRoles(serverId);
   change(policy);
   await setServerRoles(serverId, policy);
-  await Promise.all([refreshRoles(), refreshServers(), refreshAllMembers()]);
+  invalidateContacts();
+  await Promise.all([refreshRoles(), refreshServers()]);
 };
 
 const parseAccess = (value: string) => {
@@ -157,7 +164,7 @@ const commands: CommandDef[] = [
       { name: "type", placeholder: "text or voice", complete: typeCompleter, defaultValue: () => desiredChannelKind() },
     ],
     execute: async (args) => {
-      await createChannel(args.server, args.name, args.type);
+      await createChannel(args.server, args.name, channelKindArg(args.type));
       await refreshChannels();
     },
   },
@@ -172,7 +179,7 @@ const commands: CommandDef[] = [
     ],
     execute: async (args) => {
       const access = parseAccess(args.access);
-      await createPrivateChannel(args.server, args.name, args.type, access.roles, access.accounts);
+      await createPrivateChannel(args.server, args.name, channelKindArg(args.type), access.roles, access.accounts);
       await refreshChannels();
     },
   },
@@ -343,8 +350,7 @@ const commands: CommandDef[] = [
     command: "invite",
     args: [{ name: "server", placeholder: "server", complete: serverCompleter, defaultValue: () => selectedServerId() }],
     execute: async (args) => {
-      const invite = await createInvite(args.server);
-      setInviteLink(invite.link);
+      setInvite(await createInvite(args.server));
     },
   },
   {
@@ -389,10 +395,9 @@ const commands: CommandDef[] = [
     execute: async (args) => {
       const dm = await createDm(args.name);
       await refreshServers();
-      await refreshAllMembers();
+      invalidateContacts();
       await selectDm(dm.server_id);
-      const invite = await createInvite(dm.server_id);
-      setInviteLink(invite.link);
+      setInvite(await createInvite(dm.server_id));
     },
   },
   {

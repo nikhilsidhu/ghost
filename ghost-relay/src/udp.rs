@@ -36,8 +36,11 @@ pub async fn run(state: AppState) {
 
         let packet = &buf[..len];
         if let Some(bind) = VoiceBind::from_bytes(packet) {
-            if !state.routing.bind(&bind, sender_addr) {
-                tracing::debug!("voice bind refused from {sender_addr}");
+            match state.routing.bind(&bind, sender_addr) {
+                Some(answer) => {
+                    let _ = socket.try_send_to(&answer.to_bytes(), sender_addr);
+                }
+                None => tracing::debug!("voice bind refused from {sender_addr}"),
             }
             continue;
         }

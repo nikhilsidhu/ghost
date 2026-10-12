@@ -1,11 +1,11 @@
 import { register, unregister } from "@tauri-apps/plugin-global-shortcut";
 import { listen } from "@tauri-apps/api/event";
 import { getKeybinds, getConfig, setPttActive } from "./api";
-import type { VoiceState } from "./types";
+import type { InputMode, VoiceState } from "./types";
 
 let currentPttShortcut: string | null = null;
 let voiceActive = false;
-let inputMode = "voice_activity";
+let inputMode: InputMode = "voice_activity";
 let pttActiveCallback: ((active: boolean) => void) | null = null;
 
 export function onPttActiveChange(cb: (active: boolean) => void) {
@@ -30,7 +30,6 @@ async function registerPtt(shortcut: string) {
       }
     });
     currentPttShortcut = shortcut;
-    console.log("keybinds: registered PTT shortcut:", shortcut);
   } catch (e) {
     const inst = import.meta.env.VITE_GHOST_INSTANCE;
     console.error(`keybinds${inst ? ` [#${inst}]` : ""}: failed to register PTT shortcut:`, shortcut, "(likely owned by another instance)", e);
@@ -45,6 +44,9 @@ async function unregisterPtt() {
     // already unregistered or invalid
   }
   currentPttShortcut = null;
+  // A key held now would never be heard released: let go of the gate here.
+  pttActiveCallback?.(false);
+  setPttActive(false).catch(() => {});
 }
 
 function syncPtt() {
@@ -62,7 +64,7 @@ export function setPttShortcut(shortcut: string | null) {
   syncPtt();
 }
 
-export function setInputMode(mode: string) {
+export function setInputMode(mode: InputMode) {
   inputMode = mode;
   syncPtt();
 }

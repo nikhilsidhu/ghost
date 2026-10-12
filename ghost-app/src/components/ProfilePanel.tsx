@@ -6,8 +6,12 @@ import { Tooltip } from "./ui/tooltip";
 import { cn } from "../lib/cn";
 import { identity, profileOpen, setProfileOpen, ownStatus, setOwnStatus, ownStatusMessage, setOwnStatusMessage, selectedExpiry, setSelectedExpiry, expiresAt, setExpiresAt, rebuildPresence, setAutoMuted, updateIdentity, avatarUrl, loadAvatar } from "../lib/store";
 import { setDisplayName, setStatus as apiSetStatus, setStatusMessage as apiSetStatusMessage, uploadAvatar, clearAvatar } from "../lib/api";
+import type { OnlineStatus, ProfileReach } from "../lib/types";
 
-const STATUS_OPTIONS = [
+/** How long a note about a name or avatar change stays shown. */
+const PROFILE_NOTE_MS = 6000;
+
+const STATUS_OPTIONS: { value: OnlineStatus; label: string; color: string }[] = [
   { value: "online", label: "Online", color: "var(--emerald-400)" },
   { value: "away", label: "Away", color: "var(--ember-400)" },
   { value: "invisible", label: "Invisible", color: "var(--neutral-500)" },
@@ -88,10 +92,29 @@ export function ProfilePanel() {
     setEditingName(true);
   };
 
+  /** How far the last name or avatar change got, or why it failed, for a while. */
+  const [profileNote, setProfileNote] = createSignal<{ text: string; failed: boolean } | null>(null);
+  let profileNoteTimer: ReturnType<typeof setTimeout> | undefined;
+  const showProfileNote = (text: string, failed: boolean) => {
+    clearTimeout(profileNoteTimer);
+    setProfileNote({ text, failed });
+    profileNoteTimer = setTimeout(() => setProfileNote(null), PROFILE_NOTE_MS);
+  };
+  /** Say so when a change did not reach every server; those get it once reachable. */
+  const noteReach = (what: string, reach: ProfileReach) => {
+    if (reach.reached < reach.servers) {
+      showProfileNote(`${what} reached ${reach.reached} of ${reach.servers} servers; the others get it once they are reachable`, false);
+    }
+  };
+
   const saveName = async () => {
     const name = nameInput().trim();
     if (name && name !== identity()?.display_name) {
-      await setDisplayName(name).catch(() => {});
+      try {
+        noteReach("your name", await setDisplayName(name));
+      } catch (e) {
+        showProfileNote(`name not changed: ${String(e)}`, true);
+      }
       await updateIdentity();
     }
     setEditingName(false);
@@ -102,7 +125,7 @@ export function ProfilePanel() {
     if (e.key === "Escape") setEditingName(false);
   };
 
-  const onStatusChange = (value: string) => {
+  const onStatusChange = (value: OnlineStatus) => {
     setOwnStatus(value);
     setAutoMuted(false);
     rebuildPresence();
@@ -146,10 +169,10 @@ export function ProfilePanel() {
   const onClearAvatar = async (e: MouseEvent) => {
     e.stopPropagation();
     try {
-      await clearAvatar();
+      noteReach("removing your avatar", await clearAvatar());
       await loadAvatar(identity()!.fingerprint);
     } catch (err) {
-      console.error("clear avatar failed:", err);
+      showProfileNote(`avatar not removed: ${String(err)}`, true);
     }
   };
 
@@ -182,14 +205,14 @@ export function ProfilePanel() {
     setGifBytes(null);
   };
 
-  const onCropConfirm = async (bytes: number[]) => {
+  const onCropConfirm = async (bytes: Uint8Array) => {
     setUploading(true);
     try {
-      await uploadAvatar(bytes);
+      noteReach("your avatar", await uploadAvatar(bytes));
       await loadAvatar(identity()!.fingerprint);
       dismissCrop();
     } catch (e) {
-      console.error("avatar upload failed:", e);
+      showProfileNote(`avatar not changed: ${String(e)}`, true);
     } finally {
       setUploading(false);
     }
@@ -299,6 +322,15 @@ export function ProfilePanel() {
                   <X size={14} />
                 </button>
               </div>
+
+              <Show when={profileNote()}>
+                <div
+                  role={profileNote()!.failed ? "alert" : "status"}
+                  class={cn("text-xs break-words", profileNote()!.failed ? "text-[var(--red-400)]" : "text-[var(--amber-400)]")}
+                >
+                  {profileNote()!.text}
+                </div>
+              </Show>
 
               {/* Status pills */}
               <div

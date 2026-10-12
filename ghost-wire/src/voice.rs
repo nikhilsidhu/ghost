@@ -5,24 +5,34 @@
 //! The join, over a device-authenticated WebSocket, hands the participant a room id, a
 //! slot and a secret token. The participant then sends bind packets from its UDP
 //! socket, keyed with the token and carrying an increasing counter; the relay forwards
-//! media only between bound addresses. As with ICE binding after signaling, knowing a
-//! room or slot id is not enough to receive a room's packets, and a bind seen on the
-//! wire cannot be replayed to steal a slot.
+//! media only between bound addresses and answers each bind it accepts, so the
+//! participant knows its media gets through. As with ICE binding after signaling,
+//! knowing a room or slot id is not enough to receive a room's packets, and a bind seen
+//! on the wire cannot be replayed to steal a slot.
+//!
+//! The token also lets a participant whose WebSocket dropped claim its slot back on a
+//! new one, so the call and its media carry on through a signaling blip.
 
 use serde::{Deserialize, Serialize};
 
+use crate::presence::PresenceSender;
 use crate::VOICE_HEADER_SIZE;
 
 /// `[header_len:2 = 78][room_id:32][slot_id:4][counter:8][mac:32]`; the length field
-/// tells binds apart from media packets.
+/// tells binds apart from media packets. The relay's answer to a bind has the same
+/// layout, keyed for the other direction.
 pub const VOICE_BIND_SIZE: usize = 2 + 32 + 4 + 8 + 32;
 
 /// Client to relay, as JSON text frames on the voice WebSocket. Presence blobs are
-/// sealed to the group, so the relay only stores and forwards them (base64).
+/// sealed to the group, so the relay only stores and forwards them (base64), stamped
+/// with the authenticated device that sent them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMsg {
     Join { presence: String },
+    /// Claim back the slot a dropped connection held, proving it with the slot's token
+    /// (base64), and announce the presence as it is now.
+    Resume { slot_id: u32, token: String, presence: String },
     Leave,
     Presence { blob: String },
     Speaking { speaking: bool },
@@ -36,20 +46,23 @@ pub enum ClientMsg {
 pub enum ServerMsg {
     /// `room` goes in every media packet header; `token` keys the bind packets that tie
     /// the participant's UDP address to `slot_id`. Both are base64. Sent again, with
-    /// the current peers, after a resync.
+    /// the current peers, after a resync or a resume.
     Welcome { slot_id: u32, port: u16, room: String, token: String, peers: Vec<PeerEntry> },
-    Joined { slot_id: u32, presence: String },
+    /// The slot a resume named is gone (the relay ended it or restarted); join afresh.
+    NotResumed,
+    Joined { slot_id: u32, presence: String, from: PresenceSender },
     Left { slot_id: u32 },
-    Presence { slot_id: u32, blob: String },
+    Presence { slot_id: u32, blob: String, from: PresenceSender },
     Speaking { slot_id: u32, speaking: bool },
     Error { message: String },
 }
 
-/// A participant already in the room, with its latest presence blob.
+/// A participant already in the room, with its latest presence blob and who sent it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerEntry {
     pub slot_id: u32,
     pub presence: String,
+    pub from: PresenceSender,
 }
 
 /// The header of every media packet:
@@ -100,6 +113,7 @@ impl MediaHeader {
 
 const ROOM_DOMAIN: &str = "ghost voice room v1";
 const BIND_DOMAIN: &[u8] = b"ghost-voice-bind-v1";
+const BIND_ACK_DOMAIN: &[u8] = b"ghost-voice-bind-ack-v1";
 
 /// The relay's id for the voice room of `channel_id` within the group whose mailbox
 /// is `mailbox_id`, so rooms of different groups never meet.
@@ -120,9 +134,9 @@ pub struct VoiceBind {
     pub mac: [u8; 32],
 }
 
-fn mac(token: &[u8; 32], room_id: &[u8; 32], slot_id: u32, counter: u64) -> blake3::Hash {
+fn mac(domain: &[u8], token: &[u8; 32], room_id: &[u8; 32], slot_id: u32, counter: u64) -> blake3::Hash {
     let mut hasher = blake3::Hasher::new_keyed(token);
-    hasher.update(BIND_DOMAIN);
+    hasher.update(domain);
     hasher.update(room_id);
     hasher.update(&slot_id.to_be_bytes());
     hasher.update(&counter.to_be_bytes());
@@ -131,12 +145,23 @@ fn mac(token: &[u8; 32], room_id: &[u8; 32], slot_id: u32, counter: u64) -> blak
 
 impl VoiceBind {
     pub fn sign(token: &[u8; 32], room_id: [u8; 32], slot_id: u32, counter: u64) -> Self {
-        Self { room_id, slot_id, counter, mac: mac(token, &room_id, slot_id, counter).into() }
+        Self { room_id, slot_id, counter, mac: mac(BIND_DOMAIN, token, &room_id, slot_id, counter).into() }
     }
 
     /// Whether the MAC was made with `token` (compared in constant time).
     pub fn verify(&self, token: &[u8; 32]) -> bool {
-        mac(token, &self.room_id, self.slot_id, self.counter) == blake3::Hash::from(self.mac)
+        mac(BIND_DOMAIN, token, &self.room_id, self.slot_id, self.counter) == blake3::Hash::from(self.mac)
+    }
+
+    /// The relay's answer to this bind, once accepted: the same fields, keyed for the
+    /// way back, so a bind reflected to its sender does not pass for an answer.
+    pub fn answer(&self, token: &[u8; 32]) -> Self {
+        Self { mac: mac(BIND_ACK_DOMAIN, token, &self.room_id, self.slot_id, self.counter).into(), ..self.clone() }
+    }
+
+    /// Whether this is the relay's answer to a bind made with `token`.
+    pub fn verify_answer(&self, token: &[u8; 32]) -> bool {
+        mac(BIND_ACK_DOMAIN, token, &self.room_id, self.slot_id, self.counter) == blake3::Hash::from(self.mac)
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -181,6 +206,17 @@ mod tests {
     }
 
     #[test]
+    fn a_bind_and_its_answer_are_told_apart() {
+        let token = [7; 32];
+        let bind = VoiceBind::sign(&token, [5; 32], 9, 3);
+        let answer = VoiceBind::from_bytes(&bind.answer(&token).to_bytes()).unwrap();
+        assert!(answer.verify_answer(&token));
+        assert!(!answer.verify(&token), "an answer is no bind");
+        assert!(!bind.verify_answer(&token), "a bind reflected back is no answer");
+        assert!(!answer.verify_answer(&[8; 32]), "another slot's token");
+    }
+
+    #[test]
     fn rooms_differ_by_group_and_channel() {
         let a = voice_room_id(&[1; 32], &[2; 32]);
         assert_ne!(a, voice_room_id(&[3; 32], &[2; 32]));
@@ -218,9 +254,10 @@ mod tests {
     fn signaling_json_shape() {
         let join = serde_json::to_value(ClientMsg::Join { presence: "cA==".into() }).unwrap();
         assert_eq!(join, serde_json::json!({ "type": "join", "presence": "cA==" }));
+        let sender = PresenceSender { account_fp: [1; 32], device_vk: [2; 32] };
         let welcome: ServerMsg = serde_json::from_value(serde_json::json!({
             "type": "welcome", "slot_id": 2, "port": 7701, "room": "cg==", "token": "dA==",
-            "peers": [{ "slot_id": 1, "presence": "cA==" }],
+            "peers": [{ "slot_id": 1, "presence": "cA==", "from": serde_json::to_value(sender).unwrap() }],
         }))
         .unwrap();
         assert_eq!(
@@ -230,8 +267,13 @@ mod tests {
                 port: 7701,
                 room: "cg==".into(),
                 token: "dA==".into(),
-                peers: vec![PeerEntry { slot_id: 1, presence: "cA==".into() }],
+                peers: vec![PeerEntry { slot_id: 1, presence: "cA==".into(), from: sender }],
             }
         );
+        let joined = serde_json::to_value(ServerMsg::Joined { slot_id: 3, presence: "cA==".into(), from: sender }).unwrap();
+        assert_eq!(joined["from"]["a"], serde_json::to_value(sender).unwrap()["a"]);
+        let resume = serde_json::to_value(ClientMsg::Resume { slot_id: 4, token: "dA==".into(), presence: "cA==".into() }).unwrap();
+        assert_eq!(resume, serde_json::json!({ "type": "resume", "slot_id": 4, "token": "dA==", "presence": "cA==" }));
+        assert_eq!(serde_json::to_value(ServerMsg::NotResumed).unwrap(), serde_json::json!({ "type": "not_resumed" }));
     }
 }

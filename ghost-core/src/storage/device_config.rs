@@ -1,8 +1,8 @@
 use rusqlite::OptionalExtension;
 
-use crate::error::{GhostError, Result};
+use crate::error::Result;
 
-use super::GhostStore;
+use super::{db, GhostStore};
 
 impl GhostStore {
     pub fn get_config_blob(&self, key: &str) -> Result<Option<Vec<u8>>> {
@@ -13,7 +13,12 @@ impl GhostStore {
                 |row| row.get(0),
             )
             .optional()
-            .map_err(|e| GhostError::Database(format!("get device_config: {e}")))
+            .map_err(db("get device_config"))
+    }
+
+    pub fn delete_config_blob(&self, key: &str) -> Result<()> {
+        self.conn.execute("DELETE FROM device_config WHERE key = ?1", [key]).map_err(db("delete device_config"))?;
+        Ok(())
     }
 
     pub fn set_config_blob(&self, key: &str, value: &[u8]) -> Result<()> {
@@ -23,7 +28,7 @@ impl GhostStore {
                  ON CONFLICT (key) DO UPDATE SET value = ?2",
                 rusqlite::params![key, value],
             )
-            .map_err(|e| GhostError::Database(format!("set device_config: {e}")))?;
+            .map_err(db("set device_config"))?;
         Ok(())
     }
 }

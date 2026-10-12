@@ -39,6 +39,10 @@ impl TestAuth {
     }
 
     fn genesis_bytes(&self) -> Vec<u8> {
+        self.genesis_entry().to_bytes()
+    }
+
+    fn genesis_entry(&self) -> ghost_wire::idlog::LogEntry {
         let mut entry = ghost_wire::idlog::LogEntry {
             seq: 1,
             prev_hash: [0u8; 32],
@@ -46,7 +50,7 @@ impl TestAuth {
             entry_type: ghost_wire::idlog::EntryType::Genesis,
             timestamp: 1000,
             body: ghost_wire::idlog::EntryBody::Genesis {
-                master_verifying_key: self.master_key.verifying_key().to_bytes(),
+                genesis_verifying_key: self.master_key.verifying_key().to_bytes(),
                 device_verifying_key: self.device_key.verifying_key().to_bytes(),
                 device_label: "test".to_string(),
             },
@@ -56,7 +60,34 @@ impl TestAuth {
         let msg = ghost_wire::idlog::sign_message(&entry);
         entry.signature = self.master_key.sign(&msg).to_bytes();
         entry.counter_signature = Some(self.device_key.sign(&msg).to_bytes());
-        entry.to_bytes()
+        entry
+    }
+
+    /// Another device of this registered account, added to its log on the relay by this
+    /// one. For an account whose log holds only its genesis.
+    async fn add_device(&self, base: &str) -> TestAuth {
+        let device_key = SigningKey::generate(&mut OsRng);
+        let mut add = ghost_wire::idlog::LogEntry {
+            seq: 2,
+            prev_hash: ghost_wire::idlog::entry_hash(&self.genesis_entry()),
+            account_fp: self.account_fp,
+            entry_type: ghost_wire::idlog::EntryType::AddDevice,
+            timestamp: 2000,
+            body: ghost_wire::idlog::EntryBody::AddDevice {
+                authorizer_key: self.device_key.verifying_key().to_bytes(),
+                device_verifying_key: device_key.verifying_key().to_bytes(),
+                device_label: "second".to_string(),
+            },
+            signature: [0u8; 64],
+            counter_signature: None,
+        };
+        let msg = ghost_wire::idlog::sign_message(&add);
+        add.signature = self.device_key.sign(&msg).to_bytes();
+        add.counter_signature = Some(device_key.sign(&msg).to_bytes());
+        let url = format!("{base}/idlog/{}", hex::encode(self.account_fp));
+        let resp = self.sign("PUT", &url, add.to_bytes(), reqwest::Client::new().put(&url)).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED, "adding a device failed");
+        TestAuth { account_fp: self.account_fp, master_key: self.master_key.clone(), device_key }
     }
 
     /// Push genesis entry to relay and register this device.
@@ -67,21 +98,16 @@ impl TestAuth {
         assert_eq!(resp.status(), StatusCode::CREATED, "genesis push failed");
     }
 
-    /// Sign a request builder with fresh auth headers bound to method + path.
-    fn sign(&self, method: &str, url: &str, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        let path = extract_path(url);
-        let h = ghost_wire::auth::sign_request_headers(
-            method,
-            &path,
-            &self.account_fp,
-            &self.device_key.verifying_key().to_bytes(),
-            &self.device_key,
-            None,
-        );
-        req.header("x-ghost-account", &h.account)
-            .header("x-ghost-device", &h.device)
-            .header("x-ghost-timestamp", &h.timestamp)
-            .header("x-ghost-signature", &h.signature)
+    /// Sign a request with fresh auth headers bound to method, path and `body`, which
+    /// goes on the request afterwards.
+    fn sign(&self, method: &str, url: &str, body: Vec<u8>, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        sign_as(&self.account_fp, &self.device_key, method, url, body, req)
+    }
+
+    /// A signed POST of `value` as JSON.
+    fn post_json(&self, url: &str, value: &serde_json::Value) -> reqwest::RequestBuilder {
+        let body = serde_json::to_vec(value).unwrap();
+        self.sign("POST", url, body, reqwest::Client::new().post(url).header("content-type", "application/json"))
     }
 
     /// Connect to a WebSocket URL with auth headers.
@@ -107,7 +133,9 @@ impl TestAuth {
         let ws_path = url.find("//")
             .and_then(|i| url[i+2..].find('/').map(|j| &url[i+2+j..]))
             .unwrap_or("/");
-        let message = ghost_wire::auth::auth_message("GET", ws_path, &self.account_fp, &vk, timestamp, None);
+        let mut nonce = [0u8; ghost_wire::auth::AUTH_NONCE_LEN];
+        rand::RngCore::fill_bytes(&mut OsRng, &mut nonce);
+        let message = ghost_wire::auth::auth_message("GET", ws_path, &self.account_fp, &vk, timestamp, &nonce, &ghost_wire::auth::body_hash(&[]));
         let signature = self.device_key.sign(&message);
 
         let request = http::Request::builder()
@@ -123,11 +151,32 @@ impl TestAuth {
             .header("x-ghost-account", hex::encode(self.account_fp))
             .header("x-ghost-device", hex::encode(vk))
             .header("x-ghost-timestamp", timestamp.to_string())
+            .header("x-ghost-nonce", hex::encode(nonce))
             .header("x-ghost-signature", hex::encode(signature.to_bytes()))
             .body(())
             .unwrap();
         request
     }
+}
+
+/// Sign a request for `account_fp` with `key` in the device headers: a device key,
+/// or the account's root, which relays accept there for reading the account's data.
+fn sign_as(account_fp: &[u8; 32], key: &SigningKey, method: &str, url: &str, body: Vec<u8>, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    let path = extract_path(url);
+    let h = ghost_wire::auth::sign_request_headers(method, &path, &body, account_fp, &key.verifying_key().to_bytes(), key);
+    req.header("x-ghost-account", &h.account)
+        .header("x-ghost-device", &h.device)
+        .header("x-ghost-timestamp", &h.timestamp)
+        .header("x-ghost-nonce", &h.nonce)
+        .header("x-ghost-signature", &h.signature)
+        .body(body)
+}
+
+/// A mailbox for invites in tests that never upload group state, so anyone is a member.
+const INVITE_MAILBOX: [u8; 32] = [0x77; 32];
+
+fn invite_registration(token: &str, expires_at: u64) -> serde_json::Value {
+    serde_json::json!({ "token": token, "expires_at": expires_at, "mailbox": URL_SAFE_NO_PAD.encode(INVITE_MAILBOX) })
 }
 
 // ── Server setup ──────────────────────────────────────────────────
@@ -138,7 +187,7 @@ async fn start_server(config: Config) -> String {
 
 /// A relay started exactly as the binary starts it; it serves until the test ends.
 async fn start_running(config: Config) -> server::RunningRelay {
-    let storage = Storage::open_in_memory().unwrap();
+    let storage = Storage::open_ephemeral().unwrap();
     server::start(config, storage, ([127, 0, 0, 1], 0).into()).await.unwrap()
 }
 
@@ -166,6 +215,11 @@ fn test_config() -> Config {
         log_min_entries: 100,
         public_url: None,
         mirror_refresh_secs: 30,
+        trusted_proxies: Vec::new(),
+        ws_ping_secs: 30,
+        presence_grace_secs: 30,
+        skip_policy_checks_for_tests: false,
+        revoked_devices_for_tests: Default::default(),
     }
 }
 
@@ -204,13 +258,14 @@ async fn ws_handshake(
         .unwrap();
 }
 
-/// Consume the vs_snap and ps_snap text frames sent after replay completes.
-async fn consume_vs_snap(
+/// Consume the text frames that end the replay: the caught-up signal, then the vs_snap
+/// and ps_snap snapshots.
+async fn consume_replay_end(
     ws: &mut tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
 ) {
-    for expected in &["vs_snap", "ps_snap"] {
+    for expected in &[ghost_wire::WS_SIGNAL_CAUGHT_UP, "vs_snap", "ps_snap"] {
         let snap = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let m = ws.next().await.unwrap().unwrap();
@@ -228,60 +283,19 @@ async fn consume_vs_snap(
 // ── Tests ─────────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn blob_post_and_get() {
+async fn blob_posts_are_numbered_in_order() {
     let base = start_server(test_config()).await;
     let auth = TestAuth::generate();
     auth.register(&base).await;
     let client = reqwest::Client::new();
     let url = mailbox_url(&base, &[0x01; 32]);
 
-    // POST
-    let resp = auth.sign("POST", &url, client.post(&url).body(test_envelope(b"hello"))).send().await.unwrap();
-    assert_eq!(resp.status(), StatusCode::CREATED);
-    let body: Value = resp.json().await.unwrap();
-    assert_eq!(body["seq"], 1);
-
-    // GET returns it
-    let blobs: Vec<Value> = auth.sign("GET", &url, client.get(&url)).send().await.unwrap().json().await.unwrap();
-    assert_eq!(blobs.len(), 1);
-    assert_eq!(blobs[0]["seq"], 1);
-
-    // POST another
-    let resp = auth.sign("POST", &url, client.post(&url).body(test_envelope(b"world"))).send().await.unwrap();
-    assert_eq!(resp.status(), StatusCode::CREATED);
-    let body: Value = resp.json().await.unwrap();
-    assert_eq!(body["seq"], 2);
-
-    // GET with after=1 returns only second
-    let blobs: Vec<Value> = auth.sign("GET", &url, client.get(format!("{url}?after=1")))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(blobs.len(), 1);
-    assert_eq!(blobs[0]["seq"], 2);
-}
-
-#[tokio::test]
-async fn long_poll_wakeup() {
-    let base = start_server(test_config()).await;
-    let auth = TestAuth::generate();
-    auth.register(&base).await;
-    let client = reqwest::Client::new();
-    let url = mailbox_url(&base, &[0x02; 32]);
-
-    let get_url = url.clone();
-    let get_req = auth.sign("GET", &get_url, client.get(&get_url).header("X-Ghost-Long-Poll", "5000"));
-    let handle = tokio::spawn(async move { get_req.send().await.unwrap() });
-
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    auth.sign("POST", &url, client.post(&url).body(test_envelope(b"wake"))).send().await.unwrap();
-
-    let resp = handle.await.unwrap();
-    let blobs: Vec<Value> = resp.json().await.unwrap();
-    assert_eq!(blobs.len(), 1);
+    for (expected_seq, payload) in [(1, b"hello".as_slice()), (2, b"world".as_slice())] {
+        let resp = auth.sign("POST", &url, test_envelope(payload), client.post(&url)).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["seq"], expected_seq);
+    }
 }
 
 #[tokio::test]
@@ -297,8 +311,8 @@ async fn ws_fanout() {
     let mut ws_b = auth.ws_connect(&ws_url).await;
     ws_handshake(&mut ws_a, 0).await;
     ws_handshake(&mut ws_b, 0).await;
-    consume_vs_snap(&mut ws_a).await;
-    consume_vs_snap(&mut ws_b).await;
+    consume_replay_end(&mut ws_a).await;
+    consume_replay_end(&mut ws_b).await;
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -318,8 +332,39 @@ async fn ws_fanout() {
     assert_eq!(&data[26..], b"from-a");
 }
 
+/// The caught-up signal follows the entries held past the resume point, and precedes
+/// the live ones.
 #[tokio::test]
-async fn ws_epoch_mismatch_ack() {
+async fn the_caught_up_signal_ends_the_replay() {
+    let base = start_server(test_config()).await;
+    let auth = TestAuth::generate();
+    auth.register(&base).await;
+    let client = reqwest::Client::new();
+    let url = mailbox_url(&base, &[0x04; 32]);
+    for payload in [b"one".as_slice(), b"two", b"three"] {
+        auth.sign("POST", &url, test_envelope(payload), client.post(&url)).send().await.unwrap();
+    }
+
+    let ws_url = format!("{}/ws/{}", base.replace("http://", "ws://"), URL_SAFE_NO_PAD.encode([0x04; 32]));
+    let mut ws = auth.ws_connect(&ws_url).await;
+    ws_handshake(&mut ws, 1).await;
+    let replayed = tokio::time::timeout(Duration::from_secs(2), async {
+        let mut replayed = 0;
+        loop {
+            match ws.next().await.unwrap().unwrap() {
+                Message::Binary(_) => replayed += 1,
+                Message::Text(t) if t.as_str() == ghost_wire::WS_SIGNAL_CAUGHT_UP => break replayed,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("the replay never ended");
+    assert_eq!(replayed, 2, "the entries after the resume point, then the signal");
+}
+
+#[tokio::test]
+async fn ws_refuses_a_stale_message_with_an_error_ack() {
     use ghost_wire::EnvelopeType;
 
     let base = start_server(test_config()).await;
@@ -339,7 +384,7 @@ async fn ws_epoch_mismatch_ack() {
 
     let mut ws = auth.ws_connect(&ws_url).await;
     ws_handshake(&mut ws, 0).await;
-    consume_vs_snap(&mut ws).await;
+    consume_replay_end(&mut ws).await;
 
     // Send at epoch 0 — no mismatch, ack is just the seq number
     ws.send(Message::Binary(envelope(EnvelopeType::Application, 0, b"ok").into())).await.unwrap();
@@ -363,7 +408,28 @@ async fn ws_epoch_mismatch_ack() {
     assert_eq!(ack, "2");
     upload_group_info(&base, &auth, &mailbox_id, &gi).await;
 
-    // Send at stale epoch 0 — relay is at 1, expect mismatch hint (app messages still stored)
+    // One epoch behind is still open to members: taken.
+    ws.send(Message::Binary(envelope(EnvelopeType::Application, 0, b"one behind").into())).await.unwrap();
+    let ack = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let m = ws.next().await.unwrap().unwrap();
+            if let Message::Text(t) = m { break t.to_string(); }
+        }
+    }).await.expect("timed out");
+    assert_eq!(ack, "3");
+
+    // Another commit moves the relay to epoch 2; a message at epoch 0 is refused, with
+    // the status in the reply so the sender knows to seal it again later.
+    let (commit_env, gi) = create_self_update_commit(&mut group, &provider, &id.signer, 1);
+    ws.send(Message::Binary(commit_env.into())).await.unwrap();
+    let ack = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let m = ws.next().await.unwrap().unwrap();
+            if let Message::Text(t) = m { break t.to_string(); }
+        }
+    }).await.expect("timed out");
+    assert_eq!(ack, "4");
+    upload_group_info(&base, &auth, &mailbox_id, &gi).await;
     ws.send(Message::Binary(envelope(EnvelopeType::Application, 0, b"stale").into())).await.unwrap();
     let ack = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
@@ -371,7 +437,7 @@ async fn ws_epoch_mismatch_ack() {
             if let Message::Text(t) = m { break t.to_string(); }
         }
     }).await.expect("timed out");
-    assert_eq!(ack, "3 epoch_mismatch");
+    assert_eq!(ack, "error: 409 conflict");
 }
 
 #[tokio::test]
@@ -382,7 +448,7 @@ async fn invalid_envelope_rejected() {
     let client = reqwest::Client::new();
     let url = mailbox_url(&base, &[0x06; 32]);
 
-    let resp = auth.sign("POST", &url, client.post(&url).body(b"not an envelope".to_vec())).send().await.unwrap();
+    let resp = auth.sign("POST", &url, b"not an envelope".to_vec(), client.post(&url)).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
@@ -390,7 +456,7 @@ async fn invalid_envelope_rejected() {
 async fn epoch_gating() {
     use ghost_wire::EnvelopeType;
 
-    let base = start_server(test_config()).await;
+    let (base, st) = start_server_with_state(test_config()).await;
     let auth = TestAuth::generate();
     auth.register(&base).await;
 
@@ -404,51 +470,39 @@ async fn epoch_gating() {
     let client = reqwest::Client::new();
     let url = mailbox_url(&base, &mailbox_id);
 
-    // Application at epoch 0 — relay epoch is 0, no mismatch
-    let body: Value = auth.sign("POST", &url, client.post(&url)
-        .body(envelope(EnvelopeType::Application, 0, b"msg1")))
+    // Application at epoch 0 — relay epoch is 0
+    let body: Value = auth.sign("POST", &url, envelope(EnvelopeType::Application, 0, b"msg1"), client.post(&url))
         .send().await.unwrap().json().await.unwrap();
     assert_eq!(body["seq"], 1);
-    assert!(body.get("epoch_mismatch").is_none());
 
     // Real commit at epoch 0 — advances relay epoch to 1
     let (commit_env, gi) = create_self_update_commit(&mut group, &provider, &id.signer, 0);
-    let body: Value = auth.sign("POST", &url, client.post(&url)
-        .body(commit_env))
+    let body: Value = auth.sign("POST", &url, commit_env, client.post(&url))
         .send().await.unwrap().json().await.unwrap();
     assert_eq!(body["seq"], 2);
-    assert!(body.get("epoch_mismatch").is_none());
     upload_group_info(&base, &auth, &mailbox_id, &gi).await;
 
     // Application at epoch 1 — matches new relay epoch
-    let body: Value = auth.sign("POST", &url, client.post(&url)
-        .body(envelope(EnvelopeType::Application, 1, b"msg2")))
+    let body: Value = auth.sign("POST", &url, envelope(EnvelopeType::Application, 1, b"msg2"), client.post(&url))
         .send().await.unwrap().json().await.unwrap();
-    assert!(body.get("epoch_mismatch").is_none());
+    assert_eq!(body["seq"], 3);
 
-    // Application at epoch 0 — stale, relay expects 1
-    let body: Value = auth.sign("POST", &url, client.post(&url)
-        .body(envelope(EnvelopeType::Application, 0, b"stale")))
+    // Application at epoch 0 — one behind, which members still open: taken
+    let body: Value = auth.sign("POST", &url, envelope(EnvelopeType::Application, 0, b"one behind"), client.post(&url))
         .send().await.unwrap().json().await.unwrap();
-    assert_eq!(body["epoch_mismatch"], true);
-
-    // Blob was still stored despite mismatch
-    let blobs: Vec<Value> = auth.sign("GET", &url, client.get(&url)).send().await.unwrap().json().await.unwrap();
-    assert_eq!(blobs.len(), 4);
-
-    // Application at epoch 1 still matches — relay didn't go backward
-    let body: Value = auth.sign("POST", &url, client.post(&url)
-        .body(envelope(EnvelopeType::Application, 1, b"still-ok")))
-        .send().await.unwrap().json().await.unwrap();
-    assert!(body.get("epoch_mismatch").is_none());
+    assert_eq!(body["seq"], 4);
 
     // Real commit at epoch 1 — advances relay to 2
     let (commit_env2, gi2) = create_self_update_commit(&mut group, &provider, &id.signer, 1);
-    let body: Value = auth.sign("POST", &url, client.post(&url)
-        .body(commit_env2))
+    let body: Value = auth.sign("POST", &url, commit_env2, client.post(&url))
         .send().await.unwrap().json().await.unwrap();
-    assert!(body.get("epoch_mismatch").is_none());
+    assert_eq!(body["seq"], 5);
     upload_group_info(&base, &auth, &mailbox_id, &gi2).await;
+
+    // Application at epoch 0 — two behind, nobody could open it: refused and not stored
+    let resp = auth.sign("POST", &url, envelope(EnvelopeType::Application, 0, b"stale"), client.post(&url)).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert_eq!(st.storage.read_from(mailbox_id, 0, 10).await.unwrap().len(), 5);
 }
 
 #[tokio::test]
@@ -465,7 +519,7 @@ async fn ws_catchup_replay() {
 
     // Post 3 blobs via HTTP
     for i in 0..3u8 {
-        let resp = auth.sign("POST", &url, client.post(&url).body(test_envelope(&[i]))).send().await.unwrap();
+        let resp = auth.sign("POST", &url, test_envelope(&[i]), client.post(&url)).send().await.unwrap();
         assert_eq!(resp.status(), StatusCode::CREATED);
     }
 
@@ -505,6 +559,60 @@ async fn ws_catchup_replay() {
     assert_eq!(data[26], 2);
 }
 
+/// A connection resuming before what the log still keeps is told where it resumes and
+/// gets only what follows; one resuming past the log's end, as after the relay's log
+/// started over, is served the whole log.
+#[tokio::test]
+async fn a_gap_names_where_the_connection_resumes_and_a_log_that_started_over_is_served_whole() {
+    let (base, st) = start_server_with_state(test_config()).await;
+    let auth = TestAuth::generate();
+    auth.register(&base).await;
+    let client = reqwest::Client::new();
+    let mailbox_id = [0x0A; 32];
+    let url = mailbox_url(&base, &mailbox_id);
+    let ws_url = format!("{}/ws/{}", base.replace("http://", "ws://"), URL_SAFE_NO_PAD.encode(mailbox_id));
+    for i in 0..4u8 {
+        let resp = auth.sign("POST", &url, test_envelope(&[i]), client.post(&url)).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+    // Keep the last two entries only.
+    st.storage.sweep_log(ghost_wire::now_millis() + 3_600_000, 2).await.unwrap();
+
+    async fn next_message(ws: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>) -> Message {
+        tokio::time::timeout(Duration::from_secs(2), ws.next()).await.expect("nothing arrived").unwrap().unwrap()
+    }
+
+    let mut behind = auth.ws_connect(&ws_url).await;
+    ws_handshake(&mut behind, 1).await;
+    let first = next_message(&mut behind).await;
+    assert_eq!(first.to_text().unwrap(), format!("{}4", ghost_wire::WS_SIGNAL_GAP));
+
+    let mut ahead = auth.ws_connect(&ws_url).await;
+    ws_handshake(&mut ahead, 40).await;
+    let mut seqs = Vec::new();
+    while seqs.len() < 2 {
+        let m = next_message(&mut ahead).await;
+        if m.is_binary() {
+            seqs.push(u64::from_be_bytes(m.into_data()[..8].try_into().unwrap()));
+        }
+    }
+    assert_eq!(seqs, vec![3, 4]);
+}
+
+/// A connection whose first frame is not a resume point is closed with a frame, which
+/// the client answers by reconnecting, rather than ended silently.
+#[tokio::test]
+async fn a_connection_without_a_resume_point_is_closed_with_a_frame() {
+    let base = start_server(test_config()).await;
+    let auth = TestAuth::generate();
+    auth.register(&base).await;
+    let ws_url = format!("{}/ws/{}", base.replace("http://", "ws://"), URL_SAFE_NO_PAD.encode([0x0B; 32]));
+    let mut ws = auth.ws_connect(&ws_url).await;
+    ws.send(Message::text("hello")).await.unwrap();
+    let mut saw_binary = false;
+    assert_eq!(close_code(&mut ws, &mut saw_binary).await, Some(1002));
+}
+
 #[tokio::test]
 async fn blob_size_limit() {
     let base = start_server(test_config()).await;
@@ -513,7 +621,7 @@ async fn blob_size_limit() {
     let client = reqwest::Client::new();
     let url = mailbox_url(&base, &[0x04; 32]);
 
-    let resp = auth.sign("POST", &url, client.post(&url).body(vec![0u8; 2048])).send().await.unwrap();
+    let resp = auth.sign("POST", &url, vec![0u8; 2048], client.post(&url)).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
 }
 
@@ -523,46 +631,85 @@ async fn invite_full_flow() {
     let auth = TestAuth::generate();
     auth.register(&base).await;
     let client = reqwest::Client::new();
+    let token = hex::encode([0xAB; 16]);
+
+    // A token that is not 16 random bytes is refused.
+    let reg_url = format!("{base}/invite");
+    let resp = auth.post_json(&reg_url, &invite_registration("abc123", u64::MAX)).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
     // Register (authenticated)
-    let reg_url = format!("{base}/invite");
-    let resp = auth.sign("POST", &reg_url, client
-        .post(&reg_url)
-        .json(&serde_json::json!({ "token": "abc123", "expires_at": u64::MAX })))
-        .send()
-        .await
-        .unwrap();
+    let resp = auth.post_json(&reg_url, &invite_registration(&token, u64::MAX)).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
 
+    // Before any payload, a joiner asking without waiting gets nothing.
+    let join_url = format!("{base}/invite/{token}/join");
+    let resp = client.get(&join_url).header("X-Ghost-Long-Poll", "0").send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
     // Join (authenticated — creator uploads initial payload)
-    let join_url = format!("{base}/invite/abc123/join");
-    let resp = auth.sign("POST", &join_url, client
-        .post(&join_url)
-        .body(b"key-package".to_vec()))
-        .send()
-        .await
-        .unwrap();
+    let resp = auth.sign("POST", &join_url, b"key-package".to_vec(), client.post(&join_url)).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
 
-    // Get join payload (unauthenticated — joiner downloads)
-    let resp = client.get(format!("{base}/invite/abc123/join")).send().await.unwrap();
+    // Get join payload (unauthenticated — joiner downloads).
+    let resp = client.get(&join_url).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(resp.bytes().await.unwrap().as_ref(), b"key-package");
 
-    // Accept (authenticated)
-    let accept_url = format!("{base}/invite/abc123/accept");
-    let resp = auth.sign("POST", &accept_url, client
-        .post(&accept_url)
-        .body(b"welcome".to_vec()))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    // The payload is set once; a second upload is refused and changes nothing.
+    let resp = auth.sign("POST", &join_url, b"again".to_vec(), client.post(&join_url)).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let resp = client.get(&join_url).send().await.unwrap();
+    assert_eq!(resp.bytes().await.unwrap().as_ref(), b"key-package");
+}
 
-    // Get accept payload (unauthenticated — joiner polls)
-    let resp = client.get(format!("{base}/invite/abc123/accept")).send().await.unwrap();
+/// The relay answers a registration with the expiry it applied: the one asked for when
+/// within its limit, its limit otherwise, and its limit when none is asked for.
+#[tokio::test]
+async fn an_invite_registration_reports_the_expiry_the_relay_applies() {
+    let base = start_server(test_config()).await;
+    let auth = TestAuth::generate();
+    auth.register(&base).await;
+    let reg_url = format!("{base}/invite");
+    let limit = ghost_relay::constants::MAX_INVITE_LIFETIME_MS;
+    let applied = |resp: serde_json::Value| resp["expires_at"].as_u64().unwrap();
+
+    let soon = ghost_wire::now_millis() + 60_000;
+    let resp = auth.post_json(&reg_url, &invite_registration(&hex::encode([0xB1; 16]), soon)).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert_eq!(applied(resp.json().await.unwrap()), soon);
+
+    let before = ghost_wire::now_millis();
+    let resp = auth.post_json(&reg_url, &invite_registration(&hex::encode([0xB2; 16]), u64::MAX)).send().await.unwrap();
+    let clamped = applied(resp.json().await.unwrap());
+    assert!(clamped >= before + limit && clamped <= ghost_wire::now_millis() + limit, "{clamped}");
+
+    let unset = serde_json::json!({ "token": hex::encode([0xB3; 16]), "mailbox": URL_SAFE_NO_PAD.encode(INVITE_MAILBOX) });
+    let resp = auth.post_json(&reg_url, &unset).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let longest = applied(resp.json().await.unwrap());
+    assert!(longest >= before + limit && longest <= ghost_wire::now_millis() + limit, "{longest}");
+}
+
+#[tokio::test]
+async fn a_joiner_waiting_for_the_payload_is_woken_by_its_upload() {
+    let base = start_server(test_config()).await;
+    let auth = TestAuth::generate();
+    auth.register(&base).await;
+    let client = reqwest::Client::new();
+    let token = hex::encode([0xAC; 16]);
+    let reg_url = format!("{base}/invite");
+    auth.post_json(&reg_url, &invite_registration(&token, u64::MAX)).send().await.unwrap();
+
+    let join_url = format!("{base}/invite/{token}/join");
+    let waiting = client.get(&join_url).header("X-Ghost-Long-Poll", "5000");
+    let handle = tokio::spawn(async move { waiting.send().await.unwrap() });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    auth.sign("POST", &join_url, b"key-package".to_vec(), client.post(&join_url)).send().await.unwrap();
+
+    let resp = handle.await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(resp.bytes().await.unwrap().as_ref(), b"welcome");
+    assert_eq!(resp.bytes().await.unwrap().as_ref(), b"key-package");
 }
 
 #[tokio::test]
@@ -573,21 +720,12 @@ async fn expired_invite_rejected() {
     let client = reqwest::Client::new();
 
     // Register with already-expired timestamp (authenticated)
+    let token = hex::encode([0xAD; 16]);
     let reg_url = format!("{base}/invite");
-    auth.sign("POST", &reg_url, client
-        .post(&reg_url)
-        .json(&serde_json::json!({ "token": "expired", "expires_at": 1 })))
-        .send()
-        .await
-        .unwrap();
+    auth.post_json(&reg_url, &invite_registration(&token, 1)).send().await.unwrap();
 
-    let join_url = format!("{base}/invite/expired/join");
-    let resp = auth.sign("POST", &join_url, client
-        .post(&join_url)
-        .body(b"kp".to_vec()))
-        .send()
-        .await
-        .unwrap();
+    let join_url = format!("{base}/invite/{token}/join");
+    let resp = auth.sign("POST", &join_url, b"kp".to_vec(), client.post(&join_url)).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::GONE);
 }
 
@@ -635,12 +773,24 @@ async fn read_voice_msg(
 /// A group holding only `auth`'s account, published on the relay, whose voice rooms
 /// `auth` may join. Returns the group's mailbox.
 async fn voice_group(base: &str, auth: &TestAuth) -> [u8; 32] {
+    voice_group_with(base, auth, &[]).await
+}
+
+/// A group of `owner`'s account and `others`', published on the relay, whose voice rooms
+/// they may all join. Returns the group's mailbox.
+async fn voice_group_with(base: &str, owner: &TestAuth, others: &[&TestAuth]) -> [u8; 32] {
     let provider = OpenMlsRustCrypto::default();
-    let identity = MlsTestIdentity::new(&auth.account_fp);
+    let identity = MlsTestIdentity::new(&owner.account_fp);
     let relay_vk = fetch_relay_vk(base).await;
-    let (group, mailbox_id) = create_test_mls_group(&provider, &identity, &relay_vk);
+    let (mut group, mailbox_id) = create_test_mls_group(&provider, &identity, &relay_vk);
     let group_info = export_group_info_bytes(&group, &provider, &identity.signer);
-    upload_group_info(base, auth, &mailbox_id, &group_info).await;
+    upload_group_info(base, owner, &mailbox_id, &group_info).await;
+    let url = mailbox_url(base, &mailbox_id);
+    for other in others {
+        let add = add_member_commit(&mut group, &provider, &identity.signer, &other.account_fp);
+        let resp = owner.sign("POST", &url, add, reqwest::Client::new().post(&url)).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED, "adding a member to the voice group failed");
+    }
     mailbox_id
 }
 
@@ -660,7 +810,9 @@ async fn voice_signaling_join_leave() {
     let (base, _) = start_server_with_voice(test_config()).await;
     let auth = TestAuth::generate();
     auth.register(&base).await;
-    let ws_url = voice_url(&base, &voice_group(&base, &auth).await, &[0x10; 32]);
+    let bob = TestAuth::generate();
+    bob.register(&base).await;
+    let ws_url = voice_url(&base, &voice_group_with(&base, &auth, &[&bob]).await, &[0x10; 32]);
 
     let presence_a = B64.encode(b"opaque-presence-a");
     let presence_b = B64.encode(b"opaque-presence-b");
@@ -678,7 +830,7 @@ async fn voice_signaling_join_leave() {
     assert_eq!(msg["peers"].as_array().unwrap().len(), 0);
 
     // B joins
-    let mut ws_b = auth.ws_connect(&ws_url).await;
+    let mut ws_b = bob.ws_connect(&ws_url).await;
     let join_b = serde_json::json!({"type": "join", "presence": presence_b});
     ws_b.send(Message::Text(join_b.to_string().into())).await.unwrap();
 
@@ -694,7 +846,10 @@ async fn voice_signaling_join_leave() {
         .expect("timed out waiting for joined event");
     assert_eq!(msg["type"], "joined");
     assert!(msg["slot_id"].as_u64().is_some());
-    assert!(msg["presence"].as_str().is_some());
+    assert_eq!(msg["presence"], presence_b);
+    // The relay vouches for who sent the presence, from B's authenticated connection.
+    assert_eq!(msg["from"]["a"], B64.encode(bob.account_fp));
+    assert!(msg["from"]["d"].as_str().is_some());
 
     // B disconnects
     let leave = serde_json::json!({"type": "leave"});
@@ -750,20 +905,27 @@ async fn voice_welcome_names_the_public_port_when_configured() {
     assert_ne!(udp_port, 40_123, "the relay still binds its own port");
 }
 
-async fn bound_voice_pair(base: &str, udp_port: u16, auth: &TestAuth, channel_id: [u8; 32]) -> VoicePair {
-    let ws_url = voice_url(base, &voice_group(base, auth).await, &channel_id);
+/// Two accounts in one room, each with its UDP address bound: the relay answers each
+/// bind it accepts, keyed with the slot's token.
+async fn bound_voice_pair(base: &str, udp_port: u16, a: &TestAuth, b: &TestAuth, channel_id: [u8; 32]) -> VoicePair {
+    let ws_url = voice_url(base, &voice_group_with(base, a, &[b]).await, &channel_id);
     let relay_addr: SocketAddr = format!("127.0.0.1:{udp_port}").parse().unwrap();
-    let (mut ws_a, slot_a, room, token_a) = join_voice(&ws_url, auth, b"pa").await;
-    let (ws_b, slot_b, room_b, token_b) = join_voice(&ws_url, auth, b"pb").await;
+    let (mut ws_a, slot_a, room, token_a) = join_voice(&ws_url, a, b"pa").await;
+    let (ws_b, slot_b, room_b, token_b) = join_voice(&ws_url, b, b"pb").await;
     assert_eq!(room, room_b, "one channel, one room");
     // drain A's "joined" notification for B
     let _ = tokio::time::timeout(Duration::from_secs(1), read_voice_msg(&mut ws_a)).await;
 
     let sock_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let sock_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    sock_a.send_to(&VoiceBind::sign(&token_a, room, slot_a, 1).to_bytes(), relay_addr).await.unwrap();
-    sock_b.send_to(&VoiceBind::sign(&token_b, room, slot_b, 1).to_bytes(), relay_addr).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    let mut buf = [0u8; 1500];
+    for (sock, slot, token) in [(&sock_a, slot_a, &token_a), (&sock_b, slot_b, &token_b)] {
+        let bind = VoiceBind::sign(token, room, slot, 1);
+        sock.send_to(&bind.to_bytes(), relay_addr).await.unwrap();
+        let len = received(sock, &mut buf).await.expect("an accepted bind was not answered");
+        let answer = VoiceBind::from_bytes(&buf[..len]).expect("the answer has a bind's layout");
+        assert!(answer.verify_answer(token) && answer.counter == 1, "the answer is keyed for the way back");
+    }
 
     VoicePair { relay_addr, room, a: (sock_a, slot_a, token_a), b: (sock_b, slot_b, token_b), _ws: vec![ws_a, ws_b] }
 }
@@ -777,7 +939,9 @@ async fn voice_udp_forwarding() {
     let (base, udp_port) = start_server_with_voice(test_config()).await;
     let auth = TestAuth::generate();
     auth.register(&base).await;
-    let pair = bound_voice_pair(&base, udp_port, &auth, [0x20; 32]).await;
+    let bob = TestAuth::generate();
+    bob.register(&base).await;
+    let pair = bound_voice_pair(&base, udp_port, &auth, &bob, [0x20; 32]).await;
     let (sock_a, slot_a, _) = &pair.a;
     let (sock_b, _, _) = &pair.b;
     let (relay_addr, room) = (pair.relay_addr, pair.room);
@@ -808,7 +972,9 @@ async fn voice_media_needs_a_bound_address() {
     let (base, udp_port) = start_server_with_voice(test_config()).await;
     let auth = TestAuth::generate();
     auth.register(&base).await;
-    let pair = bound_voice_pair(&base, udp_port, &auth, [0x21; 32]).await;
+    let bob = TestAuth::generate();
+    bob.register(&base).await;
+    let pair = bound_voice_pair(&base, udp_port, &auth, &bob, [0x21; 32]).await;
     let (_, slot_a, token_a) = &pair.a;
     let (sock_b, _, _) = &pair.b;
     let mut buf = [0u8; 1500];
@@ -822,10 +988,10 @@ async fn voice_media_needs_a_bound_address() {
     outsider.send_to(&build_voice_packet(&pair.room, *slot_a, 4, b"injected"), pair.relay_addr).await.unwrap();
     assert!(received(sock_b, &mut buf).await.is_none(), "unbound media was forwarded");
 
-    // Nor does the outsider receive B's media.
+    // Nor does the outsider receive B's media, or an answer to the binds it sent.
     let (sock_b, slot_b, _) = &pair.b;
     sock_b.send_to(&build_voice_packet(&pair.room, *slot_b, 5, b"secret"), pair.relay_addr).await.unwrap();
-    assert!(received(&outsider, &mut buf).await.is_none(), "an unbound address received media");
+    assert!(received(&outsider, &mut buf).await.is_none(), "an unbound address received media or an answer");
 }
 
 #[tokio::test]
@@ -854,7 +1020,10 @@ async fn voice_max_participants() {
     let (base, _) = start_server_with_voice(config).await;
     let auth = TestAuth::generate();
     auth.register(&base).await;
-    let ws_url = voice_url(&base, &voice_group(&base, &auth).await, &[0x30; 32]);
+    let (second, third) = (TestAuth::generate(), TestAuth::generate());
+    second.register(&base).await;
+    third.register(&base).await;
+    let ws_url = voice_url(&base, &voice_group_with(&base, &auth, &[&second, &third]).await, &[0x30; 32]);
 
     // Fill to capacity
     let mut ws1 = auth.ws_connect(&ws_url).await;
@@ -863,14 +1032,14 @@ async fn voice_max_participants() {
     )).await.unwrap();
     let _ = read_voice_msg(&mut ws1).await; // welcome
 
-    let mut ws2 = auth.ws_connect(&ws_url).await;
+    let mut ws2 = second.ws_connect(&ws_url).await;
     ws2.send(Message::Text(
         serde_json::json!({"type": "join", "presence": B64.encode(b"p2")}).to_string().into(),
     )).await.unwrap();
     let _ = read_voice_msg(&mut ws2).await; // welcome
 
     // Third should be rejected
-    let mut ws3 = auth.ws_connect(&ws_url).await;
+    let mut ws3 = third.ws_connect(&ws_url).await;
     ws3.send(Message::Text(
         serde_json::json!({"type": "join", "presence": B64.encode(b"p3")}).to_string().into(),
     )).await.unwrap();
@@ -880,6 +1049,117 @@ async fn voice_max_participants() {
         .expect("timed out waiting for error");
     assert_eq!(msg["type"], "error");
     assert!(msg["message"].as_str().unwrap().contains("full"));
+}
+
+/// How a voice connection ended: the close code, if the relay sent one.
+async fn voice_close_code(ws: &mut TestWs) -> Option<u16> {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Close(frame))) => return frame.map(|f| u16::from(f.code)),
+                Some(Ok(_)) => continue,
+                _ => return None,
+            }
+        }
+    })
+    .await
+    .expect("the connection never ended")
+}
+
+/// The next voice message of `kind`, skipping others.
+async fn next_voice_msg_of(ws: &mut TestWs, kind: &str) -> Value {
+    loop {
+        let msg = read_voice_msg(ws).await;
+        if msg["type"] == kind {
+            return msg;
+        }
+    }
+}
+
+/// A room holds one device per account: a second device joining takes the first one's
+/// place, and the first is closed with the reason.
+#[tokio::test]
+async fn a_second_device_of_an_account_takes_the_first_ones_place() {
+    let (base, _) = start_server_with_voice(test_config()).await;
+    let alice = TestAuth::generate();
+    alice.register(&base).await;
+    let alice_laptop = alice.add_device(&base).await;
+    let bob = TestAuth::generate();
+    bob.register(&base).await;
+    let ws_url = voice_url(&base, &voice_group_with(&base, &alice, &[&bob]).await, &[0x12; 32]);
+
+    let (mut bob_ws, ..) = join_voice(&ws_url, &bob, b"bob").await;
+    let (mut phone, phone_slot, ..) = join_voice(&ws_url, &alice, b"phone").await;
+    assert_eq!(next_voice_msg_of(&mut bob_ws, "joined").await["slot_id"], phone_slot);
+
+    let (_laptop, laptop_slot, ..) = join_voice(&ws_url, &alice_laptop, b"laptop").await;
+    assert_eq!(voice_close_code(&mut phone).await, Some(ghost_wire::WS_CLOSE_VOICE_REPLACED));
+    assert_eq!(next_voice_msg_of(&mut bob_ws, "left").await["slot_id"], phone_slot);
+    let joined = next_voice_msg_of(&mut bob_ws, "joined").await;
+    assert_eq!(joined["slot_id"], laptop_slot);
+    assert_eq!(joined["presence"], B64.encode(b"laptop"));
+}
+
+/// A device whose voice connection dropped claims its slot back on a new one with the
+/// slot's token: the room hears its presence and no departure, and the connection it
+/// lost can no longer end the slot.
+#[tokio::test]
+async fn a_dropped_voice_connection_is_resumed_on_a_new_one() {
+    let (base, _) = start_server_with_voice(test_config()).await;
+    let alice = TestAuth::generate();
+    alice.register(&base).await;
+    let bob = TestAuth::generate();
+    bob.register(&base).await;
+    let ws_url = voice_url(&base, &voice_group_with(&base, &alice, &[&bob]).await, &[0x13; 32]);
+    let (mut bob_ws, ..) = join_voice(&ws_url, &bob, b"bob").await;
+    let (mut lost, slot, _, token) = join_voice(&ws_url, &alice, b"before").await;
+    next_voice_msg_of(&mut bob_ws, "joined").await;
+
+    let mut again = alice.ws_connect(&ws_url).await;
+    let resume = serde_json::json!({ "type": "resume", "slot_id": slot, "token": B64.encode(token), "presence": B64.encode(b"after") });
+    again.send(Message::text(resume.to_string())).await.unwrap();
+    let welcome = next_voice_msg_of(&mut again, "welcome").await;
+    assert_eq!(welcome["slot_id"], slot, "the resumed connection holds the same slot");
+    assert_eq!(welcome_binding(&welcome).1, token, "with the same token");
+    assert_eq!(welcome["peers"].as_array().unwrap().len(), 1, "and sees the room as it is");
+    let presence = read_voice_msg(&mut bob_ws).await;
+    assert_eq!((presence["type"].as_str(), presence["blob"].as_str()), (Some("presence"), Some(B64.encode(b"after").as_str())));
+
+    // The connection it lost is let go, and its end takes nothing from the room.
+    assert_eq!(voice_close_code(&mut lost).await, None);
+    drop(lost);
+    let heard = tokio::time::timeout(Duration::from_millis(300), read_voice_msg(&mut bob_ws)).await;
+    assert!(heard.is_err(), "the lost connection's end reached the room: {heard:?}");
+    again.send(Message::text(serde_json::json!({ "type": "leave" }).to_string())).await.unwrap();
+    assert_eq!(read_voice_msg(&mut bob_ws).await["type"], "left");
+}
+
+/// Only the slot's device, with the slot's token, claims a slot back, and only while the
+/// slot lives.
+#[tokio::test]
+async fn a_resume_needs_the_slots_device_and_token() {
+    let (base, _) = start_server_with_voice(test_config()).await;
+    let alice = TestAuth::generate();
+    alice.register(&base).await;
+    let alice_laptop = alice.add_device(&base).await;
+    let ws_url = voice_url(&base, &voice_group(&base, &alice).await, &[0x14; 32]);
+    let (holder, slot, _, token) = join_voice(&ws_url, &alice, b"p").await;
+
+    let attempt = |auth: &TestAuth, token: [u8; 32]| {
+        let ws_url = ws_url.clone();
+        let request = auth.ws_request(&ws_url);
+        async move {
+            let (mut ws, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+            let resume = serde_json::json!({ "type": "resume", "slot_id": slot, "token": B64.encode(token), "presence": B64.encode(b"p") });
+            ws.send(Message::text(resume.to_string())).await.unwrap();
+            read_voice_msg(&mut ws).await["type"].as_str().unwrap().to_string()
+        }
+    };
+    assert_eq!(attempt(&alice, [0x55; 32]).await, "not_resumed", "a wrong token");
+    assert_eq!(attempt(&alice_laptop, token).await, "not_resumed", "another device of the account");
+    drop(holder);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(attempt(&alice, token).await, "not_resumed", "a slot the relay ended");
 }
 
 // --- Identity log tests ---
@@ -905,7 +1185,7 @@ fn make_test_genesis() -> (
         entry_type: ghost_wire::idlog::EntryType::Genesis,
         timestamp: 1000,
         body: ghost_wire::idlog::EntryBody::Genesis {
-            master_verifying_key: mk.verifying_key().to_bytes(),
+            genesis_verifying_key: mk.verifying_key().to_bytes(),
             device_verifying_key: dk.verifying_key().to_bytes(),
             device_label: "test".to_string(),
         },
@@ -919,7 +1199,7 @@ fn make_test_genesis() -> (
 }
 
 #[tokio::test]
-async fn idlog_rejects_bad_seq() {
+async fn idlog_refuses_a_second_genesis() {
     let base = start_server(test_config()).await;
     let client = reqwest::Client::new();
     let (fp, _mk, _dk, genesis) = make_test_genesis();
@@ -928,9 +1208,9 @@ async fn idlog_rejects_bad_seq() {
     let resp = client.put(idlog_url(&base, &fp)).body(genesis.clone()).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
 
-    // Duplicate genesis (seq 1 again)
+    // Genesis again: a different claim on a held position is a conflict
     let resp = client.put(idlog_url(&base, &fp)).body(genesis).send().await.unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
 }
 
 #[tokio::test]
@@ -984,7 +1264,7 @@ async fn open_pairing(base: &str, auth: &TestAuth, token: &[u8; 16], offer: &[u8
     let mut body = token.to_vec();
     body.extend_from_slice(offer);
     let client = reqwest::Client::new();
-    auth.sign("POST", &url, client.post(&url).body(body)).send().await.unwrap().status()
+    auth.sign("POST", &url, body, client.post(&url)).send().await.unwrap().status()
 }
 
 #[tokio::test]
@@ -1003,10 +1283,10 @@ async fn pairing_full_flow() {
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(resp.bytes().await.unwrap().as_ref(), b"encrypted-offer");
 
-    // Poll for response — none yet (authenticated)
+    // Poll for response — none yet (authenticated), in a session that lives
     let resp_url = format!("{session}/response");
-    let resp = auth.sign("GET", &resp_url, client.get(&resp_url)).send().await.unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let resp = auth.sign("GET", &resp_url, Vec::new(), client.get(&resp_url)).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
     // New device posts response (unauthenticated)
     let resp = client.post(format!("{session}/respond")).body(b"encrypted-response".to_vec()).send().await.unwrap();
@@ -1014,19 +1294,45 @@ async fn pairing_full_flow() {
 
     // Existing device polls — gets response, and the session stays alive
     for _ in 0..2 {
-        let resp = auth.sign("GET", &resp_url, client.get(&resp_url)).send().await.unwrap();
+        let resp = auth.sign("GET", &resp_url, Vec::new(), client.get(&resp_url)).send().await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.bytes().await.unwrap().as_ref(), b"encrypted-response");
     }
 
-    // Provision round trip
+    // Provision round trip; a redraft uploads it again, which replaces it
     let prov_url = format!("{session}/provision");
     let resp = client.get(&prov_url).send().await.unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    let resp = auth.sign("PUT", &prov_url, client.put(&prov_url).body(b"sealed-provision".to_vec())).send().await.unwrap();
-    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    for provision in [b"sealed-provision".as_slice(), b"after a redraft".as_slice()] {
+        let resp = auth.sign("PUT", &prov_url, provision.to_vec(), client.put(&prov_url)).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
     let resp = client.get(&prov_url).send().await.unwrap();
-    assert_eq!(resp.bytes().await.unwrap().as_ref(), b"sealed-provision");
+    assert_eq!(resp.bytes().await.unwrap().as_ref(), b"after a redraft");
+
+    // The existing device ends the session: the code reaches nothing any more.
+    let resp = auth.sign("DELETE", &session, Vec::new(), client.delete(&session)).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(client.get(&prov_url).send().await.unwrap().status(), StatusCode::NOT_FOUND, "a gone session is told from an empty slot");
+    assert_eq!(client.get(&session).send().await.unwrap().status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn only_the_accounts_device_ends_a_pairing_session() {
+    let base = start_server(test_config()).await;
+    let auth = TestAuth::generate();
+    auth.register(&base).await;
+    let stranger = TestAuth::generate();
+    stranger.register(&base).await;
+    let client = reqwest::Client::new();
+    let token = [0x12; 16];
+    open_pairing(&base, &auth, &token, b"offer").await;
+    let session = session_url(&base, &auth.account_fp, &token);
+
+    assert_eq!(client.delete(&session).send().await.unwrap().status(), StatusCode::UNAUTHORIZED, "the code alone cannot end it");
+    let resp = stranger.sign("DELETE", &session, Vec::new(), client.delete(&session)).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "another account cannot end it");
+    assert_eq!(client.get(&session).send().await.unwrap().status(), StatusCode::OK);
 }
 
 #[tokio::test]
@@ -1073,7 +1379,7 @@ async fn pairing_response_cannot_be_replaced() {
     assert_eq!(second.status(), StatusCode::CONFLICT);
 
     let resp_url = format!("{session}/response");
-    let resp = auth.sign("GET", &resp_url, client.get(&resp_url)).send().await.unwrap();
+    let resp = auth.sign("GET", &resp_url, Vec::new(), client.get(&resp_url)).send().await.unwrap();
     assert_eq!(resp.bytes().await.unwrap().as_ref(), b"first");
 }
 
@@ -1126,7 +1432,7 @@ async fn auth_rejects_revoked_device() {
         entry_type: ghost_wire::idlog::EntryType::Genesis,
         timestamp: 1000,
         body: ghost_wire::idlog::EntryBody::Genesis {
-            master_verifying_key: mk.verifying_key().to_bytes(),
+            genesis_verifying_key: mk.verifying_key().to_bytes(),
             device_verifying_key: dk1.verifying_key().to_bytes(),
             device_label: "d1".to_string(),
         },
@@ -1162,7 +1468,7 @@ async fn auth_rejects_revoked_device() {
     let add_bytes = add.to_bytes();
     let dk1_auth = TestAuth { account_fp: fp, master_key: mk.clone(), device_key: dk1.clone() };
     let add_url = idlog_url(&base, &fp);
-    dk1_auth.sign("PUT", &add_url, client.put(&add_url).body(add_bytes)).send().await.unwrap();
+    dk1_auth.sign("PUT", &add_url, add_bytes, client.put(&add_url)).send().await.unwrap();
 
     // Revoke device 2
     let add_hash = ghost_wire::idlog::entry_hash(&add);
@@ -1182,7 +1488,7 @@ async fn auth_rejects_revoked_device() {
     let msg = ghost_wire::idlog::sign_message(&revoke);
     revoke.signature = dk1.sign(&msg).to_bytes();
     let revoke_url = idlog_url(&base, &fp);
-    dk1_auth.sign("PUT", &revoke_url, client.put(&revoke_url).body(revoke.to_bytes())).send().await.unwrap();
+    dk1_auth.sign("PUT", &revoke_url, revoke.to_bytes(), client.put(&revoke_url)).send().await.unwrap();
 
     // Revoked device 2 should be rejected
     let timestamp = std::time::SystemTime::now()
@@ -1192,7 +1498,9 @@ async fn auth_rejects_revoked_device() {
     let vk = dk2.verifying_key().to_bytes();
     let url = mailbox_url(&base, &[0xE1; 32]);
     let url_path = extract_path(&url);
-    let auth_msg = ghost_wire::auth::auth_message("POST", &url_path, &fp, &vk, timestamp, None);
+    let nonce = [0x11; ghost_wire::auth::AUTH_NONCE_LEN];
+    let body = test_envelope(b"revoked");
+    let auth_msg = ghost_wire::auth::auth_message("POST", &url_path, &fp, &vk, timestamp, &nonce, &ghost_wire::auth::body_hash(&body));
     let sig = dk2.sign(&auth_msg);
 
     let resp = client
@@ -1200,16 +1508,20 @@ async fn auth_rejects_revoked_device() {
         .header("x-ghost-account", hex::encode(fp))
         .header("x-ghost-device", hex::encode(vk))
         .header("x-ghost-timestamp", timestamp.to_string())
+        .header("x-ghost-nonce", hex::encode(nonce))
         .header("x-ghost-signature", hex::encode(sig.to_bytes()))
-        .body(test_envelope(b"revoked"))
+        .body(body)
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let cause = resp.headers().get(ghost_wire::REVOKED_BY_HEADER).and_then(|v| v.to_str().ok()).and_then(ghost_wire::RevocationCause::decode);
+    assert_eq!(cause, Some(ghost_wire::RevocationCause::Device("d1".into())), "the refusal names the remover to the removed device");
 
     // Active device 1 should succeed
     let vk1 = dk1.verifying_key().to_bytes();
-    let auth_msg1 = ghost_wire::auth::auth_message("POST", &url_path, &fp, &vk1, timestamp, None);
+    let body = test_envelope(b"active");
+    let auth_msg1 = ghost_wire::auth::auth_message("POST", &url_path, &fp, &vk1, timestamp, &nonce, &ghost_wire::auth::body_hash(&body));
     let sig1 = dk1.sign(&auth_msg1);
 
     let resp = client
@@ -1217,8 +1529,9 @@ async fn auth_rejects_revoked_device() {
         .header("x-ghost-account", hex::encode(fp))
         .header("x-ghost-device", hex::encode(vk1))
         .header("x-ghost-timestamp", timestamp.to_string())
+        .header("x-ghost-nonce", hex::encode(nonce))
         .header("x-ghost-signature", hex::encode(sig1.to_bytes()))
-        .body(test_envelope(b"active"))
+        .body(body)
         .send()
         .await
         .unwrap();
@@ -1242,7 +1555,9 @@ async fn auth_rejects_bad_signature() {
     // Use wrong key to sign
     let wrong_key = SigningKey::generate(&mut OsRng);
     let url_path = extract_path(&url);
-    let auth_msg = ghost_wire::auth::auth_message("POST", &url_path, &auth.account_fp, &vk, timestamp, None);
+    let nonce = [0x22; ghost_wire::auth::AUTH_NONCE_LEN];
+    let body = test_envelope(b"bad-sig");
+    let auth_msg = ghost_wire::auth::auth_message("POST", &url_path, &auth.account_fp, &vk, timestamp, &nonce, &ghost_wire::auth::body_hash(&body));
     let bad_sig = wrong_key.sign(&auth_msg);
 
     let resp = client
@@ -1250,8 +1565,9 @@ async fn auth_rejects_bad_signature() {
         .header("x-ghost-account", hex::encode(auth.account_fp))
         .header("x-ghost-device", hex::encode(vk))
         .header("x-ghost-timestamp", timestamp.to_string())
+        .header("x-ghost-nonce", hex::encode(nonce))
         .header("x-ghost-signature", hex::encode(bad_sig.to_bytes()))
-        .body(test_envelope(b"bad-sig"))
+        .body(body)
         .send()
         .await
         .unwrap();
@@ -1274,7 +1590,9 @@ async fn auth_rejects_stale_timestamp() {
         - 120;
     let vk = auth.device_key.verifying_key().to_bytes();
     let path = extract_path(&url);
-    let auth_msg = ghost_wire::auth::auth_message("POST", &path, &auth.account_fp, &vk, timestamp, None);
+    let nonce = [0x33; ghost_wire::auth::AUTH_NONCE_LEN];
+    let body = test_envelope(b"stale");
+    let auth_msg = ghost_wire::auth::auth_message("POST", &path, &auth.account_fp, &vk, timestamp, &nonce, &ghost_wire::auth::body_hash(&body));
     let sig = auth.device_key.sign(&auth_msg);
 
     let resp = client
@@ -1282,8 +1600,9 @@ async fn auth_rejects_stale_timestamp() {
         .header("x-ghost-account", hex::encode(auth.account_fp))
         .header("x-ghost-device", hex::encode(vk))
         .header("x-ghost-timestamp", timestamp.to_string())
+        .header("x-ghost-nonce", hex::encode(nonce))
         .header("x-ghost-signature", hex::encode(sig.to_bytes()))
-        .body(test_envelope(b"stale"))
+        .body(body)
         .send()
         .await
         .unwrap();
@@ -1321,7 +1640,9 @@ async fn auth_rejects_future_timestamp() {
         + 120;
     let vk = auth.device_key.verifying_key().to_bytes();
     let path = extract_path(&url);
-    let auth_msg = ghost_wire::auth::auth_message("POST", &path, &auth.account_fp, &vk, timestamp, None);
+    let nonce = [0x44; ghost_wire::auth::AUTH_NONCE_LEN];
+    let body = test_envelope(b"future");
+    let auth_msg = ghost_wire::auth::auth_message("POST", &path, &auth.account_fp, &vk, timestamp, &nonce, &ghost_wire::auth::body_hash(&body));
     let sig = auth.device_key.sign(&auth_msg);
 
     let resp = client
@@ -1329,8 +1650,9 @@ async fn auth_rejects_future_timestamp() {
         .header("x-ghost-account", hex::encode(auth.account_fp))
         .header("x-ghost-device", hex::encode(vk))
         .header("x-ghost-timestamp", timestamp.to_string())
+        .header("x-ghost-nonce", hex::encode(nonce))
         .header("x-ghost-signature", hex::encode(sig.to_bytes()))
-        .body(test_envelope(b"future"))
+        .body(body)
         .send()
         .await
         .unwrap();
@@ -1354,51 +1676,18 @@ async fn auth_cross_account_sync_state_rejected() {
     let url_b = format!("{base}/sync_state/{}", hex::encode(auth_b.account_fp));
     let mut b_state = 1u64.to_be_bytes().to_vec();
     b_state.extend_from_slice(b"b-state");
-    let resp = auth_b.sign("PUT", &url_b, client.put(&url_b).body(b_state)).send().await.unwrap();
+    let resp = auth_b.sign("PUT", &url_b, b_state, client.put(&url_b)).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
     // Account A tries to read account B's sync state → rejected
-    let resp = auth_a.sign("GET", &url_b, client.get(&url_b)).send().await.unwrap();
+    let resp = auth_a.sign("GET", &url_b, Vec::new(), client.get(&url_b)).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
     // Account A tries to overwrite account B's sync state → rejected
     let mut evil = 2u64.to_be_bytes().to_vec();
     evil.extend_from_slice(b"evil");
-    let resp = auth_a.sign("PUT", &url_b, client.put(&url_b).body(evil)).send().await.unwrap();
+    let resp = auth_a.sign("PUT", &url_b, evil, client.put(&url_b)).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-}
-
-#[tokio::test]
-async fn auth_cross_account_recovery_rejected() {
-    let base = start_server(test_config()).await;
-
-    let auth_a = TestAuth::generate();
-    auth_a.register(&base).await;
-
-    let auth_b = TestAuth::generate();
-    auth_b.register(&base).await;
-
-    // Account B stores its recovery bundle
-    let client = reqwest::Client::new();
-    let url_b = format!("{base}/recovery/{}", hex::encode(auth_b.account_fp));
-    let bundle = |generation: u64, blob: &[u8]| {
-        ghost_wire::recovery_bundle::RecoveryBundle { generation, recovery_blob: blob.to_vec(), master_blob: vec![] }.to_bytes()
-    };
-    let resp = auth_b.sign("PUT", &url_b, client.put(&url_b).body(bundle(5, b"recovery-blob"))).send().await.unwrap();
-    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-
-    // Account A tries to overwrite B's recovery bundle → rejected
-    let resp = auth_a.sign("PUT", &url_b, client.put(&url_b).body(bundle(6, b"evil"))).send().await.unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-
-    // B replaying an older generation is refused too (rollback)
-    let resp = auth_b.sign("PUT", &url_b, client.put(&url_b).body(bundle(4, b"old"))).send().await.unwrap();
-    assert_eq!(resp.status(), StatusCode::CONFLICT);
-
-    // Recovery GET is public (no auth needed for bootstrap)
-    let resp = reqwest::get(&url_b).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(resp.bytes().await.unwrap().as_ref(), bundle(5, b"recovery-blob").as_slice());
 }
 
 #[tokio::test]
@@ -1415,18 +1704,7 @@ async fn auth_cross_account_provision_rejected() {
     let client = reqwest::Client::new();
     open_pairing(&base, &auth_b, &[0x66; 16], b"offer").await;
     let url_b = format!("{}/provision", session_url(&base, &auth_b.account_fp, &[0x66; 16]));
-    let resp = auth_a.sign("PUT", &url_b, client.put(&url_b).body(b"evil-provision".to_vec())).send().await.unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-}
-
-#[tokio::test]
-async fn auth_get_blobs_requires_auth() {
-    let base = start_server(test_config()).await;
-    let client = reqwest::Client::new();
-    let url = mailbox_url(&base, &[0xE6; 32]);
-
-    // GET without auth → 401
-    let resp = client.get(&url).send().await.unwrap();
+    let resp = auth_a.sign("PUT", &url_b, b"evil-provision".to_vec(), client.put(&url_b)).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
@@ -1449,7 +1727,7 @@ async fn ws_closed_on_device_revocation() {
         entry_type: ghost_wire::idlog::EntryType::Genesis,
         timestamp: 1000,
         body: ghost_wire::idlog::EntryBody::Genesis {
-            master_verifying_key: mk.verifying_key().to_bytes(),
+            genesis_verifying_key: mk.verifying_key().to_bytes(),
             device_verifying_key: dk1.verifying_key().to_bytes(),
             device_label: "d1".to_string(),
         },
@@ -1483,7 +1761,7 @@ async fn ws_closed_on_device_revocation() {
     let dk1_auth = TestAuth { account_fp: fp, master_key: mk.clone(), device_key: dk1.clone() };
     let dk2_auth = TestAuth { account_fp: fp, master_key: mk.clone(), device_key: dk2.clone() };
     let add_url = idlog_url(&base, &fp);
-    let resp = dk1_auth.sign("PUT", &add_url, client.put(&add_url).body(add.to_bytes())).send().await.unwrap();
+    let resp = dk1_auth.sign("PUT", &add_url, add.to_bytes(), client.put(&add_url)).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
 
     // Connect dk1 to WS
@@ -1510,7 +1788,7 @@ async fn ws_closed_on_device_revocation() {
     let msg = ghost_wire::idlog::sign_message(&revoke);
     revoke.signature = dk2.sign(&msg).to_bytes();
     let revoke_url = idlog_url(&base, &fp);
-    let resp = dk2_auth.sign("PUT", &revoke_url, client.put(&revoke_url).body(revoke.to_bytes())).send().await.unwrap();
+    let resp = dk2_auth.sign("PUT", &revoke_url, revoke.to_bytes(), client.put(&revoke_url)).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
 
     // dk1's WS should receive a close frame with code 4001 (may arrive after other messages)
@@ -1524,6 +1802,7 @@ async fn ws_closed_on_device_revocation() {
         if let Message::Close(Some(frame)) = msg {
             let code: u16 = frame.code.into();
             assert_eq!(code, ghost_wire::WS_CLOSE_DEVICE_REVOKED);
+            assert_eq!(ghost_wire::RevocationCause::decode(&frame.reason), Some(ghost_wire::RevocationCause::Device("d2".into())), "the close names the remover");
             break;
         }
     }
@@ -1531,26 +1810,41 @@ async fn ws_closed_on_device_revocation() {
 
 // ── MLS enforcement test helpers ─────────────────────────────────
 
-/// Minimal MLS identity for integration tests.
+/// Minimal MLS identity for integration tests: a credential that names the account, as
+/// a Ghost credential's first 32 bytes do.
 struct MlsTestIdentity {
+    account_fp: [u8; 32],
     signer: SignatureKeyPair,
     credential: CredentialWithKey,
 }
 
 impl MlsTestIdentity {
-    fn new(label: &[u8]) -> Self {
+    fn new(account_fp: &[u8; 32]) -> Self {
         let signer = SignatureKeyPair::new(SignatureScheme::ED25519).unwrap();
         let credential = CredentialWithKey {
-            credential: Credential::new(CredentialType::Basic, label.to_vec()),
+            credential: Credential::new(CredentialType::Basic, account_fp.to_vec()),
             signature_key: SignaturePublicKey::from(signer.public().to_vec()),
         };
-        Self { signer, credential }
+        Self { account_fp: *account_fp, signer, credential }
     }
-
 }
 
-/// Create an MLS group with ExternalSendersExtension, upload GroupInfo, return (group, mailbox_id).
-/// Derive mailbox_id from MLS group_id (same as ghost-core's wire::mls_group_mailbox_id).
+/// The leaf capabilities a Ghost device advertises: a group may carry only the context
+/// extensions every member's leaf supports.
+fn ghost_capabilities() -> Capabilities {
+    let types: Vec<ExtensionType> = [
+        ghost_wire::policy::SERVER_POLICY_EXTENSION,
+        ghost_wire::policy::CHANNEL_POLICY_EXTENSION,
+        ghost_wire::policy::SERVER_REMOVALS_EXTENSION,
+    ]
+    .into_iter()
+    .map(ExtensionType::Unknown)
+    .collect();
+    Capabilities::new(None, None, Some(&types), None, None)
+}
+
+/// The mailbox of an MLS group, derived from its group id as ghost-core's
+/// `wire::mls_group_mailbox_id` does.
 fn test_mls_group_mailbox_id(mls_group_id: &[u8]) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(mls_group_id);
@@ -1558,6 +1852,8 @@ fn test_mls_group_mailbox_id(mls_group_id: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+/// A server group as a Ghost device makes one: the relay as external sender and a server
+/// policy owned by the creator's account.
 fn create_test_mls_group(
     provider: &OpenMlsRustCrypto,
     identity: &MlsTestIdentity,
@@ -1567,11 +1863,17 @@ fn create_test_mls_group(
         SignaturePublicKey::from(relay_vk.to_vec()),
         Credential::new(CredentialType::Basic, b"ghost-relay".to_vec()),
     );
-    let extensions = Extensions::single(Extension::ExternalSenders(vec![external_sender])).unwrap();
+    let policy = ghost_wire::policy::ServerPolicy::new(identity.account_fp);
+    let extensions = Extensions::from_vec(vec![
+        Extension::ExternalSenders(vec![external_sender]),
+        Extension::Unknown(ghost_wire::policy::SERVER_POLICY_EXTENSION, UnknownExtension(policy.to_bytes())),
+    ])
+    .unwrap();
     let config = MlsGroupCreateConfig::builder()
         .use_ratchet_tree_extension(true)
         .max_past_epochs(1)
         .wire_format_policy(MIXED_PLAINTEXT_WIRE_FORMAT_POLICY)
+        .capabilities(ghost_capabilities())
         .with_group_context_extensions(extensions)
         .build();
 
@@ -1619,7 +1921,7 @@ async fn upload_group_info(
         "{base}/box/{}/server_info",
         URL_SAFE_NO_PAD.encode(mailbox_id)
     );
-    let resp = auth.sign("PUT", &url, client.put(&url).body(group_info.to_vec()))
+    let resp = auth.sign("PUT", &url, group_info.to_vec(), client.put(&url))
         .send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::NO_CONTENT, "upload GroupInfo failed");
 }
@@ -1665,7 +1967,7 @@ async fn relay_info_endpoint() {
 
     let client = reqwest::Client::new();
     let body: Value = client.get(format!("{base}/relay")).send().await.unwrap().json().await.unwrap();
-    assert_eq!(body["protocol"].as_u64().unwrap(), 2);
+    assert_eq!(body["protocol"].as_u64().unwrap(), u64::from(ghost_wire::RELAY_PROTOCOL_ACCOUNT_KEYS));
     assert!(body["kt_head"].is_null(), "no entries yet");
     let relay_ref = ghost_wire::relay_ref::RelayRef::decode(body["ref"].as_str().unwrap()).unwrap();
     assert_eq!(relay_ref.relay_vk, vk);
@@ -1693,7 +1995,7 @@ async fn non_member_blob_rejected_after_acl() {
     let client = reqwest::Client::new();
     let url = mailbox_url(&base, &mailbox_id);
     let resp = bob
-        .sign("POST", &url, client.post(&url).body(test_envelope(b"intruder")))
+        .sign("POST", &url, test_envelope(b"intruder"), client.post(&url))
         .send()
         .await
         .unwrap();
@@ -1718,7 +2020,7 @@ async fn member_blob_accepted() {
     let client = reqwest::Client::new();
     let url = mailbox_url(&base, &mailbox_id);
     let resp = alice
-        .sign("POST", &url, client.post(&url).body(test_envelope(b"hello")))
+        .sign("POST", &url, test_envelope(b"hello"), client.post(&url))
         .send()
         .await
         .unwrap();
@@ -1744,7 +2046,7 @@ async fn invalid_commit_rejected() {
     let client = reqwest::Client::new();
     let url = mailbox_url(&base, &mailbox_id);
     let resp = alice
-        .sign("POST", &url, client.post(&url).body(garbage_commit))
+        .sign("POST", &url, garbage_commit, client.post(&url))
         .send()
         .await
         .unwrap();
@@ -1773,11 +2075,71 @@ async fn desync_recovery_via_group_info_reupload() {
     let client = reqwest::Client::new();
     let url = mailbox_url(&base, &mailbox_id);
     let resp = alice
-        .sign("POST", &url, client.post(&url).body(test_envelope(b"still works")))
+        .sign("POST", &url, test_envelope(b"still works"), client.post(&url))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn an_owner_behind_on_epochs_does_not_replace_the_newer_group_info() {
+    let base = start_server(test_config()).await;
+    let alice = TestAuth::generate();
+    alice.register(&base).await;
+
+    let relay_vk = fetch_relay_vk(&base).await;
+    let provider = OpenMlsRustCrypto::default();
+    let id = MlsTestIdentity::new(&alice.account_fp);
+    let (mut group, mailbox_id) = create_test_mls_group(&provider, &id, &relay_vk);
+    let stale = export_group_info_bytes(&group, &provider, &id.signer);
+    upload_group_info(&base, &alice, &mailbox_id, &stale).await;
+
+    let client = reqwest::Client::new();
+    let url = mailbox_url(&base, &mailbox_id);
+    let (commit_env, current) = create_self_update_commit(&mut group, &provider, &id.signer, 0);
+    let resp = alice.sign("POST", &url, commit_env, client.post(&url)).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    upload_group_info(&base, &alice, &mailbox_id, &current).await;
+
+    // Another of the owner's devices, still at epoch 0, uploads what it holds.
+    upload_group_info(&base, &alice, &mailbox_id, &stale).await;
+
+    let info_url = format!("{base}/box/{}/server_info", URL_SAFE_NO_PAD.encode(mailbox_id));
+    let served = alice.sign("GET", &info_url, Vec::new(), client.get(&info_url)).send().await.unwrap().bytes().await.unwrap();
+    assert_eq!(served.as_ref(), current.as_slice(), "joiners must get the epoch the relay validates against");
+}
+
+#[tokio::test]
+async fn an_accounts_sync_mailbox_admits_its_devices_alone_and_takes_no_mls() {
+    let (base, st) = start_server_with_state(test_config()).await;
+    let alice = TestAuth::generate();
+    let bob = TestAuth::generate();
+    alice.register(&base).await;
+    bob.register(&base).await;
+    let mailbox = ghost_wire::sync_mailbox_id(&alice.account_fp);
+    let url = mailbox_url(&base, &mailbox);
+    let client = reqwest::Client::new();
+
+    // Alice's device posts; the relay never saw group state for this mailbox.
+    let resp = alice.sign("POST", &url, test_envelope(b"read marker"), client.post(&url)).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert_eq!(st.storage.read_from(mailbox, 0, 10).await.unwrap().len(), 1);
+
+    // Bob's device is refused, posting and reading alike.
+    let resp = bob.sign("POST", &url, test_envelope(b"intruder"), client.post(&url)).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let resp = tokio_tungstenite::connect_async(bob.ws_request(&format!("{}/ws/{}", base.replace("http", "ws"), URL_SAFE_NO_PAD.encode(mailbox)))).await;
+    assert!(resp.is_err(), "another account's device opens no connection to the sync mailbox");
+
+    // No MLS: a commit, a proposal and a GroupInfo upload are all refused, even from Alice.
+    for typ in [ghost_wire::EnvelopeType::Commit, ghost_wire::EnvelopeType::Proposal] {
+        let resp = alice.sign("POST", &url, envelope(typ, 0, b"mls"), client.post(&url)).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{typ:?}");
+    }
+    let info_url = format!("{base}/box/{}/server_info", URL_SAFE_NO_PAD.encode(mailbox));
+    let resp = alice.sign("PUT", &info_url, vec![0u8; 32], client.put(&info_url)).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
@@ -1794,7 +2156,7 @@ async fn pre_upgrade_group_app_msg_allowed_commit_rejected() {
 
     // Application messages still pass (no ACL → skip membership check)
     let resp = alice
-        .sign("POST", &url, client.post(&url).body(test_envelope(b"legacy")))
+        .sign("POST", &url, test_envelope(b"legacy"), client.post(&url))
         .send()
         .await
         .unwrap();
@@ -1803,7 +2165,7 @@ async fn pre_upgrade_group_app_msg_allowed_commit_rejected() {
     // Commits are rejected without PublicGroup
     let commit_env = envelope(ghost_wire::EnvelopeType::Commit, 0, b"fake-commit");
     let resp = alice
-        .sign("POST", &url, client.post(&url).body(commit_env))
+        .sign("POST", &url, commit_env, client.post(&url))
         .send()
         .await
         .unwrap();
@@ -1830,14 +2192,43 @@ async fn commit_validated_and_acl_updated() {
     let client = reqwest::Client::new();
     let url = mailbox_url(&base, &mailbox_id);
     let resp = alice
-        .sign("POST", &url, client.post(&url).body(commit_envelope))
+        .sign("POST", &url, commit_envelope, client.post(&url))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
 
     // Verify ACL was updated: bob should now be a member
-    assert!(st.storage.is_mailbox_member(&mailbox_id, &bob.account_fp).unwrap());
+    assert!(st.storage.is_mailbox_member(mailbox_id, bob.account_fp).await.unwrap());
+}
+
+/// A commit whose log entry cannot be written leaves the group as it was, in storage and
+/// in memory, so the same commit is taken once the log can be written again; the group
+/// is not dropped to wait for a GroupInfo upload.
+#[tokio::test]
+async fn a_commit_whose_entry_cannot_be_written_leaves_the_group_as_it_was() {
+    let (base, st) = start_server_with_state(test_config()).await;
+    let alice = TestAuth::generate();
+    alice.register(&base).await;
+    let bob = TestAuth::generate();
+    bob.register(&base).await;
+    let relay_vk = fetch_relay_vk(&base).await;
+    let provider = OpenMlsRustCrypto::default();
+    let id_a = MlsTestIdentity::new(&alice.account_fp);
+    let (mut group, mailbox_id) = create_test_mls_group(&provider, &id_a, &relay_vk);
+    upload_group_info(&base, &alice, &mailbox_id, &export_group_info_bytes(&group, &provider, &id_a.signer)).await;
+    let commit = add_member_commit(&mut group, &provider, &id_a.signer, &bob.account_fp);
+    let client = reqwest::Client::new();
+    let url = mailbox_url(&base, &mailbox_id);
+
+    st.storage.write(|conn| conn.execute_batch("ALTER TABLE log RENAME TO log_aside").map_err(|e| ghost_relay::error::RelayError::Storage(e.to_string()))).await.unwrap();
+    let resp = alice.sign("POST", &url, commit.clone(), client.post(&url)).send().await.unwrap();
+    assert!(resp.status().is_server_error(), "{}", resp.status());
+    st.storage.write(|conn| conn.execute_batch("ALTER TABLE log_aside RENAME TO log").map_err(|e| ghost_relay::error::RelayError::Storage(e.to_string()))).await.unwrap();
+
+    let resp = alice.sign("POST", &url, commit, client.post(&url)).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert!(st.storage.is_mailbox_member(mailbox_id, bob.account_fp).await.unwrap());
 }
 
 /// What a test commit changes in the group.
@@ -1851,6 +2242,7 @@ enum Change {
 fn add_member_commit(group: &mut MlsGroup, provider: &OpenMlsRustCrypto, signer: &SignatureKeyPair, account_fp: &[u8; 32]) -> Vec<u8> {
     let joiner = MlsTestIdentity::new(account_fp);
     let key_package = KeyPackage::builder()
+        .leaf_node_capabilities(ghost_capabilities())
         .build(Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519, provider, &joiner.signer, joiner.credential.clone())
         .unwrap();
     commit_change(group, provider, signer, Change::Add(Box::new(key_package.key_package().clone())))
@@ -1919,18 +2311,18 @@ async fn removal_ends_the_members_voice_and_mailbox_connections() {
     let client = reqwest::Client::new();
     let url = mailbox_url(&base, &mailbox_id);
     let add = add_member_commit(&mut group, &provider, &id_a.signer, &bob.account_fp);
-    let resp = alice.sign("POST", &url, client.post(&url).body(add)).send().await.unwrap();
+    let resp = alice.sign("POST", &url, add, client.post(&url)).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
 
     // Bob is connected to the mailbox and to a voice room of the group.
     let ws_base = base.replace("http://", "ws://");
     let mut mailbox_ws = bob.ws_connect(&format!("{ws_base}/ws/{}", URL_SAFE_NO_PAD.encode(mailbox_id))).await;
     ws_handshake(&mut mailbox_ws, 1).await;
-    consume_vs_snap(&mut mailbox_ws).await;
+    consume_replay_end(&mut mailbox_ws).await;
     let (mut voice_ws, _, _, _) = join_voice(&voice_url(&base, &mailbox_id, &[0x40; 32]), &bob, b"pb").await;
 
     let remove = remove_member_commit(&mut group, &provider, &id_a.signer, &bob.account_fp);
-    let resp = alice.sign("POST", &url, client.post(&url).body(remove)).send().await.unwrap();
+    let resp = alice.sign("POST", &url, remove, client.post(&url)).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
 
     let mut voice_binary = false;
@@ -1939,6 +2331,218 @@ async fn removal_ends_the_members_voice_and_mailbox_connections() {
     let mut saw_commit = false;
     assert_eq!(close_code(&mut mailbox_ws, &mut saw_commit).await, Some(ghost_wire::WS_CLOSE_REMOVED));
     assert!(saw_commit, "the removing commit was not delivered before the close");
+}
+
+type TestWs = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// The next text frame within `within`, skipping everything else.
+async fn next_text(ws: &mut TestWs, within: Duration) -> Option<String> {
+    tokio::time::timeout(within, async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Text(t))) => return Some(t.to_string()),
+                Some(Ok(_)) => continue,
+                _ => return None,
+            }
+        }
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// A presence announcement as a client sends it, under `key` (`ps` or `vs`).
+fn presence_announcement(key: &str, channel: Option<&[u8; 32]>, blob: Option<&[u8]>) -> String {
+    let mut body = serde_json::Map::new();
+    if let Some(channel) = channel {
+        body.insert("ch".into(), B64.encode(channel).into());
+    }
+    match blob {
+        Some(blob) => body.insert("p".into(), B64.encode(blob).into()),
+        None => body.insert("leave".into(), true.into()),
+    };
+    serde_json::json!({ key: body }).to_string()
+}
+
+/// A mailbox connection for `auth`, past its catch-up and snapshots.
+async fn presence_connection(ws_url: &str, auth: &TestAuth) -> TestWs {
+    let mut ws = auth.ws_connect(ws_url).await;
+    ws_handshake(&mut ws, 0).await;
+    consume_replay_end(&mut ws).await;
+    ws
+}
+
+/// The relay knows a removed member cannot come back to the mailbox, so its presence goes
+/// at once rather than after the grace a blip gets.
+#[tokio::test]
+async fn a_removed_member_goes_offline_at_once() {
+    let (base, _) = start_server_with_state(test_config()).await;
+    let alice = TestAuth::generate();
+    alice.register(&base).await;
+    let bob = TestAuth::generate();
+    bob.register(&base).await;
+
+    let provider = OpenMlsRustCrypto::default();
+    let id_a = MlsTestIdentity::new(&alice.account_fp);
+    let (mut group, mailbox_id) = create_test_mls_group(&provider, &id_a, &fetch_relay_vk(&base).await);
+    upload_group_info(&base, &alice, &mailbox_id, &export_group_info_bytes(&group, &provider, &id_a.signer)).await;
+    let client = reqwest::Client::new();
+    let url = mailbox_url(&base, &mailbox_id);
+    let add = add_member_commit(&mut group, &provider, &id_a.signer, &bob.account_fp);
+    assert_eq!(alice.sign("POST", &url, add, client.post(&url)).send().await.unwrap().status(), StatusCode::CREATED);
+
+    let ws_url = format!("{}/ws/{}", base.replace("http://", "ws://"), URL_SAFE_NO_PAD.encode(mailbox_id));
+    let mut alice_ws = presence_connection(&ws_url, &alice).await;
+    let mut bob_ws = presence_connection(&ws_url, &bob).await;
+    bob_ws.send(Message::text(presence_announcement("ps", None, Some(b"bob")))).await.unwrap();
+    let online = next_text(&mut alice_ws, Duration::from_secs(2)).await.expect("bob's presence was not fanned out");
+    assert!(online.contains("\"p\""), "expected bob's presence, got {online}");
+
+    let remove = remove_member_commit(&mut group, &provider, &id_a.signer, &bob.account_fp);
+    assert_eq!(alice.sign("POST", &url, remove, client.post(&url)).send().await.unwrap().status(), StatusCode::CREATED);
+    let gone = next_text(&mut alice_ws, Duration::from_secs(3)).await.expect("bob stayed online after his removal");
+    assert!(gone.contains("\"leave\":true") && gone.contains(&B64.encode(bob.account_fp)), "expected bob's leave, got {gone}");
+}
+
+/// One entry per device: a device back on a new connection after a blip takes over what
+/// its earlier connection announced, so going invisible there takes it offline at once,
+/// and announcing again rides out the grace without a leave.
+#[tokio::test]
+async fn a_device_back_after_a_blip_takes_over_its_presence() {
+    let config = Config { presence_grace_secs: 1, ..test_config() };
+    let base = start_server(config).await;
+    let alice = TestAuth::generate();
+    alice.register(&base).await;
+    let bob = TestAuth::generate();
+    bob.register(&base).await;
+    let ws_url = format!("{}/ws/{}", base.replace("http://", "ws://"), URL_SAFE_NO_PAD.encode([0x05; 32]));
+    let mut alice_ws = presence_connection(&ws_url, &alice).await;
+    let quiet = Duration::from_millis(1600);
+
+    // Bob drops without a close frame and comes back invisible: offline at once, and the
+    // grace of the dropped connection has nothing left to withdraw.
+    let mut first = presence_connection(&ws_url, &bob).await;
+    first.send(Message::text(presence_announcement("ps", None, Some(b"one")))).await.unwrap();
+    assert!(next_text(&mut alice_ws, Duration::from_secs(2)).await.is_some_and(|t| t.contains(&B64.encode(b"one"))));
+    drop(first);
+    let mut second = presence_connection(&ws_url, &bob).await;
+    second.send(Message::text(presence_announcement("ps", None, None))).await.unwrap();
+    let gone = next_text(&mut alice_ws, Duration::from_millis(500)).await.expect("going invisible waited for the grace");
+    assert!(gone.contains("\"leave\":true"), "expected a leave, got {gone}");
+    assert_eq!(next_text(&mut alice_ws, quiet).await, None, "a second leave followed the grace");
+
+    // Bob drops again and comes back announcing: the others see the new presence and no leave.
+    second.send(Message::text(presence_announcement("ps", None, Some(b"two")))).await.unwrap();
+    assert!(next_text(&mut alice_ws, Duration::from_secs(2)).await.is_some_and(|t| t.contains(&B64.encode(b"two"))));
+    drop(second);
+    let mut third = presence_connection(&ws_url, &bob).await;
+    third.send(Message::text(presence_announcement("ps", None, Some(b"three")))).await.unwrap();
+    assert!(next_text(&mut alice_ws, Duration::from_secs(2)).await.is_some_and(|t| t.contains(&B64.encode(b"three"))));
+    assert_eq!(next_text(&mut alice_ws, quiet).await, None, "a device that came back was withdrawn");
+}
+
+/// A connection that falls behind the fan-out of `key` announcements is sent the
+/// mailbox's snapshot again, so it ends up seeing the last thing announced.
+async fn a_lagging_connection_catches_up_from_a_snapshot(key: &str, snapshot_key: &str) {
+    let base = start_server(test_config()).await;
+    let alice = TestAuth::generate();
+    alice.register(&base).await;
+    let bob = TestAuth::generate();
+    bob.register(&base).await;
+    let ws_url = format!("{}/ws/{}", base.replace("http://", "ws://"), URL_SAFE_NO_PAD.encode([0x06; 32]));
+    let mut alice_ws = presence_connection(&ws_url, &alice).await;
+    let (mut bob_sink, mut bob_stream) = presence_connection(&ws_url, &bob).await.split();
+    tokio::spawn(async move { while bob_stream.next().await.is_some() {} });
+
+    // Alice reads nothing while Bob announces far more than her connection's socket and
+    // fan-out hold.
+    let channel = [0x41; 32];
+    let channel = (key == "vs").then_some(&channel);
+    let filler = vec![0xAB; 2000];
+    for _ in 0..3000 {
+        bob_sink.send(Message::text(presence_announcement(key, channel, Some(&filler)))).await.unwrap();
+    }
+    bob_sink.send(Message::text(presence_announcement(key, channel, Some(b"last")))).await.unwrap();
+
+    let (mut snapshots, mut latest) = (0, String::new());
+    while let Some(text) = next_text(&mut alice_ws, Duration::from_secs(2)).await {
+        if text.starts_with(&format!("{{\"{snapshot_key}\"")) {
+            snapshots += 1;
+        }
+        latest = text;
+    }
+    assert!(snapshots > 0, "alice fell behind but was never sent a snapshot");
+    assert!(latest.contains(&B64.encode(b"last")), "alice did not end on bob's last announcement");
+}
+
+#[tokio::test]
+async fn a_connection_behind_on_online_presence_is_sent_the_snapshot() {
+    a_lagging_connection_catches_up_from_a_snapshot("ps", "ps_snap").await;
+}
+
+#[tokio::test]
+async fn a_connection_behind_on_voice_state_is_sent_the_snapshot() {
+    a_lagging_connection_catches_up_from_a_snapshot("vs", "vs_snap").await;
+}
+
+/// A device is in one call at most: announcing a channel takes it out of any other.
+#[tokio::test]
+async fn announcing_a_voice_channel_leaves_the_last_one() {
+    let base = start_server(test_config()).await;
+    let alice = TestAuth::generate();
+    alice.register(&base).await;
+    let bob = TestAuth::generate();
+    bob.register(&base).await;
+    let ws_url = format!("{}/ws/{}", base.replace("http://", "ws://"), URL_SAFE_NO_PAD.encode([0x07; 32]));
+    let mut alice_ws = presence_connection(&ws_url, &alice).await;
+    let mut bob_ws = presence_connection(&ws_url, &bob).await;
+    let (first, second) = ([0x51; 32], [0x52; 32]);
+
+    bob_ws.send(Message::text(presence_announcement("vs", Some(&first), Some(b"in")))).await.unwrap();
+    assert!(next_text(&mut alice_ws, Duration::from_secs(2)).await.is_some_and(|t| t.contains(&B64.encode(first))));
+    bob_ws.send(Message::text(presence_announcement("vs", Some(&second), Some(b"in")))).await.unwrap();
+    let left = next_text(&mut alice_ws, Duration::from_secs(2)).await.expect("no leave for the first channel");
+    assert!(left.contains(&B64.encode(first)) && left.contains("\"leave\":true"), "expected a leave of the first channel, got {left}");
+    let joined = next_text(&mut alice_ws, Duration::from_secs(2)).await.expect("no announcement of the second channel");
+    assert!(joined.contains(&B64.encode(second)) && joined.contains("\"p\""), "expected the second channel, got {joined}");
+}
+
+/// A device whose account was just removed cannot post a message on the connection it
+/// still holds: the membership the relay checks changes with the removing commit, before
+/// the connection hears of the departure.
+#[tokio::test]
+async fn a_removed_member_cannot_post_on_a_connection_it_still_holds() {
+    let (base, state) = start_server_with_state(test_config()).await;
+    let alice = TestAuth::generate();
+    alice.register(&base).await;
+    let bob = TestAuth::generate();
+    bob.register(&base).await;
+
+    let provider = OpenMlsRustCrypto::default();
+    let id_a = MlsTestIdentity::new(&alice.account_fp);
+    let (mut group, mailbox_id) = create_test_mls_group(&provider, &id_a, &fetch_relay_vk(&base).await);
+    upload_group_info(&base, &alice, &mailbox_id, &export_group_info_bytes(&group, &provider, &id_a.signer)).await;
+    let client = reqwest::Client::new();
+    let url = mailbox_url(&base, &mailbox_id);
+    let add = add_member_commit(&mut group, &provider, &id_a.signer, &bob.account_fp);
+    assert_eq!(alice.sign("POST", &url, add, client.post(&url)).send().await.unwrap().status(), StatusCode::CREATED);
+
+    let ws_base = base.replace("http://", "ws://");
+    let mut ws = bob.ws_connect(&format!("{ws_base}/ws/{}", URL_SAFE_NO_PAD.encode(mailbox_id))).await;
+    ws_handshake(&mut ws, 1).await;
+    consume_replay_end(&mut ws).await;
+
+    // Bob is removed and posts at once, at the epoch his message is still accepted at.
+    let epoch_before = group.epoch().as_u64();
+    let remove = remove_member_commit(&mut group, &provider, &id_a.signer, &bob.account_fp);
+    assert_eq!(alice.sign("POST", &url, remove, client.post(&url)).send().await.unwrap().status(), StatusCode::CREATED);
+    let _ = ws.send(Message::Binary(envelope(ghost_wire::EnvelopeType::Application, epoch_before, b"after removal").into())).await;
+
+    // Whether the relay refused the post or had already closed the connection, the log
+    // ends with the removal.
+    let _ = tokio::time::timeout(Duration::from_secs(3), async { while ws.next().await.is_some() {} }).await;
+    let entries = state.storage.read_from(mailbox_id, 0, 100).await.unwrap();
+    assert!(entries.iter().all(|e| !e.payload.ends_with(b"after removal")), "a removed member's post was stored");
 }
 
 // ── Key Transparency integration tests ──────────────────────────
@@ -1974,7 +2578,7 @@ async fn get_idlog_returns_anchored_entries() {
 
     // GET serves the same anchored entry and names this relay as home.
     let req = client.get(&url);
-    let resp = alice.sign("GET", &url, req).send().await.unwrap();
+    let resp = alice.sign("GET", &url, Vec::new(), req).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["home_relay_vk"].as_str().unwrap(), hex::encode(st.relay_vk));
@@ -2022,14 +2626,14 @@ async fn anchored_push_registers_foreign_account_with_invite_only() {
     let msg = ghost_wire::idlog::sign_message(&set_home);
     set_home.signature = alice.device_key.sign(&msg).to_bytes();
     let resp = alice
-        .sign("PUT", &home_url, client.put(&home_url).body(set_home.to_bytes()))
+        .sign("PUT", &home_url, set_home.to_bytes(), client.put(&home_url))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
 
     // Fetch the anchored chain from the home.
-    let resp = alice.sign("GET", &home_url, client.get(&home_url)).send().await.unwrap();
+    let resp = alice.sign("GET", &home_url, Vec::new(), client.get(&home_url)).send().await.unwrap();
     let body: Value = resp.json().await.unwrap();
     let mut chain = Vec::new();
     for e in body["entries"].as_array().unwrap() {
@@ -2039,7 +2643,7 @@ async fn anchored_push_registers_foreign_account_with_invite_only() {
     // The mirror has never heard of Alice: her device cannot authenticate there.
     let mirror_url = format!("{mirror_base}/idlog/{}", hex::encode(alice.account_fp));
     let probe = format!("{mirror_base}/accounts/{}", hex::encode(alice.account_fp));
-    let resp = alice.sign("GET", &probe, client.get(&probe)).send().await.unwrap();
+    let resp = alice.sign("GET", &probe, Vec::new(), client.get(&probe)).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
     // Without an invite the anchored push is refused.
@@ -2057,17 +2661,14 @@ async fn anchored_push_registers_foreign_account_with_invite_only() {
     let bob = TestAuth::generate();
     bob.register(&mirror_base).await;
     let invite_url = format!("{mirror_base}/invite");
+    let token = hex::encode([0xAE; 16]);
     let expires_at = ghost_relay::util::now_millis() + 60_000;
-    let resp = bob
-        .sign("POST", &invite_url, client.post(&invite_url).json(&serde_json::json!({"token": "tok1", "expires_at": expires_at})))
-        .send()
-        .await
-        .unwrap();
+    let resp = bob.post_json(&invite_url, &invite_registration(&token, expires_at)).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
 
     // With the invite the mirror validates the chain and registers Alice as a guest.
     let resp = client
-        .put(format!("{mirror_url}/anchored?invite=tok1"))
+        .put(format!("{mirror_url}/anchored?invite={token}"))
         .body(chain.clone())
         .send()
         .await
@@ -2079,9 +2680,9 @@ async fn anchored_push_registers_foreign_account_with_invite_only() {
     assert_eq!(info["head_seq"].as_u64().unwrap(), 2);
 
     // Alice's device now authenticates at the mirror and sees the same view.
-    let resp = alice.sign("GET", &probe, client.get(&probe)).send().await.unwrap();
+    let resp = alice.sign("GET", &probe, Vec::new(), client.get(&probe)).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let resp = alice.sign("GET", &mirror_url, client.get(&mirror_url)).send().await.unwrap();
+    let resp = alice.sign("GET", &mirror_url, Vec::new(), client.get(&mirror_url)).send().await.unwrap();
     let mirrored: Value = resp.json().await.unwrap();
     assert_eq!(mirrored["home_relay_vk"].as_str().unwrap(), hex::encode(home_state.relay_vk));
     assert_eq!(mirrored["entries"].as_array().unwrap().len(), 2);
@@ -2119,11 +2720,11 @@ async fn anchored_push_registers_foreign_account_with_invite_only() {
     add.signature = alice.device_key.sign(&msg).to_bytes();
     add.counter_signature = Some(device2.sign(&msg).to_bytes());
     let resp = alice
-        .sign("PUT", &mirror_url, client.put(&mirror_url).body(add.to_bytes()))
+        .sign("PUT", &mirror_url, add.to_bytes(), client.put(&mirror_url))
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert_eq!(resp.status(), StatusCode::MISDIRECTED_REQUEST, "the account is homed elsewhere");
 }
 
 #[tokio::test]
@@ -2158,7 +2759,7 @@ async fn kt_consistency_proof_valid() {
 
     let client = reqwest::Client::new();
     let url = format!("{}/idlog/{}", base, hex::encode(alice.account_fp));
-    let resp = alice.sign("PUT", &url, client.put(&url).body(add_bytes)).send().await.unwrap();
+    let resp = alice.sign("PUT", &url, add_bytes, client.put(&url)).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
 
     // Tree should now have 2 leaves. Get consistency proof from 1 to 2
@@ -2192,7 +2793,7 @@ async fn server_location_requires_an_active_device_signature_and_increasing_gene
     let client = reqwest::Client::new();
     let server_id = [0x5E; 32];
     let url = format!("{base}/accounts/{}/servers/{}/location", hex::encode(alice.account_fp), hex::encode(server_id));
-    let put = |body: Vec<u8>| alice.sign("PUT", &url, client.put(&url).body(body));
+    let put = |body: Vec<u8>| alice.sign("PUT", &url, body, client.put(&url));
 
     // Signed by Alice's device: stored and readable without credentials.
     let first = ServerLocation::sign(server_id, 1, RelayRef::https([0x11; 32], "https://new.example"), &alice.device_key);
@@ -2212,4 +2813,232 @@ async fn server_location_requires_an_active_device_signature_and_increasing_gene
     // Unknown servers have no location.
     let other = format!("{base}/accounts/{}/servers/{}/location", hex::encode(alice.account_fp), hex::encode([0x5F; 32]));
     assert_eq!(client.get(&other).send().await.unwrap().status(), StatusCode::NOT_FOUND);
+}
+
+// ── Account keys ──────────────────────────────────────────────────
+
+mod account_keys {
+    use super::*;
+    use ghost_wire::account_key::{decode_key_sets, AccountKeySet, SealedCopy};
+    use ghost_wire::batch::LogBatch;
+    use ghost_wire::idlog::{validate_chain, LogEntry, LogState};
+    use ghost_wire::log_entries::{
+        create_account_key, create_add_device, create_device_key, create_genesis, create_recovery, create_rotate_root,
+    };
+
+    fn batch_url(base: &str, fp: &[u8; 32]) -> String {
+        format!("{base}/idlog/{}/batch", hex::encode(fp))
+    }
+
+    /// A set for the generation after `state`'s, with a stand-in copy for everyone
+    /// `state` must cover; relays never open copies.
+    fn stand_in_key_set(state: &LogState) -> AccountKeySet {
+        AccountKeySet {
+            account_fp: state.account_fp,
+            generation: state.account_key().map_or(1, |k| k.generation + 1),
+            copies: state
+                .coverage()
+                .into_iter()
+                .map(|recipient| SealedCopy { recipient, encapsulated_key: [0x5A; 32], ciphertext: vec![0xA5; 48] })
+                .collect(),
+            back_link: None,
+        }
+    }
+
+    async fn post_batch(base: &str, fp: &[u8; 32], batch: &LogBatch, auth: Option<&TestAuth>) -> reqwest::Response {
+        let url = batch_url(base, fp);
+        let body = batch.to_bytes();
+        let req = reqwest::Client::new().post(&url);
+        let req = match auth {
+            Some(auth) => auth.sign("POST", &url, body, req),
+            None => req.body(body),
+        };
+        req.send().await.unwrap()
+    }
+
+    /// Create `auth`'s account at `base` the way new clients do: genesis, the device's
+    /// encryption key, a rotation to `root` and the first account key, in one batch.
+    async fn create_rotated(base: &str, auth: &TestAuth, root: &SigningKey) -> Vec<LogEntry> {
+        let mut entries = vec![create_genesis(&auth.master_key, &auth.device_key, "test")];
+        entries.push(create_device_key(&validate_chain(&entries).unwrap(), &auth.device_key, &auth.device_key, [0x01; 32]));
+        entries.push(create_rotate_root(&validate_chain(&entries).unwrap(), &auth.master_key, root, [0x02; 32], &auth.device_key));
+        let state = validate_chain(&entries).unwrap();
+        let set = stand_in_key_set(&state);
+        entries.push(create_account_key(&state, &auth.device_key, &SigningKey::generate(&mut OsRng), [0x03; 32], &set));
+        let batch = LogBatch { entries: entries.clone(), key_sets: vec![set] };
+        let resp = post_batch(base, &auth.account_fp, &batch, None).await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let anchors = ghost_wire::anchor::decode_sequence(&resp.bytes().await.unwrap()).unwrap();
+        assert_eq!(anchors.len(), entries.len(), "one anchor per entry");
+        entries
+    }
+
+    async fn idlog_len(base: &str, auth: &TestAuth) -> usize {
+        let url = idlog_url(base, &auth.account_fp);
+        let resp = auth.sign("GET", &url, Vec::new(), reqwest::Client::new().get(&url)).send().await.unwrap();
+        let body: Value = resp.json().await.unwrap();
+        body["entries"].as_array().unwrap().len()
+    }
+
+    #[tokio::test]
+    async fn a_batch_is_all_or_nothing() {
+        let base = start_server(test_config()).await;
+        let alice = TestAuth::generate();
+        let root = SigningKey::generate(&mut OsRng);
+        let entries = create_rotated(&base, &alice, &root).await;
+
+        // Adding a device brings it into coverage, so the batch needs an account key and its set.
+        let phone = SigningKey::generate(&mut OsRng);
+        let mut chain = entries.clone();
+        chain.push(create_add_device(&validate_chain(&chain).unwrap(), &alice.device_key, &phone, "phone"));
+        chain.push(create_device_key(&validate_chain(&chain).unwrap(), &alice.device_key, &phone, [0x04; 32]));
+        let state = validate_chain(&chain).unwrap();
+        let set = stand_in_key_set(&state);
+        chain.push(create_account_key(&state, &alice.device_key, &SigningKey::generate(&mut OsRng), [0x05; 32], &set));
+        let tail = chain[entries.len()..].to_vec();
+
+        let without_set = LogBatch { entries: tail.clone(), key_sets: Vec::new() };
+        let resp = post_batch(&base, &alice.account_fp, &without_set, Some(&alice)).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(idlog_len(&base, &alice).await, entries.len(), "nothing from the refused batch landed");
+
+        let with_set = LogBatch { entries: tail, key_sets: vec![set] };
+        let resp = post_batch(&base, &alice.account_fp, &with_set, Some(&alice)).await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        assert_eq!(idlog_len(&base, &alice).await, chain.len());
+    }
+
+    #[tokio::test]
+    async fn rate_limits_count_only_valid_recoveries() {
+        let base = start_server(test_config()).await;
+        let alice = TestAuth::generate();
+        let root = SigningKey::generate(&mut OsRng);
+        let mut chain = create_rotated(&base, &alice, &root).await;
+
+        // Recoveries signed by the genesis key, no longer the root, never count.
+        for _ in 0..5 {
+            let junk = create_recovery(&validate_chain(&chain).unwrap(), &alice.master_key, &SigningKey::generate(&mut OsRng), "junk");
+            let resp = post_batch(&base, &alice.account_fp, &LogBatch { entries: vec![junk], key_sets: Vec::new() }, None).await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        }
+
+        // Real recoveries spend the budget of three a day.
+        for attempt in 0..4 {
+            let recovery = create_recovery(&validate_chain(&chain).unwrap(), &root, &SigningKey::generate(&mut OsRng), "owner");
+            let resp = post_batch(&base, &alice.account_fp, &LogBatch { entries: vec![recovery.clone()], key_sets: Vec::new() }, None).await;
+            if attempt < 3 {
+                assert_eq!(resp.status(), StatusCode::CREATED, "recovery {attempt}");
+                chain.push(recovery);
+            } else {
+                assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+                // The first of the three leaves the day's window in a little under a day.
+                let wait: u64 = resp.headers()[reqwest::header::RETRY_AFTER].to_str().unwrap().parse().unwrap();
+                assert!((23 * 3600..=24 * 3600).contains(&wait), "Retry-After {wait}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rotated_away_root_reads_nothing_and_by_root_finds_the_account() {
+        let base = start_server(test_config()).await;
+        let alice = TestAuth::generate();
+        let root = SigningKey::generate(&mut OsRng);
+        create_rotated(&base, &alice, &root).await;
+        let client = reqwest::Client::new();
+
+        let url = idlog_url(&base, &alice.account_fp);
+        let as_genesis = sign_as(&alice.account_fp, &alice.master_key, "GET", &url, Vec::new(), client.get(&url)).send().await.unwrap();
+        assert_eq!(as_genesis.status(), StatusCode::UNAUTHORIZED, "the genesis key reads nothing once rotated");
+        let as_root = sign_as(&alice.account_fp, &root, "GET", &url, Vec::new(), client.get(&url)).send().await.unwrap();
+        assert_eq!(as_root.status(), StatusCode::OK);
+
+        let lookup = format!("{base}/accounts/by_root");
+        let found = client
+            .get(&lookup)
+            .header(ghost_wire::auth::ROOT_AUTH_HEADER, ghost_wire::auth::sign_root_auth("GET", "/accounts/by_root", &root))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(found.status(), StatusCode::OK);
+        let body: Value = found.json().await.unwrap();
+        assert_eq!(body["account_fp"].as_str().unwrap(), hex::encode(alice.account_fp));
+
+        let stale = client
+            .get(&lookup)
+            .header(ghost_wire::auth::ROOT_AUTH_HEADER, ghost_wire::auth::sign_root_auth("GET", "/accounts/by_root", &alice.master_key))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stale.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn single_entries_are_refused_after_rotation() {
+        let base = start_server(test_config()).await;
+        let alice = TestAuth::generate();
+        let root = SigningKey::generate(&mut OsRng);
+        let chain = create_rotated(&base, &alice, &root).await;
+        let client = reqwest::Client::new();
+
+        let url = idlog_url(&base, &alice.account_fp);
+        let add = create_add_device(&validate_chain(&chain).unwrap(), &alice.device_key, &SigningKey::generate(&mut OsRng), "phone");
+        let resp = alice.sign("PUT", &url, add.to_bytes(), client.put(&url)).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::GONE);
+    }
+
+    #[tokio::test]
+    async fn key_sets_are_for_the_account_alone() {
+        let base = start_server(test_config()).await;
+        let alice = TestAuth::generate();
+        let root = SigningKey::generate(&mut OsRng);
+        create_rotated(&base, &alice, &root).await;
+        let bob = TestAuth::generate();
+        bob.register(&base).await;
+        let client = reqwest::Client::new();
+
+        let url = format!("{base}/accounts/{}/key_sets", hex::encode(alice.account_fp));
+        let resp = alice.sign("GET", &url, Vec::new(), client.get(&url)).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let sets = decode_key_sets(&resp.bytes().await.unwrap()).unwrap();
+        assert_eq!(sets.len(), 1);
+        assert_eq!(sets[0].generation, 1);
+
+        let resp = bob.sign("GET", &url, Vec::new(), client.get(&url)).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "another account's device");
+
+        // A relay that holds no matching entry stores nothing.
+        let other = start_server(test_config()).await;
+        let other_url = format!("{other}/accounts/{}/key_sets", hex::encode(alice.account_fp));
+        let resp = client.put(&other_url).body(ghost_wire::account_key::encode_key_sets(&sets)).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn a_new_pairing_draft_clears_the_old_signature() {
+        let base = start_server(test_config()).await;
+        let alice = TestAuth::generate();
+        alice.register(&base).await;
+        let token = [0x42u8; 16];
+        assert_eq!(open_pairing(&base, &alice, &token, b"offer").await, StatusCode::CREATED);
+        let client = reqwest::Client::new();
+        let draft_url = format!("{}/draft", session_url(&base, &alice.account_fp, &token));
+        let signatures_url = format!("{}/signatures", session_url(&base, &alice.account_fp, &token));
+
+        let resp = alice.sign("PUT", &draft_url, b"draft one".to_vec(), client.put(&draft_url)).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        assert_eq!(client.get(&draft_url).send().await.unwrap().bytes().await.unwrap().as_ref(), b"draft one");
+        let resp = client.post(&signatures_url).body(b"signed one".to_vec()).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let resp = client.post(&signatures_url).body(b"replaced".to_vec()).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT, "one signature per draft");
+
+        let resp = alice.sign("PUT", &draft_url, b"draft two".to_vec(), client.put(&draft_url)).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let resp = alice.sign("GET", &signatures_url, Vec::new(), client.get(&signatures_url)).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT, "the old signature went with the old draft");
+        let resp = client.post(&signatures_url).body(b"signed two".to_vec()).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let resp = alice.sign("GET", &signatures_url, Vec::new(), client.get(&signatures_url)).send().await.unwrap();
+        assert_eq!(resp.bytes().await.unwrap().as_ref(), b"signed two");
+    }
 }

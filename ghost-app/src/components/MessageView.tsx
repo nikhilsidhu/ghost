@@ -1,13 +1,15 @@
-import { createSignal, createEffect, on, onCleanup, For, Show } from "solid-js";
+import { createSignal, createEffect, createMemo, on, onCleanup, For, Show } from "solid-js";
 import { listen } from "@tauri-apps/api/event";
-import type { Message } from "../lib/types";
-import { listMessages, sendMessage } from "../lib/api";
+import type { Message, MessageDelivery } from "../lib/types";
+import { acceptRelayState, listMessages, retryMessage, sendMessage } from "../lib/api";
 import { hashGradient } from "../lib/gradients";
 import { Avatar } from "./ui/avatar";
 import type { AvatarStatus } from "./ui/avatar";
 import { cn } from "../lib/cn";
 import { ChevronDown, SendHorizonal } from "lucide-solid";
-import { selectedServerId, selectedChannelId, members, settingsOpen, onlinePresence } from "../lib/store";
+import { selectedServerId, selectedChannelId, selectedServer, channels, members, settingsOpen, onlinePresence, forgetServer, refreshServers, waitingChannels } from "../lib/store";
+import { MESSAGE_TYPES } from "../lib/types";
+import { ConfirmButton } from "./ui/confirm-button";
 import { slideDuration } from "../lib/constants";
 import { sections } from "../lib/settings-registry";
 import { showTimestamps } from "./settings/AppearanceSettings";
@@ -20,6 +22,28 @@ const formatTime = (ts: number) => {
   const d = new Date(ts);
   return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 };
+
+/** Under a message the relay has not taken: that it is on its way, or that it was refused and can be retried. */
+function DeliveryNote(props: { message: Message; onRetry: (messageId: string) => void }) {
+  return (
+    <Show when={props.message.delivery !== "delivered"}>
+      <div class="text-xs mt-0.5">
+        <Show when={props.message.delivery === "pending"}>
+          <span class="text-[var(--neutral-500)]">sending...</span>
+        </Show>
+        <Show when={props.message.delivery === "failed"}>
+          <span class="text-[var(--red-400)]">not sent</span>
+          <button
+            class="ml-2 text-[var(--neutral-300)] hover:text-[var(--neutral-100)] cursor-pointer"
+            onClick={() => props.onRetry(props.message.message_id)}
+          >
+            retry
+          </button>
+        </Show>
+      </div>
+    </Show>
+  );
+}
 
 export function MessageView() {
   const [messages, setMessages] = createSignal<Message[]>([]);
@@ -34,13 +58,13 @@ export function MessageView() {
   let containerRef!: HTMLDivElement;
   let inputRef!: HTMLInputElement;
 
-  const senderMap = () => {
+  const senderMap = createMemo(() => {
     const m = new Map<string, string>();
     for (const member of members()) {
       m.set(member.fingerprint, member.display_name);
     }
     return m;
-  };
+  });
 
   const scrollToBottom = () => {
     if (containerRef) containerRef.scrollTop = containerRef.scrollHeight;
@@ -89,8 +113,26 @@ export function MessageView() {
       setMessages((prev) => [...prev, msg]);
       if (nearBottom()) requestAnimationFrame(scrollToBottom);
     });
-    onCleanup(() => { unlisten.then((fn) => fn()); });
+    // The relay took or refused one of our messages: it stops looking pending.
+    const unlistenDelivery = listen<MessageDelivery>("message-delivery", (event) => {
+      const { message_id, delivery } = event.payload;
+      if (!seenIds.has(message_id)) return;
+      setMessages((prev) => prev.map((m) => (m.message_id === message_id ? { ...m, delivery } : m)));
+    });
+    onCleanup(() => {
+      unlisten.then((fn) => fn());
+      unlistenDelivery.then((fn) => fn());
+    });
   }));
+
+  const handleRetry = async (messageId: string) => {
+    try {
+      const msg = await retryMessage(messageId);
+      setMessages((prev) => prev.map((m) => (m.message_id === messageId ? msg : m)));
+    } catch (e: any) {
+      setError(String(e));
+    }
+  };
 
   const loadMore = async () => {
     const current = messages();
@@ -144,13 +186,21 @@ export function MessageView() {
             const grouped = () => isGrouped(messages(), idx());
             const name = () => senderMap().get(msg.sender_fp) ?? msg.sender_fp.slice(0, 16);
             const grad = () => hashGradient(msg.sender_fp);
+            if (msg.message_type === MESSAGE_TYPES.undecryptable) {
+              return <UndecryptableNotice message={msg} isNew={!initialLoad && idx() === messages().length - 1} />;
+            }
+            if (msg.message_type === MESSAGE_TYPES.historyGap) {
+              return <HistoryGapNotice message={msg} isNew={!initialLoad && idx() === messages().length - 1} />;
+            }
             return (
               <div
                 class={cn(
                   "group/msg -mx-2 px-2 rounded-md hover:bg-[var(--neutral-900)]",
                   grouped() ? "py-1 pl-[var(--msg-indent)]" : "mt-2 py-1.5",
                   !initialLoad && idx() === messages().length - 1 ? "msg-new" : "",
+                  msg.delivery === "pending" ? "opacity-60" : "",
                 )}
+                data-delivery={msg.delivery}
               >
                 <Show when={!grouped()}>
                   <div class="flex items-start gap-3">
@@ -177,6 +227,7 @@ export function MessageView() {
                       <div class="text-sm text-[var(--neutral-300)] break-words leading-relaxed">
                         {msg.content}
                       </div>
+                      <DeliveryNote message={msg} onRetry={handleRetry} />
                     </div>
                   </div>
                 </Show>
@@ -184,6 +235,7 @@ export function MessageView() {
                   <div class="text-sm text-[var(--neutral-300)] break-words leading-relaxed">
                     {msg.content}
                   </div>
+                  <DeliveryNote message={msg} onRetry={handleRetry} />
                 </Show>
               </div>
             );
@@ -208,6 +260,11 @@ export function MessageView() {
       <Show when={error()}>
         <div class="px-4 py-1 text-xs text-[var(--red-400)]">{error()}</div>
       </Show>
+      <Show when={selectedChannelId() && waitingChannels().has(selectedChannelId()!)}>
+        <div role="status" class="px-4 py-1 text-xs text-[var(--neutral-400)]">
+          Waiting for this server's latest changes; this channel's new messages appear once they arrive.
+        </div>
+      </Show>
       <div
         class="flex-shrink-0 px-4 py-3"
         style={{
@@ -216,38 +273,148 @@ export function MessageView() {
           transition: `transform ${slideDuration(sections().length)} var(--ease-out)`,
         }}
       >
-        <div
-          class="flex items-center gap-2 rounded-lg px-3"
-          style={{
-            background: "var(--neutral-800)",
-            border: "1px solid var(--neutral-700)",
-          }}
+        <Show
+          when={!selectedServer()?.removed && !selectedServer()?.halted}
+          fallback={<Show when={selectedServer()?.removed} fallback={<HaltedNotice />}><RemovedNotice /></Show>}
         >
-          <input
-            ref={inputRef}
-            class="flex-1 h-10 bg-transparent text-sm text-[var(--neutral-100)] placeholder:text-[var(--neutral-500)] outline-none"
-            placeholder="send a message..."
-            value={inputText()}
-            onInput={(e) => setInputText(e.currentTarget.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") {
-                const send = enterSends() ? !e.shiftKey : e.shiftKey;
-                if (send) { e.preventDefault(); handleSend(); }
-              }
+          <div
+            class="flex items-center gap-2 rounded-lg px-3"
+            style={{
+              background: "var(--neutral-800)",
+              border: "1px solid var(--neutral-700)",
             }}
-          />
-          <button
-            class="w-7 h-7 flex items-center justify-center rounded-md cursor-pointer transition-colors duration-150"
-            classList={{
-              "text-[var(--purple-400)] hover:text-[var(--purple-300)] hover:bg-[var(--accent-hover)]": inputText().trim().length > 0,
-              "text-[var(--neutral-600)]": inputText().trim().length === 0,
-            }}
-            onClick={handleSend}
           >
-            <SendHorizonal size={16} />
-          </button>
-        </div>
+            <input
+              ref={inputRef}
+              class="flex-1 h-10 bg-transparent text-sm text-[var(--neutral-100)] placeholder:text-[var(--neutral-500)] outline-none"
+              placeholder="send a message..."
+              value={inputText()}
+              onInput={(e) => setInputText(e.currentTarget.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  const send = enterSends() ? !e.shiftKey : e.shiftKey;
+                  if (send) { e.preventDefault(); handleSend(); }
+                }
+              }}
+            />
+            <button
+              class="w-7 h-7 flex items-center justify-center rounded-md cursor-pointer transition-colors duration-150"
+              classList={{
+                "text-[var(--purple-400)] hover:text-[var(--purple-300)] hover:bg-[var(--accent-hover)]": inputText().trim().length > 0,
+                "text-[var(--neutral-600)]": inputText().trim().length === 0,
+              }}
+              onClick={handleSend}
+            >
+              <SendHorizonal size={16} />
+            </button>
+          </div>
+        </Show>
       </div>
+    </div>
+  );
+}
+
+/** Stands in the history for a message this device could not decrypt. A public
+ * channel's messages travel in the server's one group, so there the notice cannot say
+ * which channel the message was for; a private channel has a group of its own. */
+function UndecryptableNotice(props: { message: Message; isNew: boolean }) {
+  const inPrivateChannel = () => channels().find((c) => c.channel_id === props.message.channel_id)?.private ?? false;
+  return (
+    <div role="note" class={cn("-mx-2 px-2 mt-2 py-1.5 flex items-baseline gap-2", props.isNew && "msg-new")}>
+      <span class="text-sm italic text-[var(--neutral-500)]">
+        {inPrivateChannel() ? "a message could not be decrypted" : "a message sent somewhere in this server could not be decrypted"}
+      </span>
+      <Show when={showTimestamps()}>
+        <span class="text-xs text-[var(--neutral-600)]">{formatTime(props.message.received_at)}</span>
+      </Show>
+    </div>
+  );
+}
+
+/** Marks where the history skips what the relay no longer kept when this device came
+ * back. As with a stand-in, a public channel's messages travel in the server's one group,
+ * so there the notice cannot say which channel lost them. */
+function HistoryGapNotice(props: { message: Message; isNew: boolean }) {
+  const inPrivateChannel = () => channels().find((c) => c.channel_id === props.message.channel_id)?.private ?? false;
+  return (
+    <div role="note" class={cn("-mx-2 px-2 mt-2 py-1.5 flex items-baseline gap-2", props.isNew && "msg-new")}>
+      <span class="text-sm italic text-[var(--neutral-500)]">
+        {inPrivateChannel()
+          ? "earlier messages here were not kept by the relay while this device was away"
+          : "earlier messages in this server were not kept by its relay while this device was away"}
+      </span>
+      <Show when={showTimestamps()}>
+        <span class="text-xs text-[var(--neutral-600)]">{formatTime(props.message.received_at)}</span>
+      </Show>
+    </div>
+  );
+}
+
+/** In place of the message box on a server this device stopped following: its relay
+ * accepted a change the server's rules forbid, so this copy is from before it and
+ * read-only. The person takes the relay's version after all, or leaves. */
+function HaltedNotice() {
+  const server = () => selectedServer();
+  const halt = () => server()?.halted;
+  const [busy, setBusy] = createSignal(false);
+  const [error, setError] = createSignal<string | null>(null);
+  const accept = async () => {
+    const id = server()?.server_id;
+    if (!id) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await acceptRelayState(id);
+      await refreshServers();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div
+      role="status"
+      class="flex items-center gap-3 rounded-lg px-3 py-2"
+      style={{ background: "var(--neutral-800)", border: "1px solid var(--neutral-700)" }}
+    >
+      <div class="flex-1 min-w-0 text-sm text-[var(--neutral-300)]">
+        {`${server()?.name} is read-only.`}
+        <span class="text-[var(--neutral-500)]">
+          {` Its relay${halt()?.relay ? ` (${halt()?.relay})` : ""} accepted a change the server's rules forbid: ${halt()?.reason}. Your copy from before it is kept; newer messages show as unreadable.`}
+        </span>
+        <Show when={error()}>
+          <div class="text-xs text-[var(--red-400)]">{error()}</div>
+        </Show>
+      </div>
+      <ConfirmButton
+        variant="outline"
+        label={busy() ? "rejoining…" : "rejoin anyway"}
+        confirm="take the relay's version and drop yours?"
+        disabled={busy()}
+        onConfirm={accept}
+      />
+      <ConfirmButton variant="outline" label="leave" confirm="leave it and delete its history?" onConfirm={() => server() && forgetServer(server()!.server_id)} />
+    </div>
+  );
+}
+
+/** In place of the message box on a server this account was removed from: who removed
+ * it, why nothing can be sent, and deleting the server with its history. */
+function RemovedNotice() {
+  const server = () => selectedServer();
+  const who = () => server()?.removed?.by;
+  return (
+    <div
+      role="status"
+      class="flex items-center gap-3 rounded-lg px-3 py-2"
+      style={{ background: "var(--neutral-800)", border: "1px solid var(--neutral-700)" }}
+    >
+      <div class="flex-1 min-w-0 text-sm text-[var(--neutral-300)]">
+        {who() ? `${who()} removed you from ${server()?.name}.` : `You were removed from ${server()?.name}.`}
+        <span class="text-[var(--neutral-500)]"> You can't send messages or join calls here.</span>
+      </div>
+      <ConfirmButton variant="outline" label="delete" confirm="delete it and its history?" onConfirm={() => server() && forgetServer(server()!.server_id)} />
     </div>
   );
 }

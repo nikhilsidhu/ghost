@@ -7,11 +7,11 @@ use base64::Engine;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use thiserror::Error;
 
+use crate::bytes::{put_prefixed16, ReadError, Reader};
 use crate::relay_ref::RelayRef;
 
 pub const SERVER_LOCATION_VERSION: u8 = 0x01;
 const SIGN_PREFIX: &[u8] = b"ghost-server-location-v1:";
-const SIGNATURE_LEN: usize = 64;
 
 #[derive(Debug, Error)]
 pub enum ServerLocationError {
@@ -19,6 +19,12 @@ pub enum ServerLocationError {
     Format(String),
     #[error("server location signature is invalid")]
     BadSignature,
+}
+
+impl From<ReadError> for ServerLocationError {
+    fn from(e: ReadError) -> Self {
+        ServerLocationError::Format(e.to_string())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,14 +52,11 @@ impl ServerLocation {
     }
 
     fn body(&self) -> Vec<u8> {
-        let ref_bytes = self.relay_ref.to_bytes();
-        let mut buf = Vec::with_capacity(1 + 32 + 8 + 32 + 2 + ref_bytes.len());
-        buf.push(SERVER_LOCATION_VERSION);
+        let mut buf = vec![SERVER_LOCATION_VERSION];
         buf.extend_from_slice(&self.server_id);
         buf.extend_from_slice(&self.generation.to_be_bytes());
         buf.extend_from_slice(&self.signer_vk);
-        buf.extend_from_slice(&(ref_bytes.len() as u16).to_be_bytes());
-        buf.extend_from_slice(&ref_bytes);
+        put_prefixed16(&mut buf, &self.relay_ref.to_bytes());
         buf
     }
 
@@ -78,23 +81,16 @@ impl ServerLocation {
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self, ServerLocationError> {
-        let err = |msg: &str| ServerLocationError::Format(msg.into());
-        if data.len() < 1 + 32 + 8 + 32 + 2 + SIGNATURE_LEN {
-            return Err(err("too short"));
+        let mut r = Reader::new(data);
+        if r.u8()? != SERVER_LOCATION_VERSION {
+            return Err(ServerLocationError::Format("unknown version".into()));
         }
-        if data[0] != SERVER_LOCATION_VERSION {
-            return Err(err("unknown version"));
-        }
-        let server_id: [u8; 32] = data[1..33].try_into().unwrap();
-        let generation = u64::from_be_bytes(data[33..41].try_into().unwrap());
-        let signer_vk: [u8; 32] = data[41..73].try_into().unwrap();
-        let ref_len = u16::from_be_bytes(data[73..75].try_into().unwrap()) as usize;
-        if data.len() != 75 + ref_len + SIGNATURE_LEN {
-            return Err(err("length mismatch"));
-        }
-        let relay_ref = RelayRef::from_bytes(&data[75..75 + ref_len])
-            .map_err(|e| ServerLocationError::Format(e.to_string()))?;
-        let signature: [u8; 64] = data[75 + ref_len..].try_into().unwrap();
+        let server_id = r.array()?;
+        let generation = r.u64()?;
+        let signer_vk = r.array()?;
+        let relay_ref = RelayRef::from_bytes(r.prefixed16()?).map_err(|e| ServerLocationError::Format(e.to_string()))?;
+        let signature = r.array()?;
+        r.finish()?;
         Ok(Self { server_id, generation, signer_vk, relay_ref, signature })
     }
 

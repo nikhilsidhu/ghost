@@ -1,8 +1,8 @@
 use std::collections::HashSet;
 
-use crate::error::{GhostError, Result};
+use crate::error::Result;
 
-use super::{blob32, GhostStore};
+use super::{blob32, db, GhostStore};
 
 impl GhostStore {
     pub fn mark_channel_read(&self, channel_id: &[u8; 32], ts: u64) -> Result<()> {
@@ -12,7 +12,7 @@ impl GhostStore {
                  ON CONFLICT(channel_id) DO UPDATE SET last_read_ts = excluded.last_read_ts",
                 rusqlite::params![channel_id.as_slice(), ts],
             )
-            .map_err(|e| GhostError::Database(format!("mark channel read: {e}")))?;
+            .map_err(db("mark channel read"))?;
         Ok(())
     }
 
@@ -31,17 +31,17 @@ impl GhostStore {
                  WHERE c.server_id = ?1
                  GROUP BY c.channel_id",
             )
-            .map_err(|e| GhostError::Database(format!("prepare unread counts: {e}")))?;
+            .map_err(db("prepare unread counts"))?;
 
         let rows = stmt
             .query_map([server_id.as_slice()], |row| {
                 Ok((blob32(row, 0)?, row.get::<_, u32>(1)?))
             })
-            .map_err(|e| GhostError::Database(format!("get unread counts: {e}")))?;
+            .map_err(db("get unread counts"))?;
 
         let mut counts = Vec::new();
         for row in rows {
-            counts.push(row.map_err(|e| GhostError::Database(format!("read unread row: {e}")))?);
+            counts.push(row.map_err(db("read unread row"))?);
         }
         Ok(counts)
     }
@@ -59,15 +59,15 @@ impl GhostStore {
                      (SELECT last_read_ts FROM channel_read_state WHERE channel_id = c.channel_id), 0
                    )",
             )
-            .map_err(|e| GhostError::Database(format!("prepare servers_with_unread: {e}")))?;
+            .map_err(db("prepare servers_with_unread"))?;
 
         let rows = stmt
             .query_map([], |row| blob32(row, 0))
-            .map_err(|e| GhostError::Database(format!("servers_with_unread: {e}")))?;
+            .map_err(db("servers_with_unread"))?;
 
         let mut ids = HashSet::new();
         for row in rows {
-            ids.insert(row.map_err(|e| GhostError::Database(format!("read unread server: {e}")))?);
+            ids.insert(row.map_err(db("read unread server"))?);
         }
         Ok(ids)
     }

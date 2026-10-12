@@ -3,6 +3,7 @@
 //! commit can overtake the server group commit that granted the access it relies on.
 
 use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, Instant};
 
 use crate::client::GhostClient;
 use crate::relay::IncomingBlob;
@@ -11,6 +12,7 @@ struct Waiting {
     server_mailbox: [u8; 32],
     epoch: u64,
     blobs: VecDeque<IncomingBlob>,
+    since: Instant,
 }
 
 /// Blobs held per mailbox. Once a mailbox waits, its later blobs queue behind the
@@ -31,8 +33,19 @@ impl DeferredBlobs {
             server_mailbox,
             epoch,
             blobs: VecDeque::new(),
+            since: Instant::now(),
         });
         waiting.blobs.push_back(blob);
+    }
+
+    /// Mailboxes held for longer than `threshold`.
+    pub fn held_longer_than(&self, threshold: Duration) -> Vec<[u8; 32]> {
+        self.waiting.iter().filter(|(_, w)| w.since.elapsed() > threshold).map(|(mailbox_id, _)| *mailbox_id).collect()
+    }
+
+    /// Drop what is held for a mailbox this device no longer reads.
+    pub fn forget(&mut self, mailbox_id: &[u8; 32]) {
+        self.waiting.remove(mailbox_id);
     }
 
     /// Queue a blob behind those already held for its mailbox.
@@ -57,5 +70,28 @@ impl DeferredBlobs {
             .filter_map(|mailbox_id| self.waiting.remove(&mailbox_id))
             .flat_map(|w| w.blobs)
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn blob(mailbox_id: [u8; 32], seq: u64) -> IncomingBlob {
+        IncomingBlob { mailbox_id, relay_url: "http://relay".into(), seq, received_at: 0, payload: Vec::new() }
+    }
+
+    #[test]
+    fn a_hold_is_reported_by_how_long_it_has_lasted_and_gone_once_forgotten() {
+        let mut deferred = DeferredBlobs::default();
+        let (channel, other) = ([1; 32], [2; 32]);
+        deferred.hold(blob(channel, 4), [9; 32], 3);
+        deferred.queue(blob(channel, 5));
+        assert_eq!(deferred.held_longer_than(Duration::ZERO), vec![channel]);
+        assert!(deferred.held_longer_than(Duration::from_secs(3600)).is_empty());
+        assert!(!deferred.is_waiting(&other));
+
+        deferred.forget(&channel);
+        assert!(deferred.held_longer_than(Duration::ZERO).is_empty());
     }
 }

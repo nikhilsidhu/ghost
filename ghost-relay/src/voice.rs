@@ -4,18 +4,32 @@ use dashmap::DashMap;
 use smallvec::SmallVec;
 use tokio::sync::broadcast;
 
+use ghost_wire::presence::PresenceSender;
+
 use crate::constants::{DEFAULT_MAX_VOICE_PARTICIPANTS, VOICE_EVENT_CAPACITY};
 
 #[derive(Clone, Debug)]
 pub enum VoiceEvent {
     Joined { slot_id: u32 },
     Left { slot_id: u32 },
-    Presence { slot_id: u32, blob: Vec<u8> },
+    Presence { slot_id: u32, from: PresenceSender, blob: Vec<u8> },
     Speaking { slot_id: u32, speaking: bool },
+    /// Another device of the slot's account joined the room, which holds one device per
+    /// account: the slot is gone, and the connection that held it closes.
+    Replaced { slot_id: u32 },
+    /// The slot's device claimed it back on connection `conn_id`; any other connection
+    /// still holding it ends.
+    Resumed { slot_id: u32, conn_id: u64 },
 }
 
 pub struct Participant {
     pub slot_id: u32,
+    /// The device behind the slot, as it authenticated.
+    pub from: PresenceSender,
+    /// The connection holding the slot now; a resume moves it.
+    pub conn_id: u64,
+    /// Keys the slot's binds, and proves a resume.
+    pub token: [u8; 32],
     pub latest_presence: Option<Vec<u8>>,
 }
 
@@ -39,6 +53,11 @@ impl VoiceChannel {
         let id = self.next_slot;
         self.next_slot = self.next_slot.wrapping_add(1);
         id
+    }
+
+    /// Whether connection `conn_id` still holds `slot_id`.
+    pub fn holds(&self, slot_id: u32, conn_id: u64) -> bool {
+        self.participants.iter().any(|p| p.slot_id == slot_id && p.conn_id == conn_id)
     }
 }
 
@@ -86,16 +105,17 @@ impl RoutingTable {
 
     /// Bind the sender's address to the slot a bind packet names. Its MAC must verify
     /// under the slot's token and its counter must exceed every earlier one, which also
-    /// lets a participant move to a new address (a changed network) at any time.
-    pub fn bind(&self, bind: &ghost_wire::voice::VoiceBind, addr: SocketAddr) -> bool {
-        let Some(mut entries) = self.rooms.get_mut(&bind.room_id) else { return false };
-        let Some(entry) = entries.iter_mut().find(|e| e.slot_id == bind.slot_id) else { return false };
+    /// lets a participant move to a new address (a changed network) at any time. Returns
+    /// the answer to send back, which tells the participant its media gets through.
+    pub fn bind(&self, bind: &ghost_wire::voice::VoiceBind, addr: SocketAddr) -> Option<ghost_wire::voice::VoiceBind> {
+        let mut entries = self.rooms.get_mut(&bind.room_id)?;
+        let entry = entries.iter_mut().find(|e| e.slot_id == bind.slot_id)?;
         if bind.counter <= entry.last_counter || !bind.verify(&entry.token) {
-            return false;
+            return None;
         }
         entry.last_counter = bind.counter;
         entry.addr = Some(addr);
-        true
+        Some(bind.answer(&entry.token))
     }
 
     /// Where to forward a media packet: every other bound address in the room, provided
@@ -134,8 +154,9 @@ mod tests {
         // Unbound slots carry nothing, whatever address claims them.
         assert!(table.forward_targets(&room, 1, &addr(1000)).is_none());
 
-        assert!(table.bind(&VoiceBind::sign(&[11; 32], room, 1, 1), addr(1000)));
-        assert!(table.bind(&VoiceBind::sign(&[22; 32], room, 2, 1), addr(2000)));
+        let answer = table.bind(&VoiceBind::sign(&[11; 32], room, 1, 1), addr(1000)).expect("the bind was refused");
+        assert!(answer.verify_answer(&[11; 32]), "the answer is keyed with the slot's token");
+        assert!(table.bind(&VoiceBind::sign(&[22; 32], room, 2, 1), addr(2000)).is_some());
         assert_eq!(table.forward_targets(&room, 1, &addr(1000)).unwrap().as_slice(), &[addr(2000)]);
 
         // Another address cannot speak for a bound slot.
@@ -148,15 +169,15 @@ mod tests {
         let room = [1; 32];
         table.admit(room, 1, [11; 32]);
 
-        assert!(!table.bind(&VoiceBind::sign(&[99; 32], room, 1, 1), addr(1000)), "wrong token");
-        assert!(!table.bind(&VoiceBind::sign(&[11; 32], room, 2, 1), addr(1000)), "slot never admitted");
+        assert!(table.bind(&VoiceBind::sign(&[99; 32], room, 1, 1), addr(1000)).is_none(), "wrong token");
+        assert!(table.bind(&VoiceBind::sign(&[11; 32], room, 2, 1), addr(1000)).is_none(), "slot never admitted");
 
         let first = VoiceBind::sign(&[11; 32], room, 1, 5);
-        assert!(table.bind(&first, addr(1000)));
-        assert!(!table.bind(&first, addr(6666)), "a replayed bind cannot move the slot");
+        assert!(table.bind(&first, addr(1000)).is_some());
+        assert!(table.bind(&first, addr(6666)).is_none(), "a replayed bind cannot move the slot");
 
         // The participant itself moves to a new address with a newer bind.
-        assert!(table.bind(&VoiceBind::sign(&[11; 32], room, 1, 6), addr(1001)));
+        assert!(table.bind(&VoiceBind::sign(&[11; 32], room, 1, 6), addr(1001)).is_some());
         table.admit(room, 2, [22; 32]);
         table.bind(&VoiceBind::sign(&[22; 32], room, 2, 1), addr(2000));
         assert_eq!(table.forward_targets(&room, 2, &addr(2000)).unwrap().as_slice(), &[addr(1001)]);

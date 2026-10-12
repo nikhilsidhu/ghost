@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use ghost_media::{FrameSender, Inbound, TrackIo};
+use ghost_media::{FrameSender, Inbound, TrackEvent, TrackIo};
 use tokio::sync::mpsc;
 
 use crate::constants::*;
@@ -113,6 +113,7 @@ impl Transmitter {
         if muted || (mode == InputMode::PushToTalk && !ptt_active) {
             self.vad_hangover = 0;
             controls.speaking.store(false, Ordering::Relaxed);
+            controls.input_level.store(0.0f32.to_bits(), Ordering::Relaxed);
             self.quiet(sequence);
             self.pre_roll.clear();
             return;
@@ -124,6 +125,8 @@ impl Transmitter {
                 *s = (*s * gain).clamp(-1.0, 1.0);
             }
         }
+        let level = (frame.iter().map(|s| s * s).sum::<f32>() / frame.len() as f32).sqrt();
+        controls.input_level.store(level.to_bits(), Ordering::Relaxed);
 
         let ns_mode = NoiseSuppressionMode::from(controls.noise_suppression.load(Ordering::Relaxed));
         if ns_mode == NoiseSuppressionMode::Nnnoiseless && self.last_ns_mode != NoiseSuppressionMode::Nnnoiseless {
@@ -196,7 +199,7 @@ fn route_inbound(received: &mut mpsc::Receiver<Inbound>, playback: &Playback) ->
                     std::collections::hash_map::Entry::Vacant(entry) => match Receiver::new() {
                         Ok(receiver) => entry.insert(receiver),
                         Err(e) => {
-                            eprintln!("voice: {e}");
+                            tracing::warn!("voice: {e}");
                             continue;
                         }
                     },
@@ -220,8 +223,8 @@ fn read_quality(playback: &Playback, controls: &AudioControls) -> String {
     let mut window = PlayoutStats::default();
     let (mut max_depth, mut max_target) = (0u32, 0u32);
     for receiver in mixer.receivers.values_mut() {
-        window.add(&receiver.stats);
-        receiver.stats = PlayoutStats::default();
+        window.add(&receiver.stats.since(&receiver.reported));
+        receiver.reported = receiver.stats;
         max_depth = max_depth.max(receiver.buffered());
         max_target = max_target.max(receiver.target());
     }
@@ -244,7 +247,7 @@ pub(crate) fn run(
     io: TrackIo,
     stop: Arc<AtomicBool>,
 ) -> Result<(), String> {
-    let TrackIo { sender, mut received } = io;
+    let TrackIo { sender, mut received, events } = io;
     let playback = Playback::new(controls.clone());
     let mut streams = devices.open(playback.clone())?;
     let mut transmitter = Transmitter::new(sender.clone())?;
@@ -266,8 +269,13 @@ pub(crate) fn run(
                 }
                 CaptureRead::Waiting => break,
                 CaptureRead::Restarted => {
-                    eprintln!("voice: audio devices reopened");
+                    tracing::info!("voice: audio devices reopened");
                     transmitter.denoise_primed = false;
+                }
+                CaptureRead::Substituted(notice) => {
+                    tracing::warn!("voice: {notice}");
+                    transmitter.denoise_primed = false;
+                    let _ = events.send(TrackEvent::Notice(notice));
                 }
                 CaptureRead::Failed(e) => return Err(e),
             }
@@ -279,7 +287,7 @@ pub(crate) fn run(
         ticks += 1;
         if ticks >= DIAG_TICKS {
             let playout = read_quality(&playback, &controls);
-            eprintln!(
+            tracing::debug!(
                 "voice diag: sent={} recv={frames_received} cap_empty={capture_empty}/{ticks} playout=[{playout}]",
                 transmitter.frames_sent
             );
@@ -289,4 +297,30 @@ pub(crate) fn run(
     read_quality(&playback, &controls);
     controls.speaking.store(false, Ordering::Relaxed);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quality_readings_count_each_frame_once() {
+        let controls = Arc::new(AudioControls::new());
+        let playback = Playback::new(controls.clone());
+        let mut receiver = Receiver::new().unwrap();
+        // A buffered frame keeps the receiver from counting as gone quiet.
+        receiver.insert(0, OPUS_SILENCE.to_vec(), std::time::Instant::now());
+        receiver.stats.played = 90;
+        receiver.stats.concealed = 10;
+        playback.mixer().receivers.insert(1, receiver);
+
+        read_quality(&playback, &controls);
+        assert_eq!(f32::from_bits(controls.packet_loss_pct.load(Ordering::Relaxed)), 10.0);
+        playback.mixer().receivers.get_mut(&1).unwrap().stats.played += 50;
+        read_quality(&playback, &controls);
+
+        let totals = *controls.playout_totals.lock().unwrap();
+        assert_eq!((totals.played, totals.concealed), (140, 10));
+        assert_eq!(f32::from_bits(controls.packet_loss_pct.load(Ordering::Relaxed)), 0.0, "nothing was lost since the first reading");
+    }
 }

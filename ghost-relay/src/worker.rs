@@ -1,3 +1,6 @@
+//! Periodic housekeeping: expired invites, pairing sessions, lapsed mirror grants and
+//! rate-limiter entries go, and the log is trimmed to its retention.
+
 use std::time::Duration;
 
 use crate::constants::WORKER_INTERVAL_SECS;
@@ -11,28 +14,34 @@ pub async fn run(state: AppState) {
 
     loop {
         interval.tick().await;
-
         let now = now_millis();
 
-        // Sweep expired invites
-        {
-            let mut invites = state.invites.write().await;
-            invites.retain(|_, inv| inv.expires_at > now);
+        match state.storage.invite_sweep(now).await {
+            Ok(gone) => {
+                if !gone.is_empty() {
+                    state.forget_invite_waiters(|token| !gone.iter().any(|t| t == token));
+                }
+            }
+            Err(e) => tracing::warn!("invite sweep failed: {e}"),
         }
 
-        // Sweep expired pairing sessions
-        crate::routes::pair::reap_expired(&state);
+        crate::routes::pair::reap_expired(&state).await;
+        match state.storage.sweep_mirror_grants(now).await {
+            Ok(n) if n > 0 => tracing::debug!("{n} mirror grants lapsed"),
+            Err(e) => tracing::warn!("mirror grant sweep failed: {e}"),
+            _ => {}
+        }
 
-        // Sweep expired rate limiter entries
-        state.recovery_limiter.sweep();
         state.idlog_recovery_limiter.sweep();
         state.idlog_anchored_limiter.sweep();
         state.idlog_import_limiter.sweep();
+        state.idlog_batch_limiter.sweep();
+        state.ip_limits.sweep();
+        state.replay_cache.sweep();
 
-        // Sweep old log entries (retain at least min_entries per mailbox)
         if retention_ms > 0 {
             let cutoff = now.saturating_sub(retention_ms);
-            match state.storage.sweep_log(cutoff, min_entries) {
+            match state.storage.sweep_log(cutoff, min_entries).await {
                 Ok(n) if n > 0 => tracing::info!("swept {n} expired log entries"),
                 Err(e) => tracing::warn!("log sweep error: {e}"),
                 _ => {}

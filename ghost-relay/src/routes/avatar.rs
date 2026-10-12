@@ -27,12 +27,12 @@ pub async fn put(
         return Err(RelayError::PayloadTooLarge);
     }
     let id = decode_mailbox_id(&mailbox_id)?;
-    state.check_membership(&id, &auth.account_fp)?;
+    state.check_membership(id, auth.account_fp).await?;
     let fp = decode_fingerprint(&fingerprint)?;
     if fp != auth.account_fp {
         return Err(RelayError::Forbidden("can only update your own avatar".into()));
     }
-    state.storage.put_avatar(&id, &fp, &body)?;
+    state.storage.put_avatar(id, fp, body.to_vec()).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -42,9 +42,9 @@ pub async fn get(
     Path((mailbox_id, fingerprint)): Path<(String, String)>,
 ) -> Result<impl IntoResponse> {
     let id = decode_mailbox_id(&mailbox_id)?;
-    state.check_membership(&id, &auth.account_fp)?;
+    state.check_membership(id, auth.account_fp).await?;
     let fp = decode_fingerprint(&fingerprint)?;
-    match state.storage.get_avatar(&id, &fp)? {
+    match state.storage.get_avatar(id, fp).await? {
         Some(data) => Ok((StatusCode::OK, data)),
         None => Err(RelayError::NotFound),
     }
@@ -56,11 +56,11 @@ pub async fn delete(
     Path((mailbox_id, fingerprint)): Path<(String, String)>,
 ) -> Result<StatusCode> {
     let id = decode_mailbox_id(&mailbox_id)?;
-    state.check_membership(&id, &auth.account_fp)?;
+    state.check_membership(id, auth.account_fp).await?;
     let fp = decode_fingerprint(&fingerprint)?;
     if fp != auth.account_fp {
         return Err(RelayError::Forbidden("can only delete your own avatar".into()));
     }
-    state.storage.delete_avatar(&id, &fp)?;
+    state.storage.delete_avatar(id, fp).await?;
     Ok(StatusCode::NO_CONTENT)
 }

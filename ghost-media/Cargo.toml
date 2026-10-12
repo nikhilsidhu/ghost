@@ -13,11 +13,12 @@ ghost-wire = { path = "../ghost-wire" }
 sframe = { version = "2.0", default-features = false, features = ["rust-crypto"] }
 thiserror = "1"
 tokio = { version = "1", features = ["net", "rt", "sync", "time", "macros"] }
-rand = { version = "0.8", optional = true }
+rand = "0.8"
+tracing = "0.1"
 
 [features]
 # A lossy-network forwarder for tests of whatever runs over the session.
-test-util = ["dep:rand"]
+test-util = []
 
 [dev-dependencies]
 tokio = { version = "1", features = ["net", "rt-multi-thread", "sync", "time", "macros"] }

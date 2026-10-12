@@ -1,8 +1,8 @@
 use rusqlite::OptionalExtension;
 
-use crate::error::{GhostError, Result};
+use crate::error::Result;
 
-use super::GhostStore;
+use super::{db, GhostStore};
 
 impl GhostStore {
     pub fn get_last_seen_seq(&self, mailbox_id: &[u8; 32]) -> Result<u64> {
@@ -14,7 +14,7 @@ impl GhostStore {
                 |row| row.get(0),
             )
             .optional()
-            .map_err(|e| GhostError::Database(format!("get last_seen_seq: {e}")))?;
+            .map_err(db("get last_seen_seq"))?;
         Ok(seq.unwrap_or(0) as u64)
     }
 
@@ -25,7 +25,33 @@ impl GhostStore {
                  ON CONFLICT(mailbox_id) DO UPDATE SET last_seen_seq = excluded.last_seen_seq",
                 rusqlite::params![mailbox_id.as_slice(), seq as i64],
             )
-            .map_err(|e| GhostError::Database(format!("set last_seen_seq: {e}")))?;
+            .map_err(db("set last_seen_seq"))?;
+        Ok(())
+    }
+
+    /// Where this device last saw a mailbox that is open on several relays, each of which
+    /// numbers it on its own.
+    pub fn get_last_seen_seq_at(&self, mailbox_id: &[u8; 32], relay_url: &str) -> Result<u64> {
+        let seq: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT last_seen_seq FROM relay_mailbox_state WHERE relay_url = ?1 AND mailbox_id = ?2",
+                rusqlite::params![relay_url.trim_end_matches('/'), mailbox_id.as_slice()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db("get last_seen_seq at relay"))?;
+        Ok(seq.unwrap_or(0) as u64)
+    }
+
+    pub fn set_last_seen_seq_at(&self, mailbox_id: &[u8; 32], relay_url: &str, seq: u64) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO relay_mailbox_state (relay_url, mailbox_id, last_seen_seq) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(relay_url, mailbox_id) DO UPDATE SET last_seen_seq = excluded.last_seen_seq",
+                rusqlite::params![relay_url.trim_end_matches('/'), mailbox_id.as_slice(), seq as i64],
+            )
+            .map_err(db("set last_seen_seq at relay"))?;
         Ok(())
     }
 }

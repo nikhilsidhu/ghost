@@ -3,9 +3,9 @@ import { Dynamic } from "solid-js/web";
 import "../lib/commands";
 import {
   selectedServer, selectedChannelId,
-  inviteLink, moveLink, showInfo, settingsOpen, settingsCategory,
+  invite, moveLink, showInfo, settingsOpen, settingsCategory,
   initialize,
-  setInviteLink, setMoveLink, setShowInfo, dmViewActive,
+  setInvite, setMoveLink, setShowInfo, dmViewActive,
 } from "../lib/store";
 import { sections } from "../lib/settings-registry";
 import { slideDuration } from "../lib/constants";
@@ -13,9 +13,11 @@ import { Sidebar } from "./Sidebar";
 import { ServerView } from "./ServerView";
 import { MemberPanel } from "./MemberPanel";
 import { CommandPalette } from "./CommandPalette";
-import { InviteDialog } from "./InviteDialog";
+import { InviteDialog, expiryNote } from "./InviteDialog";
 import { ShortcutOverlay } from "./ShortcutOverlay";
 import { KeyBadge } from "./KeyBadge";
+import { AccountAlerts } from "./AccountAlerts";
+import { Notices } from "./Notices";
 import { shortcuts as shortcutDefs } from "../lib/shortcuts";
 
 export function Layout() {
@@ -34,6 +36,10 @@ export function Layout() {
       <Sidebar />
       <div class="divider-v" />
       <main class="flex-1 min-w-0 pt-7 relative overflow-hidden">
+        <div class="absolute top-7 inset-x-0 z-30">
+          <AccountAlerts />
+          <Notices />
+        </div>
         {/* Main content — slides up when settings open */}
         <div
           class={settingsOpen() ? "pointer-events-none" : undefined}
@@ -124,7 +130,11 @@ export function Layout() {
         <MemberPanel />
       </div>
       <CommandPalette />
-      <InviteDialog link={inviteLink()} onClose={() => setInviteLink(null)} />
+      <InviteDialog
+        link={invite()?.link ?? null}
+        onClose={() => setInvite(null)}
+        note={invite() ? expiryNote(invite()!.expires_at, Date.now()) : ""}
+      />
       <InviteDialog
         link={moveLink()}
         onClose={() => setMoveLink(null)}

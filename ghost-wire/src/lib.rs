@@ -1,13 +1,19 @@
+pub mod account_key;
 pub mod anchor;
 pub mod auth;
+pub mod batch;
+pub mod bytes;
 pub mod idlog;
+pub mod log_entries;
 pub mod merkle;
 pub mod policy;
 #[cfg(feature = "mls")]
 pub mod policy_mls;
-pub mod recovery_bundle;
+pub mod presence;
 pub mod relay_ref;
 pub mod server_location;
+#[cfg(test)]
+mod test_support;
 pub mod voice;
 
 /// Envelope framing for blobs transiting the relay.
@@ -36,23 +42,131 @@ pub fn mls_group_mailbox_id(mls_group_id: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+/// Tag for the group id the account's sync mailbox derives from; kept from when the
+/// mailbox carried an MLS group, so existing accounts' mailboxes stay where they are.
+const SYNC_GROUP_TAG: &[u8] = b"ghost-sync-group-v1";
+
+/// The mailbox an account's devices sync through, the same on every relay. Relays admit
+/// only the account's active devices to it and take no MLS messages there.
+/// The first eight bytes of an identifier as hex: how fingerprints, mailbox, server,
+/// channel and message ids read in logs and messages.
+/// Milliseconds since the Unix epoch: the clock every timestamp in Ghost is read from.
+pub fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+pub fn short_id(id: &[u8]) -> String {
+    hex::encode(&id[..id.len().min(8)])
+}
+
+pub fn sync_mailbox_id(account_fp: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(account_fp);
+    hasher.update(SYNC_GROUP_TAG);
+    mls_group_mailbox_id(hasher.finalize().as_bytes())
+}
+
 // WS frame: [seq:8 BE][received_at:8 BE][payload...]
 pub const WS_SEQ_SIZE: usize = 8;
 pub const WS_TIMESTAMP_SIZE: usize = 8;
 pub const WS_FRAME_HEADER_SIZE: usize = WS_SEQ_SIZE + WS_TIMESTAMP_SIZE;
 
 // WS text signals
-pub const WS_SIGNAL_GAP: &str = "gap";
-pub const WS_SIGNAL_EPOCH_MISMATCH: &str = "epoch_mismatch";
+/// Sent before anything else on a connection that asked for entries the relay no longer
+/// keeps, followed by the sequence the connection resumes after: everything up to it is
+/// skipped, as unprocessable once the device rebuilds its group state.
+pub const WS_SIGNAL_GAP: &str = "gap ";
+/// Sent once everything the mailbox held past the device's resume point when it connected
+/// has gone out; only live entries follow. Until then the device is catching up.
+pub const WS_SIGNAL_CAUGHT_UP: &str = "caught-up";
+/// A posted blob the relay refused is answered `error: <status> <message>`, in the
+/// order the blobs were posted; an accepted one is answered with its sequence number.
+pub const WS_ERROR_PREFIX: &str = "error: ";
 /// Sent on a server mailbox connection when a private channel of that server newly
 /// admits the connected account (created, or its access changed), so the device runs
 /// discovery. Only admitted accounts receive it, so others learn nothing.
 pub const WS_SIGNAL_CHANNELS: &str = "channels";
 
+
+/// The relay protocol generation that understands account keys: root rotation, device
+/// keys, account key sets, batches and the fork rule.
+pub const RELAY_PROTOCOL_ACCOUNT_KEYS: u32 = 4;
+
+/// Header on a relay refusal naming why, so the client can explain it.
+pub const REFUSAL_HEADER: &str = "X-Ghost-Refusal";
+/// Refused because the account was removed from the server and not let back in.
+pub const REFUSAL_REMOVED: &str = "removed";
+/// Refused because the account's log revokes the signing device. Only a request that
+/// device signed is told, so nobody else learns a device's status.
+pub const REFUSAL_DEVICE_REVOKED: &str = "device-revoked";
+/// Beside a `device-revoked` refusal: what revoked the device (`RevocationCause::encode`).
+pub const REVOKED_BY_HEADER: &str = "X-Ghost-Revoked-By";
+
+/// What revoked a device, as relays tell that device alone, on its own signed request or
+/// its own connection: the device can read nothing else of its account any more.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RevocationCause {
+    /// The account was recovered on another device, which revoked every other one.
+    Recovery,
+    /// The recovery key removed it.
+    RecoveryKey,
+    /// Another device of the account removed it; that device's label.
+    Device(String),
+}
+
+impl RevocationCause {
+    /// `recovery`, `recovery-key`, or `device ` and the label in base64: a label as
+    /// long as an entry allows still fits a WebSocket close reason (123 bytes).
+    pub fn encode(&self) -> String {
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine;
+        match self {
+            Self::Recovery => "recovery".into(),
+            Self::RecoveryKey => "recovery-key".into(),
+            Self::Device(label) => {
+                let mut end = label.len().min(idlog::MAX_DEVICE_LABEL_BYTES);
+                while !label.is_char_boundary(end) {
+                    end -= 1;
+                }
+                format!("device {}", STANDARD.encode(&label.as_bytes()[..end]))
+            }
+        }
+    }
+
+    pub fn decode(text: &str) -> Option<Self> {
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine;
+        match text {
+            "recovery" => Some(Self::Recovery),
+            "recovery-key" => Some(Self::RecoveryKey),
+            _ => {
+                let label = STANDARD.decode(text.strip_prefix("device ")?).ok()?;
+                Some(Self::Device(String::from_utf8(label).ok()?))
+            }
+        }
+    }
+}
+
 // WS close codes (4000-4999 = application-defined)
 pub const WS_CLOSE_DEVICE_REVOKED: u16 = 4001;
 /// The account was removed from the group whose mailbox (or voice room) this was.
 pub const WS_CLOSE_REMOVED: u16 = 4002;
+/// The relay's grounds for admitting the device are gone (its account moved home away
+/// and belongs to no group here). Reconnecting gets the relay's answer for it.
+pub const WS_CLOSE_ADMISSION_CHANGED: u16 = 4003;
+/// Another device of the account joined the voice room, which holds one per account.
+pub const WS_CLOSE_VOICE_REPLACED: u16 = 4004;
+
+/// How long a pairing session lives on the relay. The existing device can complete a link
+/// only while it lives, so neither device needs to wait longer, the new one aside: it
+/// waits a little more for the batch that lands just after.
+pub const PAIRING_TTL_MS: u64 = 10 * 60 * 1000;
+
+/// An invite token is this many random bytes, hex-encoded.
+pub const INVITE_TOKEN_LEN: usize = 16;
 
 /// Length of the media packet header (see `voice::MediaHeader`).
 pub const VOICE_HEADER_SIZE: usize = 53;
@@ -126,6 +240,29 @@ pub fn envelope_payload(data: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sync_mailbox_is_fixed_per_account_and_distinct_between_accounts() {
+        assert_eq!(sync_mailbox_id(&[1; 32]), sync_mailbox_id(&[1; 32]));
+        assert_ne!(sync_mailbox_id(&[1; 32]), sync_mailbox_id(&[2; 32]));
+        assert_ne!(sync_mailbox_id(&[1; 32]), mls_group_mailbox_id(&[1; 32]), "not a group's own mailbox");
+    }
+
+    #[test]
+    fn a_revocation_cause_survives_a_close_reason() {
+        let longest = "é".repeat(idlog::MAX_DEVICE_LABEL_BYTES / 2);
+        for cause in [RevocationCause::Recovery, RevocationCause::RecoveryKey, RevocationCause::Device("phone: \"work\"".into()), RevocationCause::Device(longest)] {
+            let text = cause.encode();
+            assert!(text.len() <= 123, "fits a WebSocket close reason: {text}");
+            assert!(header_safe(&text), "fits a header: {text}");
+            assert_eq!(RevocationCause::decode(&text), Some(cause));
+        }
+        assert_eq!(RevocationCause::decode("device revoked"), None, "the bare reason tells no cause");
+    }
+
+    fn header_safe(text: &str) -> bool {
+        text.bytes().all(|b| b == b' ' || b.is_ascii_graphic())
+    }
 
     #[test]
     fn roundtrip_application() {

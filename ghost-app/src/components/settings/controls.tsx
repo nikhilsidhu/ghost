@@ -1,6 +1,9 @@
 import { createSignal, createEffect, Show, For, onCleanup, type JSX } from "solid-js";
 import { cn } from "../../lib/cn";
-import { Check, Copy, ChevronDown, RotateCcw } from "lucide-solid";
+import { Card } from "../ui/card";
+import { Segmented } from "../ui/segmented";
+import { Select } from "../ui/select";
+import { Check, Copy, RotateCcw } from "lucide-solid";
 
 const DEBOUNCE_MS = 600;
 const FLASH_MS = 1500;
@@ -21,9 +24,7 @@ export function SettingGroup(props: { label?: string; footer?: string; children:
           {props.label}
         </div>
       </Show>
-      <div class="rounded-lg bg-[var(--neutral-900)] px-3">
-        {props.children}
-      </div>
+      <Card class="px-3">{props.children}</Card>
       <Show when={props.footer}>
         <div class="text-xs text-[var(--neutral-500)] mt-1.5 px-3">{props.footer}</div>
       </Show>
@@ -147,25 +148,14 @@ export function SettingInput(props: {
 
 // --- Select ---
 
-export function SettingSelect(props: {
+export function SettingSelect<T extends string>(props: {
   label: string;
   description?: string;
-  value: string;
-  options: { value: string; label: string }[];
-  onChange: (v: string) => void;
+  value: T;
+  options: { value: T; label: string }[];
+  onChange: (v: T) => void;
   disabled?: boolean;
 }) {
-  const [open, setOpen] = createSignal(false);
-  let ref!: HTMLDivElement;
-
-  const selected = () => props.options.find((o) => o.value === props.value);
-
-  const handleClickOutside = (e: MouseEvent) => {
-    if (open() && ref && !ref.contains(e.target as Node)) setOpen(false);
-  };
-  document.addEventListener("mousedown", handleClickOutside);
-  onCleanup(() => document.removeEventListener("mousedown", handleClickOutside));
-
   return (
     <SettingRow disabled={props.disabled}>
       <div class="flex items-center justify-between gap-4">
@@ -175,47 +165,7 @@ export function SettingSelect(props: {
             <div class="text-xs text-[var(--neutral-500)] mt-0.5">{props.description}</div>
           </Show>
         </div>
-        <div ref={ref} class="relative">
-          <button
-            class={cn(
-              "h-7 rounded px-2.5 text-xs flex items-center gap-1.5 cursor-pointer transition-colors duration-150",
-              "bg-[var(--neutral-800)] text-[var(--neutral-200)]",
-              "border border-[var(--neutral-700)]",
-              "hover:border-[var(--neutral-600)]",
-              open() && "border-[var(--purple-500)]",
-            )}
-            disabled={props.disabled}
-            onClick={() => setOpen((v) => !v)}
-          >
-            {selected()?.label ?? props.value}
-            <ChevronDown size={12} class={cn(
-              "text-[var(--neutral-500)] transition-transform duration-150",
-              open() && "rotate-180",
-            )} />
-          </button>
-          <Show when={open()}>
-            <div
-              class="absolute right-0 top-full mt-1 min-w-full rounded-md py-1 z-50 bg-[var(--neutral-800)] border border-[var(--neutral-700)]"
-              style={{ "box-shadow": "var(--shadow-float)" }}
-            >
-              <For each={props.options}>
-                {(o) => (
-                  <button
-                    class={cn(
-                      "w-full text-left px-2.5 py-1.5 text-xs cursor-pointer transition-colors duration-100",
-                      o.value === props.value
-                        ? "text-[var(--purple-400)]"
-                        : "text-[var(--neutral-300)] hover:bg-[var(--neutral-700)]",
-                    )}
-                    onClick={() => { props.onChange(o.value); setOpen(false); }}
-                  >
-                    {o.label}
-                  </button>
-                )}
-              </For>
-            </div>
-          </Show>
-        </div>
+        <Select value={props.value} options={props.options} onChange={props.onChange} label={props.label} disabled={props.disabled} />
       </div>
     </SettingRow>
   );
@@ -223,12 +173,12 @@ export function SettingSelect(props: {
 
 // --- Segmented control ---
 
-export function SettingSegmented(props: {
+export function SettingSegmented<T extends string>(props: {
   label: string;
   description?: string;
-  value: string;
-  options: { value: string; label: string }[];
-  onChange: (v: string) => void;
+  value: T;
+  options: { value: T; label: string }[];
+  onChange: (v: T) => void;
   disabled?: boolean;
   children?: JSX.Element;
 }) {
@@ -241,25 +191,7 @@ export function SettingSegmented(props: {
             <div class="text-xs text-[var(--neutral-500)] mt-0.5">{props.description}</div>
           </Show>
         </div>
-        <div class="flex rounded-md border border-[var(--neutral-700)] overflow-hidden flex-shrink-0">
-          <For each={props.options}>
-            {(o) => (
-              <button
-                class={cn(
-                  "h-7 px-2.5 text-xs cursor-pointer transition-colors duration-150",
-                  "border-r border-[var(--neutral-700)] last:border-r-0",
-                  o.value === props.value
-                    ? "bg-[var(--purple-500)]/20 text-[var(--purple-400)]"
-                    : "bg-[var(--neutral-800)] text-[var(--neutral-400)] hover:text-[var(--neutral-200)]",
-                )}
-                disabled={props.disabled}
-                onClick={() => props.onChange(o.value)}
-              >
-                {o.label}
-              </button>
-            )}
-          </For>
-        </div>
+        <Segmented value={props.value} options={props.options} onChange={props.onChange} label={props.label} disabled={props.disabled} />
       </div>
       {props.children}
     </SettingRow>
