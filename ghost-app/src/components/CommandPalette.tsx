@@ -542,6 +542,7 @@ export function CommandPalette() {
               >
                 <div class="relative flex-1 min-w-[80px] flex items-center">
                   <input
+                    data-testid="palette-input"
                     ref={inputRef}
                     on:keydown={handleKeyDown}
                     placeholder={placeholder()}

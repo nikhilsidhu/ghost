@@ -17,7 +17,7 @@ export function RecoveryKeyDisplay(props: { value: string }) {
   };
   return (
     <div class="flex items-start gap-2 p-3 rounded bg-[var(--neutral-800)] border border-[var(--neutral-700)]">
-      <span class="text-sm text-[var(--neutral-100)] font-mono tracking-wider leading-relaxed flex-1 break-words">
+      <span data-testid="recovery-key" class="text-sm text-[var(--neutral-100)] font-mono tracking-wider leading-relaxed flex-1 break-words">
         {props.value}
       </span>
       <button class="flex-shrink-0 mt-0.5 text-[var(--neutral-500)] hover:text-[var(--neutral-400)] cursor-pointer" onClick={copy} aria-label="copy">
@@ -69,7 +69,7 @@ export function RecoveryKeySteps(props: Props) {
           lasts only as long as one of your devices does.
         </p>
         <RecoveryKeyDisplay value={props.shown} />
-        <Button size="lg" class="w-full" onClick={() => setStep("type")}>
+        <Button data-testid="recovery-key-saved" size="lg" class="w-full" onClick={() => setStep("type")}>
           I've saved it
         </Button>
         <Show when={props.onCancel}>
@@ -81,6 +81,7 @@ export function RecoveryKeySteps(props: Props) {
       <Show when={step() === "type"}>
         <p class="text-xs text-[var(--neutral-400)]">type the key back, so you know your copy is right.</p>
         <input
+          data-testid="recovery-key-typed"
           class={`${inputClass} font-mono`}
           placeholder="XXXX-XXXX-XXXX-…"
           value={typed()}
@@ -93,7 +94,7 @@ export function RecoveryKeySteps(props: Props) {
         <Show when={error()}>
           <p class="text-xs text-[var(--red-400)]">{error()}</p>
         </Show>
-        <Button size="lg" class="w-full" onClick={submit} disabled={!typed().trim() || busy()}>
+        <Button data-testid="recovery-key-confirm" size="lg" class="w-full" onClick={submit} disabled={!typed().trim() || busy()}>
           {busy() ? "working…" : props.confirmLabel ?? "continue"}
         </Button>
         <Button variant="outline" size="lg" class="w-full" onClick={() => { setStep("show"); setError(null); }}>

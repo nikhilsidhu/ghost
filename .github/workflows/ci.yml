@@ -79,3 +79,43 @@ jobs:
         run: cargo test -p ghost-app bindings
       - name: Compare with the committed files
         run: git diff --exit-code -- ghost-app/src/lib/generated
+
+  # The desktop app driven through its interface (ghost-node/tests/ui.rs), with headless
+  # devices as the other people: Linux only, where tauri-driver runs, under Xvfb.
+  ui:
+    name: UI smoke tests (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ghost-app/package-lock.json
+      - name: Tauri, WebKit WebDriver and display libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev \
+            libasound2-dev libdbus-1-dev libssl-dev libopus-dev libxdo-dev libxss-dev pkg-config \
+            webkit2gtk-driver xvfb dbus dbus-x11
+      - run: cargo install tauri-driver --locked
+      # A debug build with the front end embedded, as the tests launch it.
+      - name: Build the app
+        working-directory: ghost-app
+        run: |
+          npm ci
+          npx tauri build --debug --no-bundle
+      - name: Test
+        env:
+          GHOST_UI_APP: ${{ github.workspace }}/target/debug/ghost-app
+          GHOST_UI_ARTIFACTS: ${{ github.workspace }}/ui-failures
+        run: dbus-run-session -- xvfb-run -a -s "-screen 0 1280x800x24" cargo test -p ghost-node --test ui -- --ignored --test-threads=1
+      - name: Screenshots of what the app showed when a test gave up
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ui-failures
+          path: ui-failures
+          if-no-files-found: ignore

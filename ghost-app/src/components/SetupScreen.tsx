@@ -265,6 +265,7 @@ export function SetupScreen(props: Props) {
     <div>
       <label class="text-xs text-[var(--neutral-400)] mb-1 block">this device's name</label>
       <input
+        data-testid="setup-device-label"
         class={inputClass}
         placeholder="how your other devices will list this one"
         value={deviceLabel()}
@@ -327,7 +328,7 @@ export function SetupScreen(props: Props) {
               <Show when={linkCode()}>
                 <div class="flex flex-col gap-1 p-3 rounded bg-[var(--neutral-800)] border border-[var(--neutral-700)]">
                   <p class="text-xs text-[var(--neutral-400)]">your other device shows a code. it should be:</p>
-                  <p class="text-2xl text-center font-mono tracking-widest text-[var(--neutral-100)]">{linkCode()}</p>
+                  <p data-testid="link-code" class="text-2xl text-center font-mono tracking-widest text-[var(--neutral-100)]">{linkCode()}</p>
                   <p class="text-xs text-[var(--neutral-500)]">confirm there, only if they match.</p>
                 </div>
               </Show>
@@ -413,7 +414,7 @@ export function SetupScreen(props: Props) {
             {(shown) => (
               <div class="flex flex-col gap-3">
                 <p class="text-sm text-[var(--neutral-200)]">{shown().title}</p>
-                <p class="text-xs text-[var(--neutral-400)]">{shown().note}</p>
+                <p data-testid="done-note" class="text-xs text-[var(--neutral-400)]">{shown().note}</p>
                 <Button size="lg" class="w-full" onClick={() => props.onComplete()}>
                   continue
                 </Button>
@@ -438,6 +439,7 @@ export function SetupScreen(props: Props) {
               <div>
                 <label class="text-xs text-[var(--neutral-400)] mb-1 block">display name</label>
                 <input
+                  data-testid="setup-name"
                   class={inputClass}
                   placeholder="what should people call you?"
                   value={name()}
@@ -459,7 +461,7 @@ export function SetupScreen(props: Props) {
               </div>
               {deviceLabelField()}
               {error() && <p class="text-xs text-[var(--red-400)]">{error()}</p>}
-              <Button size="lg" class="w-full" onClick={handleNewAccount} disabled={!name().trim() || loading()}>
+              <Button data-testid="setup-start" size="lg" class="w-full" onClick={handleNewAccount} disabled={!name().trim() || loading()}>
                 {loading() ? "contacting relay…" : "get started"}
               </Button>
               <Button variant="outline" size="lg" class="w-full" onClick={() => reset("link")}>

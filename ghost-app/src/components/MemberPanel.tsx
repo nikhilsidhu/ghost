@@ -114,6 +114,7 @@ export function MemberPanel() {
           <For each={sortedMembers()}>
             {(m) => (
               <div
+                data-testid="member"
                 class="flex items-center gap-2.5 px-2 py-1.5 rounded-md hover:bg-[var(--hover)]"
                 onContextMenu={(e) => onRightClick(m.fingerprint, e)}
               >
@@ -146,7 +147,7 @@ export function MemberPanel() {
             <div class="px-2 pt-4 pb-1 text-sm font-medium text-[var(--neutral-500)]">kept out — {kept().length}</div>
             <For each={kept()}>
               {(k) => (
-                <div class="flex items-center gap-2 px-2 py-1 rounded-md">
+                <div data-testid="kept-out" class="flex items-center gap-2 px-2 py-1 rounded-md">
                   <span class="flex-1 min-w-0 truncate text-sm text-[var(--neutral-400)]">
                     {k.display_name ?? k.fingerprint.slice(0, FINGERPRINT_SHOWN)}
                   </span>
@@ -173,6 +174,7 @@ export function MemberPanel() {
               onClick={(e) => e.stopPropagation()}
             >
               <button
+                data-testid="kick-member"
                 class="w-full px-3 py-1.5 text-left text-sm text-red-400 hover:bg-[var(--neutral-700)] cursor-pointer"
                 onClick={handleKick}
               >

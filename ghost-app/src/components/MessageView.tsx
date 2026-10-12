@@ -27,7 +27,7 @@ const formatTime = (ts: number) => {
 function DeliveryNote(props: { message: Message; onRetry: (messageId: string) => void }) {
   return (
     <Show when={props.message.delivery !== "delivered"}>
-      <div class="text-xs mt-0.5">
+      <div class="text-xs mt-0.5" data-testid="delivery-note">
         <Show when={props.message.delivery === "pending"}>
           <span class="text-[var(--neutral-500)]">sending...</span>
         </Show>
@@ -224,7 +224,7 @@ export function MessageView() {
                           </span>
                         </Show>
                       </div>
-                      <div class="text-sm text-[var(--neutral-300)] break-words leading-relaxed">
+                      <div data-testid="message-content" class="text-sm text-[var(--neutral-300)] break-words leading-relaxed">
                         {msg.content}
                       </div>
                       <DeliveryNote message={msg} onRetry={handleRetry} />
@@ -232,7 +232,7 @@ export function MessageView() {
                   </div>
                 </Show>
                 <Show when={grouped()}>
-                  <div class="text-sm text-[var(--neutral-300)] break-words leading-relaxed">
+                  <div data-testid="message-content" class="text-sm text-[var(--neutral-300)] break-words leading-relaxed">
                     {msg.content}
                   </div>
                   <DeliveryNote message={msg} onRetry={handleRetry} />
@@ -261,7 +261,7 @@ export function MessageView() {
         <div class="px-4 py-1 text-xs text-[var(--red-400)]">{error()}</div>
       </Show>
       <Show when={selectedChannelId() && waitingChannels().has(selectedChannelId()!)}>
-        <div role="status" class="px-4 py-1 text-xs text-[var(--neutral-400)]">
+        <div role="status" data-testid="channel-waiting" class="px-4 py-1 text-xs text-[var(--neutral-400)]">
           Waiting for this server's latest changes; this channel's new messages appear once they arrive.
         </div>
       </Show>
@@ -285,6 +285,7 @@ export function MessageView() {
             }}
           >
             <input
+              data-testid="composer"
               ref={inputRef}
               class="flex-1 h-10 bg-transparent text-sm text-[var(--neutral-100)] placeholder:text-[var(--neutral-500)] outline-none"
               placeholder="send a message..."
@@ -320,7 +321,7 @@ export function MessageView() {
 function UndecryptableNotice(props: { message: Message; isNew: boolean }) {
   const inPrivateChannel = () => channels().find((c) => c.channel_id === props.message.channel_id)?.private ?? false;
   return (
-    <div role="note" class={cn("-mx-2 px-2 mt-2 py-1.5 flex items-baseline gap-2", props.isNew && "msg-new")}>
+    <div role="note" data-testid="undecryptable" class={cn("-mx-2 px-2 mt-2 py-1.5 flex items-baseline gap-2", props.isNew && "msg-new")}>
       <span class="text-sm italic text-[var(--neutral-500)]">
         {inPrivateChannel() ? "a message could not be decrypted" : "a message sent somewhere in this server could not be decrypted"}
       </span>
@@ -337,7 +338,7 @@ function UndecryptableNotice(props: { message: Message; isNew: boolean }) {
 function HistoryGapNotice(props: { message: Message; isNew: boolean }) {
   const inPrivateChannel = () => channels().find((c) => c.channel_id === props.message.channel_id)?.private ?? false;
   return (
-    <div role="note" class={cn("-mx-2 px-2 mt-2 py-1.5 flex items-baseline gap-2", props.isNew && "msg-new")}>
+    <div role="note" data-testid="history-gap" class={cn("-mx-2 px-2 mt-2 py-1.5 flex items-baseline gap-2", props.isNew && "msg-new")}>
       <span class="text-sm italic text-[var(--neutral-500)]">
         {inPrivateChannel()
           ? "earlier messages here were not kept by the relay while this device was away"

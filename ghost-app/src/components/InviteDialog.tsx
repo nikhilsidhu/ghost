@@ -70,6 +70,7 @@ export function InviteDialog(props: Props) {
           </Show>
 
           <div
+            data-testid="invite-link"
             class="w-full px-3 py-2 rounded text-xs font-mono break-all select-all text-center"
             style={{ background: "var(--neutral-900)", color: "var(--neutral-400)" }}
           >
@@ -80,7 +81,7 @@ export function InviteDialog(props: Props) {
             <Button class="flex-1" onClick={handleCopy}>
               {copied() ? "Copied!" : "Copy Link"}
             </Button>
-            <Button variant="ghost" onClick={props.onClose}>
+            <Button data-testid="invite-done" variant="ghost" onClick={props.onClose}>
               Done
             </Button>
           </div>

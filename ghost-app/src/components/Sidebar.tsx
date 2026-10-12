@@ -518,6 +518,7 @@ function ServerIcon(props: { server: Server; isActive: boolean; onClick: (id: st
       />
       <Tooltip label={props.server.name}>
         <button
+          data-testid="server"
           aria-label={props.server.name}
           class="w-[var(--size-lg)] h-[var(--size-lg)] flex items-center justify-center cursor-pointer"
           onClick={() => props.onClick(props.server.server_id)}
@@ -571,6 +572,7 @@ function ChannelItem(props: {
 
   return (
     <NavItem
+      data-testid="channel"
       ref={sortable.ref}
       selected={props.isSelected}
       emphasis={props.channel.unread_count > 0}

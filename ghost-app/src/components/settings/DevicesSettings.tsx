@@ -516,7 +516,7 @@ export default function DevicesSettings() {
               <Show when={pairing()?.stage === "confirm"}>
                 <div class="flex flex-col gap-2 p-3 mb-3 rounded bg-[var(--neutral-800)] border border-[var(--neutral-700)]">
                   <p class="text-xs text-[var(--neutral-400)]">the new device shows a code. does it match this one?</p>
-                  <p class="text-2xl text-center font-mono tracking-widest text-[var(--neutral-100)]">{pairing()?.code}</p>
+                  <p data-testid="pairing-code" class="text-2xl text-center font-mono tracking-widest text-[var(--neutral-100)]">{pairing()?.code}</p>
                   <div class="flex gap-2">
                     <Button size="sm" class="flex-1" onClick={handleCodesMatch}>they match</Button>
                     <Button size="sm" variant="outline" class="flex-1" onClick={handleCancelPairing}>they don't</Button>

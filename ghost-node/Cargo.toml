@@ -24,3 +24,6 @@ ghost-media = { path = "../ghost-media", features = ["test-util"] }
 ghost-log = { path = "../ghost-log" }
 tempfile = "3"
 tokio = { version = "1", features = ["process"] }
+# Drives the desktop app through tauri-driver in the UI smoke tests, over plain HTTP on
+# localhost, so without a TLS backend.
+thirtyfour = { version = "0.37", default-features = false, features = ["reqwest"] }
