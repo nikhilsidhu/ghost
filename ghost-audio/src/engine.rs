@@ -9,6 +9,7 @@ use std::time::Duration;
 use ghost_media::{FrameSender, Inbound, TrackEvent, TrackIo};
 use tokio::sync::mpsc;
 
+use crate::codec::Encoder;
 use crate::constants::*;
 use crate::devices::{AudioDevices, CaptureRead, Playback, PlayoutLink};
 use crate::dsp::denoise_frame;
@@ -25,15 +26,14 @@ const FRAME_DURATION: Duration = Duration::from_millis(FRAME_MS as u64);
 /// The voice diagnostics are worth reading in dev builds, where the launcher keeps logs.
 const DIAG_LEVEL: tracing::Level = if cfg!(feature = "devtools") { tracing::Level::INFO } else { tracing::Level::DEBUG };
 
-fn create_encoder() -> Result<opus::Encoder, String> {
-    let mut encoder = opus::Encoder::new(SAMPLE_RATE, opus::Channels::Mono, opus::Application::Voip)
-        .map_err(|e| format!("opus encoder: {e}"))?;
-    encoder.set_bitrate(opus::Bitrate::Bits(OPUS_BITRATE)).map_err(|e| format!("opus bitrate: {e}"))?;
+fn create_encoder() -> Result<Encoder, String> {
+    let mut encoder = Encoder::voip().map_err(|e| format!("opus encoder: {e}"))?;
+    encoder.set_bitrate(OPUS_BITRATE).map_err(|e| format!("opus bitrate: {e}"))?;
     encoder.set_vbr(true).map_err(|e| format!("opus vbr: {e}"))?;
     encoder.set_complexity(OPUS_COMPLEXITY).map_err(|e| format!("opus complexity: {e}"))?;
     // The microphone carries voice: whatever the encoder might take for music (laughter,
     // humming) is still coded as voice, and so still protected once loss is reported.
-    encoder.set_signal(opus::Signal::Voice).map_err(|e| format!("opus signal: {e}"))?;
+    encoder.set_voice_signal().map_err(|e| format!("opus signal: {e}"))?;
     // Used only while the others report loss (`opus_loss_pct`); until then no bits go to it.
     encoder.set_inband_fec(true).map_err(|e| format!("opus fec: {e}"))?;
     encoder.set_packet_loss_perc(0).map_err(|e| format!("opus loss pct: {e}"))?;
@@ -51,7 +51,7 @@ fn opus_loss_pct(reported: u8) -> i32 {
 /// silence).
 struct Transmitter {
     sender: FrameSender,
-    encoder: opus::Encoder,
+    encoder: Encoder,
     /// The loss the encoder protects against now, percent.
     opus_loss: i32,
     processing: CaptureProcessing,
@@ -419,6 +419,7 @@ pub(crate) fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codec::Decoder;
     use crate::fake::{speech_like, ToneDevices};
     use crate::receiver::PeerStats;
     use crate::{AudioTrack, VoiceAudio};
@@ -440,7 +441,7 @@ mod tests {
         let voice = speech_like(1.6, 0.03);
         let mut encoder = create_encoder().unwrap();
         let mut packet = vec![0u8; OPUS_MAX_FRAME_BYTES];
-        let mut modes = |encoder: &mut opus::Encoder| -> Vec<&'static str> {
+        let mut modes = |encoder: &mut Encoder| -> Vec<&'static str> {
             voice.chunks_exact(FRAME_SAMPLES).map(|frame| {
                 let len = encoder.encode_float(frame, &mut packet).unwrap();
                 coding(&packet[..len])
@@ -459,8 +460,8 @@ mod tests {
         let dropouts = |reported: u8| -> usize {
             let mut encoder = create_encoder().unwrap();
             encoder.set_packet_loss_perc(opus_loss_pct(reported)).unwrap();
-            let packets: Vec<Vec<u8>> = voice.chunks_exact(FRAME_SAMPLES).map(|f| encoder.encode_vec_float(f, OPUS_MAX_FRAME_BYTES).unwrap()).collect();
-            let mut decoder = opus::Decoder::new(SAMPLE_RATE, opus::Channels::Mono).unwrap();
+            let packets: Vec<Vec<u8>> = voice.chunks_exact(FRAME_SAMPLES).map(|f| encoder.encode_vec_float(f)).collect();
+            let mut decoder = Decoder::new().unwrap();
             let mut out = vec![0.0f32; FRAME_SAMPLES];
             let mut drops = 0;
             for (i, (packet, input)) in packets.iter().zip(voice.chunks_exact(FRAME_SAMPLES)).enumerate() {

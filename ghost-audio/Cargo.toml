@@ -11,7 +11,8 @@ license = "AGPL-3.0"
 [dependencies]
 ghost-media = { path = "../ghost-media" }
 ghost-wire = { path = "../ghost-wire" }
-opus = "0.3"
+# libopus, built from source and linked statically, at the same version everywhere.
+opusic-sys = "0.7.5"
 nnnoiseless = "0.5"
 # WebRTC's echo canceller (AEC3) and volume normalizer (AGC2), ported to Rust.
 sonora = "0.2"

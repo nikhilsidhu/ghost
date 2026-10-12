@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::codec::Decoder;
 use crate::constants::*;
 use crate::policy::TargetDelay;
 use crate::stretch;
@@ -130,7 +131,7 @@ pub(crate) struct Receiver {
     /// Opus frames, sorted by sequence. Ordered as plain integers: sequences wrap only
     /// after about 2.7 years of one call.
     frames: Vec<(u32, Vec<u8>)>,
-    decoder: opus::Decoder,
+    decoder: Decoder,
     /// The next sequence to play; `None` until playout starts, and again once the
     /// sender has paused.
     next: Option<u32>,
@@ -168,7 +169,7 @@ pub(crate) struct Receiver {
 impl Receiver {
     /// A playout publishing its figures to `shared`.
     pub fn new(shared: Arc<PeerStats>) -> Result<Self, String> {
-        let decoder = opus::Decoder::new(SAMPLE_RATE, opus::Channels::Mono).map_err(|e| format!("opus decoder: {e}"))?;
+        let decoder = Decoder::new().map_err(|e| format!("opus decoder: {e}"))?;
         Ok(Self {
             frames: Vec::with_capacity(PLAYOUT_MAX_BUFFERED),
             decoder,
@@ -438,9 +439,9 @@ mod tests {
     use std::time::Duration;
 
     fn encode(count: usize, amplitude: f32) -> Vec<Vec<u8>> {
-        let mut encoder = opus::Encoder::new(SAMPLE_RATE, opus::Channels::Mono, opus::Application::Voip).unwrap();
+        let mut encoder = crate::codec::Encoder::voip().unwrap();
         let tone: Vec<f32> = (0..FRAME_SAMPLES).map(|i| (i as f32 * 0.05).sin() * amplitude).collect();
-        (0..count).map(|_| encoder.encode_vec_float(&tone, OPUS_MAX_FRAME_BYTES).unwrap()).collect()
+        (0..count).map(|_| encoder.encode_vec_float(&tone)).collect()
     }
 
     fn frames(count: usize) -> Vec<Vec<u8>> {

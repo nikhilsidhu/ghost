@@ -2,6 +2,7 @@
 //! session, and frames from others are buffered, decoded and mixed for playback.
 //! Devices plug in through `devices`, at 48 kHz mono.
 
+mod codec;
 pub mod constants;
 pub mod devices;
 mod dsp;
