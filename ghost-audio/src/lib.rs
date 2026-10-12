@@ -6,21 +6,24 @@ pub mod constants;
 pub mod devices;
 mod dsp;
 mod engine;
-#[cfg(feature = "test-util")]
+#[cfg(any(test, feature = "test-util"))]
 pub mod fake;
 #[cfg(feature = "devtools")]
 mod figures;
 mod policy;
+mod processing;
 mod receiver;
 mod stretch;
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub use ghost_media::{AudioTrack, TrackEvent, TrackIo};
 use ghost_media::TrackQuality;
 
-use constants::VAD_THRESHOLD;
+use constants::{AGC_START_GAIN_DB, VAD_THRESHOLD};
+use processing::CaptureProcessing;
 pub use devices::{AudioDevices, CaptureRead, DeviceStreams, Playback};
 #[cfg(feature = "devtools")]
 pub use figures::{CallFigures, PeerFigures};
@@ -76,6 +79,9 @@ impl From<u8> for InputMode {
     }
 }
 
+/// Told a microphone's name and the gain the volume normalizer settled on for it.
+pub type GainListener = Arc<dyn Fn(&str, f32) + Send + Sync>;
+
 /// Settings and readings shared with the audio thread, which reads them every frame.
 pub(crate) struct AudioControls {
     pub muted: AtomicBool,
@@ -90,8 +96,15 @@ pub(crate) struct AudioControls {
     pub input_gain: AtomicU32,
     pub input_mode: AtomicU8,
     pub ptt_active: AtomicBool,
+    pub echo_cancellation: AtomicBool,
     /// RMS of the last captured frame after the input gain, 0 to 1, for a level meter.
     pub input_level: AtomicU32,
+    /// The gain the volume normalizer settled on, by microphone, to start from next time.
+    pub learned_gains: Mutex<HashMap<String, f32>>,
+    pub gain_listener: Mutex<Option<GainListener>>,
+    /// Capture processing kept between calls, so each starts where the last left off;
+    /// the running call holds it.
+    pub processing: Mutex<Option<CaptureProcessing>>,
     /// What playout has done this call, gathered every few seconds.
     pub playout_totals: Mutex<PlayoutStats>,
     #[cfg(feature = "devtools")]
@@ -99,7 +112,7 @@ pub(crate) struct AudioControls {
 }
 
 impl AudioControls {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             muted: AtomicBool::new(false),
             deafened: AtomicBool::new(false),
@@ -113,10 +126,28 @@ impl AudioControls {
             input_gain: AtomicU32::new(1.0f32.to_bits()),
             input_mode: AtomicU8::new(InputMode::VoiceActivity as u8),
             ptt_active: AtomicBool::new(false),
+            echo_cancellation: AtomicBool::new(true),
             input_level: AtomicU32::new(0.0f32.to_bits()),
+            learned_gains: Mutex::new(HashMap::new()),
+            gain_listener: Mutex::new(None),
+            processing: Mutex::new(None),
             playout_totals: Mutex::new(PlayoutStats::default()),
             #[cfg(feature = "devtools")]
             figures: figures::Figures::default(),
+        }
+    }
+
+    /// The gain to start `input`'s volume normalizer at.
+    pub(crate) fn start_gain_db(&self, input: &str) -> f32 {
+        self.learned_gains.lock().unwrap().get(input).copied().unwrap_or(AGC_START_GAIN_DB)
+    }
+
+    /// The normalizer settled on `gain_db` for `input`.
+    pub(crate) fn learned(&self, input: &str, gain_db: f32) {
+        self.learned_gains.lock().unwrap().insert(input.to_string(), gain_db);
+        let listener = self.gain_listener.lock().unwrap().clone();
+        if let Some(listener) = listener {
+            listener(input, gain_db);
         }
     }
 }
@@ -213,6 +244,25 @@ impl VoiceAudio {
     /// Whether the push-to-talk key is held.
     pub fn set_ptt_active(&self, active: bool) {
         self.controls.ptt_active.store(active, Ordering::Relaxed);
+    }
+
+    /// Whether what the speakers play is taken out of the microphone. On by default; a
+    /// running call follows a change at once.
+    pub fn set_echo_cancellation(&self, enabled: bool) {
+        self.controls.echo_cancellation.store(enabled, Ordering::Relaxed);
+    }
+
+    /// The gains the volume normalizer settled on before, by microphone, for it to
+    /// start from instead of finding the level again.
+    pub fn set_learned_gains(&self, gains: HashMap<String, f32>) {
+        *self.controls.learned_gains.lock().unwrap() = gains;
+    }
+
+    /// Call `listener` whenever the normalizer settles on a microphone's gain (at the
+    /// end of a call, and when capture moves to another microphone), so it can be kept
+    /// for next time. It runs on the audio thread and should return quickly.
+    pub fn on_gain_learned(&self, listener: impl Fn(&str, f32) + Send + Sync + 'static) {
+        *self.controls.gain_listener.lock().unwrap() = Some(Arc::new(listener));
     }
 
     /// How loud the microphone is right now, 0 to 1, after the input gain; 0 between calls.

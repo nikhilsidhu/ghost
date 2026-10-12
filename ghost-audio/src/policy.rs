@@ -8,6 +8,10 @@ use std::time::Instant;
 
 use crate::constants::*;
 
+/// Arrivals the history keeps room for: twice what it holds on a steady network, so it
+/// does not allocate on the playback thread it runs on.
+const HISTORY_ROOM: usize = 2 * (QUANTILE_HISTORY.as_millis() as usize / FRAME_MS as usize);
+
 /// A histogram that forgets: each new sample weighs `1 - forget` and every older one
 /// fades by `forget`, starting fast so the first samples count fully.
 struct ForgetfulHistogram {
@@ -74,7 +78,7 @@ impl TargetDelay {
     pub fn new() -> Self {
         Self {
             started: Instant::now(),
-            history: VecDeque::new(),
+            history: VecDeque::with_capacity(HISTORY_ROOM),
             highest: None,
             interval_start: 0.0,
             interval_worst: 0.0,

@@ -1,5 +1,5 @@
 //! The audio thread of a call: paced by capture, it processes and encodes what the
-//! microphone hears, and hands received frames to the jitter buffers playback mixes.
+//! microphone hears, and hands received frames to the playout playback runs.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -10,15 +10,19 @@ use ghost_media::{FrameSender, Inbound, TrackEvent, TrackIo};
 use tokio::sync::mpsc;
 
 use crate::constants::*;
-use crate::devices::{AudioDevices, CaptureRead, Playback};
-use crate::dsp::{denoise_frame, energy_vad, Agc};
-use crate::receiver::{PlayoutStats, Receiver};
+use crate::devices::{AudioDevices, CaptureRead, Playback, PlayoutLink};
+use crate::dsp::{denoise_frame, energy_vad};
+use crate::processing::{CaptureProcessing, EchoCanceller, VolumeNormalizer};
+use crate::receiver::PlayoutStats;
 use crate::{AgcMode, AudioControls, InputMode, NoiseSuppressionMode};
 
 /// CELT-only fullband 20 ms mono silence; resets the receiver's decoder state cleanly.
 const OPUS_SILENCE: [u8; 3] = [0xF8, 0xFF, 0xFE];
 
 const FRAME_DURATION: Duration = Duration::from_millis(FRAME_MS as u64);
+
+/// The voice diagnostics are worth reading in dev builds, where the launcher keeps logs.
+const DIAG_LEVEL: tracing::Level = if cfg!(feature = "devtools") { tracing::Level::INFO } else { tracing::Level::DEBUG };
 
 fn create_encoder() -> Result<opus::Encoder, String> {
     let mut encoder = opus::Encoder::new(SAMPLE_RATE, opus::Channels::Mono, opus::Application::Voip)
@@ -31,16 +35,17 @@ fn create_encoder() -> Result<opus::Encoder, String> {
     Ok(encoder)
 }
 
-/// Turns captured frames into sent ones: gain, noise suppression, voice activity,
-/// normalization, Opus, and the talk-spurt edges (pre-roll, closing silence).
+/// Turns captured frames into sent ones: echo cancellation, gain, noise suppression,
+/// voice activity, normalization, Opus, and the talk-spurt edges (pre-roll, closing
+/// silence).
 struct Transmitter {
     sender: FrameSender,
     encoder: opus::Encoder,
+    processing: CaptureProcessing,
     denoiser: Box<nnnoiseless::DenoiseState<'static>>,
     /// nnnoiseless's first frame after a reset is unreliable and is not sent.
     denoise_primed: bool,
     last_ns_mode: NoiseSuppressionMode,
-    agc: Agc,
     /// The sender's media clock: one step per captured frame, sent or not, so
     /// receivers can tell lateness from silence.
     sequence: u32,
@@ -60,14 +65,14 @@ struct Transmitter {
 }
 
 impl Transmitter {
-    fn new(sender: FrameSender) -> Result<Self, String> {
+    fn new(sender: FrameSender, processing: CaptureProcessing) -> Result<Self, String> {
         Ok(Self {
             sender,
             encoder: create_encoder()?,
+            processing,
             denoiser: nnnoiseless::DenoiseState::new(),
             denoise_primed: false,
             last_ns_mode: NoiseSuppressionMode::Nnnoiseless,
-            agc: Agc::new(),
             sequence: 0,
             vad_hangover: 0,
             was_speaking: false,
@@ -116,6 +121,11 @@ impl Transmitter {
 
     fn process(&mut self, frame: &mut [f32], controls: &AudioControls) {
         let sequence = self.next_sequence();
+        // Echo comes out first, of every frame, muted or not: the canceller keeps up with
+        // the room, and nothing ahead of it changes the signal it models.
+        self.processing.echo.set_enabled(controls.echo_cancellation.load(Ordering::Relaxed));
+        self.processing.echo.process(frame);
+
         let muted = controls.muted.load(Ordering::Relaxed);
         let mode = InputMode::from(controls.input_mode.load(Ordering::Relaxed));
         let ptt_active = controls.ptt_active.load(Ordering::Relaxed);
@@ -156,12 +166,12 @@ impl Transmitter {
             NoiseSuppressionMode::Off => energy_vad(frame),
         };
 
+        let voiced = voice_probability > f32::from_bits(controls.vad_threshold.load(Ordering::Relaxed));
         let speaking = match mode {
             InputMode::PushToTalk => true,
             InputMode::VoiceActivity => {
                 // Stay "speaking" briefly after the voice drops, so word ends go out.
-                let threshold = f32::from_bits(controls.vad_threshold.load(Ordering::Relaxed));
-                if voice_probability > threshold {
+                if voiced {
                     self.vad_hangover = VAD_HANGOVER_FRAMES;
                 } else if self.vad_hangover > 0 {
                     self.vad_hangover -= 1;
@@ -172,7 +182,7 @@ impl Transmitter {
         controls.speaking.store(speaking, Ordering::Relaxed);
 
         if AgcMode::from(controls.agc.load(Ordering::Relaxed)) == AgcMode::Auto {
-            self.agc.process(frame);
+            self.processing.volume.process(frame, voiced);
         }
 
         // Encode every frame, sent or not, so the encoder's state stays warm.
@@ -196,50 +206,71 @@ impl Transmitter {
     }
 }
 
+/// The processing kept from the last call, moved over to `input` if capture now comes
+/// from another microphone; fresh processing if none was kept.
+fn processing_for(controls: &AudioControls, input: String) -> CaptureProcessing {
+    let kept = controls.processing.lock().unwrap().take();
+    match kept {
+        Some(mut processing) => {
+            if processing.input != input {
+                switch_input(controls, &mut processing, input);
+            }
+            processing
+        }
+        None => CaptureProcessing {
+            echo: EchoCanceller::new(controls.echo_cancellation.load(Ordering::Relaxed)),
+            volume: VolumeNormalizer::new(controls.start_gain_db(&input)),
+            input,
+        },
+    }
+}
+
+/// Keep the gain the normalizer settled on for the microphone it learned on.
+fn keep_learned_gain(controls: &AudioControls, processing: &CaptureProcessing) {
+    if let Some(gain_db) = processing.volume.learned_gain_db() {
+        controls.learned(&processing.input, gain_db);
+    }
+}
+
+/// Capture moved to `input`: keep what was learned of the last microphone, and start
+/// normalizing the new one from what was learned of it.
+fn switch_input(controls: &AudioControls, processing: &mut CaptureProcessing, input: String) {
+    keep_learned_gain(controls, processing);
+    processing.volume = VolumeNormalizer::new(controls.start_gain_db(&input));
+    processing.input = input;
+}
+
 /// Hand what the session received to each sender's playout. Returns how many frames.
-fn route_inbound(received: &mut mpsc::Receiver<Inbound>, playback: &Playback) -> u32 {
+fn route_inbound(received: &mut mpsc::Receiver<Inbound>, link: &mut PlayoutLink) -> u32 {
     let mut frames = 0;
-    let mut mixer = playback.mixer();
     while let Ok(inbound) = received.try_recv() {
         match inbound {
             Inbound::Frame(frame) => {
                 frames += 1;
-                let receiver = match mixer.receivers.entry(frame.slot_id) {
-                    std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-                    std::collections::hash_map::Entry::Vacant(entry) => match Receiver::new() {
-                        Ok(receiver) => entry.insert(receiver),
-                        Err(e) => {
-                            tracing::warn!("voice: {e}");
-                            continue;
-                        }
-                    },
-                };
-                receiver.insert(frame.sequence, frame.payload, frame.arrived);
+                link.frame(frame.slot_id, frame.sequence, frame.payload, frame.arrived);
             }
-            Inbound::PeerLeft(slot_id) => {
-                mixer.receivers.remove(&slot_id);
-            }
+            Inbound::PeerLeft(slot_id) => link.peer_left(slot_id),
         }
     }
     frames
 }
 
-/// Read playout quality since the last reading into the controls, and drop the
-/// playout of senders long gone quiet.
-fn read_quality(playback: &Playback, controls: &AudioControls) -> String {
-    let mut mixer = playback.mixer();
-    let summary: Vec<String> =
-        mixer.receivers.values().map(|r| format!("d{}t{}", r.buffered(), r.target())).collect();
+/// Read playout quality since the last reading into the controls.
+fn read_quality(link: &mut PlayoutLink, controls: &AudioControls) -> String {
+    let mut summary = Vec::with_capacity(link.peers.len());
     let mut window = PlayoutStats::default();
     let (mut max_depth, mut max_target) = (0u32, 0u32);
-    for receiver in mixer.receivers.values_mut() {
-        window.add(&receiver.stats.since(&receiver.reported));
-        receiver.reported = receiver.stats;
-        max_depth = max_depth.max(receiver.buffered());
-        max_target = max_target.max(receiver.target());
+    for peer in link.peers.values_mut() {
+        let playout = peer.stats.playout();
+        window.add(&playout.since(&peer.reported));
+        peer.reported = playout;
+        summary.push(format!("d{}t{}", peer.stats.depth(), peer.stats.target()));
+        // A silent sender's buffer says nothing about how the call sounds now.
+        if !peer.stats.is_idle() {
+            max_depth = max_depth.max(peer.stats.depth());
+            max_target = max_target.max(peer.stats.target());
+        }
     }
-    mixer.receivers.retain(|_, receiver| !receiver.is_idle());
-    drop(mixer);
     let heard = window.played + window.recovered + window.concealed + window.dropped_late;
     let lost = window.recovered + window.concealed + window.dropped_late;
     let loss_pct = if heard > 0 { lost as f32 / heard as f32 * 100.0 } else { 0.0 };
@@ -252,18 +283,20 @@ fn read_quality(playback: &Playback, controls: &AudioControls) -> String {
 
 /// Hand each sender's playout to the call figures.
 #[cfg(feature = "devtools")]
-fn publish_peers(playback: &Playback, controls: &AudioControls) {
-    let peers = playback
-        .mixer()
-        .receivers
+fn publish_peers(link: &PlayoutLink, controls: &AudioControls) {
+    let peers = link
+        .peers
         .iter()
-        .map(|(&slot_id, receiver)| crate::PeerFigures {
-            slot_id,
-            depth: receiver.buffered(),
-            target: receiver.target(),
-            playout: receiver.stats,
-            received_frames: receiver.received.0,
-            received_bytes: receiver.received.1,
+        .map(|(&slot_id, peer)| {
+            let (received_frames, received_bytes) = peer.stats.received();
+            crate::PeerFigures {
+                slot_id,
+                depth: peer.stats.depth(),
+                target: peer.stats.target(),
+                playout: peer.stats.playout(),
+                received_frames,
+                received_bytes,
+            }
         })
         .collect();
     controls.figures.set_peers(peers);
@@ -277,14 +310,16 @@ pub(crate) fn run(
     stop: Arc<AtomicBool>,
 ) -> Result<(), String> {
     let TrackIo { sender, mut received, events } = io;
-    let playback = Playback::new(controls.clone());
-    let mut streams = devices.open(playback.clone())?;
-    let mut transmitter = Transmitter::new(sender.clone())?;
+    let (playback, mut link) = Playback::new(controls.clone());
+    let mut streams = devices.open(playback)?;
+    let mut transmitter = Transmitter::new(sender.clone(), processing_for(&controls, streams.input_name()))?;
     let mut frame = vec![0.0f32; FRAME_SAMPLES];
 
     let (mut ticks, mut frames_received, mut capture_empty) = (0u32, 0u32, 0u32);
-    while !stop.load(Ordering::Relaxed) && !sender.is_closed() {
-        frames_received += route_inbound(&mut received, &playback);
+    let mut result = Ok(());
+    'call: while !stop.load(Ordering::Relaxed) && !sender.is_closed() {
+        frames_received += route_inbound(&mut received, &mut link);
+        link.collect();
 
         // Capture paces the loop: wait for one frame, then take any that queued up.
         let mut timeout = FRAME_DURATION;
@@ -295,6 +330,8 @@ pub(crate) fn run(
                     got_capture = true;
                     #[cfg(feature = "devtools")]
                     let started = std::time::Instant::now();
+                    // What played before this frame was captured is what may echo in it.
+                    link.played(|samples| transmitter.processing.echo.played(samples));
                     transmitter.process(&mut frame, &controls);
                     #[cfg(feature = "devtools")]
                     {
@@ -307,13 +344,18 @@ pub(crate) fn run(
                 CaptureRead::Restarted => {
                     tracing::info!("voice: audio devices reopened");
                     transmitter.denoise_primed = false;
+                    switch_input(&controls, &mut transmitter.processing, streams.input_name());
                 }
                 CaptureRead::Substituted(notice) => {
                     tracing::warn!("voice: {notice}");
                     transmitter.denoise_primed = false;
+                    switch_input(&controls, &mut transmitter.processing, streams.input_name());
                     let _ = events.send(TrackEvent::Notice(notice));
                 }
-                CaptureRead::Failed(e) => return Err(e),
+                CaptureRead::Failed(e) => {
+                    result = Err(e);
+                    break 'call;
+                }
             }
         }
         if !got_capture {
@@ -323,44 +365,119 @@ pub(crate) fn run(
         ticks += 1;
         #[cfg(feature = "devtools")]
         if ticks % FIGURES_TICKS == 0 {
-            publish_peers(&playback, &controls);
+            publish_peers(&link, &controls);
         }
         if ticks >= DIAG_TICKS {
-            let playout = read_quality(&playback, &controls);
-            tracing::debug!(
-                "voice diag: sent={} recv={frames_received} cap_empty={capture_empty}/{ticks} playout=[{playout}]",
-                transmitter.frames_sent
+            let playout = read_quality(&mut link, &controls);
+            tracing::event!(
+                DIAG_LEVEL,
+                "voice diag: sent={} recv={frames_received} cap_empty={capture_empty}/{ticks} echo=[{}] playout=[{playout}]",
+                transmitter.frames_sent,
+                transmitter.processing.echo.summary()
             );
             (ticks, frames_received, capture_empty, transmitter.frames_sent) = (0, 0, 0, 0);
         }
     }
-    read_quality(&playback, &controls);
+    read_quality(&mut link, &controls);
     controls.speaking.store(false, Ordering::Relaxed);
-    Ok(())
+    // The next call starts from what this one learned.
+    keep_learned_gain(&controls, &transmitter.processing);
+    *controls.processing.lock().unwrap() = Some(transmitter.processing);
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fake::{speech_like, ToneDevices};
+    use crate::receiver::PeerStats;
+    use crate::{AudioTrack, VoiceAudio};
 
     #[test]
     fn quality_readings_count_each_frame_once() {
         let controls = Arc::new(AudioControls::new());
-        let playback = Playback::new(controls.clone());
-        let mut receiver = Receiver::new().unwrap();
-        // A buffered frame keeps the receiver from counting as gone quiet.
-        receiver.insert(0, OPUS_SILENCE.to_vec(), std::time::Instant::now());
-        receiver.stats.played = 90;
-        receiver.stats.concealed = 10;
-        playback.mixer().receivers.insert(1, receiver);
+        let (_playback, mut link) = Playback::new(controls.clone());
+        let stats = Arc::new(PeerStats::default());
+        stats.set_playout(PlayoutStats { played: 90, concealed: 10, ..Default::default() });
+        link.peers.insert(1, crate::devices::Peer { stats: stats.clone(), reported: PlayoutStats::default() });
 
-        read_quality(&playback, &controls);
+        read_quality(&mut link, &controls);
         assert_eq!(f32::from_bits(controls.packet_loss_pct.load(Ordering::Relaxed)), 10.0);
-        playback.mixer().receivers.get_mut(&1).unwrap().stats.played += 50;
-        read_quality(&playback, &controls);
+        stats.set_playout(PlayoutStats { played: 140, concealed: 10, ..Default::default() });
+        read_quality(&mut link, &controls);
 
         let totals = *controls.playout_totals.lock().unwrap();
         assert_eq!((totals.played, totals.concealed), (140, 10));
         assert_eq!(f32::from_bits(controls.packet_loss_pct.load(Ordering::Relaxed)), 0.0, "nothing was lost since the first reading");
+    }
+
+    /// Voiced level of speech, in RMS.
+    const SPEECH: f32 = 0.03;
+    const SPEECH_SECONDS: f32 = 4.4;
+    /// Recorded after the speech ends, for echoes to ring out (or not).
+    const TAIL_SECONDS: f32 = 2.0;
+    /// Level (RMS, -60 dBFS) under which the last second is silent: no echo rings on.
+    const SILENT: f32 = 1e-3;
+    /// How strongly the microphone hears the speakers: nearly as loud as they play, as
+    /// a laptop's own microphone hears them turned up.
+    const LEAK: f32 = 0.9;
+
+    /// Play the default chain's own output back to it, through the sealed loopback a mic
+    /// test uses, with the speakers heard by the microphone at `leak`. Returns the
+    /// speech and what played.
+    fn call_with_speakers(leak: f32, echo_cancellation: bool) -> (Vec<f32>, Vec<f32>) {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _enter = runtime.enter();
+        let devices = ToneDevices::new();
+        devices.set_leak(leak);
+        let audio = VoiceAudio::new(devices.clone());
+        audio.set_echo_cancellation(echo_cancellation);
+        let speech = speech_like(SPEECH_SECONDS, SPEECH);
+        devices.play(&speech);
+        let (events, _events) = mpsc::unbounded_channel();
+        audio.start(TrackIo::loopback(events).unwrap()).unwrap();
+        std::thread::sleep(Duration::from_secs_f32(SPEECH_SECONDS + TAIL_SECONDS));
+        audio.stop();
+        (speech, devices.recording())
+    }
+
+    /// Level of the last second played, in RMS: after the speech, so only echo.
+    fn tail(played: &[f32]) -> f32 {
+        crate::dsp::rms(&played[played.len().saturating_sub(SAMPLE_RATE as usize)..])
+    }
+
+    /// Share of the speech's voiced frames heard in `played` (at least a tenth of their
+    /// level, allowing for the path's delay), and the level of its last second, in RMS.
+    fn heard(speech: &[f32], played: &[f32]) -> (f32, f32) {
+        let voiced: Vec<usize> = speech.chunks_exact(FRAME_SAMPLES).enumerate().filter(|(_, f)| crate::dsp::rms(f) > SPEECH * 0.3).map(|(i, _)| i).collect();
+        let audible = voiced
+            .iter()
+            .filter(|&&i| (0..10).any(|lag| played.get((i + lag) * FRAME_SAMPLES..(i + lag + 1) * FRAME_SAMPLES).is_some_and(|f| crate::dsp::rms(f) > SPEECH * 0.1)))
+            .count();
+        (audible as f32 / voiced.len() as f32, tail(played))
+    }
+
+    #[test]
+    fn speech_comes_through_the_default_chain() {
+        let (speech, played) = call_with_speakers(0.0, true);
+        let (share, tail) = heard(&speech, &played);
+        assert!(share > 0.9, "only {:.0}% of speech heard", share * 100.0);
+        assert!(tail < SILENT, "silence after the speech, got RMS {tail}");
+    }
+
+    #[test]
+    fn speakers_the_microphone_hears_do_not_feed_back() {
+        let (speech, played) = call_with_speakers(LEAK, true);
+        let (share, tail) = heard(&speech, &played);
+        assert!(share > 0.7, "only {:.0}% of speech heard", share * 100.0);
+        assert!(tail < SILENT, "the echo rang on after the speech: RMS {tail}");
+    }
+
+    #[test]
+    fn without_echo_cancellation_the_same_speakers_feed_back() {
+        // What the test above guards against: the loop sustains itself.
+        let (_, played) = call_with_speakers(LEAK, false);
+        let level = tail(&played);
+        assert!(level > SILENT, "the echo died out on its own: RMS {level}");
     }
 }

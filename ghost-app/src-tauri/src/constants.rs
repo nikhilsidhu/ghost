@@ -6,9 +6,13 @@ pub const INPUT_GAIN_MAX: f32 = 2.0;
 pub const EXIT_CLOSE_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
 
 // Audio devices
-pub const AUDIO_CHANNELS: u16 = 1; // mono
-/// Device buffer size: 10 ms at 48 kHz, half an engine frame.
+/// The voice engine's audio is mono; devices are converted to and from it.
+pub const ENGINE_CHANNELS: usize = 1;
+/// Device buffer asked for where the device allows it: 10 ms at 48 kHz, half an engine frame.
 pub const DEVICE_BUFFER_SAMPLES: u32 = 480;
+/// Mono samples a device callback converts without allocating: more than the largest
+/// buffers devices use.
+pub const CALLBACK_ROOM: usize = 8192;
 
 // Shared buffer holds ~1 second of audio between device callbacks and processing thread
 pub const RING_CAPACITY: usize = 48_000;

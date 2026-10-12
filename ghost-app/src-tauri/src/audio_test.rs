@@ -3,41 +3,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, StreamTrait};
-use cpal::SampleFormat;
 use ghost_audio::{TrackEvent, TrackIo, VoiceAudio};
 use tauri::{AppHandle, Emitter};
 
-use crate::audio::resolve_device;
-
-// Pick an F32 config targeting the given sample rate, preserving native channel count.
-fn pick_test_config(
-    configs: impl Iterator<Item = cpal::SupportedStreamConfigRange>,
-    target_rate: u32,
-) -> Result<cpal::StreamConfig, String> {
-    let mut best: Option<cpal::SupportedStreamConfig> = None;
-    for cfg in configs {
-        if cfg.sample_format() != SampleFormat::F32 {
-            continue;
-        }
-        let min = cfg.min_sample_rate().0;
-        let max = cfg.max_sample_rate().0;
-        if min <= target_rate && target_rate <= max {
-            best = Some(cfg.with_sample_rate(cpal::SampleRate(target_rate)));
-            break;
-        }
-        let candidate = cfg.with_max_sample_rate();
-        if let Some(ref b) = best {
-            if (candidate.sample_rate().0 as i64 - target_rate as i64).unsigned_abs()
-                < (b.sample_rate().0 as i64 - target_rate as i64).unsigned_abs()
-            {
-                best = Some(candidate);
-            }
-        } else {
-            best = Some(candidate);
-        }
-    }
-    best.map(|c| c.config()).ok_or_else(|| "no f32 audio config".into())
-}
+use crate::audio::{open_output, pick_format, resolve_device};
 
 /// The mic test running now, by its number; 0 when none runs. A test stopped and one
 /// started right after never mix: the first's thread sees it is no longer current.
@@ -131,32 +100,21 @@ fn run_test_tone(output_device_name: Option<String>) -> Result<(), String> {
     let host = cpal::default_host();
 
     let device = resolve_device(&host, &output_device_name, "output")?;
-    let config = pick_test_config(
-        device.supported_output_configs().map_err(|e| format!("output configs: {e}"))?,
-        48_000,
-    )?;
+    let format = pick_format(device.supported_output_configs().map_err(|e| format!("output configs: {e}"))?)?;
 
-    let sample_rate = config.sample_rate.0 as f32;
-    let channels = config.channels as usize;
-    let phase_inc = TONE_FREQ / sample_rate;
+    let phase_inc = TONE_FREQ / format.config.sample_rate.0 as f32;
     let mut phase = 0.0f32;
-
-    let stream = device
-        .build_output_stream(
-            &config,
-            move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                for frame in data.chunks_mut(channels) {
-                    let sample = (phase * 2.0 * std::f32::consts::PI).sin() * TONE_VOLUME;
-                    for s in frame.iter_mut() {
-                        *s = sample;
-                    }
-                    phase = (phase + phase_inc) % 1.0;
-                }
-            },
-            |err| tracing::warn!("test tone error: {err}"),
-            None,
-        )
-        .map_err(|e| format!("build output: {e}"))?;
+    let stream = open_output(
+        &device,
+        &format,
+        move |out| {
+            for sample in out.iter_mut() {
+                *sample = (phase * std::f32::consts::TAU).sin() * TONE_VOLUME;
+                phase = (phase + phase_inc) % 1.0;
+            }
+        },
+        |err| tracing::warn!("test tone error: {err}"),
+    )?;
 
     stream.play().map_err(|e| format!("start playback: {e}"))?;
     std::thread::sleep(TONE_DURATION);

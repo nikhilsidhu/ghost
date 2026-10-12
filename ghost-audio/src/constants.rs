@@ -2,6 +2,8 @@
 pub const SAMPLE_RATE: u32 = 48_000;
 pub const FRAME_MS: u32 = 20;
 pub const FRAME_SAMPLES: usize = (SAMPLE_RATE * FRAME_MS / 1000) as usize; // 960
+/// Echo cancellation and volume normalization work on 10 ms chunks.
+pub const PROCESSING_CHUNK: usize = (SAMPLE_RATE / 100) as usize; // 480
 
 // Opus
 pub const OPUS_BITRATE: i32 = 64_000;
@@ -15,12 +17,17 @@ pub const DENOISE_FRAME_SIZE: usize = 480;
 pub const DENOISE_SAMPLE_SCALE: f32 = i16::MAX as f32;
 
 // Volume normalizer
-pub const AGC_TARGET_RMS: f32 = 0.1;
-pub const AGC_MAX_GAIN: f32 = 3.0;
-pub const AGC_ATTACK: f32 = 0.3;
-pub const AGC_RELEASE: f32 = 0.05;
-/// Signals below this (silence, noise floor) are left alone.
-pub const AGC_SILENCE_FLOOR: f32 = 1e-6;
+/// Gain for a microphone whose level is not learned yet: none, so a loud one is not
+/// pushed into the limiter while the normalizer finds its level.
+pub const AGC_START_GAIN_DB: f32 = 0.0;
+/// The most it raises speech: enough to bring a -50 dBFS microphone to the target.
+pub const AGC_MAX_GAIN_DB: f32 = 30.0;
+/// Weight of each speech frame in the estimate of the gain the normalizer settled on.
+pub const AGC_LEARN_WEIGHT: f32 = 0.05;
+/// Speech frames heard before that estimate is worth keeping (2 s).
+pub const AGC_LEARN_MIN_FRAMES: u32 = 100;
+/// Frames quieter than this (RMS) are left out of it: their level is mostly noise.
+pub const AGC_LEARN_MIN_LEVEL: f32 = 1e-4;
 
 /// Voice activity threshold on nnnoiseless's 0.0–1.0 probability (0.85+ is the usual advice).
 pub const VAD_THRESHOLD: f32 = 0.85;
@@ -40,6 +47,17 @@ pub const PLAYOUT_MIN_TARGET: u32 = 2;
 pub const PLAYOUT_MAX_TARGET: u32 = 10;
 /// Frames held per sender at most.
 pub const PLAYOUT_MAX_BUFFERED: usize = 50;
+/// Decoded samples a sender's playout keeps room for: the largest device buffers plus a
+/// lengthened frame, so playback does not allocate.
+pub const PLAYOUT_OUTPUT_ROOM: usize = FRAME_SAMPLES * 8;
+/// Senders playback keeps room for: the relay's default room size.
+pub const PLAYOUT_SENDER_ROOM: usize = 25;
+/// Commands from the audio thread waiting for playback: more than a full inbound queue.
+pub const PLAYOUT_COMMAND_QUEUE: usize = 256;
+/// What playback hands back to the audio thread to free, so it never frees memory itself.
+pub const PLAYOUT_RETURN_QUEUE: usize = 256;
+/// What playback played, kept for the echo canceller: one second.
+pub const RENDER_QUEUE: usize = SAMPLE_RATE as usize;
 /// Concealed frames in a row after which the sender is taken to have paused (~300 ms).
 pub const PLAYOUT_MAX_CONCEALED: u32 = 15;
 /// Frames after a stretch before the next may stretch, so changes stay gentle.

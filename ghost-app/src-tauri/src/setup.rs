@@ -367,12 +367,30 @@ pub fn initialize() -> SetupResult {
         idle_mute: Arc::default(),
     };
 
+    keep_learned_gains(&state);
+
     SetupResult {
         state,
         inbox_rx,
         voice_loop,
         phase,
     }
+}
+
+/// Keep in the config each gain the volume normalizer settles on, by microphone, so the
+/// next start begins at the right loudness.
+fn keep_learned_gains(state: &AppState) {
+    let (config, config_path) = (state.config.clone(), state.config_path.clone());
+    state.audio.on_gain_learned(move |input, gain_db| {
+        let (config, config_path, input) = (config.clone(), config_path.clone(), input.to_string());
+        tauri::async_runtime::spawn(async move {
+            let mut cfg = config.lock().await;
+            cfg.input_gains.get_or_insert_with(Default::default).insert(input, gain_db);
+            if let Err(e) = cfg.save(&config_path) {
+                tracing::warn!("learned microphone gain not saved: {e}");
+            }
+        });
+    });
 }
 
 #[cfg(all(test, debug_assertions))]

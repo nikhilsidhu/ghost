@@ -121,6 +121,7 @@ fn main() {
             commands::note_activity,
             commands::dismiss_alert,
             commands::set_auto_mute_on_idle,
+            commands::set_echo_cancellation,
             commands::list_servers,
             commands::create_server,
             commands::create_dm,

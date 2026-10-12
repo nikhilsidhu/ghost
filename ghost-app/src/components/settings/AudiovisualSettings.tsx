@@ -1,6 +1,6 @@
 import { createSignal, createEffect, on, onCleanup, onMount, Show } from "solid-js";
 import { listen } from "@tauri-apps/api/event";
-import { startMicTest, stopMicTest, playTestTone, listAudioDevices, setInputDevice, setOutputDevice, setNoiseSuppression, setAgc, setInputMode, setVadThreshold, setInputGain, setAutoMuteOnIdle, getConfig, getKeybinds } from "../../lib/api";
+import { startMicTest, stopMicTest, playTestTone, listAudioDevices, setInputDevice, setOutputDevice, setNoiseSuppression, setAgc, setInputMode, setVadThreshold, setInputGain, setAutoMuteOnIdle, setEchoCancellation, getConfig, getKeybinds } from "../../lib/api";
 import { settingsOpen, settingsCategory, setSettingsCategory, setIsPttMode } from "../../lib/store";
 import { setInputMode as setKeybindInputMode } from "../../lib/keybinds";
 import { SettingGroup, SettingSelect, SettingSegmented, SettingSlider, SettingToggle } from "./controls";
@@ -22,6 +22,7 @@ export default function AudiovisualSettings() {
   const [selectedOutput, setSelectedOutput] = createSignal("default");
   const [selectedNs, setSelectedNs] = createSignal<NoiseSuppression>("nnnoiseless");
   const [selectedAgc, setSelectedAgc] = createSignal<Agc>("auto");
+  const [echoCancellation, setEchoCancellationLocal] = createSignal(true);
   const [autoMuteOnIdle, setAutoMuteOnIdleLocal] = createSignal(true);
   const [selectedInputMode, setSelectedInputMode] = createSignal<InputMode>("voice_activity");
   const [pttKeyBound, setPttKeyBound] = createSignal(false);
@@ -36,6 +37,7 @@ export default function AudiovisualSettings() {
     setSelectedOutput(config.output_device ?? "default");
     setSelectedNs(config.noise_suppression);
     setSelectedAgc(config.agc);
+    setEchoCancellationLocal(config.echo_cancellation);
     setAutoMuteOnIdleLocal(config.auto_mute_on_idle);
     setSelectedInputMode(config.input_mode);
     setVadThresholdLocal(config.vad_threshold);
@@ -245,6 +247,15 @@ export default function AudiovisualSettings() {
             { value: "off", label: "off" },
           ]}
           onChange={handleAgcChange}
+        />
+        <SettingToggle
+          label="echo cancellation"
+          description="keeps what your speakers play out of your microphone, so others do not hear themselves"
+          checked={echoCancellation()}
+          onChange={(v) => {
+            setEchoCancellationLocal(v);
+            setEchoCancellation(v).catch(() => {});
+          }}
         />
         <SettingToggle
           label="mute when idle"

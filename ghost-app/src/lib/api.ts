@@ -17,6 +17,7 @@ export const dismissAccountAlert = (id: number) => invoke<void>("dismiss_alert",
 
 /** Whether going idle mutes a call. */
 export const setAutoMuteOnIdle = (enabled: boolean) => invoke<void>("set_auto_mute_on_idle", { enabled });
+export const setEchoCancellation = (enabled: boolean) => invoke<void>("set_echo_cancellation", { enabled });
 
 export const listServers = () => invoke<Server[]>("list_servers");
 

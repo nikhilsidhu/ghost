@@ -445,6 +445,8 @@ pub struct ConfigDto {
     pub input_mode: InputModeDto,
     pub vad_threshold: f32,
     pub input_gain: f32,
+    /// Whether echo cancellation runs; this device's own setting.
+    pub echo_cancellation: bool,
     /// Whether going idle mutes a call.
     pub auto_mute_on_idle: bool,
     pub status: OnlineStatusDto,

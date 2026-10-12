@@ -1,7 +1,8 @@
-//! The real audio devices behind voice calls: cpal capture and playback, converted
-//! to and from the engine's 48 kHz mono, and reopened when the default device changes,
-//! when the user chooses other devices, and when a device goes away. A chosen device
-//! that is not there gives way to the system default, and the call is told.
+//! The real audio devices behind voice calls: cpal capture and playback, opened in each
+//! device's own channel layout and sample format and converted to and from the engine's
+//! 48 kHz mono, and reopened when the default device changes, when the user chooses
+//! other devices, and when a device goes away. A chosen device that is not there gives
+//! way to the system default, and the call is told.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -9,13 +10,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{SampleFormat, SampleRate, StreamConfig};
+use cpal::{BufferSize, FromSample, Sample, SampleFormat, SampleRate, SizedSample, StreamConfig, SupportedBufferSize};
 use ghost_audio::constants::{FRAME_MS, FRAME_SAMPLES, SAMPLE_RATE};
 use ghost_audio::{AudioDevices, CaptureRead, DeviceStreams, Playback};
 use ringbuf::{traits::*, HeapRb};
 use rubato::Resampler as _;
 
-use crate::constants::{AUDIO_CHANNELS, DEVICE_BUFFER_SAMPLES, DEVICE_LOSS_LIMIT, DEVICE_LOSS_WINDOW, RESAMPLE_SUB_CHUNKS, RING_CAPACITY};
+use crate::constants::{CALLBACK_ROOM, DEVICE_BUFFER_SAMPLES, DEVICE_LOSS_LIMIT, DEVICE_LOSS_WINDOW, ENGINE_CHANNELS, RESAMPLE_SUB_CHUNKS, RING_CAPACITY};
 use crate::device_watcher::DeviceWatcher;
 
 /// How often capture is checked while waiting for a frame.
@@ -35,7 +36,7 @@ impl SampleRateConverter {
             to_rate as usize,
             chunk_size,
             RESAMPLE_SUB_CHUNKS,
-            AUDIO_CHANNELS as usize,
+            ENGINE_CHANNELS,
         )
         .map_err(|e| format!("resampler: {e}"))?;
         let out_len = resampler.output_frames_max();
@@ -63,41 +64,171 @@ impl SampleRateConverter {
     }
 }
 
-fn pick_config(
-    configs: impl Iterator<Item = cpal::SupportedStreamConfigRange>,
-) -> Result<StreamConfig, String> {
-    let mut best: Option<cpal::SupportedStreamConfig> = None;
-    for cfg in configs {
-        if cfg.sample_format() != SampleFormat::F32 {
-            continue;
-        }
-        let min = cfg.min_sample_rate().0;
-        let max = cfg.max_sample_rate().0;
+/// Sample formats converted from and to, best first: the formats cpal's hosts offer.
+const SAMPLE_FORMATS: [SampleFormat; 7] =
+    [SampleFormat::F32, SampleFormat::I32, SampleFormat::I16, SampleFormat::F64, SampleFormat::U16, SampleFormat::I8, SampleFormat::U8];
 
-        // Exact 48kHz match — ideal, no resampling needed
-        if min <= SAMPLE_RATE && SAMPLE_RATE <= max {
-            best = Some(cfg.with_sample_rate(SampleRate(SAMPLE_RATE)));
-            break;
-        }
-
-        // Prefer the config whose max rate is closest to 48kHz
-        let candidate = cfg.with_max_sample_rate();
-        if let Some(ref current) = best {
-            let cur_diff = (current.sample_rate().0 as i64 - SAMPLE_RATE as i64).unsigned_abs();
-            let new_diff = (candidate.sample_rate().0 as i64 - SAMPLE_RATE as i64).unsigned_abs();
-            if new_diff < cur_diff {
-                best = Some(candidate);
+/// Evaluate `$build` with `$t` naming the Rust type of `$format`, one of `SAMPLE_FORMATS`.
+macro_rules! for_sample_format {
+    ($format:expr, $t:ident => $build:expr) => {
+        match $format {
+            SampleFormat::F32 => {
+                type $t = f32;
+                $build
             }
-        } else {
-            best = Some(candidate);
+            SampleFormat::I32 => {
+                type $t = i32;
+                $build
+            }
+            SampleFormat::I16 => {
+                type $t = i16;
+                $build
+            }
+            SampleFormat::F64 => {
+                type $t = f64;
+                $build
+            }
+            SampleFormat::U16 => {
+                type $t = u16;
+                $build
+            }
+            SampleFormat::I8 => {
+                type $t = i8;
+                $build
+            }
+            SampleFormat::U8 => {
+                type $t = u8;
+                $build
+            }
+            other => Err(format!("sample format {other} is not supported")),
         }
+    };
+}
+
+/// How a device's stream is opened: in its own channel layout and sample format, which
+/// it is sure to accept, at 48 kHz when it runs at it (else the nearest rate it does).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeviceFormat {
+    pub config: StreamConfig,
+    pub sample_format: SampleFormat,
+}
+
+impl std::fmt::Display for DeviceFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let buffer = match self.config.buffer_size {
+            BufferSize::Fixed(frames) => format!("{frames}-frame buffer"),
+            BufferSize::Default => "default buffer".into(),
+        };
+        write!(f, "{} Hz, {} ch, {}, {buffer}", self.config.sample_rate.0, self.config.channels, self.sample_format)
     }
-    let supported = best.ok_or("no suitable audio config")?;
-    Ok(StreamConfig {
-        channels: AUDIO_CHANNELS,
-        sample_rate: supported.sample_rate(),
-        buffer_size: cpal::BufferSize::Fixed(DEVICE_BUFFER_SAMPLES),
+}
+
+/// The format to open a device in, from the configurations it lists: the rate nearest
+/// 48 kHz first, then the best sample format, then the fewest channels. A 10 ms buffer
+/// where the device allows one, else its own.
+pub fn pick_format(configs: impl Iterator<Item = cpal::SupportedStreamConfigRange>) -> Result<DeviceFormat, String> {
+    let rate = |range: &cpal::SupportedStreamConfigRange| SAMPLE_RATE.clamp(range.min_sample_rate().0, range.max_sample_rate().0);
+    let best = configs
+        .filter(|range| range.channels() > 0)
+        .filter_map(|range| {
+            let format_rank = SAMPLE_FORMATS.iter().position(|format| *format == range.sample_format())?;
+            Some(((rate(&range).abs_diff(SAMPLE_RATE), format_rank, range.channels()), range))
+        })
+        .min_by_key(|(rank, _)| *rank)
+        .map(|(_, range)| range)
+        .ok_or("the device offers no format Ghost can use")?;
+    let supported = best.with_sample_rate(SampleRate(rate(&best)));
+    let buffer_size = match supported.buffer_size() {
+        SupportedBufferSize::Range { min, max } if (*min..=*max).contains(&DEVICE_BUFFER_SAMPLES) => BufferSize::Fixed(DEVICE_BUFFER_SAMPLES),
+        _ => BufferSize::Default,
+    };
+    Ok(DeviceFormat {
+        config: StreamConfig { channels: supported.channels(), sample_rate: supported.sample_rate(), buffer_size },
+        sample_format: supported.sample_format(),
     })
+}
+
+/// Average each frame of interleaved `samples`, `channels` wide, into `mono`.
+fn downmix<T: Sample>(samples: &[T], channels: usize, mono: &mut Vec<f32>)
+where
+    f32: FromSample<T>,
+{
+    mono.clear();
+    mono.extend(samples.chunks_exact(channels).map(|frame| frame.iter().map(|s| f32::from_sample(*s)).sum::<f32>() / channels as f32));
+}
+
+/// Write each sample of `mono` to every channel of its frame in interleaved `out`.
+fn upmix<T: Sample + FromSample<f32>>(mono: &[f32], channels: usize, out: &mut [T]) {
+    for (frame, sample) in out.chunks_exact_mut(channels).zip(mono) {
+        frame.fill(T::from_sample(*sample));
+    }
+}
+
+fn build_input<T>(
+    device: &cpal::Device,
+    format: &DeviceFormat,
+    mut take: impl FnMut(&[f32]) + Send + 'static,
+    on_error: impl FnMut(cpal::StreamError) + Send + 'static,
+) -> Result<cpal::Stream, String>
+where
+    T: SizedSample,
+    f32: FromSample<T>,
+{
+    let channels = format.config.channels as usize;
+    let mut mono = Vec::with_capacity(CALLBACK_ROOM);
+    device
+        .build_input_stream(
+            &format.config,
+            move |data: &[T], _: &cpal::InputCallbackInfo| {
+                downmix(data, channels, &mut mono);
+                take(&mono);
+            },
+            on_error,
+            None,
+        )
+        .map_err(|e| format!("build input stream: {e}"))
+}
+
+fn build_output<T: SizedSample + FromSample<f32>>(
+    device: &cpal::Device,
+    format: &DeviceFormat,
+    mut render: impl FnMut(&mut [f32]) + Send + 'static,
+    on_error: impl FnMut(cpal::StreamError) + Send + 'static,
+) -> Result<cpal::Stream, String> {
+    let channels = format.config.channels as usize;
+    let mut mono = Vec::with_capacity(CALLBACK_ROOM);
+    device
+        .build_output_stream(
+            &format.config,
+            move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
+                mono.resize(data.len() / channels, 0.0);
+                render(&mut mono);
+                upmix(&mono, channels, data);
+            },
+            on_error,
+            None,
+        )
+        .map_err(|e| format!("build output stream: {e}"))
+}
+
+/// Capture from `device` in `format`, handing `take` each callback's audio as mono.
+fn open_input(
+    device: &cpal::Device,
+    format: &DeviceFormat,
+    take: impl FnMut(&[f32]) + Send + 'static,
+    on_error: impl FnMut(cpal::StreamError) + Send + 'static,
+) -> Result<cpal::Stream, String> {
+    for_sample_format!(format.sample_format, T => build_input::<T>(device, format, take, on_error))
+}
+
+/// Play to `device` in `format` what `render` writes, as mono, at each callback.
+pub fn open_output(
+    device: &cpal::Device,
+    format: &DeviceFormat,
+    render: impl FnMut(&mut [f32]) + Send + 'static,
+    on_error: impl FnMut(cpal::StreamError) + Send + 'static,
+) -> Result<cpal::Stream, String> {
+    for_sample_format!(format.sample_format, T => build_output::<T>(device, format, render, on_error))
 }
 
 fn find_device_by_name(
@@ -201,6 +332,7 @@ struct OpenStreams {
     _capture: cpal::Stream,
     _playback: cpal::Stream,
     capture_cons: ringbuf::HeapCons<f32>,
+    input_name: String,
     input_rate: u32,
     /// Set by either stream when its device goes away.
     device_lost: Arc<AtomicBool>,
@@ -219,28 +351,22 @@ impl OpenStreams {
             }
         };
         let input_device = resolve_device(host, &choice.input, "input")?;
-        let input_config = pick_config(
-            input_device.supported_input_configs().map_err(|e| format!("input configs: {e}"))?,
-        )?;
-        let input_rate = input_config.sample_rate.0;
+        let input_format = pick_format(input_device.supported_input_configs().map_err(|e| format!("input configs: {e}"))?)?;
+        let input_rate = input_format.config.sample_rate.0;
 
         let (mut capture_prod, capture_cons) = HeapRb::<f32>::new(RING_CAPACITY).split();
-        let capture_stream = input_device
-            .build_input_stream(
-                &input_config,
-                move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                    capture_prod.push_slice(data);
-                },
-                lost_by("capture"),
-                None,
-            )
-            .map_err(|e| format!("build input stream: {e}"))?;
+        let capture_stream = open_input(
+            &input_device,
+            &input_format,
+            move |mono| {
+                capture_prod.push_slice(mono);
+            },
+            lost_by("capture"),
+        )?;
 
         let output_device = resolve_device(host, &choice.output, "output")?;
-        let output_config = pick_config(
-            output_device.supported_output_configs().map_err(|e| format!("output configs: {e}"))?,
-        )?;
-        let output_rate = output_config.sample_rate.0;
+        let output_format = pick_format(output_device.supported_output_configs().map_err(|e| format!("output configs: {e}"))?)?;
+        let output_rate = output_format.config.sample_rate.0;
 
         // The output hardware clock drives the mixer; at other rates than 48 kHz, whole
         // engine frames are converted and the remainder kept for the next callback.
@@ -250,38 +376,36 @@ impl OpenStreams {
             None
         };
         let mut mixed = vec![0.0f32; FRAME_SAMPLES];
-        let mut residual: Vec<f32> = Vec::with_capacity(FRAME_SAMPLES * 2);
-        let playback_stream = output_device
-            .build_output_stream(
-                &output_config,
-                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| match converter {
-                    None => playback.fill(data),
-                    Some(ref mut converter) => {
-                        while residual.len() < data.len() {
-                            playback.fill(&mut mixed);
-                            residual.extend_from_slice(converter.process(&mixed));
-                        }
-                        data.copy_from_slice(&residual[..data.len()]);
-                        residual.drain(..data.len());
+        let mut residual: Vec<f32> = Vec::with_capacity(CALLBACK_ROOM + FRAME_SAMPLES * 2);
+        let playback_stream = open_output(
+            &output_device,
+            &output_format,
+            move |out| match converter {
+                None => playback.fill(out),
+                Some(ref mut converter) => {
+                    while residual.len() < out.len() {
+                        playback.fill(&mut mixed);
+                        residual.extend_from_slice(converter.process(&mixed));
                     }
-                },
-                lost_by("playback"),
-                None,
-            )
-            .map_err(|e| format!("build output stream: {e}"))?;
+                    out.copy_from_slice(&residual[..out.len()]);
+                    residual.drain(..out.len());
+                }
+            },
+            lost_by("playback"),
+        )?;
 
         capture_stream.play().map_err(|e| format!("start capture: {e}"))?;
         playback_stream.play().map_err(|e| format!("start playback: {e}"))?;
 
+        let input_name = input_device.name().unwrap_or_default();
         tracing::info!(
-            "voice: capture \"{}\" @ {}Hz, playback \"{}\" @ {}Hz",
-            input_device.name().unwrap_or_default(),
-            input_rate,
+            "voice: capture \"{input_name}\" ({}), playback \"{}\" ({})",
+            input_format,
             output_device.name().unwrap_or_default(),
-            output_rate,
+            output_format,
         );
 
-        Ok(Self { _capture: capture_stream, _playback: playback_stream, capture_cons, input_rate, device_lost })
+        Ok(Self { _capture: capture_stream, _playback: playback_stream, capture_cons, input_name, input_rate, device_lost })
     }
 }
 
@@ -397,5 +521,74 @@ impl DeviceStreams for CpalStreams {
             }
             std::thread::sleep(CAPTURE_POLL);
         }
+    }
+
+    fn input_name(&self) -> String {
+        self.streams.input_name.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cpal::SupportedStreamConfigRange;
+
+    const ANY_BUFFER: SupportedBufferSize = SupportedBufferSize::Range { min: 64, max: 4096 };
+
+    fn range(channels: u16, rates: (u32, u32), sample_format: SampleFormat, buffer: SupportedBufferSize) -> SupportedStreamConfigRange {
+        SupportedStreamConfigRange::new(channels, SampleRate(rates.0), SampleRate(rates.1), buffer, sample_format)
+    }
+
+    #[test]
+    fn speakers_that_only_play_stereo_open_in_stereo() {
+        // A MacBook's speakers list no mono configuration.
+        let format = pick_format([range(2, (44_100, 96_000), SampleFormat::F32, ANY_BUFFER)].into_iter()).unwrap();
+        assert_eq!(format.config.channels, 2);
+        assert_eq!(format.config.sample_rate.0, SAMPLE_RATE);
+        assert_eq!(format.config.buffer_size, BufferSize::Fixed(DEVICE_BUFFER_SAMPLES));
+    }
+
+    #[test]
+    fn the_rate_decides_first_then_the_sample_format_then_fewer_channels() {
+        let configs = [
+            range(1, (44_100, 44_100), SampleFormat::F32, ANY_BUFFER),
+            range(1, (48_000, 48_000), SampleFormat::I16, ANY_BUFFER),
+            range(2, (48_000, 48_000), SampleFormat::F32, ANY_BUFFER),
+        ];
+        let format = pick_format(configs.into_iter()).unwrap();
+        assert_eq!((format.config.channels, format.sample_format), (2, SampleFormat::F32));
+
+        let integer_only = [range(2, (48_000, 48_000), SampleFormat::I16, ANY_BUFFER), range(1, (48_000, 48_000), SampleFormat::I16, ANY_BUFFER)];
+        let format = pick_format(integer_only.into_iter()).unwrap();
+        assert_eq!((format.config.channels, format.sample_format), (1, SampleFormat::I16));
+    }
+
+    #[test]
+    fn a_device_without_48k_opens_at_its_nearest_rate_and_its_own_buffer() {
+        let format = pick_format([range(2, (88_200, 192_000), SampleFormat::I32, SupportedBufferSize::Unknown)].into_iter()).unwrap();
+        assert_eq!(format.config.sample_rate.0, 88_200);
+        assert_eq!(format.config.buffer_size, BufferSize::Default);
+    }
+
+    #[test]
+    fn formats_that_cannot_be_converted_are_passed_over() {
+        assert!(pick_format([range(2, (48_000, 48_000), SampleFormat::U64, ANY_BUFFER)].into_iter()).is_err());
+    }
+
+    #[test]
+    fn capture_is_averaged_to_mono_and_playback_fills_every_channel() {
+        let mut mono = Vec::new();
+        downmix(&[0.5f32, 0.25, -0.75, -0.25], 2, &mut mono);
+        assert_eq!(mono, vec![0.375, -0.5]);
+        downmix(&[i16::MAX, i16::MAX], 2, &mut mono);
+        assert!((mono[0] - 1.0).abs() < 1e-3, "integer samples come in at full scale");
+
+        let mut out = [0.0f32; 4];
+        upmix(&[0.25, -0.5], 2, &mut out);
+        assert_eq!(out, [0.25, 0.25, -0.5, -0.5]);
+        let mut out = [0i16; 2];
+        upmix(&[0.5], 2, &mut out);
+        assert_eq!(out[0], out[1]);
+        assert!(out[0] > 16_000, "half scale goes out as half of i16");
     }
 }

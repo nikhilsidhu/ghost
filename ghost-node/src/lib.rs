@@ -179,6 +179,8 @@ impl Device {
         // A pure tone is not speech, and noise suppression would silence it; loudness
         // decides what is sent instead.
         audio.set_noise_suppression(NoiseSuppressionMode::Off);
+        // Synthetic devices have no room for playback to echo in.
+        audio.set_echo_cancellation(false);
         let presence = PresenceInfo { avatar: flows::presence::own_avatar(&client), ..PresenceInfo::default() };
         Self {
             client: Arc::new(Mutex::new(client)),

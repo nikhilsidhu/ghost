@@ -626,11 +626,25 @@ pub async fn get_config(state: State<'_, AppState>) -> CommandResult<ConfigDto> 
         input_mode: cfg.input_mode(),
         vad_threshold: cfg.vad_threshold(),
         input_gain: cfg.input_gain(),
+        echo_cancellation: cfg.echo_cancellation(),
         auto_mute_on_idle: cfg.auto_mute_on_idle(),
         status: cfg.status(),
         status_message: cfg.status_message.clone(),
         status_expiry: cfg.status_expiry,
     })
+}
+
+/// Whether what the speakers play is taken out of the microphone; this device's own
+/// setting, followed by a running call at once.
+#[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
+pub async fn set_echo_cancellation(enabled: bool, state: State<'_, AppState>) -> CommandResult<()> {
+    let mut cfg = state.config.lock().await;
+    cfg.echo_cancellation = Some(enabled);
+    cfg.save(&state.config_path)?;
+    drop(cfg);
+    state.audio.set_echo_cancellation(enabled);
+    Ok(())
 }
 
 /// Whether going idle mutes a call; this device's own setting.

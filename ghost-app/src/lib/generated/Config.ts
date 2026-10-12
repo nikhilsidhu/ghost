@@ -10,6 +10,10 @@ export type Config = { display_name: string | null,
  */
 relay_url: string, input_device: string | null, output_device: string | null, noise_suppression: NoiseSuppression, agc: Agc, input_mode: InputMode, vad_threshold: number, input_gain: number, 
 /**
+ * Whether echo cancellation runs; this device's own setting.
+ */
+echo_cancellation: boolean, 
+/**
  * Whether going idle mutes a call.
  */
 auto_mute_on_idle: boolean, status: OnlineStatus, status_message: string | null, 

@@ -36,7 +36,7 @@ let config: Config;
 const defaultConfig = (): Config => ({
   display_name: "me", relay_url: "http://relay", input_device: null, output_device: null,
   noise_suppression: "nnnoiseless", agc: "auto", input_mode: "voice_activity", vad_threshold: 0.85,
-  input_gain: 1, auto_mute_on_idle: true, status: "online", status_message: null, status_expiry: null,
+  input_gain: 1, echo_cancellation: true, auto_mute_on_idle: true, status: "online", status_message: null, status_expiry: null,
 });
 const quietLive = (): LiveState => ({
   connectivity: { home: true, any: true, relays_down: [], relays_refusing: [], catching_up: false },
