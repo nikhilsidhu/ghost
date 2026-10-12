@@ -11,6 +11,8 @@ mod commands;
 mod config;
 mod constants;
 mod device_watcher;
+#[cfg(feature = "devtools")]
+mod devtools;
 mod dto;
 mod error;
 mod idle_task;
@@ -19,12 +21,21 @@ mod setup;
 mod state;
 mod sync_utils;
 
+// The profiler is for development: it must never reach a release build.
+#[cfg(all(feature = "devtools", not(debug_assertions)))]
+compile_error!("the devtools feature is for debug builds only");
+
 /// Daily log files, inside the data directory.
 const LOG_DIR: &str = "logs";
 
 fn main() {
-    // Before anything is logged, so every line is seen.
+    // Before anything is logged or traced, so every line and span is seen.
     let log_file = ghost_log::LogFile { dir: setup::ghost_dir().join(LOG_DIR), stem: "ghost" };
+    #[cfg(feature = "devtools")]
+    let (devtools_state, devtools_layer) = devtools::prepare();
+    #[cfg(feature = "devtools")]
+    let _log = ghost_log::init_with(Some(log_file), devtools_layer);
+    #[cfg(not(feature = "devtools"))]
     let _log = ghost_log::init(Some(log_file));
     let setup::SetupResult {
         state: app_state,
@@ -36,9 +47,12 @@ fn main() {
     let relay_task_handle = app_state.relay_task_handle.clone();
     let relay_for_exit = app_state.relay.clone();
 
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
-        .manage(app_state)
+        .manage(app_state);
+    #[cfg(feature = "devtools")]
+    let builder = builder.manage(devtools_state);
+    builder
         .setup(move |app| {
             #[cfg(target_os = "macos")]
             {
@@ -151,6 +165,16 @@ fn main() {
             commands::resume_unfinished_account,
             commands::exit_app,
             commands::spawn_dev_instance,
+            #[cfg(feature = "devtools")]
+            devtools::devtools_limits,
+            #[cfg(feature = "devtools")]
+            devtools::devtools_snapshot,
+            #[cfg(feature = "devtools")]
+            devtools::devtools_reset,
+            #[cfg(feature = "devtools")]
+            devtools::devtools_capture,
+            #[cfg(feature = "devtools")]
+            devtools::devtools_open_profiler,
         ])
         .build(tauri::generate_context!())
         .expect("error while building ghost")

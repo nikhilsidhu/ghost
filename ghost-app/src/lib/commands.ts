@@ -9,6 +9,7 @@ import {
   createServer, createDm, createChannel, renameChannel, deleteChannel,
   createInvite, joinByInvite, setDisplayName, moveServer, followServerMove,
   createPrivateChannel, getChannelAccess, setChannelAccess, getServerRoles, setServerRoles,
+  openProfiler,
 } from "./api";
 import { ALL_PERMISSIONS, PERMISSIONS } from "./types";
 import type { ServerPolicy } from "./types";
@@ -414,6 +415,15 @@ const cleanups: (() => void)[] = [];
 
 if (import.meta.hot) {
   import.meta.hot.dispose(() => { cleanups.forEach((fn) => fn()); cleanups.length = 0; });
+}
+
+// The profiler exists only in devtools builds; other builds drop these commands entirely.
+if (__GHOST_DEVTOOLS__) {
+  commands.push(
+    { id: "open-profiler", command: "profiler", args: [], execute: () => openProfiler() },
+    // Capture from where the slowness was felt; the recorder already holds the last minute.
+    { id: "capture-trace", command: "capture", args: [], execute: () => openProfiler(true) },
+  );
 }
 
 cleanups.push(...commands.map(registerCommand));

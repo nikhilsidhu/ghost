@@ -212,6 +212,7 @@ impl GhostGroup {
     /// context extensions of the same types, either or both, keeping every other
     /// extension. Returns the envelope-wrapped commit. It is staged, not merged: the caller
     /// posts it to the relay, then merges the pending commit or clears it.
+    #[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
     pub fn stage_change(
         &mut self,
         provider: &GhostProvider,
@@ -240,6 +241,7 @@ impl GhostGroup {
     }
 
     /// Encrypt a plaintext message so only group members can read it.
+    #[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
     pub fn encrypt(
         &mut self,
         provider: &GhostProvider,
@@ -251,6 +253,7 @@ impl GhostGroup {
     }
 
     /// Decrypt and validate an inbound MLS message (could be a commit or an app message).
+    #[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
     pub fn process_message(
         &mut self,
         provider: &GhostProvider,
@@ -308,6 +311,7 @@ impl GhostGroup {
     /// policy no longer admits it), so a compromised relay key cannot remove anyone
     /// else. A proposal removing this device is left for another member, since a member
     /// cannot commit its own removal. `None` when nothing is left to commit.
+    #[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
     pub fn commit_pending_proposals(
         &mut self,
         provider: &GhostProvider,
@@ -412,6 +416,7 @@ impl GhostGroup {
     }
 
     /// Apply a commit that we received and already validated via process_message.
+    #[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
     pub fn merge_staged_commit(
         &mut self,
         provider: &GhostProvider,
@@ -460,6 +465,7 @@ impl GhostGroup {
     }
 
     /// Export the group's current state so someone can join via external commit.
+    #[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
     pub fn export_group_info(&self, provider: &GhostProvider) -> Result<Vec<u8>> {
         let msg = self
             .mls_group

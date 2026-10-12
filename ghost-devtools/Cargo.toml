@@ -1,0 +1,14 @@
+[package]
+name = "ghost-devtools"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0"
+
+# Performance tooling for dev builds: timing statistics of tracing spans and a flight
+# recorder of the last minute of spans for the profiler's timeline. Everything stays in
+# the app. Release builds never depend on it.
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }

@@ -130,12 +130,14 @@ const MAX_PROVISION_FETCH_ATTEMPTS: usize = 5;
 const PROVISION_FETCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn get_identity(state: State<'_, AppState>) -> CommandResult<IdentityDto> {
     let client = state.client.lock().await;
     Ok(IdentityDto::from(client.identity()))
 }
 
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn list_servers(state: State<'_, AppState>) -> CommandResult<Vec<ServerDto>> {
     let client = state.client.lock().await;
     let store = client.store();
@@ -157,16 +159,19 @@ async fn create_server_impl(name: &str, kind: ServerKind, state: &AppState) -> C
 }
 
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn create_server(name: String, state: State<'_, AppState>) -> CommandResult<ServerDto> {
     create_server_impl(&name, ServerKind::Server, &state).await
 }
 
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn create_dm(name: String, state: State<'_, AppState>) -> CommandResult<ServerDto> {
     create_server_impl(&name, ServerKind::Dm, &state).await
 }
 
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn list_channels(
     server_id: String,
     state: State<'_, AppState>,
@@ -184,6 +189,7 @@ pub async fn list_channels(
 }
 
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn list_members(
     server_id: String,
     state: State<'_, AppState>,
@@ -209,6 +215,7 @@ pub async fn list_members(
 }
 
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn save_server_order(order: Vec<String>, state: State<'_, AppState>) -> CommandResult<()> {
     let value = serde_json::to_vec(&order).map_err(|e| CommandError::internal(e.to_string()))?;
     flows::sync::set_and_push(&state.client, &state.relay, ghost_core::wire::SYNC_KEY_SERVER_ORDER, &value).await;
@@ -216,6 +223,7 @@ pub async fn save_server_order(order: Vec<String>, state: State<'_, AppState>) -
 }
 
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn get_server_order(state: State<'_, AppState>) -> CommandResult<Vec<String>> {
     let client = state.client.lock().await;
     match client.sync_get(ghost_core::wire::SYNC_KEY_SERVER_ORDER) {
@@ -225,6 +233,7 @@ pub async fn get_server_order(state: State<'_, AppState>) -> CommandResult<Vec<S
 }
 
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn list_messages(
     channel_id: String,
     before: Option<u64>,
@@ -241,6 +250,7 @@ pub async fn list_messages(
 }
 
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn send_message(
     server_id: String,
     channel_id: String,
@@ -270,6 +280,7 @@ pub async fn retry_message(message_id: String, state: State<'_, AppState>) -> Co
 }
 
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn create_channel(
     server_id: String,
     name: String,
@@ -288,12 +299,14 @@ pub async fn create_channel(
 }
 
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn rename_channel(channel_id: String, name: String, state: State<'_, AppState>) -> CommandResult<()> {
     flows::channels::rename(&state.client, &state.relay, &parse_id(&channel_id)?, &name).await?;
     Ok(())
 }
 
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn delete_channel(channel_id: String, state: State<'_, AppState>) -> CommandResult<()> {
     flows::channels::delete(&state.client, &state.relay, &parse_id(&channel_id)?).await?;
     Ok(())
@@ -302,6 +315,7 @@ pub async fn delete_channel(channel_id: String, state: State<'_, AppState>) -> C
 /// Create a private channel admitting the given roles and accounts (and always the
 /// server's channel managers). Members it does not admit never learn it exists.
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn reorder_channels(server_id: String, channel_ids: Vec<String>, state: State<'_, AppState>) -> CommandResult<()> {
     let sid = parse_id(&server_id)?;
     let order = channel_ids.iter().map(|id| parse_id(id)).collect::<CommandResult<Vec<_>>>()?;
@@ -309,6 +323,7 @@ pub async fn reorder_channels(server_id: String, channel_ids: Vec<String>, state
 }
 
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn create_private_channel(
     server_id: String,
     name: String,
@@ -331,6 +346,7 @@ pub async fn create_private_channel(
 
 /// Who a private channel admits; `None` for a public channel.
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn get_channel_access(channel_id: String, state: State<'_, AppState>) -> CommandResult<Option<ChannelAccessDto>> {
     let cid = parse_id(&channel_id)?;
     let client = state.client.lock().await;
@@ -340,6 +356,7 @@ pub async fn get_channel_access(channel_id: String, state: State<'_, AppState>) 
 
 /// Change whom a private channel admits. Members it no longer admits are removed.
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn set_channel_access(channel_id: String, access: ChannelAccessDto, state: State<'_, AppState>) -> CommandResult<()> {
     let cid = parse_id(&channel_id)?;
     let current = {
@@ -353,6 +370,7 @@ pub async fn set_channel_access(channel_id: String, access: ChannelAccessDto, st
 
 /// A server's roles, assignments and what everyone may do, with role names.
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn get_server_roles(server_id: String, state: State<'_, AppState>) -> CommandResult<ServerRolesDto> {
     let sid = parse_id(&server_id)?;
     let client = state.client.lock().await;
@@ -381,6 +399,7 @@ pub async fn get_server_roles(server_id: String, state: State<'_, AppState>) -> 
 /// Replace a server's roles, assignments, everyone permissions or owner, then send the
 /// names of roles that are new or renamed. The relay and every member check the change.
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn set_server_roles(server_id: String, policy: PolicyDto, state: State<'_, AppState>) -> CommandResult<()> {
     let sid = parse_id(&server_id)?;
     let new_policy = ServerPolicy {
@@ -421,6 +440,7 @@ pub async fn set_server_roles(server_id: String, policy: PolicyDto, state: State
 
 /// Accounts the server keeps from rejoining, for those who may let them back in.
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn kept_out(server_id: String, state: State<'_, AppState>) -> CommandResult<Vec<KeptOutDto>> {
     let sid = parse_id(&server_id)?;
     let client = state.client.lock().await;
@@ -433,6 +453,7 @@ pub async fn kept_out(server_id: String, state: State<'_, AppState>) -> CommandR
 
 /// Let an account the server keeps out back in, so it may rejoin with an invite.
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn let_back_in(server_id: String, fingerprint: String, app: tauri::AppHandle, state: State<'_, AppState>) -> CommandResult<()> {
     let (sid, fp) = (parse_id(&server_id)?, parse_id(&fingerprint)?);
     let let_in = flows::members::let_back_in(&state.client, &state.relay, &sid, &fp).await;
@@ -442,6 +463,7 @@ pub async fn let_back_in(server_id: String, fingerprint: String, app: tauri::App
 
 /// Forget a server this account was removed from, with its history.
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn forget_server(server_id: String, state: State<'_, AppState>) -> CommandResult<()> {
     let sid = parse_id(&server_id)?;
     Ok(state.client.lock().await.forget_server(&sid)?)
@@ -450,6 +472,7 @@ pub async fn forget_server(server_id: String, state: State<'_, AppState>) -> Com
 /// Take the relay's version of a halted server after all: rejoin its groups at the
 /// relay's epoch and follow it again.
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn accept_relay_state(server_id: String, state: State<'_, AppState>) -> CommandResult<()> {
     let sid = parse_id(&server_id)?;
     Ok(flows::server::accept_relay_state(&state.client, &state.relay, &sid).await?)
@@ -457,6 +480,7 @@ pub async fn accept_relay_state(server_id: String, state: State<'_, AppState>) -
 
 /// Kick a member, who is kept from rejoining until someone who may kick lets them back.
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn kick_member(
     server_id: String,
     fingerprint: String,
@@ -471,6 +495,7 @@ pub async fn kick_member(
 }
 
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn mark_channel_read(
     channel_id: String,
     state: State<'_, AppState>,
@@ -495,6 +520,7 @@ pub(crate) async fn issue_invite(state: &AppState, sid: &[u8; 32]) -> CommandRes
 }
 
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn create_invite(
     server_id: String,
     state: State<'_, AppState>,
@@ -516,6 +542,7 @@ pub async fn create_invite(
 /// account's home). Returns a move link to share with members who cannot reach the
 /// old relay any more.
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn move_server(server_id: String, relay_url: String, state: State<'_, AppState>) -> CommandResult<String> {
     let sid = parse_id(&server_id)?;
     let location = flows::server::move_server(&state.client, &state.relay, &sid, &relay_url)
@@ -526,6 +553,7 @@ pub async fn move_server(server_id: String, relay_url: String, state: State<'_, 
 
 /// Follow a server move from a link the server's creator shared.
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn follow_server_move(link: String, state: State<'_, AppState>) -> CommandResult<bool> {
     let location = flows::server::parse_move_link(&link)?;
     flows::server::follow_move_link(&state.client, &state.relay, &location).await.map_err(|e| match CommandError::from(e) {
@@ -538,6 +566,7 @@ pub async fn follow_server_move(link: String, state: State<'_, AppState>) -> Com
 /// other; `relay_ref`, when the link carries one, pins the relay's key so a link
 /// pointing at the wrong relay fails instead of joining it.
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn join_by_invite(
     relay_url: String,
     token: String,
@@ -583,6 +612,7 @@ pub async fn join_by_invite(
 }
 
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn get_config(state: State<'_, AppState>) -> CommandResult<ConfigDto> {
     let relay_url = state.relay_url();
     let cfg = state.config.lock().await;
@@ -605,6 +635,7 @@ pub async fn get_config(state: State<'_, AppState>) -> CommandResult<ConfigDto> 
 
 /// Whether going idle mutes a call; this device's own setting.
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn set_auto_mute_on_idle(enabled: bool, state: State<'_, AppState>) -> CommandResult<()> {
     let mut cfg = state.config.lock().await;
     cfg.auto_mute_on_idle = Some(enabled);
@@ -613,6 +644,7 @@ pub async fn set_auto_mute_on_idle(enabled: bool, state: State<'_, AppState>) ->
 }
 
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn set_display_name(
     name: String,
     app: tauri::AppHandle,
@@ -632,6 +664,7 @@ pub async fn set_display_name(
 const MAX_AVATAR_BYTES: usize = 2 * 1024 * 1024;
 
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn upload_avatar(request: tauri::ipc::Request<'_>, state: State<'_, AppState>) -> CommandResult<ProfileReachDto> {
     let data = match request.body() {
         tauri::ipc::InvokeBody::Raw(bytes) => bytes.clone(),
@@ -647,6 +680,7 @@ pub async fn upload_avatar(request: tauri::ipc::Request<'_>, state: State<'_, Ap
 }
 
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn clear_avatar(
     state: State<'_, AppState>,
 ) -> CommandResult<ProfileReachDto> {
@@ -666,6 +700,7 @@ async fn announce_avatar(state: &AppState, avatar: Option<ghost_core::mls::prese
 }
 
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 /// A member's cached avatar as raw image bytes; empty when none is cached.
 pub async fn get_cached_avatar(fingerprint_hex: String, state: State<'_, AppState>) -> CommandResult<tauri::ipc::Response> {
     let fingerprint = parse_id(&fingerprint_hex)?;
@@ -674,6 +709,7 @@ pub async fn get_cached_avatar(fingerprint_hex: String, state: State<'_, AppStat
 }
 
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 /// Connect to the account's home relay at another address. The relay there must be the
 /// home the account's log names; moving the home is `move_home`. Without an account
 /// yet, it is simply the relay the setup screens use.
@@ -714,6 +750,7 @@ pub async fn set_relay_url(url: String, app: tauri::AppHandle, state: State<'_, 
 }
 
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn join_voice(
     server_id: String,
     channel_id: String,
@@ -733,11 +770,13 @@ pub async fn join_voice(
 }
 
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn leave_voice(state: State<'_, AppState>) -> CommandResult<()> {
     Ok(state.voice.leave().await?)
 }
 
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn set_muted(muted: bool, state: State<'_, AppState>) -> CommandResult<()> {
     // The user's mute now, which the return from idle leaves alone.
     state.idle_mute.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -745,12 +784,14 @@ pub async fn set_muted(muted: bool, state: State<'_, AppState>) -> CommandResult
 }
 
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn set_deafened(deafened: bool, state: State<'_, AppState>) -> CommandResult<()> {
     state.idle_mute.store(false, std::sync::atomic::Ordering::SeqCst);
     Ok(state.voice.set_deafened(deafened).await?)
 }
 
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn start_mic_test(app: tauri::AppHandle, state: State<'_, AppState>) -> CommandResult<()> {
     if state.voice.in_call() {
         return Err(CommandError::state("the microphone is in a call"));
@@ -759,18 +800,21 @@ pub async fn start_mic_test(app: tauri::AppHandle, state: State<'_, AppState>) -
 }
 
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn stop_mic_test() -> CommandResult<()> {
     crate::audio_test::stop_mic_test();
     Ok(())
 }
 
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn play_test_tone(state: State<'_, AppState>) -> CommandResult<()> {
     let cfg = state.config.lock().await;
     crate::audio_test::play_test_tone(cfg.output_device.clone()).map_err(CommandError::internal)
 }
 
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn list_audio_devices() -> CommandResult<AudioDevicesDto> {
     use cpal::traits::{DeviceTrait, HostTrait};
     let host = cpal::default_host();
@@ -809,6 +853,7 @@ pub struct AudioDevicesDto {
 }
 
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn set_input_device(
     name: Option<String>,
     state: State<'_, AppState>,
@@ -822,6 +867,7 @@ pub async fn set_input_device(
 }
 
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn set_output_device(
     name: Option<String>,
     state: State<'_, AppState>,
@@ -835,6 +881,7 @@ pub async fn set_output_device(
 }
 
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn set_noise_suppression(mode: NoiseSuppressionDto, state: State<'_, AppState>) -> CommandResult<()> {
     use ghost_core::wire::SYNC_KEY_NOISE_SUPPRESSION;
 
@@ -848,6 +895,7 @@ pub async fn set_noise_suppression(mode: NoiseSuppressionDto, state: State<'_, A
 }
 
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn set_agc(mode: AgcDto, state: State<'_, AppState>) -> CommandResult<()> {
     use ghost_core::wire::SYNC_KEY_AGC;
 
@@ -861,6 +909,7 @@ pub async fn set_agc(mode: AgcDto, state: State<'_, AppState>) -> CommandResult<
 }
 
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn set_input_mode(mode: InputModeDto, state: State<'_, AppState>) -> CommandResult<()> {
     use ghost_core::wire::SYNC_KEY_INPUT_MODE;
 
@@ -874,6 +923,7 @@ pub async fn set_input_mode(mode: InputModeDto, state: State<'_, AppState>) -> C
 }
 
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn set_ptt_active(
     active: bool,
     state: State<'_, AppState>,
@@ -883,6 +933,7 @@ pub async fn set_ptt_active(
 }
 
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn set_vad_threshold(
     value: f32,
     state: State<'_, AppState>,
@@ -900,6 +951,7 @@ pub async fn set_vad_threshold(
 }
 
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn set_input_gain(
     value: f32,
     state: State<'_, AppState>,
@@ -917,6 +969,7 @@ pub async fn set_input_gain(
 }
 
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn get_keybinds(state: State<'_, AppState>) -> CommandResult<KeybindConfigDto> {
     let cfg = state.config.lock().await;
     let kb = cfg.keybinds.clone().unwrap_or_default();
@@ -926,6 +979,7 @@ pub async fn get_keybinds(state: State<'_, AppState>) -> CommandResult<KeybindCo
 }
 
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn set_keybind(
     action: String,
     shortcut: Option<String>,
@@ -941,6 +995,7 @@ pub async fn set_keybind(
 }
 
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn set_status(status: OnlineStatusDto, state: State<'_, AppState>) -> CommandResult<()> {
     use ghost_core::wire::SYNC_KEY_STATUS;
 
@@ -962,6 +1017,7 @@ pub async fn set_status(status: OnlineStatusDto, state: State<'_, AppState>) -> 
 }
 
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn set_status_message(
     message: Option<String>,
     expiry: Option<u64>,
@@ -995,6 +1051,7 @@ pub async fn set_status_message(
 // ── Device management ───────────────────────────────────────────────
 
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn get_devices(state: State<'_, AppState>) -> CommandResult<DeviceListDto> {
     let list = flows::devices::list(&state.client, &state.relay).await?;
     let (own_device_vk, pending) = {
@@ -1023,6 +1080,7 @@ pub async fn get_devices(state: State<'_, AppState>) -> CommandResult<DeviceList
 
 /// Remove a device of this account.
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn revoke_device(device_key_hex: String, state: State<'_, AppState>) -> CommandResult<RevokeOutcomeDto> {
     use flows::devices::RevokeOutcome;
     let target_key = parse_id(&device_key_hex)?;
@@ -1039,6 +1097,7 @@ pub async fn revoke_device(device_key_hex: String, state: State<'_, AppState>) -
 }
 
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn rename_device(device_key_hex: String, label: String, state: State<'_, AppState>) -> CommandResult<()> {
     let target_key = parse_id(&device_key_hex)?;
     let label = label.trim();
@@ -1051,6 +1110,7 @@ pub async fn rename_device(device_key_hex: String, label: String, state: State<'
 // ── Account ─────────────────────────────────────────────────────────
 
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn get_account_status(state: State<'_, AppState>) -> CommandResult<AccountStatusDto> {
     let phase = match *state.phase.lock().await {
         AccountPhase::None => AccountPhaseDto::None,
@@ -1096,6 +1156,7 @@ fn fresh_db_keys() -> ([u8; 32], [u8; 32]) {
 /// Make an account at `relay_url` for `display_name` and show its recovery key. Nothing
 /// is sent until `confirm_new_account` sees the key typed back.
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn begin_create_account(
     display_name: String,
     relay_url: String,
@@ -1125,6 +1186,7 @@ pub async fn begin_create_account(
 /// the relay has the account, a failure keeps the pending account, so the key the user
 /// wrote down is still the one to type.
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn confirm_new_account(typed: String, app: tauri::AppHandle, state: State<'_, AppState>) -> CommandResult<()> {
     let pending = state.pending_creation.lock().await.take().ok_or_else(|| CommandError::state("no account is being made"))?;
     if let Err(e) = typed_matches(&pending.recovery_key, &typed) {
@@ -1199,6 +1261,7 @@ async fn relay_holds(unfinished: &crate::setup::UnfinishedAccount) -> Option<boo
 /// its record (the app closed in between): the relay holding it makes the filed record
 /// this device's, and the account runs. One the relay does not know is forgotten.
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn resume_unfinished_account(app: tauri::AppHandle, state: State<'_, AppState>) -> CommandResult<UnfinishedOutcomeDto> {
     if *state.phase.lock().await != AccountPhase::None {
         return Ok(UnfinishedOutcomeDto::none());
@@ -1239,6 +1302,7 @@ async fn publish_account(pending: &PendingCreation) -> CommandResult<RelayInfo> 
 }
 
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn cancel_create_account(state: State<'_, AppState>) -> CommandResult<()> {
     *state.pending_creation.lock().await = None;
     // A batch sent may have landed though its answer never came: that account stays
@@ -1255,6 +1319,7 @@ pub async fn cancel_create_account(state: State<'_, AppState>) -> CommandResult<
 
 /// Start pairing: post a sealed offer and return the code the new device scans.
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn start_pairing(state: State<'_, AppState>) -> CommandResult<String> {
     let relay_url = state.relay_url();
     let display_name = state.config.lock().await.display_name.clone().unwrap_or_default();
@@ -1277,6 +1342,7 @@ pub async fn start_pairing(state: State<'_, AppState>) -> CommandResult<String> 
 /// Where the pairing stands. Polled: while waiting for the new device to answer; then,
 /// after `confirm_pairing`, while waiting for it to sign the addition.
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn check_pairing(state: State<'_, AppState>) -> CommandResult<PairingStatusDto> {
     let mut guard = state.pending_pairing.lock().await;
     let pending = guard.as_mut().ok_or_else(|| CommandError::state("no active pairing session"))?;
@@ -1323,6 +1389,7 @@ async fn check_pending_pairing(state: &AppState, pending: &mut PendingPairing) -
 
 /// The user compared the codes and they match: draft the addition for the new device to sign.
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn confirm_pairing(state: State<'_, AppState>) -> CommandResult<()> {
     let mut guard = state.pending_pairing.lock().await;
     let pending = guard.as_mut().ok_or_else(|| CommandError::state("no active pairing session"))?;
@@ -1335,6 +1402,7 @@ pub async fn confirm_pairing(state: State<'_, AppState>) -> CommandResult<()> {
 /// Cancel an active pairing session, also when the codes did not match. The relay ends
 /// it too, so the new device stops waiting and the code answers nobody.
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn cancel_pairing(state: State<'_, AppState>) -> CommandResult<()> {
     let Some(pending) = state.pending_pairing.lock().await.take() else { return Ok(()) };
     if let Err(e) = state.relay.close_pairing(&pending.code.account_fp, &pending.code.token).await {
@@ -1351,6 +1419,7 @@ pub async fn cancel_pairing(state: State<'_, AppState>) -> CommandResult<()> {
 /// drafts, wait for the log to list this device, fetch the provision, then replace the
 /// local identity in place.
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn join_as_new_device(
     pairing_code: String,
     device_label: String,
@@ -1458,6 +1527,7 @@ pub async fn join_as_new_device(
 /// Find the account behind a recovery key through `relay_url` and show the new key every
 /// recovery sets. Nothing changes until `confirm_recovery` sees it typed back.
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn begin_recovery(
     recovery_key: String,
     relay_url: String,
@@ -1493,6 +1563,7 @@ pub async fn begin_recovery(
 /// does not answer, nothing is done and the outcome says so; `recover_through_relay`
 /// then recovers through the relay given, making it the home.
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn confirm_recovery(typed: String, app: tauri::AppHandle, state: State<'_, AppState>) -> CommandResult<RecoveryOutcomeDto> {
     let pending = state.pending_recovery.lock().await.take().ok_or_else(|| CommandError::state("no recovery is in progress"))?;
     if let Err(e) = typed_matches(&pending.new_key, &typed) {
@@ -1526,6 +1597,7 @@ pub async fn confirm_recovery(typed: String, app: tauri::AppHandle, state: State
 /// The home did not answer and the user chose to go on: recover through the relay given
 /// and make it the account's home.
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn recover_through_relay(app: tauri::AppHandle, state: State<'_, AppState>) -> CommandResult<RecoveryOutcomeDto> {
     let pending = state.pending_recovery.lock().await.take().ok_or_else(|| CommandError::state("no recovery is in progress"))?;
     let (source, _events) = RelayClient::new(&pending.relay_url);
@@ -1544,6 +1616,7 @@ pub async fn recover_through_relay(app: tauri::AppHandle, state: State<'_, AppSt
 }
 
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn cancel_recovery(state: State<'_, AppState>) -> CommandResult<()> {
     *state.pending_recovery.lock().await = None;
     Ok(())
@@ -1600,6 +1673,7 @@ async fn finish_recovery(app: tauri::AppHandle, state: &AppState, material: Reco
 
 /// Whether `recovery_key` is this account's current one. Nothing is sent.
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn check_recovery_key(recovery_key: String, state: State<'_, AppState>) -> CommandResult<KeyCheckDto> {
     let key = RecoveryKey::parse(&recovery_key)?;
     let check = flows::account::check_recovery_key(&state.client, &state.relay, &key).await?;
@@ -1609,6 +1683,7 @@ pub async fn check_recovery_key(recovery_key: String, state: State<'_, AppState>
 /// Replacing the key needs the current one. Shows the new key; `confirm_new_recovery_key`
 /// makes the change once it is typed back.
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn begin_replace_recovery_key(current: String, state: State<'_, AppState>) -> CommandResult<String> {
     let current = RecoveryKey::parse(&current)?;
     if !flows::account::check_recovery_key(&state.client, &state.relay, &current).await?.matches {
@@ -1622,6 +1697,7 @@ pub async fn begin_replace_recovery_key(current: String, state: State<'_, AppSta
 
 /// The user typed the new key back: replace the current key.
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn confirm_new_recovery_key(typed: String, state: State<'_, AppState>) -> CommandResult<()> {
     let pending = state.pending_new_key.lock().await.take().ok_or_else(|| CommandError::state("no new recovery key is being set"))?;
     if let Err(e) = typed_matches(&pending.new_key, &typed) {
@@ -1637,6 +1713,7 @@ pub async fn confirm_new_recovery_key(typed: String, state: State<'_, AppState>)
 }
 
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn cancel_new_recovery_key(state: State<'_, AppState>) -> CommandResult<()> {
     *state.pending_new_key.lock().await = None;
     Ok(())
@@ -1647,6 +1724,7 @@ pub async fn cancel_new_recovery_key(state: State<'_, AppState>) -> CommandResul
 /// Move the account's home to `relay_url`, which the recovery key authorises, and
 /// connect there. Servers made on the old home stay where they are.
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn move_home(recovery_key: String, relay_url: String, app: tauri::AppHandle, state: State<'_, AppState>) -> CommandResult<()> {
     let key = RecoveryKey::parse(&recovery_key)?;
     let relay_url = relay_url_input(&relay_url)?;
@@ -1665,6 +1743,7 @@ pub async fn move_home(recovery_key: String, relay_url: String, app: tauri::AppH
 /// Forget this device's account, after another device removed it: its record and
 /// databases go, and the app restarts into setup.
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn reset_device(app: tauri::AppHandle, state: State<'_, AppState>) -> CommandResult<()> {
     // The app restarts into setup; the session is cut off with the process.
     if let Some(handle) = state.relay_task_handle.lock().await.take() {
@@ -1685,11 +1764,13 @@ pub async fn reset_device(app: tauri::AppHandle, state: State<'_, AppState>) -> 
 }
 
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub fn exit_app(app: tauri::AppHandle) {
     app.exit(0);
 }
 
 #[tauri::command]
+#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub fn spawn_dev_instance() -> Result<u32, String> {
     // Grab an OS-assigned free port
     let listener = std::net::TcpListener::bind("127.0.0.1:0")

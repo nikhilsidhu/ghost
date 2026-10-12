@@ -110,4 +110,18 @@ fn export_typescript_bindings() {
     OnlinePresenceMemberDto::export_all(&cfg).unwrap();
     LiveStateDto::export_all(&cfg).unwrap();
     ConnectivityDto::export_all(&cfg).unwrap();
+    // The profiler's types; CI generates bindings with the feature on.
+    #[cfg(feature = "devtools")]
+    {
+        use crate::devtools::*;
+        SpanTimingDto::export_all(&cfg).unwrap();
+        BlockingSpanDto::export_all(&cfg).unwrap();
+        LoadFigureDto::export_all(&cfg).unwrap();
+        PeerFigureDto::export_all(&cfg).unwrap();
+        CallFigureDto::export_all(&cfg).unwrap();
+        DevtoolsLimitsDto::export_all(&cfg).unwrap();
+        DevtoolsSnapshotDto::export_all(&cfg).unwrap();
+        TraceSpanDto::export_all(&cfg).unwrap();
+        TraceCaptureDto::export_all(&cfg).unwrap();
+    }
 }

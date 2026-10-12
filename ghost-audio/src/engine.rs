@@ -54,6 +54,9 @@ struct Transmitter {
     denoise_in: [f32; DENOISE_FRAME_SIZE],
     denoise_out: [f32; DENOISE_FRAME_SIZE],
     frames_sent: u32,
+    /// Frames sent over the call, and their encoded size.
+    #[cfg(feature = "devtools")]
+    sent: (u64, u64),
 }
 
 impl Transmitter {
@@ -74,12 +77,19 @@ impl Transmitter {
             denoise_in: [0.0; DENOISE_FRAME_SIZE],
             denoise_out: [0.0; DENOISE_FRAME_SIZE],
             frames_sent: 0,
+            #[cfg(feature = "devtools")]
+            sent: (0, 0),
         })
     }
 
     fn send(&mut self, sequence: u32, frame: &[u8]) {
         let _ = self.sender.send(sequence, frame);
         self.frames_sent += 1;
+        #[cfg(feature = "devtools")]
+        {
+            self.sent.0 += 1;
+            self.sent.1 += frame.len() as u64;
+        }
     }
 
     fn next_sequence(&mut self) -> u32 {
@@ -240,6 +250,25 @@ fn read_quality(playback: &Playback, controls: &AudioControls) -> String {
     format!("{} {window:?}", summary.join(","))
 }
 
+/// Hand each sender's playout to the call figures.
+#[cfg(feature = "devtools")]
+fn publish_peers(playback: &Playback, controls: &AudioControls) {
+    let peers = playback
+        .mixer()
+        .receivers
+        .iter()
+        .map(|(&slot_id, receiver)| crate::PeerFigures {
+            slot_id,
+            depth: receiver.buffered(),
+            target: receiver.target(),
+            playout: receiver.stats,
+            received_frames: receiver.received.0,
+            received_bytes: receiver.received.1,
+        })
+        .collect();
+    controls.figures.set_peers(peers);
+}
+
 /// Run a call's audio until `stop` is set, the session ends, or the devices fail.
 pub(crate) fn run(
     controls: Arc<AudioControls>,
@@ -264,7 +293,14 @@ pub(crate) fn run(
             match streams.read_frame(&mut frame, timeout) {
                 CaptureRead::Frame => {
                     got_capture = true;
+                    #[cfg(feature = "devtools")]
+                    let started = std::time::Instant::now();
                     transmitter.process(&mut frame, &controls);
+                    #[cfg(feature = "devtools")]
+                    {
+                        controls.figures.capture.record(started.elapsed(), FRAME_DURATION);
+                        controls.figures.set_sent(transmitter.sent.0, transmitter.sent.1);
+                    }
                     timeout = Duration::ZERO;
                 }
                 CaptureRead::Waiting => break,
@@ -285,6 +321,10 @@ pub(crate) fn run(
         }
 
         ticks += 1;
+        #[cfg(feature = "devtools")]
+        if ticks % FIGURES_TICKS == 0 {
+            publish_peers(&playback, &controls);
+        }
         if ticks >= DIAG_TICKS {
             let playout = read_quality(&playback, &controls);
             tracing::debug!(

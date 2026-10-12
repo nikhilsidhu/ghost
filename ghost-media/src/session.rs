@@ -234,6 +234,7 @@ impl Drop for MediaSession {
 impl MediaSession {
     /// Open the socket and start binding, sending and receiving. Frames arrive on the
     /// returned receiver once their sender's key is set.
+    #[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
     pub async fn start(config: SessionConfig) -> Result<(Self, mpsc::Receiver<Inbound>), MediaError> {
         let unspecified: SocketAddr = if config.endpoint.is_ipv6() {
             (Ipv6Addr::UNSPECIFIED, 0).into()

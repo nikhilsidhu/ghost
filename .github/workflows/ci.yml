@@ -75,8 +75,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev \
             libasound2-dev libdbus-1-dev libssl-dev libopus-dev libxdo-dev libxss-dev pkg-config
+      # With devtools on, so the profiler's types are covered too.
       - name: Regenerate
-        run: cargo test -p ghost-app bindings
+        run: cargo test -p ghost-app --features devtools bindings
       - name: Compare with the committed files
         run: git diff --exit-code -- ghost-app/src/lib/generated
 

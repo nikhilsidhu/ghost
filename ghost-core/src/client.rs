@@ -658,6 +658,7 @@ impl GhostClient {
     /// again on `UnknownDevice`; a generation not held yet fails with
     /// `AccountKeyUnavailable`, and the message opens once its key set is fetched. The
     /// message counts as seen only once it opened, so a retry after either is not dropped.
+    #[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
     pub fn receive_sync(&mut self, blob: &[u8]) -> Result<SyncReceiveResult> {
         let (envelope_type, _epoch) = ghost_wire::decode_envelope(blob)
             .map_err(|e| GhostError::Format(format!("envelope: {e}")))?;
@@ -890,6 +891,7 @@ impl GhostClient {
         )
     }
 
+    #[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
     pub fn create_server(&mut self, name: &str, kind: ServerKind, timestamp: u64) -> Result<[u8; 32]> {
         let mut server_id = [0u8; 32];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut server_id);
@@ -969,6 +971,7 @@ impl GhostClient {
         mailboxes
     }
 
+    #[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
     pub fn send_message(
         &mut self,
         server_id: &[u8; 32],
@@ -1121,6 +1124,7 @@ impl GhostClient {
 
     /// Decrypt a blob and store the message. Uses relay-stamped arrival time if
     /// provided, otherwise falls back to local clock.
+    #[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
     pub fn receive_blob(
         &mut self,
         channel_id: &[u8; 32],
@@ -1232,6 +1236,7 @@ impl GhostClient {
     /// `server_group_info`: the server group's state as its relay holds it now. Returns
     /// the server id, one (channel, commit, mailbox) per group joined, and the grant.
     #[allow(clippy::type_complexity)]
+    #[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
     pub fn join_by_invite(
         &mut self,
         mut payload: InvitePayload,
@@ -1492,6 +1497,7 @@ impl GhostClient {
     /// Returns (channel_id, mailbox_id, commit). The channel is unnamed until a member
     /// answers the info request this device sends once the relay accepts the commit;
     /// if the relay refuses it, call `drop_private_channel`.
+    #[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
     pub fn join_private_channel(&mut self, server_id: &[u8; 32], group_info: &[u8]) -> Result<([u8; 32], [u8; 32], Vec<u8>)> {
         let server_epoch = self.default_group(server_id)?.epoch();
         let aad = CommitAad { invite: None, server_epoch: Some(server_epoch) };
@@ -2182,6 +2188,7 @@ impl GhostClient {
 
     /// Process an inbound blob — could be an app message, a commit, or a self-message.
     /// Takes channel_id to identify which MLS group to decrypt with.
+    #[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
     pub fn receive_any(
         &mut self,
         channel_id: &[u8; 32],
@@ -2393,6 +2400,7 @@ impl GhostClient {
 
     /// Commit the pending proposals of a channel's group that this device may commit
     /// (relay removals of revoked or excluded devices). `None` when there are none.
+    #[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
     pub fn commit_pending_proposals(
         &mut self,
         channel_id: &[u8; 32],

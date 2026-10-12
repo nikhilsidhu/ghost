@@ -11,6 +11,7 @@ serde_json = "1"
 ghost-core = { path = "../../ghost-core" }
 ghost-wire = { path = "../../ghost-wire" }
 ghost-audio = { path = "../../ghost-audio" }
+ghost-devtools = { path = "../../ghost-devtools", optional = true }
 ghost-log = { path = "../../ghost-log" }
 tracing = "0.1"
 ed25519-dalek = "2"
@@ -18,7 +19,7 @@ dirs = "6"
 gethostname = "1"
 hex = "0.4"
 rand = "0.8"
-tokio = { version = "1", features = ["sync"] }
+tokio = { version = "1", features = ["sync", "rt"] }
 url = "2"
 toml = "0.8"
 # Not used directly: enables TLS for ghost-core's WebSocket connections (wss relays).
@@ -35,6 +36,11 @@ zeroize = "1.8.2"
 objc2-app-kit = { version = "0.3", features = ["NSColor", "NSWindow"] }
 objc2-core-foundation = "0.3"
 coreaudio-sys = { version = "0.2", default-features = false, features = ["core_audio"] }
+
+[features]
+# The profiler window and the timings behind it, for debug builds only (main.rs refuses
+# a release build with it). Run with `npm run dev:devtools`.
+devtools = ["dep:ghost-devtools", "ghost-core/devtools", "ghost-audio/devtools"]
 
 [dev-dependencies]
 # Generates the front end's TypeScript types from the Rust ones (see src/bindings.rs).

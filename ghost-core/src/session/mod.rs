@@ -964,6 +964,7 @@ impl Runner {
         stored(self.client.lock().await.store().set_last_seen_seq(mailbox_id, seq), "last seen seq not kept");
     }
 
+    #[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
     async fn handle_event(&self, event: RelayEvent, sync_mailbox: [u8; 32], state: &mut LoopState) {
         match event {
             RelayEvent::Blob(blob) if blob.mailbox_id == sync_mailbox => self.handle_sync_blob(blob, state).await,

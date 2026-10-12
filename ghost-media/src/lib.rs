@@ -4,6 +4,8 @@
 
 pub mod constants;
 pub mod crypto;
+#[cfg(feature = "devtools")]
+pub mod load;
 #[cfg(feature = "test-util")]
 pub mod netem;
 pub mod session;

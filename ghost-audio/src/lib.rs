@@ -8,6 +8,8 @@ mod dsp;
 mod engine;
 #[cfg(feature = "test-util")]
 pub mod fake;
+#[cfg(feature = "devtools")]
+mod figures;
 mod policy;
 mod receiver;
 mod stretch;
@@ -20,6 +22,10 @@ use ghost_media::TrackQuality;
 
 use constants::VAD_THRESHOLD;
 pub use devices::{AudioDevices, CaptureRead, DeviceStreams, Playback};
+#[cfg(feature = "devtools")]
+pub use figures::{CallFigures, PeerFigures};
+#[cfg(feature = "devtools")]
+pub use ghost_media::load::Load;
 pub use receiver::PlayoutStats;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,6 +94,8 @@ pub(crate) struct AudioControls {
     pub input_level: AtomicU32,
     /// What playout has done this call, gathered every few seconds.
     pub playout_totals: Mutex<PlayoutStats>,
+    #[cfg(feature = "devtools")]
+    pub figures: figures::Figures,
 }
 
 impl AudioControls {
@@ -107,6 +115,8 @@ impl AudioControls {
             ptt_active: AtomicBool::new(false),
             input_level: AtomicU32::new(0.0f32.to_bits()),
             playout_totals: Mutex::new(PlayoutStats::default()),
+            #[cfg(feature = "devtools")]
+            figures: figures::Figures::default(),
         }
     }
 }
@@ -140,6 +150,8 @@ impl VoiceAudio {
     pub fn start_run(&self, io: TrackIo) -> Result<TrackRun, String> {
         self.stop();
         *self.controls.playout_totals.lock().unwrap() = PlayoutStats::default();
+        #[cfg(feature = "devtools")]
+        self.controls.figures.reset();
         let stop = Arc::new(AtomicBool::new(false));
         let run = TrackRun(self.runs.fetch_add(1, Ordering::Relaxed) + 1);
         let (controls, devices, thread_stop, events) = (self.controls.clone(), self.devices.clone(), stop.clone(), io.events.clone());
@@ -211,6 +223,12 @@ impl VoiceAudio {
     /// What playout has done in the current call, as of the last quality reading.
     pub fn playout_stats(&self) -> PlayoutStats {
         *self.controls.playout_totals.lock().unwrap()
+    }
+
+    /// The current call's figures, its audio threads' loads since the last read.
+    #[cfg(feature = "devtools")]
+    pub fn call_figures(&self) -> CallFigures {
+        self.controls.figures.read()
     }
 }
 

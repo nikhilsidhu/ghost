@@ -82,6 +82,9 @@ pub(crate) struct Receiver {
     pub(crate) stats: PlayoutStats,
     /// `stats` as of the last quality reading.
     pub(crate) reported: PlayoutStats,
+    /// Frames that arrived, late ones included, and their encoded size.
+    #[cfg(feature = "devtools")]
+    pub(crate) received: (u64, u64),
     decoded: Vec<f32>,
     stretched: Vec<f32>,
 }
@@ -105,12 +108,19 @@ impl Receiver {
             cooldown: 0,
             stats: PlayoutStats::default(),
             reported: PlayoutStats::default(),
+            #[cfg(feature = "devtools")]
+            received: (0, 0),
             decoded: vec![0.0; FRAME_SAMPLES],
             stretched: Vec::with_capacity(FRAME_SAMPLES * 2),
         })
     }
 
     pub fn insert(&mut self, sequence: u32, frame: Vec<u8>, arrived: Instant) {
+        #[cfg(feature = "devtools")]
+        {
+            self.received.0 += 1;
+            self.received.1 += frame.len() as u64;
+        }
         self.policy.arrived(sequence, arrived);
         if self.next.is_some_and(|next| before(sequence, next)) {
             self.stats.dropped_late += 1;

@@ -18,3 +18,5 @@ tracing = "0.1"
 [features]
 # Synthetic devices: a tone generator for capture and a recorder for playback.
 test-util = []
+# Per-stream call figures for the dev builds' profiler.
+devtools = ["ghost-media/devtools"]

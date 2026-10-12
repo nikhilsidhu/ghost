@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::filter::{EnvFilter, LevelFilter};
-use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::layer::{Identity, SubscriberExt};
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{Layer, Registry};
 
@@ -32,9 +32,20 @@ pub struct LogGuard {
     _file_writer: Option<WorkerGuard>,
 }
 
+/// A layer put on the process's subscriber beside the stderr and file output. It is not
+/// subject to `GHOST_LOG`: the profiler's layer sees every span whatever is logged.
+pub trait ExtraLayer: Layer<Registry> + Send + Sync + 'static {}
+
+impl<L: Layer<Registry> + Send + Sync + 'static> ExtraLayer for L {}
+
 /// Install logging to stderr and, given a file, to daily log files. Call once, first
 /// thing in `main`.
 pub fn init(file: Option<LogFile>) -> LogGuard {
+    init_with(file, Identity::new())
+}
+
+/// `init` with a further layer that sees every span and event.
+pub fn init_with(file: Option<LogFile>, extra: impl ExtraLayer) -> LogGuard {
     let stderr = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stderr)
         .with_ansi(std::io::stderr().is_terminal())
@@ -47,7 +58,7 @@ pub fn init(file: Option<LogFile>) -> LogGuard {
         Some(Err(e)) => (None, None, Some(e)),
         None => (None, None, None),
     };
-    Registry::default().with(stderr).with(file_layer).init();
+    Registry::default().with(extra).with(stderr).with(file_layer).init();
     if let Some(e) = file_error {
         tracing::error!("log file not opened; logging to stderr alone: {e}");
     }

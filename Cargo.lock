@@ -2245,6 +2245,7 @@ dependencies = [
  "gethostname",
  "ghost-audio",
  "ghost-core",
+ "ghost-devtools",
  "ghost-log",
  "ghost-wire",
  "hex",
@@ -2313,6 +2314,15 @@ dependencies = [
  "tokio-tungstenite 0.26.2",
  "tracing",
  "zeroize",
+]
+
+[[package]]
+name = "ghost-devtools"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

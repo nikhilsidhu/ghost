@@ -1,0 +1,6 @@
+{
+  "build": {
+    "beforeDevCommand": "vite --mode devtools",
+    "beforeBuildCommand": "vite build --mode devtools"
+  }
+}

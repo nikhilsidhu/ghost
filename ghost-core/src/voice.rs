@@ -116,6 +116,23 @@ enum Command {
     UnmuteForPushToTalk,
 }
 
+/// Who is behind each media slot of the current call, for the dev builds' profiler.
+#[cfg(feature = "devtools")]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CallSlots {
+    pub server_id: [u8; 32],
+    pub channel_id: [u8; 32],
+    /// This device's media slot, once the relay welcomed it.
+    pub own_slot: Option<u32>,
+    /// Each other caller's media slot, and their fingerprint.
+    pub peers: HashMap<u32, [u8; 32]>,
+    /// The voice server's round trip over the signalling connection.
+    pub ping_ms: Option<u32>,
+}
+
+#[cfg(feature = "devtools")]
+type SharedSlots = Arc<std::sync::Mutex<Option<CallSlots>>>;
+
 /// Controls the voice loop. Cheap to clone.
 #[derive(Clone)]
 pub struct Voice {
@@ -124,6 +141,8 @@ pub struct Voice {
     in_call: Arc<AtomicBool>,
     /// Whether this device is muted, as the loop last reported.
     muted: Arc<AtomicBool>,
+    #[cfg(feature = "devtools")]
+    slots: SharedSlots,
 }
 
 impl Voice {
@@ -132,10 +151,14 @@ impl Voice {
         let (commands, receiver) = mpsc::channel(COMMAND_QUEUE);
         let in_call = Arc::new(AtomicBool::new(false));
         let muted = Arc::new(AtomicBool::new(false));
+        #[cfg(feature = "devtools")]
+        let slots = SharedSlots::default();
         let voice = Self {
             commands,
             in_call: in_call.clone(),
             muted: muted.clone(),
+            #[cfg(feature = "devtools")]
+            slots: slots.clone(),
         };
         let voice_loop = VoiceLoop {
             client,
@@ -144,6 +167,8 @@ impl Voice {
             commands: receiver,
             in_call,
             muted,
+            #[cfg(feature = "devtools")]
+            slots,
         };
         (voice, voice_loop)
     }
@@ -156,6 +181,12 @@ impl Voice {
     /// Whether this device is muted (deafened included); it outlives calls.
     pub fn muted(&self) -> bool {
         self.muted.load(Ordering::Relaxed)
+    }
+
+    /// The current call's slots, if in one.
+    #[cfg(feature = "devtools")]
+    pub fn call_slots(&self) -> Option<CallSlots> {
+        self.slots.lock().unwrap().clone()
     }
 
     async fn send(&self, command: Command) -> Result<()> {
@@ -255,6 +286,8 @@ pub struct VoiceLoop {
     commands: mpsc::Receiver<Command>,
     in_call: Arc<AtomicBool>,
     muted: Arc<AtomicBool>,
+    #[cfg(feature = "devtools")]
+    slots: SharedSlots,
 }
 
 impl VoiceLoop {
@@ -269,6 +302,8 @@ impl VoiceLoop {
             deafened: false,
             in_call: self.in_call,
             muted_now: self.muted,
+            #[cfg(feature = "devtools")]
+            slots: self.slots,
         };
         runner.run(self.commands).await;
     }
@@ -285,6 +320,8 @@ struct Runner {
     in_call: Arc<AtomicBool>,
     /// `muted`, for the `Voice` handles to read.
     muted_now: Arc<AtomicBool>,
+    #[cfg(feature = "devtools")]
+    slots: SharedSlots,
 }
 
 impl Runner {
@@ -323,6 +360,19 @@ impl Runner {
         let mut everyone: Vec<[u8; 32]> = call.peers.values().map(|p| p.fingerprint).collect();
         everyone.push(call.own_fp);
         self.emit(VoiceEvent::Participants(everyone));
+        #[cfg(feature = "devtools")]
+        self.publish_slots(Some(call));
+    }
+
+    #[cfg(feature = "devtools")]
+    fn publish_slots(&self, call: Option<&Call>) {
+        *self.slots.lock().unwrap() = call.map(|call| CallSlots {
+            server_id: call.server_id,
+            channel_id: call.channel_id,
+            own_slot: call.slot_id,
+            peers: call.peers.iter().map(|(slot, presence)| (*slot, presence.fingerprint)).collect(),
+            ping_ms: call.last_ping_ms,
+        });
     }
 
     fn emit_mute_state(&self, peer: &PresenceState) {
@@ -360,6 +410,7 @@ impl Runner {
         self.leave(&mut call, &mut link).await;
     }
 
+    #[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
     async fn handle_command(&mut self, command: Command, call: &mut Option<Call>, link: &mut Link) {
         match command {
             Command::Join { server_id, channel_id, muted, deafened } => {
@@ -623,6 +674,8 @@ impl Runner {
         drop(current);
         self.audio.stop();
         self.emit_state(call);
+        #[cfg(feature = "devtools")]
+        self.publish_slots(None);
     }
 
     /// Our mute or deafen changed: report it, and reseal our presence for the room and
@@ -753,6 +806,7 @@ impl Runner {
         self.emit_participants(current);
     }
 
+    #[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
     async fn handle_message(&mut self, message: Message, call: &mut Option<Call>, link: &mut Link) {
         let Some(current) = call.as_mut() else { return };
         let text = match message {
@@ -760,6 +814,8 @@ impl Runner {
                 if let Some(sent) = current.ping_sent_at.take() {
                     current.last_ping_ms = Some(sent.elapsed().as_millis() as u32);
                 }
+                #[cfg(feature = "devtools")]
+                self.publish_slots(Some(current));
                 return;
             }
             Message::Text(text) => text,
@@ -920,6 +976,7 @@ impl Runner {
         }
     }
 
+    #[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
     #[allow(clippy::too_many_arguments)]
     async fn start_media(
         &self,

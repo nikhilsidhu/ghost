@@ -483,6 +483,7 @@ impl RelayClient {
     }
 
     /// Fetch the relay's identity, reachability hints and KT head.
+    #[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
     pub async fn get_relay_info(&self) -> Result<RelayInfo> {
         let req = self.start(&self.base_url(), reqwest::Method::GET, "/relay", None, Body::None, Signing::Anonymous);
         let body: RelayInfoJson = body_json(Self::finish(req, "get relay info", &[]).await?).await?;
@@ -656,6 +657,7 @@ impl RelayClient {
     }
 
     /// Result of posting a blob via HTTP.
+    #[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
     pub async fn post_blob(&self, mailbox_id: &[u8; 32], blob: Vec<u8>) -> Result<PostBlobResult> {
         self.post_blob_at(&self.base_for(mailbox_id), mailbox_id, blob).await
     }
@@ -686,6 +688,7 @@ impl RelayClient {
     }
 
     /// Open an invite into the server whose mailbox is `mailbox`.
+    #[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
     pub async fn register_invite(&self, token: &str, mailbox: &[u8; 32], expires_at: Option<u64>) -> Result<u64> {
         let body = serde_json::to_vec(&serde_json::json!({
             "token": token,
@@ -704,6 +707,7 @@ impl RelayClient {
 
     /// Upload the payload joiners fetch for an invite token, once: a second upload is
     /// refused with a 409 `RelayStatus`.
+    #[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
     pub async fn put_invite_payload(&self, token: &str, payload: Vec<u8>) -> Result<()> {
         let path = format!("/invite/{token}/join");
         let req = self.start(&self.base_url(), reqwest::Method::POST, &path, None, Body::Bytes(payload), Signing::Device);
@@ -712,6 +716,7 @@ impl RelayClient {
 
     /// Fetch the invite payload. `None` when the inviter has not uploaded it yet. Works
     /// without auth so joiners can call it.
+    #[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
     pub async fn get_invite_payload(&self, token: &str) -> Result<Option<Vec<u8>>> {
         let path = format!("/invite/{token}/join");
         let req = self.start(&self.base_url(), reqwest::Method::GET, &path, None, Body::None, Signing::Device);
@@ -722,12 +727,14 @@ impl RelayClient {
         body_bytes(resp).await.map(Some)
     }
 
+    #[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
     pub async fn put_server_info(&self, mailbox_id: &[u8; 32], data: Vec<u8>) -> Result<()> {
         let path = format!("/box/{}/server_info", URL_SAFE_NO_PAD.encode(mailbox_id));
         let req = self.start(&self.base_for(mailbox_id), reqwest::Method::PUT, &path, None, Body::Bytes(data), Signing::Device);
         Self::finish(req, "put server_info", &[]).await.map(drop)
     }
 
+    #[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
     pub async fn get_server_info(&self, mailbox_id: &[u8; 32]) -> Result<Vec<u8>> {
         self.fetch_server_info(mailbox_id, None).await
     }
@@ -746,6 +753,7 @@ impl RelayClient {
     }
 
     /// The server's private channels this account may enter, with their GroupInfo.
+    #[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
     pub async fn get_admitted_channels(&self, server_mailbox: &[u8; 32]) -> Result<ghost_wire::policy::AdmittedChannels> {
         let path = format!("/servers/{}/channels", URL_SAFE_NO_PAD.encode(server_mailbox));
         let req = self.start(&self.base_for(server_mailbox), reqwest::Method::GET, &path, None, Body::None, Signing::Device);
@@ -786,6 +794,7 @@ impl RelayClient {
     }
 
     /// Append a raw entry at the account's home relay; returns the home's anchor for it.
+    #[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
     pub async fn put_idlog_entry(
         &self,
         account_fp: &[u8; 32],
@@ -890,6 +899,7 @@ impl RelayClient {
     }
 
     /// Where this relay believes the account is homed.
+    #[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
     pub async fn get_account(&self, account_fp: &[u8; 32]) -> Result<AccountInfo> {
         let path = format!("/accounts/{}", hex::encode(account_fp));
         let req = self.start(&self.base_url(), reqwest::Method::GET, &path, None, Body::None, Signing::Device);
@@ -897,6 +907,7 @@ impl RelayClient {
     }
 
     /// Fetch an account's anchored identity log.
+    #[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
     pub async fn get_idlog(
         &self,
         account_fp: &[u8; 32],

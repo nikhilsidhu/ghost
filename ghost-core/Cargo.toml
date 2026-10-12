@@ -34,6 +34,11 @@ ghost-wire = { path = "../ghost-wire", features = ["mls"] }
 ghost-media = { path = "../ghost-media" }
 tracing = "0.1"
 
+[features]
+# Tracing spans on MLS operations, relay calls and the session and voice loops, for the
+# dev builds' performance tooling (ghost-devtools). Off, none of it is compiled in.
+devtools = ["ghost-media/devtools"]
+
 [dev-dependencies]
 tempfile = "3"
 ghost-relay = { path = "../ghost-relay", features = ["test-util"] }

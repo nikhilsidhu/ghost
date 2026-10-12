@@ -6,6 +6,8 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+#[cfg(feature = "devtools")]
+use crate::constants::SAMPLE_RATE;
 use crate::receiver::Receiver;
 use crate::AudioControls;
 
@@ -64,6 +66,8 @@ impl Playback {
     /// each sender's playout keeps its own delay. Deafened, playout runs on unheard so
     /// nothing piles up.
     pub fn fill(&self, out: &mut [f32]) {
+        #[cfg(feature = "devtools")]
+        let started = std::time::Instant::now();
         let deafened = self.controls.deafened.load(Ordering::Relaxed);
         out.fill(0.0);
         let len = out.len();
@@ -81,5 +85,7 @@ impl Playback {
         for sample in out.iter_mut() {
             *sample = sample.clamp(-1.0, 1.0);
         }
+        #[cfg(feature = "devtools")]
+        self.controls.figures.playback.record(started.elapsed(), Duration::from_secs_f64(len as f64 / SAMPLE_RATE as f64));
     }
 }

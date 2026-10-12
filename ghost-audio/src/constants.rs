@@ -64,3 +64,7 @@ pub const QUANTILE_MS_PER_LOSS_PERCENT: f64 = 20.0;
 
 /// Processing ticks between quality readings and diagnostics (2 s).
 pub const DIAG_TICKS: u32 = 100;
+/// Ticks between updates of the call figures for the dev builds' profiler, which polls
+/// once a second.
+#[cfg(feature = "devtools")]
+pub const FIGURES_TICKS: u32 = 10;

@@ -19,6 +19,8 @@ tracing = "0.1"
 [features]
 # A lossy-network forwarder for tests of whatever runs over the session.
 test-util = []
+# Tracing spans and the processing-load timer for the dev builds' performance tooling.
+devtools = []
 
 [dev-dependencies]
 tokio = { version = "1", features = ["net", "rt-multi-thread", "sync", "time", "macros"] }

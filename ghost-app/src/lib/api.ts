@@ -237,3 +237,6 @@ export const resetDevice = () => invoke<void>("reset_device");
 
 // Dev testing
 export const spawnDevInstance = () => invoke<number>("spawn_dev_instance");
+
+// Devtools builds only: the command exists nowhere else.
+export const openProfiler = (capture = false) => invoke<void>("devtools_open_profiler", { capture });
