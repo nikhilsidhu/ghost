@@ -1,15 +1,16 @@
 //! A UDP forwarder that stands between clients and a relay's voice port and impairs
 //! what passes through: loss, delay, jitter (which reorders) and delay spikes, for
-//! everyone or for what one client sends. It gives each client its own upstream
-//! socket, as a NAT would, so rebinding those sockets shows the relay new source
-//! addresses mid-call. Tests point the relay's advertised voice port at it, so clients
-//! run unchanged.
+//! everyone, for what one client sends, or both ways for whoever holds a call slot. It
+//! gives each client its own upstream socket, as a NAT would, so rebinding those
+//! sockets shows the relay new source addresses mid-call. Tests and the dev launcher
+//! point the relay's advertised voice port at it, so clients run unchanged.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use ghost_wire::voice::{MediaHeader, VoiceBind};
 use ghost_wire::VOICE_MAX_PACKET;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -31,6 +32,10 @@ struct Shared {
     impairment: Mutex<Impairment>,
     /// Impairment of what particular clients send, instead of `impairment`.
     client_impairments: Mutex<HashMap<SocketAddr, Impairment>>,
+    /// Each client's call slot, as its binds and media headers name it.
+    slots: Mutex<HashMap<SocketAddr, u32>>,
+    /// Impairment of everything to and from the client holding a slot, ahead of the rest.
+    slot_impairments: Mutex<HashMap<u32, Impairment>>,
     /// Until when every packet is held back (a delay spike).
     held_until: Mutex<Option<Instant>>,
     rng: Mutex<StdRng>,
@@ -40,13 +45,25 @@ struct Shared {
     seen: Mutex<Vec<SocketAddr>>,
 }
 
+/// The call slot a client packet names: binds and media packets both carry it in clear.
+fn slot_of(packet: &[u8]) -> Option<u32> {
+    VoiceBind::from_bytes(packet).map(|bind| bind.slot_id).or_else(|| MediaHeader::parse(packet).map(|(header, _)| header.slot_id))
+}
+
 impl Shared {
-    /// The delay for one packet from `sender` (a client, or `None` for the relay), or
-    /// `None` to drop it.
-    fn fate(&self, sender: Option<SocketAddr>) -> Option<Duration> {
-        let impairment = sender
-            .and_then(|client| self.client_impairments.lock().unwrap().get(&client).copied())
-            .unwrap_or(*self.impairment.lock().unwrap());
+    /// What happens to a packet from `client` (upstream) or to it.
+    fn impairment_for(&self, client: SocketAddr, upstream: bool) -> Impairment {
+        let slot = self.slots.lock().unwrap().get(&client).copied();
+        if let Some(impairment) = slot.and_then(|slot| self.slot_impairments.lock().unwrap().get(&slot).copied()) {
+            return impairment;
+        }
+        let own = if upstream { self.client_impairments.lock().unwrap().get(&client).copied() } else { None };
+        own.unwrap_or(*self.impairment.lock().unwrap())
+    }
+
+    /// The delay for one packet from `client` (upstream) or to it, or `None` to drop it.
+    fn fate(&self, client: SocketAddr, upstream: bool) -> Option<Duration> {
+        let impairment = self.impairment_for(client, upstream);
         let mut rng = self.rng.lock().unwrap();
         if impairment.loss > 0.0 && rng.gen_bool(impairment.loss) {
             return None;
@@ -56,17 +73,15 @@ impl Shared {
         Some(held + impairment.delay + jitter)
     }
 
-    /// Send `packet` through `socket` to `to` (or the socket's peer) after its fate.
-    fn pass(&self, socket: Arc<UdpSocket>, packet: Vec<u8>, to: Option<SocketAddr>, sender: Option<SocketAddr>) {
-        let Some(delay) = self.fate(sender) else { return };
+    /// Send `packet` from `client` up through its socket, or down to it through the
+    /// listening one, after its fate.
+    fn pass(&self, socket: Arc<UdpSocket>, packet: Vec<u8>, client: SocketAddr, upstream: bool) {
+        let Some(delay) = self.fate(client, upstream) else { return };
         tokio::spawn(async move {
             if !delay.is_zero() {
                 tokio::time::sleep(delay).await;
             }
-            let _ = match to {
-                Some(to) => socket.send_to(&packet, to).await,
-                None => socket.send(&packet).await,
-            };
+            let _ = if upstream { socket.send(&packet).await } else { socket.send_to(&packet, client).await };
         });
     }
 }
@@ -99,6 +114,8 @@ impl Forwarder {
             listen: Arc::new(listen),
             impairment: Mutex::new(Impairment::default()),
             client_impairments: Mutex::new(HashMap::new()),
+            slots: Mutex::new(HashMap::new()),
+            slot_impairments: Mutex::new(HashMap::new()),
             held_until: Mutex::new(None),
             rng: Mutex::new(StdRng::seed_from_u64(seed)),
             clients: Mutex::new(HashMap::new()),
@@ -125,7 +142,10 @@ impl Forwarder {
                         continue;
                     }
                 };
-                shared.pass(upstream, buf[..len].to_vec(), None, Some(client));
+                if let Some(slot) = slot_of(&buf[..len]) {
+                    shared.slots.lock().unwrap().insert(client, slot);
+                }
+                shared.pass(upstream, buf[..len].to_vec(), client, true);
             }
         });
         *self.task.lock().unwrap() = Some(task);
@@ -138,6 +158,21 @@ impl Forwarder {
     /// Impair what `client` sends differently from everything else.
     pub fn set_client_impairment(&self, client: SocketAddr, impairment: Impairment) {
         self.shared.client_impairments.lock().unwrap().insert(client, impairment);
+    }
+
+    /// Impair everything to and from whoever holds `slot` in a call, ahead of any other
+    /// setting; the default impairment clears it.
+    pub fn set_slot_impairment(&self, slot: u32, impairment: Impairment) {
+        self.shared.slot_impairments.lock().unwrap().insert(slot, impairment);
+    }
+
+    /// The call slots of the clients seen so far, each with its impairment, by slot.
+    pub fn slots(&self) -> Vec<(u32, Impairment)> {
+        let mut slots: Vec<u32> = self.shared.slots.lock().unwrap().values().copied().collect();
+        slots.sort_unstable();
+        slots.dedup();
+        let impairments = self.shared.slot_impairments.lock().unwrap();
+        slots.into_iter().map(|slot| (slot, impairments.get(&slot).copied().unwrap_or_default())).collect()
     }
 
     /// Clients in the order they first sent.
@@ -178,7 +213,7 @@ async fn upstream_for(shared: &Arc<Shared>, client: SocketAddr, relay: SocketAdd
         tokio::spawn(async move {
             let mut buf = [0u8; VOICE_MAX_PACKET];
             while let Ok(len) = socket.recv(&mut buf).await {
-                shared.pass(shared.listen.clone(), buf[..len].to_vec(), Some(client), None);
+                shared.pass(shared.listen.clone(), buf[..len].to_vec(), client, false);
             }
         })
     };
@@ -269,5 +304,25 @@ mod tests {
         client.send(b"slow").await.unwrap();
         recv_from(&relay).await;
         assert!(sent.elapsed() >= Duration::from_millis(150));
+    }
+
+    #[tokio::test]
+    async fn impairs_a_call_slot_both_ways() {
+        let (forwarder, relay, client) = setup().await;
+        let header = MediaHeader { room_id: [7; 32], slot_id: 5, epoch: 1, sequence: 0 };
+        client.send(&header.packet(b"hello")).await.unwrap();
+        let (_, upstream_addr) = recv_from(&relay).await;
+        assert_eq!(forwarder.slots(), vec![(5, Impairment::default())]);
+
+        forwarder.set_slot_impairment(5, Impairment { loss: 1.0, ..Impairment::default() });
+        client.send(&header.packet(b"lost")).await.unwrap();
+        relay.send_to(b"lost too", upstream_addr).await.unwrap();
+        let mut buf = [0u8; 64];
+        assert!(tokio::time::timeout(Duration::from_millis(200), relay.recv_from(&mut buf)).await.is_err(), "nothing went up");
+        assert!(tokio::time::timeout(Duration::from_millis(200), client.recv_from(&mut buf)).await.is_err(), "nothing came down");
+
+        forwarder.set_slot_impairment(5, Impairment::default());
+        relay.send_to(b"back", upstream_addr).await.unwrap();
+        assert_eq!(recv_from(&client).await.0, b"back");
     }
 }

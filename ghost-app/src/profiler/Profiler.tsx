@@ -8,6 +8,7 @@ import { PanelHeader } from "../components/ui/panel-header";
 import { Button } from "../components/ui/button";
 import { FadedScrollArea } from "../components/ui/scroll-area";
 import { Tabs } from "../components/ui/tabs";
+import { devProfile } from "../lib/dev-profile";
 import { CAPTURE_EVENT, CAPTURE_FRAGMENT } from "../lib/devtools/types";
 import { cn } from "../lib/cn";
 import CallView from "./CallView";
@@ -74,6 +75,9 @@ export default function Profiler() {
   return (
     <div class="h-screen flex flex-col bg-[var(--neutral-950)] text-[var(--neutral-200)]">
       <PanelHeader title="profiler">
+        <Show when={devProfile()}>
+          <span class="text-xs text-[var(--neutral-500)]">{devProfile()}</span>
+        </Show>
         <div class="ml-3">
           <Tabs value={tab()} onChange={setTab} tabs={tabs()} label="Profiler views" />
         </div>

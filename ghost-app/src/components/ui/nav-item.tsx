@@ -7,8 +7,8 @@ interface NavItemProps extends JSX.ButtonHTMLAttributes<HTMLButtonElement> {
   emphasis?: boolean;
 }
 
-/** One entry of a side list (a channel, a DM) that shows its page when clicked; the
- * selected one takes the highlight. */
+/** One entry of a side list (a channel, a DM, a launcher process) that shows its page when
+ * clicked; the selected one takes the highlight. */
 export function NavItem(props: NavItemProps) {
   const [local, rest] = splitProps(props, ["selected", "emphasis", "class", "children"]);
   return (

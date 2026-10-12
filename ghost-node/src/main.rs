@@ -27,7 +27,10 @@ struct Request {
 enum Command {
     CreateServer { name: String },
     Invite { server: String },
-    Join { token: String, key: String },
+    /// Through an invite on `relay`, the relay hosting the server, or on this device's own.
+    Join { token: String, key: String, relay: Option<String> },
+    /// This device's fingerprint.
+    Identity,
     Say { server: String, channel: String, text: String },
     Kick { server: String, member: String },
     JoinVoice { server: String, channel: String },
@@ -119,10 +122,16 @@ async fn run(device: &Device, command: Command) -> Result<Value, String> {
             let (token, key) = device.invite(&id32(&server)?).await.map_err(fail)?;
             Ok(json!({ "token": token, "key": hex::encode(key) }))
         }
-        Command::Join { token, key } => {
-            let server_id = device.join(&token, &id32(&key)?).await.map_err(fail)?;
+        Command::Join { token, key, relay } => {
+            let key = id32(&key)?;
+            let server_id = match relay {
+                Some(relay) => device.join_at(&relay, &token, &key).await,
+                None => device.join(&token, &key).await,
+            }
+            .map_err(fail)?;
             Ok(json!({ "server": hex::encode(server_id) }))
         }
+        Command::Identity => Ok(json!({ "fingerprint": hex::encode(device.fingerprint().await) })),
         Command::Say { server, channel, text } => match device.say(&id32(&server)?, &id32(&channel)?, &text).await.map_err(fail)? {
             ghost_core::flows::messages::Landed::Delivered { seq } => Ok(json!({ "delivered": seq })),
             ghost_core::flows::messages::Landed::Queued => Ok(json!({ "queued": true })),

@@ -1769,53 +1769,6 @@ pub fn exit_app(app: tauri::AppHandle) {
     app.exit(0);
 }
 
-#[tauri::command]
-#[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
-pub fn spawn_dev_instance() -> Result<u32, String> {
-    // Grab an OS-assigned free port
-    let listener = std::net::TcpListener::bind("127.0.0.1:0")
-        .map_err(|e| format!("find free port: {e}"))?;
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-
-    let data_dir = format!("/tmp/ghost-dev-{port}");
-    std::fs::create_dir_all(&data_dir).map_err(|e| format!("mkdir: {e}"))?;
-
-    std::process::Command::new("npx")
-        .args([
-            "tauri", "dev",
-            "--config",
-            &format!(
-                "{{\"identifier\":\"com.ghost.app.dev{port}\",\"build\":{{\"devUrl\":\"http://localhost:{port}\",\"beforeDevCommand\":\"npx vite --port {port}\"}}}}"
-            ),
-        ])
-        .env("GHOST_DATA_DIR", &data_dir)
-        .current_dir(
-            std::env::current_exe()
-                .ok()
-                .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-                .and_then(|d| {
-                    let mut cur = d.as_path();
-                    while let Some(parent) = cur.parent() {
-                        let candidate = parent.join("ghost-app");
-                        if candidate.join("package.json").exists() {
-                            return Some(candidate);
-                        }
-                        cur = parent;
-                    }
-                    None
-                })
-                .unwrap_or_else(|| std::path::PathBuf::from(".")),
-        )
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|e| format!("spawn: {e}"))?;
-
-    Ok(port as u32)
-}
-
 /// The latest relay connectivity, online presence and voice rosters, for a front end
 /// that starts after the session reported them.
 #[tauri::command]

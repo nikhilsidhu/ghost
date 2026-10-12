@@ -75,11 +75,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev \
             libasound2-dev libdbus-1-dev libssl-dev libopus-dev libxdo-dev libxss-dev pkg-config
-      # With devtools on, so the profiler's types are covered too.
+      # With devtools on, so the profiler's types are covered too, and the dev launcher's.
       - name: Regenerate
-        run: cargo test -p ghost-app --features devtools bindings
+        run: |
+          cargo test -p ghost-app --features devtools bindings
+          cargo test -p ghost-dev bindings
       - name: Compare with the committed files
-        run: git diff --exit-code -- ghost-app/src/lib/generated
+        run: git diff --exit-code -- ghost-app/src/lib/generated ghost-app/src/launcher/generated
 
   # The desktop app driven through its interface (ghost-node/tests/ui.rs), with headless
   # devices as the other people: Linux only, where tauri-driver runs, under Xvfb.

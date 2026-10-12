@@ -235,8 +235,8 @@ export const moveHome = (recoveryKey: string, relayUrl: string) =>
   invoke<void>("move_home", { recoveryKey, relayUrl });
 export const resetDevice = () => invoke<void>("reset_device");
 
-// Dev testing
-export const spawnDevInstance = () => invoke<number>("spawn_dev_instance");
+// Debug builds only: the command exists nowhere else.
+export const getDevProfile = () => invoke<string | null>("dev_profile");
 
 // Devtools builds only: the command exists nowhere else.
 export const openProfiler = (capture = false) => invoke<void>("devtools_open_profiler", { capture });

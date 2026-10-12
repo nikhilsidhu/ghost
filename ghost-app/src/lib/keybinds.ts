@@ -1,6 +1,7 @@
 import { register, unregister } from "@tauri-apps/plugin-global-shortcut";
 import { listen } from "@tauri-apps/api/event";
 import { getKeybinds, getConfig, setPttActive } from "./api";
+import { devProfile } from "./dev-profile";
 import type { InputMode, VoiceState } from "./types";
 
 let currentPttShortcut: string | null = null;
@@ -31,8 +32,7 @@ async function registerPtt(shortcut: string) {
     });
     currentPttShortcut = shortcut;
   } catch (e) {
-    const inst = import.meta.env.VITE_GHOST_INSTANCE;
-    console.error(`keybinds${inst ? ` [#${inst}]` : ""}: failed to register PTT shortcut:`, shortcut, "(likely owned by another instance)", e);
+    console.error(`keybinds${devProfile() ? ` [${devProfile()}]` : ""}: failed to register PTT shortcut:`, shortcut, "(likely owned by another instance)", e);
   }
 }
 

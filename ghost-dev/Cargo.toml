@@ -1,0 +1,35 @@
+[package]
+name = "ghost-dev"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0"
+publish = false
+
+# The Ghost Dev launcher: a control panel for development that runs local relays (behind
+# a network impairment forwarder), app instances as named profiles, scenarios that seed
+# them through the relays, snapshots, and headless test callers, with each one's logs.
+# Never bundled or shipped. Run with `cargo run -p ghost-dev`.
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["process", "io-util", "net", "time", "sync", "macros", "rt", "rt-multi-thread"] }
+ghost-core = { path = "../ghost-core" }
+ghost-media = { path = "../ghost-media", features = ["test-util"] }
+ghost-node = { path = "../ghost-node" }
+ghost-wire = { path = "../ghost-wire" }
+ghost-log = { path = "../ghost-log" }
+tracing = "0.1"
+rand = "0.8"
+toml = "0.8"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dev-dependencies]
+# Generates the launcher page's TypeScript types from these Rust ones (see src/bindings.rs).
+ts-rs = "12"
+# Scenarios are tested against real relays in-process.
+ghost-relay = { path = "../ghost-relay" }
+tempfile = "3"

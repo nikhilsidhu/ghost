@@ -13,6 +13,10 @@ dist/
 **/src-tauri/target/
 **/src-tauri/gen/
 **/src-tauri/WixTools/
+ghost-dev/gen/
+
+# The dev launcher's profiles, relay databases and settings
+.ghost-dev/
 
 # Secrets & data
 *.key

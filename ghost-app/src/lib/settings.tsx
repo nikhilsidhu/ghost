@@ -1,4 +1,4 @@
-import { Palette, Mail, WifiPen, MonitorSpeaker, BellRing, HatGlasses, Rat, Keyboard, MonitorSmartphone } from "lucide-solid";
+import { Palette, Mail, WifiPen, MonitorSpeaker, BellRing, HatGlasses, Keyboard, MonitorSmartphone } from "lucide-solid";
 import { registerSettings } from "./settings-registry";
 import AppearanceSettings from "../components/settings/AppearanceSettings";
 import AppearancePreview from "../components/settings/AppearancePreview";
@@ -9,7 +9,6 @@ import KeybindsSettings from "../components/settings/KeybindsSettings";
 import NotificationsSettings from "../components/settings/NotificationsSettings";
 import PrivacySettings from "../components/settings/PrivacySettings";
 import DevicesSettings from "../components/settings/DevicesSettings";
-import DevSettings from "../components/settings/DevSettings";
 
 const cleanups: (() => void)[] = [];
 
@@ -80,12 +79,4 @@ cleanups.push(registerSettings({
   icon: MonitorSmartphone,
   order: 60,
   render: DevicesSettings,
-}));
-
-cleanups.push(registerSettings({
-  id: "dev",
-  label: "dev",
-  icon: Rat,
-  order: 100,
-  render: DevSettings,
 }));

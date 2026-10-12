@@ -10,6 +10,8 @@ mod bindings;
 mod commands;
 mod config;
 mod constants;
+#[cfg(debug_assertions)]
+mod dev;
 mod device_watcher;
 #[cfg(feature = "devtools")]
 mod devtools;
@@ -27,6 +29,37 @@ compile_error!("the devtools feature is for debug builds only");
 
 /// Daily log files, inside the data directory.
 const LOG_DIR: &str = "logs";
+
+/// The main window, from its entry in the app config. A data directory given in the
+/// environment (a launcher profile, or a second install) gets webview storage of its own
+/// too, so settings kept there stay apart.
+fn main_window(app: &tauri::App) -> tauri::Result<tauri::WebviewWindow> {
+    let config = app.config().app.windows.iter().find(|w| w.label == "main").expect("a main window in the app config");
+    let builder = tauri::WebviewWindowBuilder::from_config(app.handle(), config)?;
+    #[cfg(debug_assertions)]
+    let builder = match dev::profile() {
+        Some(profile) => builder.title(format!("{} · {profile}", config.title)),
+        None => builder,
+    };
+    #[cfg(debug_assertions)]
+    let builder = match dev::window_bounds() {
+        Some(bounds) => builder.position(bounds.x, bounds.y).inner_size(bounds.width, bounds.height),
+        None => builder,
+    };
+    if std::env::var_os("GHOST_DATA_DIR").is_none() {
+        return builder.build();
+    }
+    let data_dir = setup::ghost_dir();
+    // WKWebView keeps storage by identifier, not by folder (macOS 14 and later).
+    #[cfg(target_os = "macos")]
+    let builder = {
+        let digest: [u8; 32] = blake3::hash(data_dir.as_os_str().as_encoded_bytes()).into();
+        builder.data_store_identifier(digest[..16].try_into().expect("16 bytes"))
+    };
+    #[cfg(not(target_os = "macos"))]
+    let builder = builder.data_directory(data_dir.join("webview"));
+    builder.build()
+}
 
 fn main() {
     // Before anything is logged or traced, so every line and span is seen.
@@ -54,17 +87,20 @@ fn main() {
     let builder = builder.manage(devtools_state);
     builder
         .setup(move |app| {
+            #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+            let window = main_window(app)?;
             #[cfg(target_os = "macos")]
             {
                 use objc2_app_kit::{NSColor, NSWindow};
-                use tauri::Manager;
 
-                let window = app.get_webview_window("main").unwrap();
                 let ns_window = unsafe { &*(window.ns_window().unwrap() as *mut NSWindow) };
                 // pure black — matches --neutral-950
                 let color = NSColor::colorWithSRGBRed_green_blue_alpha(0.0, 0.0, 0.0, 1.0);
                 ns_window.setBackgroundColor(Some(&color));
             }
+
+            #[cfg(debug_assertions)]
+            dev::serve(app.handle());
 
             let handle = app.handle().clone();
             // Without an account there is nothing to run a session for; the command that
@@ -164,7 +200,8 @@ fn main() {
             commands::reset_device,
             commands::resume_unfinished_account,
             commands::exit_app,
-            commands::spawn_dev_instance,
+            #[cfg(debug_assertions)]
+            dev::dev_profile,
             #[cfg(feature = "devtools")]
             devtools::devtools_limits,
             #[cfg(feature = "devtools")]

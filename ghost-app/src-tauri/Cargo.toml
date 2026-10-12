@@ -19,7 +19,7 @@ dirs = "6"
 gethostname = "1"
 hex = "0.4"
 rand = "0.8"
-tokio = { version = "1", features = ["sync", "rt"] }
+tokio = { version = "1", features = ["sync", "rt", "net", "io-util"] }
 url = "2"
 toml = "0.8"
 # Not used directly: enables TLS for ghost-core's WebSocket connections (wss relays).

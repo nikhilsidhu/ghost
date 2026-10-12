@@ -9,6 +9,7 @@ import {
 } from "../lib/store";
 import { sections } from "../lib/settings-registry";
 import { slideDuration } from "../lib/constants";
+import { devProfile } from "../lib/dev-profile";
 import { Sidebar } from "./Sidebar";
 import { ServerView } from "./ServerView";
 import { MemberPanel } from "./MemberPanel";
@@ -28,11 +29,11 @@ export function Layout() {
   return (
     <div class="h-screen flex relative" style={{ background: "var(--neutral-950)" }}>
       <div data-tauri-drag-region class="absolute inset-x-0 top-0 h-7 z-10" />
-      {import.meta.env.DEV && import.meta.env.VITE_GHOST_INSTANCE && (
+      <Show when={devProfile()}>
         <span class="absolute top-1.5 right-3 z-20 text-[10px] font-mono text-[var(--neutral-500)] select-none pointer-events-none">
-          #{import.meta.env.VITE_GHOST_INSTANCE}
+          {devProfile()}
         </span>
-      )}
+      </Show>
       <Sidebar />
       <div class="divider-v" />
       <main class="flex-1 min-w-0 pt-7 relative overflow-hidden">

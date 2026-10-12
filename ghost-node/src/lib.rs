@@ -323,6 +323,18 @@ impl Device {
         flows::channels::create(&self.client, &self.relay, server_id, name, kind).await
     }
 
+    /// Add a channel only holders of `roles`, and `accounts`, may enter, on a server this
+    /// device's home relay hosts.
+    pub async fn create_private_channel(
+        &self,
+        server_id: &[u8; 32],
+        name: &str,
+        roles: Vec<u8>,
+        accounts: Vec<[u8; 32]>,
+    ) -> Result<[u8; 32]> {
+        flows::channels::create_private(&self.client, &self.relay, &self.relay, server_id, name, ChannelKind::Text, roles, accounts).await
+    }
+
     /// Add a role named `name` with `permissions`, given to `holders`. Returns its id.
     pub async fn add_role(&self, server_id: &[u8; 32], name: &str, permissions: u32, holders: &[[u8; 32]]) -> Result<u8> {
         let mut policy = self.client.lock().await.server_policy(server_id)?;

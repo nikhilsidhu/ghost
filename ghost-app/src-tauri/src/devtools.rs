@@ -299,8 +299,12 @@ pub fn open_profiler(app: &AppHandle, capture: bool) -> Result<(), String> {
         return window.set_focus().map_err(|e| e.to_string());
     }
     let page = if capture { format!("{PROFILER_PAGE}{CAPTURE_FRAGMENT}") } else { PROFILER_PAGE.to_string() };
+    let title = match crate::dev::profile() {
+        Some(profile) => format!("Ghost profiler · {profile}"),
+        None => "Ghost profiler".to_string(),
+    };
     let builder = WebviewWindowBuilder::new(app, PROFILER_WINDOW, WebviewUrl::App(page.into()))
-        .title("Ghost profiler")
+        .title(title)
         .inner_size(PROFILER_SIZE.0, PROFILER_SIZE.1)
         .min_inner_size(PROFILER_MIN_SIZE.0, PROFILER_MIN_SIZE.1)
         .theme(Some(tauri::Theme::Dark))
