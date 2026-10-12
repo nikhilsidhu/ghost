@@ -6,9 +6,16 @@ pub const FRAME_SAMPLES: usize = (SAMPLE_RATE * FRAME_MS / 1000) as usize; // 96
 pub const PROCESSING_CHUNK: usize = (SAMPLE_RATE / 100) as usize; // 480
 
 // Opus
-pub const OPUS_BITRATE: i32 = 64_000;
+/// Full-band CELT on a clean network: at 64 kb/s Opus codes voice in hybrid mode, coarse
+/// above 8 kHz.
+pub const OPUS_BITRATE: i32 = 96_000;
 pub const OPUS_COMPLEXITY: i32 = 10;
-pub const OPUS_EXPECTED_LOSS_PCT: i32 = 5;
+/// Steps of the loss Opus protects against (percent), as WebRTC uses them: below the
+/// first, concealment covers losses and protection would cost the full-band mode.
+pub const OPUS_LOSS_STEPS: [u8; 4] = [1, 5, 10, 20];
+/// Frames heard from a sender in a quality reading before its loss is worth reporting
+/// (a second): fewer, and one lost frame reads as a large share.
+pub const RECEPTION_MIN_FRAMES: u64 = 50;
 /// Room for one encoded frame.
 pub const OPUS_MAX_FRAME_BYTES: usize = 1500;
 
@@ -31,8 +38,9 @@ pub const AGC_LEARN_MIN_LEVEL: f32 = 1e-4;
 
 /// Voice activity threshold on nnnoiseless's 0.0–1.0 probability (0.85+ is the usual advice).
 pub const VAD_THRESHOLD: f32 = 0.85;
-/// Speech threshold when noise suppression is off and loudness decides.
-pub const ENERGY_VAD_SPEECH_RMS: f32 = 0.035;
+/// Below this level (RMS, -120 dBFS) a frame is digital silence, which no microphone's
+/// noise floor reaches: what continuous input does not send.
+pub const DIGITAL_SILENCE: f32 = 1e-6;
 /// Frames still sent after voice activity drops, so word ends are not clipped (~300 ms).
 pub const VAD_HANGOVER_FRAMES: u32 = 15;
 /// Silence frames sent when a talk spurt ends, so receivers' decoders reset cleanly.

@@ -864,6 +864,48 @@ async fn voice_signaling_join_leave() {
     assert_eq!(msg["slot_id"].as_u64().unwrap() as u32, slot_b);
 }
 
+/// The next voice message of `kind` within `wait`; `None` if none came.
+async fn voice_msg_within(ws: &mut TestWs, kind: &str, wait: Duration) -> Option<Value> {
+    tokio::time::timeout(wait, next_voice_msg_of(ws, kind)).await.ok()
+}
+
+#[tokio::test]
+async fn voice_reception_reports_reach_only_the_sender_they_are_about() {
+    let (base, _) = start_server_with_voice(test_config()).await;
+    let (alice, bob, carol) = (TestAuth::generate(), TestAuth::generate(), TestAuth::generate());
+    for auth in [&alice, &bob, &carol] {
+        auth.register(&base).await;
+    }
+    let ws_url = voice_url(&base, &voice_group_with(&base, &alice, &[&bob, &carol]).await, &[0x11; 32]);
+    let mut slots = Vec::new();
+    let mut sockets = Vec::new();
+    for (auth, presence) in [(&alice, "a"), (&bob, "b"), (&carol, "c")] {
+        let mut ws = auth.ws_connect(&ws_url).await;
+        let join = serde_json::json!({"type": "join", "presence": B64.encode(presence)});
+        ws.send(Message::Text(join.to_string().into())).await.unwrap();
+        let welcome = read_voice_msg(&mut ws).await;
+        slots.push(welcome["slot_id"].as_u64().unwrap() as u32);
+        sockets.push(ws);
+    }
+    let (slot_a, slot_b) = (slots[0], slots[1]);
+    let [mut ws_a, mut ws_b, mut ws_c]: [TestWs; 3] = sockets.try_into().ok().unwrap();
+
+    // Bob reports on Alice, on himself and on a slot nobody holds: only Alice hears, and
+    // only about herself.
+    let report = serde_json::json!({"type": "reception", "reports": [
+        {"slot_id": slot_a, "loss_pct": 7}, {"slot_id": slot_b, "loss_pct": 50}, {"slot_id": 999, "loss_pct": 50},
+    ]});
+    ws_b.send(Message::Text(report.to_string().into())).await.unwrap();
+    let told = voice_msg_within(&mut ws_a, "reception", Duration::from_secs(2)).await.expect("alice was told");
+    assert_eq!(told, serde_json::json!({"type": "reception", "slot_id": slot_b, "loss_pct": 7}));
+    assert!(voice_msg_within(&mut ws_c, "reception", Duration::from_millis(300)).await.is_none(), "carol was not reported on");
+    assert!(voice_msg_within(&mut ws_b, "reception", Duration::from_millis(300)).await.is_none(), "nobody reports on bob");
+
+    // A second report within the second is dropped.
+    ws_b.send(Message::Text(report.to_string().into())).await.unwrap();
+    assert!(voice_msg_within(&mut ws_a, "reception", Duration::from_millis(300)).await.is_none(), "reports are limited to one a second");
+}
+
 /// Two participants joined to one room with bound UDP sockets: (relay address, room,
 /// (socket, slot, token) for A, the same for B, and the WebSockets keeping them joined).
 struct VoicePair {

@@ -13,7 +13,8 @@ use crate::constants::*;
 use crate::policy::TargetDelay;
 use crate::stretch;
 
-/// What playout has done, for call quality and tests.
+/// What playout has done, for call quality and tests. Every count only grows, so an
+/// earlier reading can be taken from a later one.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PlayoutStats {
     /// Frames played as sent.
@@ -22,7 +23,7 @@ pub struct PlayoutStats {
     pub recovered: u64,
     /// Lost frames concealed.
     pub concealed: u64,
-    /// Frames of concealment while waiting for a late frame.
+    /// Frames concealed while waiting for a frame that came late or was never sent.
     pub waited: u64,
     /// Frames that came after their turn had passed, dropped.
     pub dropped_late: u64,
@@ -133,7 +134,8 @@ pub(crate) struct Receiver {
     /// The next sequence to play; `None` until playout starts, and again once the
     /// sender has paused.
     next: Option<u32>,
-    /// Frames concealed in a row, and how many of those waited for `next`.
+    /// Frames concealed in a row, and how many of those waited for `next`; the waited
+    /// ones are counted when the wait ends, as waiting or as loss.
     concealed_run: u32,
     waited_run: u32,
     policy: TargetDelay,
@@ -295,6 +297,7 @@ impl Receiver {
         let decoded = if let Some(frame) = self.take(next) {
             self.next = Some(next.wrapping_add(1));
             self.concealed_run = 0;
+            self.stats.waited += u64::from(self.waited_run);
             self.waited_run = 0;
             self.stats.played += 1;
             let decoded = self.decoder.decode_float(&frame, &mut self.decoded, false);
@@ -306,7 +309,6 @@ impl Receiver {
             self.next = Some(next);
             self.concealed_run += 1;
             self.waited_run += 1;
-            self.stats.waited += 1;
             self.catch_up = 0;
             self.decoder.decode_float(&[], &mut self.decoded, false)
         } else if self.waited_run > 0 {
@@ -314,6 +316,16 @@ impl Receiver {
             // sent because the sender paused. Its time is already concealed; resume
             // from the earliest frame.
             let first = self.first().expect("frames buffered");
+            // A pause leaves a gap longer than the pre-roll, which fills any shorter
+            // one: a shorter gap is frames lost, concealed while they were waited for.
+            let skipped = first.wrapping_sub(next);
+            let mut waited = u64::from(self.waited_run);
+            if skipped as usize <= PRE_ROLL_FRAMES {
+                let lost = skipped.min(self.waited_run) as u64;
+                waited -= lost;
+                self.stats.concealed += lost;
+            }
+            self.stats.waited += waited;
             self.next = Some(first);
             self.waited_run = 0;
             self.catch_up_from(self.policy.target());
@@ -341,6 +353,7 @@ impl Receiver {
             // Long silence from the sender: stop, and start afresh when it speaks again.
             self.next = None;
             self.concealed_run = 0;
+            self.stats.waited += u64::from(self.waited_run);
             self.waited_run = 0;
             self.spent.extend(self.frames.drain(..).map(|(_, frame)| frame));
             return self.silence();
@@ -461,10 +474,11 @@ mod tests {
         receiver.produce();
         receiver.produce();
         receiver.produce();
-        assert_eq!(receiver.stats.waited, 1, "frame 2 is late");
+        assert_eq!(receiver.waited_run, 1, "frame 2 is late");
         receiver.insert(2, encoded[2].clone(), now + Duration::from_millis(60));
         receiver.produce();
         assert_eq!((receiver.stats.played, receiver.stats.dropped_late), (3, 0), "the late frame still plays");
+        assert_eq!(receiver.stats.waited, 1, "a wait for a late frame");
     }
 
     #[test]
@@ -479,6 +493,27 @@ mod tests {
             receiver.produce();
         }
         assert_eq!((receiver.stats.played, receiver.stats.recovered), (3, 1));
+    }
+
+    #[test]
+    fn a_frame_lost_while_playout_waited_for_it_counts_as_lost() {
+        let mut receiver = receiver();
+        let encoded = frames(5);
+        let now = Instant::now();
+        receiver.insert(0, encoded[0].clone(), now);
+        receiver.insert(1, encoded[1].clone(), now);
+        for _ in 0..3 {
+            receiver.produce();
+        }
+        assert_eq!(receiver.waited_run, 1, "frame 2 is waited for");
+        // A quality reading falls mid-wait.
+        let read = receiver.stats;
+        // Frame 2 never comes; 3 does.
+        receiver.insert(3, encoded[3].clone(), now);
+        receiver.produce();
+        assert_eq!((receiver.stats.waited, receiver.stats.concealed), (0, 1), "the wait was a loss");
+        let since = receiver.stats.since(&read);
+        assert_eq!((since.played, since.concealed, since.waited), (1, 1, 0), "the next reading counts on from it");
     }
 
     #[test]

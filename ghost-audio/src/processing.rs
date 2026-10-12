@@ -3,7 +3,7 @@
 //! noise suppression. The echo canceller learns from what playback played, which the
 //! device's playback thread hands over through a queue, so neither waits on the other.
 
-use sonora::config::{AdaptiveDigital, EchoCanceller as EchoCancellerConfig, GainController2};
+use sonora::config::{AdaptiveDigital, EchoCanceller as EchoCancellerConfig, GainController2, MaxProcessingRate, Pipeline};
 use sonora::{AudioProcessing, Config, StreamConfig};
 
 use crate::constants::*;
@@ -30,7 +30,9 @@ impl EchoCanceller {
     }
 
     fn config(enabled: bool) -> Config {
-        Config { echo_canceller: enabled.then(EchoCancellerConfig::default), ..Default::default() }
+        // At the pipeline's default 32 kHz everything above 16 kHz is lost.
+        let pipeline = Pipeline { maximum_internal_processing_rate: MaxProcessingRate::Rate48kHz, ..Default::default() };
+        Config { pipeline, echo_canceller: enabled.then(EchoCancellerConfig::default), ..Default::default() }
     }
 
     pub fn set_enabled(&mut self, enabled: bool) {

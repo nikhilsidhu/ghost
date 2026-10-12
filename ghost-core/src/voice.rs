@@ -50,8 +50,12 @@ const SIGNALING_SILENCE_LIMIT: Duration = Duration::from_secs(10);
 const CALL_CHECK: Duration = Duration::from_millis(500);
 /// How often our own speaking state is checked, to tell the room and the UI.
 const SPEAKING_POLL: Duration = Duration::from_millis(100);
-/// How often call quality is reported and the relay pinged for latency.
+/// How often call quality is reported, the others told what we lost of their frames,
+/// and the relay pinged for latency.
 const QUALITY_POLL: Duration = Duration::from_secs(2);
+/// How long a listener's report of loss on our frames holds: protection against it comes
+/// at once and goes once nobody has reported loss for this long.
+const REPORT_HOLD: Duration = Duration::from_secs(10);
 
 /// How often the call follows this device's epoch in the call's group. When it moves, the
 /// presence is sealed again and the send key rotated, so callers at the new epoch can open
@@ -260,6 +264,19 @@ struct Call {
     last_speaking: bool,
     ping_sent_at: Option<Instant>,
     last_ping_ms: Option<u32>,
+    /// What each listener, by slot, last reported losing of our frames, and when.
+    loss_reports: HashMap<u32, (u8, Instant)>,
+}
+
+impl Call {
+    fn expected_loss(&self, now: Instant) -> u8 {
+        worst_fresh_loss(&self.loss_reports, now)
+    }
+}
+
+/// The worst loss reported within `REPORT_HOLD` of `now`; none when every report is older.
+fn worst_fresh_loss(reports: &HashMap<u32, (u8, Instant)>, now: Instant) -> u8 {
+    reports.values().filter(|(_, at)| now.duration_since(*at) <= REPORT_HOLD).map(|(loss, _)| *loss).max().unwrap_or(0)
 }
 
 /// A caller's presence as the relay passed it on, not opened yet.
@@ -494,6 +511,7 @@ impl Runner {
             last_speaking: false,
             ping_sent_at: None,
             last_ping_ms: None,
+            loss_reports: HashMap::new(),
         })
     }
 
@@ -848,6 +866,7 @@ impl Runner {
             ServerMsg::Left { slot_id } => {
                 current.peers.remove(&slot_id);
                 current.unopened.remove(&slot_id);
+                current.loss_reports.remove(&slot_id);
                 if let Some(media) = &current.media {
                     media.remove_peer(slot_id);
                 }
@@ -889,6 +908,10 @@ impl Runner {
                 if let Some(peer) = current.peers.get(&slot_id) {
                     self.emit(VoiceEvent::Speaking { fingerprint: peer.fingerprint, speaking });
                 }
+            }
+            ServerMsg::Reception { slot_id, loss_pct } => {
+                current.loss_reports.insert(slot_id, (loss_pct, Instant::now()));
+                self.audio.set_expected_loss(current.expected_loss(Instant::now()));
             }
             // Refusing the join or resume waiting for a welcome ends the call: the room is
             // full, or will not have this device.
@@ -1019,6 +1042,8 @@ impl Runner {
         let mut path_changed = false;
         if let Some(media) = &current.media {
             self.emit(VoiceEvent::Quality { quality: self.audio.quality(), ping_ms: current.last_ping_ms });
+            // Reports past their hold stop counting.
+            self.audio.set_expected_loss(current.expected_loss(Instant::now()));
             let path = media.media_path();
             if path != current.media_path {
                 current.media_path = path;
@@ -1030,6 +1055,10 @@ impl Runner {
         }
         if current.phase == CallPhase::Live {
             if let Some(ws) = current.ws.as_mut() {
+                let reports = self.audio.reception();
+                if current.media.is_some() && !reports.is_empty() {
+                    send_within(ws, &ClientMsg::Reception { reports }).await;
+                }
                 current.ping_sent_at = Some(Instant::now());
                 let _ = tokio::time::timeout(WS_SEND_TIMEOUT, ws.send(Message::Ping(Vec::new().into()))).await;
             }
@@ -1125,4 +1154,18 @@ async fn resolve_endpoint(relay_url: &str, port: u16) -> Result<SocketAddr> {
     let mut addresses =
         tokio::net::lookup_host((host, port)).await.map_err(|e| GhostError::Network(format!("resolve relay: {e}")))?;
     addresses.next().ok_or_else(|| GhostError::Network("relay address resolved to nothing".into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_worst_recent_report_decides_the_protection() {
+        let now = Instant::now();
+        let reports = HashMap::from([(1, (3, now)), (2, (9, now - Duration::from_secs(4))), (3, (40, now - REPORT_HOLD - Duration::from_secs(1)))]);
+        assert_eq!(worst_fresh_loss(&reports, now), 9, "a stale report no longer counts");
+        assert_eq!(worst_fresh_loss(&reports, now + REPORT_HOLD), 3);
+        assert_eq!(worst_fresh_loss(&HashMap::new(), now), 0);
+    }
 }

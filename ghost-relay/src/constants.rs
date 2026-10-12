@@ -31,6 +31,8 @@ pub const VOICE_EVENT_CAPACITY: usize = 16;
 pub const MAX_PRESENCE_BLOB_SIZE: usize = 2048;
 pub const PRESENCE_RATE_LIMIT: u32 = 2;
 pub const SPEAKING_RATE_LIMIT: u32 = 20;
+/// Reception reports a voice connection may send per second; clients send one every 2 s.
+pub const RECEPTION_RATE_LIMIT: u32 = 1;
 
 // Log retention
 pub const DEFAULT_LOG_RETENTION_HOURS: u64 = 72; // 3 days

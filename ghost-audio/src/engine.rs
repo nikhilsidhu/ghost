@@ -11,10 +11,11 @@ use tokio::sync::mpsc;
 
 use crate::constants::*;
 use crate::devices::{AudioDevices, CaptureRead, Playback, PlayoutLink};
-use crate::dsp::{denoise_frame, energy_vad};
+use crate::dsp::denoise_frame;
 use crate::processing::{CaptureProcessing, EchoCanceller, VolumeNormalizer};
 use crate::receiver::PlayoutStats;
 use crate::{AgcMode, AudioControls, InputMode, NoiseSuppressionMode};
+use ghost_wire::voice::Reception;
 
 /// CELT-only fullband 20 ms mono silence; resets the receiver's decoder state cleanly.
 const OPUS_SILENCE: [u8; 3] = [0xF8, 0xFF, 0xFE];
@@ -30,9 +31,19 @@ fn create_encoder() -> Result<opus::Encoder, String> {
     encoder.set_bitrate(opus::Bitrate::Bits(OPUS_BITRATE)).map_err(|e| format!("opus bitrate: {e}"))?;
     encoder.set_vbr(true).map_err(|e| format!("opus vbr: {e}"))?;
     encoder.set_complexity(OPUS_COMPLEXITY).map_err(|e| format!("opus complexity: {e}"))?;
+    // The microphone carries voice: whatever the encoder might take for music (laughter,
+    // humming) is still coded as voice, and so still protected once loss is reported.
+    encoder.set_signal(opus::Signal::Voice).map_err(|e| format!("opus signal: {e}"))?;
+    // Used only while the others report loss (`opus_loss_pct`); until then no bits go to it.
     encoder.set_inband_fec(true).map_err(|e| format!("opus fec: {e}"))?;
-    encoder.set_packet_loss_perc(OPUS_EXPECTED_LOSS_PCT).map_err(|e| format!("opus loss pct: {e}"))?;
+    encoder.set_packet_loss_perc(0).map_err(|e| format!("opus loss pct: {e}"))?;
     Ok(encoder)
+}
+
+/// The loss Opus protects against for the worst loss the others report: the highest
+/// step at or below it, none below the first.
+fn opus_loss_pct(reported: u8) -> i32 {
+    OPUS_LOSS_STEPS.iter().rev().find(|step| reported >= **step).map_or(0, |step| *step as i32)
 }
 
 /// Turns captured frames into sent ones: echo cancellation, gain, noise suppression,
@@ -41,11 +52,17 @@ fn create_encoder() -> Result<opus::Encoder, String> {
 struct Transmitter {
     sender: FrameSender,
     encoder: opus::Encoder,
+    /// The loss the encoder protects against now, percent.
+    opus_loss: i32,
     processing: CaptureProcessing,
+    /// Runs on every frame, for its speech probability whether or not its denoised
+    /// audio is used.
     denoiser: Box<nnnoiseless::DenoiseState<'static>>,
     /// nnnoiseless's first frame after a reset is unreliable and is not sent.
     denoise_primed: bool,
-    last_ns_mode: NoiseSuppressionMode,
+    /// A frame's copy for nnnoiseless when noise suppression is off and the frame goes
+    /// out untouched.
+    analysis: Vec<f32>,
     /// The sender's media clock: one step per captured frame, sent or not, so
     /// receivers can tell lateness from silence.
     sequence: u32,
@@ -69,10 +86,11 @@ impl Transmitter {
         Ok(Self {
             sender,
             encoder: create_encoder()?,
+            opus_loss: 0,
             processing,
             denoiser: nnnoiseless::DenoiseState::new(),
             denoise_primed: false,
-            last_ns_mode: NoiseSuppressionMode::Nnnoiseless,
+            analysis: vec![0.0; FRAME_SAMPLES],
             sequence: 0,
             vad_hangover: 0,
             was_speaking: false,
@@ -148,27 +166,25 @@ impl Transmitter {
         let level = (frame.iter().map(|s| s * s).sum::<f32>() / frame.len() as f32).sqrt();
         controls.input_level.store(level.to_bits(), Ordering::Relaxed);
 
-        let ns_mode = NoiseSuppressionMode::from(controls.noise_suppression.load(Ordering::Relaxed));
-        if ns_mode == NoiseSuppressionMode::Nnnoiseless && self.last_ns_mode != NoiseSuppressionMode::Nnnoiseless {
-            self.denoise_primed = false;
-        }
-        self.last_ns_mode = ns_mode;
-        let voice_probability = match ns_mode {
-            NoiseSuppressionMode::Nnnoiseless => {
-                let vad = denoise_frame(&mut self.denoiser, frame, &mut self.denoise_in, &mut self.denoise_out);
-                if !self.denoise_primed {
-                    self.denoise_primed = true;
-                    self.quiet(sequence);
-                    return;
-                }
-                vad
+        // Speech is told apart by nnnoiseless either way; with noise suppression off it
+        // looks at a copy, and the frame goes out as captured.
+        let voice_probability = match NoiseSuppressionMode::from(controls.noise_suppression.load(Ordering::Relaxed)) {
+            NoiseSuppressionMode::Nnnoiseless => denoise_frame(&mut self.denoiser, frame, &mut self.denoise_in, &mut self.denoise_out),
+            NoiseSuppressionMode::Off => {
+                self.analysis.copy_from_slice(frame);
+                denoise_frame(&mut self.denoiser, &mut self.analysis, &mut self.denoise_in, &mut self.denoise_out)
             }
-            NoiseSuppressionMode::Off => energy_vad(frame),
         };
+        if !self.denoise_primed {
+            self.denoise_primed = true;
+            self.quiet(sequence);
+            return;
+        }
 
         let voiced = voice_probability > f32::from_bits(controls.vad_threshold.load(Ordering::Relaxed));
         let speaking = match mode {
             InputMode::PushToTalk => true,
+            InputMode::Continuous => level > DIGITAL_SILENCE,
             InputMode::VoiceActivity => {
                 // Stay "speaking" briefly after the voice drops, so word ends go out.
                 if voiced {
@@ -185,6 +201,11 @@ impl Transmitter {
             self.processing.volume.process(frame, voiced);
         }
 
+        let protected = controls.loss_protection.load(Ordering::Relaxed);
+        let opus_loss = if protected { opus_loss_pct(controls.expected_loss.load(Ordering::Relaxed)) } else { 0 };
+        if opus_loss != self.opus_loss && self.encoder.set_packet_loss_perc(opus_loss).is_ok() {
+            self.opus_loss = opus_loss;
+        }
         // Encode every frame, sent or not, so the encoder's state stays warm.
         let Ok(len) = self.encoder.encode_float(frame, &mut self.encode_buf) else { return };
         if speaking {
@@ -259,11 +280,18 @@ fn route_inbound(received: &mut mpsc::Receiver<Inbound>, link: &mut PlayoutLink)
 fn read_quality(link: &mut PlayoutLink, controls: &AudioControls) -> String {
     let mut summary = Vec::with_capacity(link.peers.len());
     let mut window = PlayoutStats::default();
+    let mut reception = Vec::with_capacity(link.peers.len());
     let (mut max_depth, mut max_target) = (0u32, 0u32);
-    for peer in link.peers.values_mut() {
+    for (&slot_id, peer) in link.peers.iter_mut() {
         let playout = peer.stats.playout();
-        window.add(&playout.since(&peer.reported));
+        let since = playout.since(&peer.reported);
+        window.add(&since);
         peer.reported = playout;
+        let lost = since.recovered + since.concealed + since.dropped_late;
+        let heard = since.played + lost;
+        if heard >= RECEPTION_MIN_FRAMES {
+            reception.push(Reception { slot_id, loss_pct: (lost as f32 * 100.0 / heard as f32).round() as u8 });
+        }
         summary.push(format!("d{}t{}", peer.stats.depth(), peer.stats.target()));
         // A silent sender's buffer says nothing about how the call sounds now.
         if !peer.stats.is_idle() {
@@ -275,6 +303,7 @@ fn read_quality(link: &mut PlayoutLink, controls: &AudioControls) -> String {
     let lost = window.recovered + window.concealed + window.dropped_late;
     let loss_pct = if heard > 0 { lost as f32 / heard as f32 * 100.0 } else { 0.0 };
     controls.packet_loss_pct.store(loss_pct.to_bits(), Ordering::Relaxed);
+    *controls.reception.lock().unwrap() = reception;
     controls.jitter_depth.store(max_depth, Ordering::Relaxed);
     controls.jitter_target.store(max_target, Ordering::Relaxed);
     controls.playout_totals.lock().unwrap().add(&window);
@@ -371,8 +400,9 @@ pub(crate) fn run(
             let playout = read_quality(&mut link, &controls);
             tracing::event!(
                 DIAG_LEVEL,
-                "voice diag: sent={} recv={frames_received} cap_empty={capture_empty}/{ticks} echo=[{}] playout=[{playout}]",
+                "voice diag: sent={} protect={}% recv={frames_received} cap_empty={capture_empty}/{ticks} echo=[{}] playout=[{playout}]",
                 transmitter.frames_sent,
+                transmitter.opus_loss,
                 transmitter.processing.echo.summary()
             );
             (ticks, frames_received, capture_empty, transmitter.frames_sent) = (0, 0, 0, 0);
@@ -392,6 +422,76 @@ mod tests {
     use crate::fake::{speech_like, ToneDevices};
     use crate::receiver::PeerStats;
     use crate::{AudioTrack, VoiceAudio};
+
+    /// Opus's coding mode and bandwidth, from a packet's TOC byte.
+    fn coding(packet: &[u8]) -> &'static str {
+        match packet[0] >> 3 {
+            0..=11 => "silk",
+            12..=15 => "hybrid",
+            _ => "celt",
+        }
+    }
+
+    #[test]
+    fn the_encoder_codes_full_band_until_loss_is_reported_then_protects_against_it() {
+        assert_eq!([0, 1, 4, 5, 9, 10, 19, 20, 100].map(opus_loss_pct), [0, 1, 1, 5, 5, 10, 10, 20, 20]);
+        // One sentence of the synthetic voice; pauses are left out, as Opus codes silence
+        // as it likes, and so are the first frames, while the encoder changes mode.
+        let voice = speech_like(1.6, 0.03);
+        let mut encoder = create_encoder().unwrap();
+        let mut packet = vec![0u8; OPUS_MAX_FRAME_BYTES];
+        let mut modes = |encoder: &mut opus::Encoder| -> Vec<&'static str> {
+            voice.chunks_exact(FRAME_SAMPLES).map(|frame| {
+                let len = encoder.encode_float(frame, &mut packet).unwrap();
+                coding(&packet[..len])
+            }).skip(5).collect()
+        };
+        assert!(modes(&mut encoder).iter().all(|m| *m == "celt"), "a clean network gets full-band CELT");
+        encoder.set_packet_loss_perc(opus_loss_pct(5)).unwrap();
+        assert!(modes(&mut encoder).iter().all(|m| *m != "celt"), "reported loss brings the SILK layer that carries FEC");
+    }
+
+    #[test]
+    fn protection_carries_speech_through_loss_far_better_than_concealment() {
+        let voice = speech_like(6.6, 0.03);
+        // Voiced 20 ms frames that come out more than 10 dB below what went in, with one
+        // frame in five lost (never two in a row, so each lost frame's copy arrives).
+        let dropouts = |reported: u8| -> usize {
+            let mut encoder = create_encoder().unwrap();
+            encoder.set_packet_loss_perc(opus_loss_pct(reported)).unwrap();
+            let packets: Vec<Vec<u8>> = voice.chunks_exact(FRAME_SAMPLES).map(|f| encoder.encode_vec_float(f, OPUS_MAX_FRAME_BYTES).unwrap()).collect();
+            let mut decoder = opus::Decoder::new(SAMPLE_RATE, opus::Channels::Mono).unwrap();
+            let mut out = vec![0.0f32; FRAME_SAMPLES];
+            let mut drops = 0;
+            for (i, (packet, input)) in packets.iter().zip(voice.chunks_exact(FRAME_SAMPLES)).enumerate() {
+                if i % 5 == 2 {
+                    decoder.decode_float(&packets[i + 1], &mut out, true).unwrap();
+                } else {
+                    decoder.decode_float(packet, &mut out, false).unwrap();
+                }
+                let level = crate::dsp::rms(input);
+                if level > SPEECH * 0.5 && crate::dsp::rms(&out) < level * 0.316 {
+                    drops += 1;
+                }
+            }
+            drops
+        };
+        let (protected, concealed) = (dropouts(20), dropouts(0));
+        assert!(concealed >= 5 && protected * 3 <= concealed, "{protected} dropouts with protection, {concealed} with concealment alone");
+    }
+
+    #[test]
+    fn each_sender_is_told_its_loss_once_enough_of_it_was_heard() {
+        let controls = Arc::new(AudioControls::new());
+        let (_playback, mut link) = Playback::new(controls.clone());
+        for (slot, played, concealed) in [(1, 95, 5), (2, 30, 10)] {
+            let stats = Arc::new(PeerStats::default());
+            stats.set_playout(PlayoutStats { played, concealed, ..Default::default() });
+            link.peers.insert(slot, crate::devices::Peer { stats, reported: PlayoutStats::default() });
+        }
+        read_quality(&mut link, &controls);
+        assert_eq!(*controls.reception.lock().unwrap(), vec![Reception { slot_id: 1, loss_pct: 5 }], "slot 2 was heard too little to tell");
+    }
 
     #[test]
     fn quality_readings_count_each_frame_once() {
@@ -471,6 +571,29 @@ mod tests {
         let (share, tail) = heard(&speech, &played);
         assert!(share > 0.7, "only {:.0}% of speech heard", share * 100.0);
         assert!(tail < SILENT, "the echo rang on after the speech: RMS {tail}");
+    }
+
+    #[test]
+    fn with_noise_suppression_off_quiet_speech_still_goes_out() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _enter = runtime.enter();
+        let devices = ToneDevices::new();
+        let audio = VoiceAudio::new(devices.clone());
+        audio.set_noise_suppression(NoiseSuppressionMode::Off);
+        // -40 dBFS: a laptop's microphone a little way off.
+        let speech = speech_like(SPEECH_SECONDS, 0.01);
+        devices.play(&speech);
+        let (events, _events) = mpsc::unbounded_channel();
+        audio.start(TrackIo::loopback(events).unwrap()).unwrap();
+        std::thread::sleep(Duration::from_secs_f32(SPEECH_SECONDS + TAIL_SECONDS));
+        audio.stop();
+        let played = devices.recording();
+        let voiced: Vec<usize> = speech.chunks_exact(FRAME_SAMPLES).enumerate().filter(|(_, f)| crate::dsp::rms(f) > 0.003).map(|(i, _)| i).collect();
+        let heard = voiced
+            .iter()
+            .filter(|&&i| (0..10).any(|lag| played.get((i + lag) * FRAME_SAMPLES..(i + lag + 1) * FRAME_SAMPLES).is_some_and(|f| crate::dsp::rms(f) > 0.001)))
+            .count();
+        assert!(heard as f32 > voiced.len() as f32 * 0.9, "only {heard} of {} voiced frames went out", voiced.len());
     }
 
     #[test]

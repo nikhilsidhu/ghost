@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 
 pub use ghost_media::{AudioTrack, TrackEvent, TrackIo};
 use ghost_media::TrackQuality;
+use ghost_wire::voice::Reception;
 
 use constants::{AGC_START_GAIN_DB, VAD_THRESHOLD};
 use processing::CaptureProcessing;
@@ -68,12 +69,16 @@ impl From<u8> for AgcMode {
 pub enum InputMode {
     VoiceActivity = 0,
     PushToTalk = 1,
+    /// Everything goes out but digital silence, which no microphone makes: for synthetic
+    /// devices, whose tones are not speech but whose pauses are real.
+    Continuous = 2,
 }
 
 impl From<u8> for InputMode {
     fn from(v: u8) -> Self {
         match v {
             1 => Self::PushToTalk,
+            2 => Self::Continuous,
             _ => Self::VoiceActivity,
         }
     }
@@ -90,6 +95,12 @@ pub(crate) struct AudioControls {
     pub packet_loss_pct: AtomicU32,
     pub jitter_depth: AtomicU32,
     pub jitter_target: AtomicU32,
+    /// Loss heard from each sender over the last quality reading.
+    pub reception: Mutex<Vec<Reception>>,
+    /// The worst loss (percent) the others report on our frames.
+    pub expected_loss: AtomicU8,
+    /// Whether what we send is protected against that loss.
+    pub loss_protection: AtomicBool,
     pub noise_suppression: AtomicU8,
     pub agc: AtomicU8,
     pub vad_threshold: AtomicU32,
@@ -120,6 +131,9 @@ impl AudioControls {
             packet_loss_pct: AtomicU32::new(0),
             jitter_depth: AtomicU32::new(0),
             jitter_target: AtomicU32::new(0),
+            reception: Mutex::new(Vec::new()),
+            expected_loss: AtomicU8::new(0),
+            loss_protection: AtomicBool::new(true),
             noise_suppression: AtomicU8::new(NoiseSuppressionMode::Nnnoiseless as u8),
             agc: AtomicU8::new(AgcMode::Auto as u8),
             vad_threshold: AtomicU32::new(VAD_THRESHOLD.to_bits()),
@@ -181,6 +195,9 @@ impl VoiceAudio {
     pub fn start_run(&self, io: TrackIo) -> Result<TrackRun, String> {
         self.stop();
         *self.controls.playout_totals.lock().unwrap() = PlayoutStats::default();
+        // Nobody has reported on this call's frames yet.
+        self.controls.expected_loss.store(0, Ordering::Relaxed);
+        self.controls.reception.lock().unwrap().clear();
         #[cfg(feature = "devtools")]
         self.controls.figures.reset();
         let stop = Arc::new(AtomicBool::new(false));
@@ -275,6 +292,19 @@ impl VoiceAudio {
         *self.controls.playout_totals.lock().unwrap()
     }
 
+    /// Whether what this device sends is protected (Opus FEC) once the others report
+    /// losing it. On by default: it carries speech through loss far better than
+    /// concealment does. Off for synthetic tones, which Opus's concealment carries
+    /// through a loss and its FEC does not.
+    pub fn set_loss_protection(&self, enabled: bool) {
+        self.controls.loss_protection.store(enabled, Ordering::Relaxed);
+    }
+
+    /// The worst loss (percent) the others last reported on what this device sends.
+    pub fn expected_loss(&self) -> u8 {
+        self.controls.expected_loss.load(Ordering::Relaxed)
+    }
+
     /// The current call's figures, its audio threads' loads since the last read.
     #[cfg(feature = "devtools")]
     pub fn call_figures(&self) -> CallFigures {
@@ -310,5 +340,13 @@ impl AudioTrack for VoiceAudio {
             jitter_depth: self.controls.jitter_depth.load(Ordering::Relaxed),
             jitter_target: self.controls.jitter_target.load(Ordering::Relaxed),
         }
+    }
+
+    fn reception(&self) -> Vec<Reception> {
+        self.controls.reception.lock().unwrap().clone()
+    }
+
+    fn set_expected_loss(&self, loss_pct: u8) {
+        self.controls.expected_loss.store(loss_pct, Ordering::Relaxed);
     }
 }

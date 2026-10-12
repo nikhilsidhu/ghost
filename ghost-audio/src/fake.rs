@@ -175,24 +175,41 @@ impl DeviceStreams for ToneStreams {
     }
 }
 
-/// For each 20 ms window of `samples`, whether `frequency` dominates it: its share of
-/// the window's energy (by the Goertzel algorithm) is above `min_share`.
-pub fn tone_windows(samples: &[f32], frequency: f32, min_share: f32) -> Vec<bool> {
+/// The power of `frequency` in a 20 ms window, by the Goertzel algorithm.
+fn tone_power(window: &[f32], frequency: f32) -> f32 {
     let coefficient = 2.0 * (TAU * frequency / SAMPLE_RATE as f32).cos();
+    let (mut s1, mut s2) = (0.0f32, 0.0f32);
+    for sample in window {
+        let s0 = sample + coefficient * s1 - s2;
+        s2 = s1;
+        s1 = s0;
+    }
+    s1 * s1 + s2 * s2 - coefficient * s1 * s2
+}
+
+/// For each 20 ms window of `samples`, whether `frequency` dominates it: its share of
+/// the window's energy is above `min_share`.
+pub fn tone_windows(samples: &[f32], frequency: f32, min_share: f32) -> Vec<bool> {
     samples
         .chunks_exact(FRAME_SAMPLES)
         .map(|window| {
-            let (mut s1, mut s2) = (0.0f32, 0.0f32);
-            for sample in window {
-                let s0 = sample + coefficient * s1 - s2;
-                s2 = s1;
-                s1 = s0;
-            }
-            let tone_power = s1 * s1 + s2 * s2 - coefficient * s1 * s2;
             let total_power: f32 = window.iter().map(|s| s * s).sum::<f32>() * window.len() as f32 / 2.0;
-            total_power > 1e-6 && tone_power / total_power > min_share
+            total_power > 1e-6 && tone_power(window, frequency) / total_power > min_share
         })
         .collect()
+}
+
+/// For each 20 ms window of `samples`, whether `frequency` is there at all: within
+/// `within_db` of its usual (median) power across the windows, whatever else plays.
+/// What tells a tone rebuilt or concealed after a loss, perhaps less pure, from a
+/// dropout.
+pub fn tone_present(samples: &[f32], frequency: f32, within_db: f32) -> Vec<bool> {
+    let powers: Vec<f32> = samples.chunks_exact(FRAME_SAMPLES).map(|window| tone_power(window, frequency)).collect();
+    let mut sorted = powers.clone();
+    sorted.sort_by(f32::total_cmp);
+    let Some(median) = sorted.get(sorted.len() / 2) else { return Vec::new() };
+    let floor = median * 10f32.powf(-within_db / 10.0);
+    powers.iter().map(|power| *median > 1e-6 && *power >= floor).collect()
 }
 
 /// A two-pole resonator: one formant of the vocal tract.
@@ -274,6 +291,20 @@ mod tests {
         samples.extend(std::iter::repeat(0.0).take(FRAME_SAMPLES));
         assert_eq!(tone_windows(&samples, 440.0, 0.5), vec![true, true, false]);
         assert_eq!(tone_windows(&tone, 1000.0, 0.5), vec![false, false]);
+    }
+
+    #[test]
+    fn a_tone_is_present_until_it_drops_out_whatever_plays_beside_it() {
+        let tone = |frequency: f32, amplitude: f32| -> Vec<f32> {
+            (0..FRAME_SAMPLES).map(|i| amplitude * (TAU * frequency * i as f32 / SAMPLE_RATE as f32).sin()).collect::<Vec<f32>>()
+        };
+        let mix = |a: Vec<f32>, b: Vec<f32>| -> Vec<f32> { a.iter().zip(&b).map(|(x, y)| x + y).collect() };
+        let mut samples = Vec::new();
+        samples.extend(mix(tone(440.0, 0.3), tone(880.0, 0.3)));
+        samples.extend(mix(tone(440.0, 0.1), tone(880.0, 0.3)));
+        samples.extend(mix(tone(440.0, 0.3), tone(880.0, 0.3)));
+        samples.extend(mix(tone(440.0, 0.03), tone(880.0, 0.3)));
+        assert_eq!(tone_present(&samples, 440.0, 10.0), vec![true, true, true, false], "-9.5 dB is there, -20 dB dropped out");
     }
 
     #[test]

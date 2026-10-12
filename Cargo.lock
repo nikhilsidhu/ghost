@@ -2310,6 +2310,7 @@ name = "ghost-audio"
 version = "0.1.0"
 dependencies = [
  "ghost-media",
+ "ghost-wire",
  "nnnoiseless",
  "opus",
  "ringbuf",

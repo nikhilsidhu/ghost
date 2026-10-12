@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ghost_audio::fake::ToneDevices;
-use ghost_audio::{NoiseSuppressionMode, VoiceAudio};
+use ghost_audio::{InputMode, NoiseSuppressionMode, VoiceAudio};
 use ghost_core::account_keys::{DeviceEncryptionKey, RecoveryKey};
 use ghost_core::client::GhostClient;
 use ghost_core::error::{GhostError, Result};
@@ -176,11 +176,15 @@ impl Device {
     fn assemble(data_dir: &Path, client: GhostClient, relay: RelayClient, events: mpsc::Receiver<RelayEvent>) -> Self {
         let tone = ToneDevices::new();
         let audio = Arc::new(VoiceAudio::new(tone.clone()));
-        // A pure tone is not speech, and noise suppression would silence it; loudness
-        // decides what is sent instead.
+        // A pure tone is not speech: noise suppression would silence it, and voice activity
+        // never send it. Everything but its pauses goes out instead.
         audio.set_noise_suppression(NoiseSuppressionMode::Off);
+        audio.set_input_mode(InputMode::Continuous);
         // Synthetic devices have no room for playback to echo in.
         audio.set_echo_cancellation(false);
+        // Opus carries a steady tone through a loss by concealment; its FEC, made for
+        // speech, rebuilds one far quieter.
+        audio.set_loss_protection(false);
         let presence = PresenceInfo { avatar: flows::presence::own_avatar(&client), ..PresenceInfo::default() };
         Self {
             client: Arc::new(Mutex::new(client)),

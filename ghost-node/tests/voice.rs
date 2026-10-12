@@ -127,6 +127,23 @@ async fn audio_holds_up_under_loss_and_jitter() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn lost_frames_are_reported_back_to_their_senders() {
+    let call = call().await;
+    wait_until_hears(&call.bob, ALICE_TONE, AUDIO_WAIT).await;
+    // A few quality reports on a clean network: nothing lost to report.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!((call.alice.device.audio.expected_loss(), call.bob.device.audio.expected_loss()), (0, 0));
+
+    // 10% lost each way: each hears the other lose about a fifth of its frames.
+    call.forwarder.set_impairment(Impairment { loss: 0.1, ..Impairment::default() });
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while call.alice.device.audio.expected_loss() < 10 || call.bob.device.audio.expected_loss() < 10 {
+        assert!(tokio::time::Instant::now() < deadline, "the loss was never reported back to the senders");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn audio_rides_out_delay_spikes() {
     let call = call().await;
     wait_until_hears(&call.bob, ALICE_TONE, AUDIO_WAIT).await;

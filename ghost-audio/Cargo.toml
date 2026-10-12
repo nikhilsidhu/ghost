@@ -10,6 +10,7 @@ license = "AGPL-3.0"
 
 [dependencies]
 ghost-media = { path = "../ghost-media" }
+ghost-wire = { path = "../ghost-wire" }
 opus = "0.3"
 nnnoiseless = "0.5"
 # WebRTC's echo canceller (AEC3) and volume normalizer (AGC2), ported to Rust.

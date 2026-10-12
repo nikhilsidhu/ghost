@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::sync::atomic::Ordering::Relaxed;
+use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
@@ -8,11 +9,11 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use ghost_wire::presence::PresenceSender;
-use ghost_wire::voice::{ClientMsg, PeerEntry, ServerMsg};
+use ghost_wire::voice::{ClientMsg, PeerEntry, Reception, ServerMsg};
 use std::time::{Duration, Instant};
 
 use crate::auth::DeviceAuth;
-use crate::constants::{MAX_PRESENCE_BLOB_SIZE, PRESENCE_RATE_LIMIT, SPEAKING_RATE_LIMIT};
+use crate::constants::{MAX_PRESENCE_BLOB_SIZE, PRESENCE_RATE_LIMIT, RECEPTION_RATE_LIMIT, SPEAKING_RATE_LIMIT};
 use crate::error::RelayError;
 use crate::state::AppState;
 use crate::util::decode_mailbox_id;
@@ -190,6 +191,7 @@ async fn voice_connection(socket: WebSocket, mailbox_id: [u8; 32], room_id: [u8;
 
     let mut presence_rate = RateWindow::new(PRESENCE_RATE_LIMIT);
     let mut speaking_rate = RateWindow::new(SPEAKING_RATE_LIMIT);
+    let mut reception_rate = RateWindow::new(RECEPTION_RATE_LIMIT);
 
     loop {
         tokio::select! {
@@ -282,6 +284,25 @@ async fn voice_connection(socket: WebSocket, mailbox_id: [u8; 32], room_id: [u8;
                                     });
                                 }
                             }
+                            Ok(ClientMsg::Reception { reports }) => {
+                                let Some((sid, _)) = held else { continue };
+                                if !reception_rate.allow() {
+                                    continue;
+                                }
+                                let channels = state.voice_channels.read().await;
+                                if let Some(channel) = channels.get(&room_id) {
+                                    // Only about the room's other participants, one report each.
+                                    let mut told = HashSet::new();
+                                    let reports: Vec<Reception> = reports
+                                        .into_iter()
+                                        .filter(|r| r.slot_id != sid && channel.participants.iter().any(|p| p.slot_id == r.slot_id) && told.insert(r.slot_id))
+                                        .map(|r| Reception { loss_pct: r.loss_pct.min(100), ..r })
+                                        .collect();
+                                    if !reports.is_empty() {
+                                        let _ = channel.notify.send(VoiceEvent::Reception { from: sid, reports: Arc::new(reports) });
+                                    }
+                                }
+                            }
                             Ok(ClientMsg::Resync) => {
                                 let Some((sid, token)) = held else { continue };
                                 let channels = state.voice_channels.read().await;
@@ -362,6 +383,14 @@ async fn voice_connection(socket: WebSocket, mailbox_id: [u8; 32], room_id: [u8;
                             let _ = send_json(&mut sink, &ServerMsg::Speaking {
                                 slot_id: sid,
                                 speaking,
+                            }).await;
+                        }
+                    }
+                    Ok(VoiceEvent::Reception { from: reporter, reports }) => {
+                        if let Some(report) = reports.iter().find(|r| Some(r.slot_id) == slot_id) {
+                            let _ = send_json(&mut sink, &ServerMsg::Reception {
+                                slot_id: reporter,
+                                loss_pct: report.loss_pct,
                             }).await;
                         }
                     }

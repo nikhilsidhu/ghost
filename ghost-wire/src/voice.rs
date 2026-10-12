@@ -38,6 +38,18 @@ pub enum ClientMsg {
     Speaking { speaking: bool },
     /// Ask for a fresh welcome listing the room's current peers.
     Resync,
+    /// How much of each other participant's media this one lost lately, for the relay
+    /// to pass to each of them: a sender protects its frames (Opus FEC) against the worst
+    /// loss its listeners report.
+    Reception { reports: Vec<Reception> },
+}
+
+/// The share of a participant's frames lost on the way to the reporter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Reception {
+    pub slot_id: u32,
+    /// Percent of its frames lost lately, 0 to 100.
+    pub loss_pct: u8,
 }
 
 /// Relay to client, as JSON text frames on the voice WebSocket.
@@ -54,6 +66,8 @@ pub enum ServerMsg {
     Left { slot_id: u32 },
     Presence { slot_id: u32, blob: String, from: PresenceSender },
     Speaking { slot_id: u32, speaking: bool },
+    /// The participant in `slot_id` lost this share (percent) of our frames lately.
+    Reception { slot_id: u32, loss_pct: u8 },
     Error { message: String },
 }
 
@@ -275,5 +289,9 @@ mod tests {
         let resume = serde_json::to_value(ClientMsg::Resume { slot_id: 4, token: "dA==".into(), presence: "cA==".into() }).unwrap();
         assert_eq!(resume, serde_json::json!({ "type": "resume", "slot_id": 4, "token": "dA==", "presence": "cA==" }));
         assert_eq!(serde_json::to_value(ServerMsg::NotResumed).unwrap(), serde_json::json!({ "type": "not_resumed" }));
+        let reception = serde_json::to_value(ClientMsg::Reception { reports: vec![Reception { slot_id: 2, loss_pct: 7 }] }).unwrap();
+        assert_eq!(reception, serde_json::json!({ "type": "reception", "reports": [{ "slot_id": 2, "loss_pct": 7 }] }));
+        let told = serde_json::to_value(ServerMsg::Reception { slot_id: 1, loss_pct: 7 }).unwrap();
+        assert_eq!(told, serde_json::json!({ "type": "reception", "slot_id": 1, "loss_pct": 7 }));
     }
 }

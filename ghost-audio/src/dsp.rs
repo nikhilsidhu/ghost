@@ -27,11 +27,6 @@ pub fn denoise_frame(
     max_vad
 }
 
-/// Speech by loudness, for when noise suppression is off: 1.0 if loud enough, else 0.0.
-pub fn energy_vad(samples: &[f32]) -> f32 {
-    if rms(samples) >= ENERGY_VAD_SPEECH_RMS { 1.0 } else { 0.0 }
-}
-
 pub fn rms(samples: &[f32]) -> f32 {
     (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
 }

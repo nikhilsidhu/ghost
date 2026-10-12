@@ -2,6 +2,7 @@
 //! audio. The call owns signaling and the media session and drives the track through
 //! this interface, so the desktop app and headless devices run the same call.
 
+use ghost_wire::voice::Reception;
 use tokio::sync::mpsc;
 
 use crate::session::{FrameSender, Inbound};
@@ -49,4 +50,11 @@ pub trait AudioTrack: Send + Sync + 'static {
     /// Whether the local user is speaking (and so transmitting) now.
     fn speaking(&self) -> bool;
     fn quality(&self) -> TrackQuality;
+    /// How much of each other caller's frames was lost on the way here lately, by slot,
+    /// for telling each how much to protect what it sends. Callers not heard enough
+    /// lately to tell are left out.
+    fn reception(&self) -> Vec<Reception>;
+    /// The worst loss (percent) the others report on our frames lately, which what we
+    /// send is protected against.
+    fn set_expected_loss(&self, loss_pct: u8);
 }

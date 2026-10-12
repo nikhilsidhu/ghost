@@ -14,6 +14,9 @@ pub enum VoiceEvent {
     Left { slot_id: u32 },
     Presence { slot_id: u32, from: PresenceSender, blob: Vec<u8> },
     Speaking { slot_id: u32, speaking: bool },
+    /// How much of each participant's frames the one in `from` lost lately; each
+    /// connection passes on the report about its own slot.
+    Reception { from: u32, reports: std::sync::Arc<Vec<ghost_wire::voice::Reception>> },
     /// Another device of the slot's account joined the room, which holds one device per
     /// account: the slot is gone, and the connection that held it closes.
     Replaced { slot_id: u32 },
