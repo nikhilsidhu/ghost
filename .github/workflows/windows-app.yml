@@ -1,0 +1,44 @@
+name: Windows app
+
+# A Windows build of the desktop app to download and try, from the run's artifacts:
+# a debug build with the dev tools (voice diagnostics in its log, the profiler), its
+# audio processing optimized as in every dev build. Windows 11 provides the WebView2
+# runtime it needs.
+
+on:
+  push:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ghost-app.exe
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ghost-app/package-lock.json
+      # SQLCipher links OpenSSL, provided through vcpkg (preinstalled on GitHub's Windows
+      # images); libopus builds from source with the preinstalled cmake.
+      - name: OpenSSL for SQLCipher
+        run: |
+          vcpkg install openssl:x64-windows-static-md
+          echo "OPENSSL_DIR=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static-md" >> $env:GITHUB_ENV
+      # The front end is embedded in the executable, so it runs on its own.
+      - name: Build
+        working-directory: ghost-app
+        run: |
+          npm ci
+          npx tauri build --debug --no-bundle --features devtools --config src-tauri/tauri.devtools.conf.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ghost-app-windows
+          path: target/debug/ghost-app.exe
+          if-no-files-found: error
