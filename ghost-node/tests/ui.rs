@@ -103,6 +103,12 @@ impl App {
             tokio::net::TcpStream::connect(("127.0.0.1", port)).await.ok()
         })
         .await;
+        // tauri-driver serves before the WebKitWebDriver it starts is listening, and passes
+        // a session request on to it straight away.
+        eventually("WebKitWebDriver listening", || async move {
+            tokio::net::TcpStream::connect(("127.0.0.1", native_port)).await.ok()
+        })
+        .await;
         let mut capabilities = Capabilities::new();
         capabilities.set("tauri:options", serde_json::json!({ "application": application })).unwrap();
         let driver = WebDriver::new(format!("http://127.0.0.1:{port}"), capabilities).await.expect("a WebDriver session");
@@ -185,6 +191,9 @@ impl App {
         self.element("recovery-key-saved").await.click().await.unwrap();
         self.element("recovery-key-typed").await.send_keys(&key).await.unwrap();
         self.element("recovery-key-confirm").await.click().await.unwrap();
+        // The main window replaces the setup screen once the account is ready; a shortcut
+        // pressed before then reaches no listener.
+        self.element("main-window").await;
     }
 
     /// Run a palette command, typing each argument and accepting it (or its top
@@ -343,6 +352,8 @@ async fn kicking_from_the_member_list() {
         .await
         .unwrap();
     app.element("kick-member").await.click().await.unwrap();
+    // The first click asks for confirmation; the second kicks.
+    app.element_with_text("kick-member", "Kick them out").await.click().await.unwrap();
 
     bob.expect(mark, "being kicked", kicked_from(server_id)).await;
     app.wait_until_gone("member", "bob").await;

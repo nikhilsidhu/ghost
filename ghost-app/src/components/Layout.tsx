@@ -27,7 +27,7 @@ export function Layout() {
   const overlayShortcuts = shortcutDefs.filter((s) => s.id !== "shortcuts");
 
   return (
-    <div class="h-screen flex relative" style={{ background: "var(--neutral-950)" }}>
+    <div data-testid="main-window" class="h-screen flex relative" style={{ background: "var(--neutral-950)" }}>
       <div data-tauri-drag-region class="absolute inset-x-0 top-0 h-7 z-10" />
       <Show when={devProfile()}>
         <span class="absolute top-1.5 right-3 z-20 text-[10px] font-mono text-[var(--neutral-500)] select-none pointer-events-none">
