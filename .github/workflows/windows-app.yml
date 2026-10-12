@@ -34,6 +34,10 @@ jobs:
       # The front end is embedded in the executable, so it runs on its own.
       - name: Build
         working-directory: ghost-app
+        # The libopus source audiopus_sys bundles asks for a CMake older than 3.5, which
+        # CMake 4 configures only with this floor.
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
         run: |
           npm ci
           npx tauri build --debug --no-bundle --features devtools --config src-tauri/tauri.devtools.conf.json

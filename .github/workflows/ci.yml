@@ -18,14 +18,21 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    # The libopus source audiopus_sys bundles asks for a CMake older than 3.5, which
+    # CMake 4 configures only with this floor.
+    env:
+      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # macOS and Windows build libopus from source with the preinstalled cmake.
-      - name: Linux libraries (D-Bus and a Secret Service for the keyring, OpenSSL for SQLCipher, Opus for voice)
+      - name: Linux libraries (D-Bus and a Secret Service for the keyring, OpenSSL for SQLCipher, Opus for voice, Tauri's for the dev launcher)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev libssl-dev libopus-dev pkg-config gnome-keyring dbus
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev libssl-dev libopus-dev pkg-config gnome-keyring dbus \
+            libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev
       # Not yet verified on a Windows machine: SQLCipher links OpenSSL, provided here
       # through vcpkg (preinstalled on GitHub's Windows images).
       - name: Windows OpenSSL for SQLCipher
