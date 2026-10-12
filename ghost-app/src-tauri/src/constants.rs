@@ -25,3 +25,9 @@ pub const RESAMPLE_SUB_CHUNKS: usize = 2;
 /// soon as it opens would otherwise be reopened every frame.
 pub const DEVICE_LOSS_LIMIT: usize = 3;
 pub const DEVICE_LOSS_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+/// Quiet after a default-device change before a call follows it: such changes come in
+/// bursts (a Bluetooth headset changing mode announces several within a second).
+pub const DEVICE_SETTLE: std::time::Duration = std::time::Duration::from_secs(1);
+/// Capture silent this long counts as its device gone: longer than a Bluetooth
+/// microphone takes to start.
+pub const CAPTURE_STALL: std::time::Duration = std::time::Duration::from_secs(3);

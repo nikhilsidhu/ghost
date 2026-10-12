@@ -16,7 +16,10 @@ use ghost_audio::{AudioDevices, CaptureRead, DeviceStreams, Playback};
 use ringbuf::{traits::*, HeapRb};
 use rubato::Resampler as _;
 
-use crate::constants::{CALLBACK_ROOM, DEVICE_BUFFER_SAMPLES, DEVICE_LOSS_LIMIT, DEVICE_LOSS_WINDOW, ENGINE_CHANNELS, RESAMPLE_SUB_CHUNKS, RING_CAPACITY};
+use crate::constants::{
+    CALLBACK_ROOM, CAPTURE_STALL, DEVICE_BUFFER_SAMPLES, DEVICE_LOSS_LIMIT, DEVICE_LOSS_WINDOW, DEVICE_SETTLE, ENGINE_CHANNELS, RESAMPLE_SUB_CHUNKS,
+    RING_CAPACITY,
+};
 use crate::device_watcher::DeviceWatcher;
 
 /// How often capture is checked while waiting for a frame.
@@ -264,6 +267,27 @@ pub fn resolve_device(
     }
 }
 
+/// A burst of notices, acted on once it stops.
+#[derive(Default)]
+struct Settle {
+    last: Option<Instant>,
+}
+
+impl Settle {
+    fn notice(&mut self, now: Instant) {
+        self.last = Some(now);
+    }
+
+    /// Whether a burst ended at least `DEVICE_SETTLE` ago; it counts once.
+    fn settled(&mut self, now: Instant) -> bool {
+        let settled = self.last.is_some_and(|at| now.duration_since(at) >= DEVICE_SETTLE);
+        if settled {
+            self.last = None;
+        }
+        settled
+    }
+}
+
 /// Which devices calls use; `None` follows the system default.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DeviceChoice {
@@ -310,6 +334,7 @@ impl AudioDevices for CpalDevices {
             capture,
             notice,
             losses: VecDeque::new(),
+            settle: Settle::default(),
         }))
     }
 }
@@ -333,6 +358,7 @@ struct OpenStreams {
     _playback: cpal::Stream,
     capture_cons: ringbuf::HeapCons<f32>,
     input_name: String,
+    output_name: String,
     input_rate: u32,
     /// Set by either stream when its device goes away.
     device_lost: Arc<AtomicBool>,
@@ -397,15 +423,15 @@ impl OpenStreams {
         capture_stream.play().map_err(|e| format!("start capture: {e}"))?;
         playback_stream.play().map_err(|e| format!("start playback: {e}"))?;
 
-        let input_name = input_device.name().unwrap_or_default();
-        tracing::info!(
-            "voice: capture \"{input_name}\" ({}), playback \"{}\" ({})",
-            input_format,
-            output_device.name().unwrap_or_default(),
-            output_format,
-        );
+        let (input_name, output_name) = (input_device.name().unwrap_or_default(), output_device.name().unwrap_or_default());
+        tracing::info!("voice: capture \"{input_name}\" ({input_format}), playback \"{output_name}\" ({output_format})");
 
-        Ok(Self { _capture: capture_stream, _playback: playback_stream, capture_cons, input_name, input_rate, device_lost })
+        Ok(Self { _capture: capture_stream, _playback: playback_stream, capture_cons, input_name, output_name, input_rate, device_lost })
+    }
+
+    /// The devices open, by name.
+    fn devices(&self) -> (Option<String>, Option<String>) {
+        (Some(self.input_name.clone()), Some(self.output_name.clone()))
     }
 }
 
@@ -417,6 +443,8 @@ struct Capture {
     converter: Option<SampleRateConverter>,
     /// Engine-rate samples not yet handed out as a whole frame.
     pending: Vec<f32>,
+    /// When the device last delivered.
+    heard_at: Instant,
 }
 
 impl Capture {
@@ -432,8 +460,15 @@ impl Capture {
             device_buf: vec![0.0; device_frame],
             converter,
             pending: Vec::with_capacity(FRAME_SAMPLES * 2),
+            heard_at: Instant::now(),
         })
     }
+}
+
+/// The devices `choice` resolves to now, by name: what a reopen would open.
+fn wanted_devices(host: &cpal::Host, choice: &DeviceChoice) -> (Option<String>, Option<String>) {
+    let name = |chosen: &Option<String>, direction| resolve_device(host, chosen, direction).ok().and_then(|device| device.name().ok());
+    (name(&choice.input, "input"), name(&choice.output, "output"))
 }
 
 struct CpalStreams {
@@ -450,6 +485,8 @@ struct CpalStreams {
     notice: Option<String>,
     /// When devices were lost lately, oldest first.
     losses: VecDeque<Instant>,
+    /// Default-device changes waiting to settle.
+    settle: Settle,
 }
 
 impl CpalStreams {
@@ -474,15 +511,17 @@ impl DeviceStreams for CpalStreams {
         if let Some(notice) = self.notice.take() {
             return CaptureRead::Substituted(notice);
         }
-        // A device went away under the streams: reopen, unless devices keep going.
-        if self.streams.device_lost.load(Ordering::Relaxed) {
+        // A device went away under the streams, or capture stopped coming: reopen, unless
+        // devices keep going.
+        let stalled = self.capture.heard_at.elapsed() >= CAPTURE_STALL;
+        if self.streams.device_lost.load(Ordering::Relaxed) || stalled {
             let now = Instant::now();
             self.losses.retain(|at| now.duration_since(*at) < DEVICE_LOSS_WINDOW);
             if self.losses.len() >= DEVICE_LOSS_LIMIT {
                 return CaptureRead::Failed("audio devices keep going away".into());
             }
             self.losses.push_back(now);
-            tracing::info!("voice: an audio device went away, reopening");
+            tracing::info!("voice: {}, reopening", if stalled { "capture stopped" } else { "an audio device went away" });
             return self.reopen();
         }
         // The user chose other devices.
@@ -492,12 +531,17 @@ impl DeviceStreams for CpalStreams {
             tracing::info!("voice: other audio devices chosen, switching");
             return self.reopen();
         }
-        // The OS says the default device changed: reopen on the new one.
-        if self.watcher.try_recv().is_some() {
-            // Input and output changes often arrive together.
-            while self.watcher.try_recv().is_some() {}
-            tracing::info!("voice: audio device changed, switching...");
-            return self.reopen();
+        // The OS says a default device changed: once the changes settle, reopen if the
+        // devices to use are not the ones open (a headset changing mode keeps its name).
+        while self.watcher.try_recv().is_some() {
+            self.settle.notice(Instant::now());
+        }
+        if self.settle.settled(Instant::now()) {
+            let choice = self.choice.lock().unwrap().clone();
+            if wanted_devices(&self.host, &choice) != self.streams.devices() {
+                tracing::info!("voice: audio device changed, switching");
+                return self.reopen();
+            }
         }
 
         let deadline = Instant::now() + timeout;
@@ -510,6 +554,7 @@ impl DeviceStreams for CpalStreams {
             }
             if self.streams.capture_cons.occupied_len() >= capture.device_frame {
                 self.streams.capture_cons.pop_slice(&mut capture.device_buf);
+                capture.heard_at = Instant::now();
                 match capture.converter {
                     Some(ref mut converter) => capture.pending.extend_from_slice(converter.process(&capture.device_buf)),
                     None => capture.pending.extend_from_slice(&capture.device_buf),
@@ -537,6 +582,18 @@ mod tests {
 
     fn range(channels: u16, rates: (u32, u32), sample_format: SampleFormat, buffer: SupportedBufferSize) -> SupportedStreamConfigRange {
         SupportedStreamConfigRange::new(channels, SampleRate(rates.0), SampleRate(rates.1), buffer, sample_format)
+    }
+
+    #[test]
+    fn a_burst_of_device_changes_is_acted_on_once_after_it_stops() {
+        let start = Instant::now();
+        let mut settle = Settle::default();
+        assert!(!settle.settled(start), "nothing to act on");
+        settle.notice(start);
+        settle.notice(start + Duration::from_millis(300));
+        assert!(!settle.settled(start + DEVICE_SETTLE), "the burst went on");
+        assert!(settle.settled(start + Duration::from_millis(300) + DEVICE_SETTLE));
+        assert!(!settle.settled(start + DEVICE_SETTLE * 5), "once");
     }
 
     #[test]
