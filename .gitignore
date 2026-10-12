@@ -18,6 +18,11 @@ ghost-dev/gen/
 # The dev launcher's profiles, relay databases and settings
 .ghost-dev/
 
+# Design docs kept local for now
+ghost-protocol/flows/
+ghost-protocol/sync-spec.md
+ghost-protocol/account-keys-spec.md
+
 # Secrets & data
 *.key
 *.db
