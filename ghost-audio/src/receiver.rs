@@ -1,6 +1,6 @@
 //! One sender's playout: its frames buffered by sequence, decoded in turn into audio
-//! for the mixer, with losses covered by Opus FEC or concealment, late frames waited
-//! for, and the delay steered toward what its delay policy asks by stretching frames.
+//! for the mixer, with losses rebuilt from Opus FEC or DRED or else concealed, late frames
+//! waited for, and the delay steered toward what its delay policy asks by stretching frames.
 //! It runs on the device's playback thread, so it never allocates or frees: room is
 //! reserved up front, and frames it is done with are handed back to be freed elsewhere.
 
@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::codec::Decoder;
+use crate::codec::{self, Decoder, Dred, DredReach, OpusError};
 use crate::constants::*;
 use crate::policy::TargetDelay;
 use crate::stretch;
@@ -20,7 +20,7 @@ use crate::stretch;
 pub struct PlayoutStats {
     /// Frames played as sent.
     pub played: u64,
-    /// Lost frames rebuilt from the next frame's FEC.
+    /// Lost frames rebuilt from the next frame's FEC or a later frame's DRED.
     pub recovered: u64,
     /// Lost frames concealed.
     pub concealed: u64,
@@ -127,11 +127,41 @@ fn before(a: u32, b: u32) -> bool {
     (a.wrapping_sub(b) as i32) < 0
 }
 
+/// How far back, up to `limit` frames before `packet`, it can rebuild a frame: the one
+/// just before from its FEC copy or its DRED, older ones from its DRED, which this parses
+/// into `dred` (only finding its reach if `defer`). DRED can leave out the last moments
+/// before its packet, so a nearer frame it misses, with no FEC copy, is concealed.
+fn rebuildable(dred: &mut Dred, packet: &[u8], limit: u32, defer: bool) -> (u32, Option<DredReach>) {
+    if limit == 0 {
+        return (0, None);
+    }
+    let reach = dred.parse(packet, limit as usize * FRAME_SAMPLES + DRED_PARSE_MARGIN, defer).ok();
+    let fec = codec::has_fec(packet);
+    let furthest = (1..=limit)
+        .rev()
+        .find(|&back| (back == 1 && fec) || reach.is_some_and(|reach| reach.covers(back as usize * FRAME_SAMPLES, FRAME_SAMPLES)))
+        .unwrap_or(0);
+    (furthest, reach)
+}
+
 pub(crate) struct Receiver {
     /// Opus frames, sorted by sequence. Ordered as plain integers: sequences wrap only
     /// after about 2.7 years of one call.
     frames: Vec<(u32, Vec<u8>)>,
     decoder: Decoder,
+    /// The DRED of the first frame after a gap, parsed for rebuilding the frames lost
+    /// before it, and which frame that is and how far back it reaches.
+    dred: Dred,
+    dred_from: Option<(u32, DredReach)>,
+    /// For finding, as a frame arrives, how much of a gap before it its DRED reaches;
+    /// apart from `dred`, which playout may be part way through.
+    probe: Dred,
+    /// Whether concealment runs Deep PLC now.
+    deep_plc: bool,
+    /// The newest frame that arrived, and whether it closed a talk spurt.
+    newest: Option<(u32, bool)>,
+    /// Whether the frame played last closed a talk spurt.
+    played_closed: bool,
     /// The next sequence to play; `None` until playout starts, and again once the
     /// sender has paused.
     next: Option<u32>,
@@ -173,6 +203,12 @@ impl Receiver {
         Ok(Self {
             frames: Vec::with_capacity(PLAYOUT_MAX_BUFFERED),
             decoder,
+            dred: Dred::new().map_err(|e| format!("opus dred: {e}"))?,
+            dred_from: None,
+            probe: Dred::new().map_err(|e| format!("opus dred: {e}"))?,
+            deep_plc: false,
+            newest: None,
+            played_closed: false,
             next: None,
             concealed_run: 0,
             waited_run: 0,
@@ -205,7 +241,16 @@ impl Receiver {
             self.received.0 += 1;
             self.received.1 += frame.len() as u64;
         }
+        // Frames lost just before this one that it can rebuild count as arriving with it,
+        // so a burst it covers deepens the target as late frames would (NetEQ adapts its
+        // delay to recovered frames the same way).
+        for back in (1..=self.rebuildable_on_arrival(sequence, &frame)).rev() {
+            self.policy.arrived(sequence.wrapping_sub(back), arrived);
+        }
         self.policy.arrived(sequence, arrived);
+        if self.newest.is_none_or(|(newest, _)| before(newest, sequence)) {
+            self.newest = Some((sequence, frame == OPUS_SILENCE));
+        }
         if self.next.is_some_and(|next| before(sequence, next)) {
             self.stats.dropped_late += 1;
             self.note_lost(1);
@@ -221,6 +266,18 @@ impl Receiver {
                 None
             }
         }
+    }
+
+    /// How far back into the frames lost just before `sequence`, newer than any that
+    /// arrived, `frame` can rebuild. None after a pause, which the sender closes with
+    /// silence: its DRED would only bring back that silence.
+    fn rebuildable_on_arrival(&mut self, sequence: u32, frame: &[u8]) -> u32 {
+        let Some((newest, false)) = self.newest else { return 0 };
+        if !before(newest, sequence) {
+            return 0;
+        }
+        let lost = sequence.wrapping_sub(newest) - 1;
+        rebuildable(&mut self.probe, frame, lost.min(PLAYOUT_MAX_TARGET), true).0
     }
 
     fn first(&self) -> Option<u32> {
@@ -259,6 +316,33 @@ impl Receiver {
         for _ in 0..frames {
             self.loss_rate += LOSS_RATE_WEIGHT * (1.0 - self.loss_rate);
         }
+    }
+
+    /// Rebuild lost frame `sequence` from the first frame buffered after it: from its FEC
+    /// copy if it is the next frame and carries one (Opus's own copy beats DRED's), else
+    /// from its DRED if that reaches back far enough.
+    fn rebuild(&mut self, sequence: u32) -> Option<Result<usize, OpusError>> {
+        let (carrier, packet) = self.frames.iter().find(|(seq, _)| before(sequence, *seq))?;
+        let back = carrier.wrapping_sub(sequence) as usize;
+        if back == 1 && codec::has_fec(packet) {
+            return Some(self.decoder.decode_float(packet, &mut self.decoded, true));
+        }
+        if self.dred_from.is_none_or(|(from, _)| from != *carrier) {
+            let reach = self.dred.parse(packet, back * FRAME_SAMPLES + DRED_PARSE_MARGIN, false).ok()?;
+            self.dred_from = Some((*carrier, reach));
+        }
+        let (_, reach) = self.dred_from?;
+        let offset = back * FRAME_SAMPLES;
+        reach.covers(offset, FRAME_SAMPLES).then(|| self.decoder.decode_dred(&self.dred, offset, &mut self.decoded))
+    }
+
+    /// Conceal a lost frame: with Deep PLC under heavy loss, else libopus's own way.
+    fn conceal(&mut self) -> Result<usize, OpusError> {
+        let deep = self.loss_rate >= DEEP_PLC_LOSS_RATE;
+        if deep != self.deep_plc && self.decoder.set_complexity(if deep { DEEP_PLC_COMPLEXITY } else { 0 }).is_ok() {
+            self.deep_plc = deep;
+        }
+        self.decoder.decode_float(&[], &mut self.decoded, false)
     }
 
     /// Nothing to play and nothing coming: the sender is gone or long paused.
@@ -319,6 +403,7 @@ impl Receiver {
             self.waited_run = 0;
             self.stats.played += 1;
             self.note_played();
+            self.played_closed = frame == OPUS_SILENCE;
             let decoded = self.decoder.decode_float(&frame, &mut self.decoded, false);
             self.spent.push(frame);
             decoded
@@ -329,40 +414,49 @@ impl Receiver {
             self.concealed_run += 1;
             self.waited_run += 1;
             self.catch_up = 0;
-            self.decoder.decode_float(&[], &mut self.decoded, false)
+            self.conceal()
         } else if self.waited_run > 0 {
             // Frames came while waiting, but not the awaited one: it was lost, or never
-            // sent because the sender paused. Its time is already concealed; resume
-            // from the earliest frame.
+            // sent because the sender paused, which it does only after closing the talk
+            // spurt with silence. Its time is already concealed. Lost frames the first
+            // to arrive can rebuild play now, late, as NetEQ plays DRED, rather than be
+            // passed over: the delay grows by what was concealed. The rest are passed over.
             let first = self.first().expect("frames buffered");
-            // A pause leaves a gap longer than the pre-roll, which fills any shorter
-            // one: a shorter gap is frames lost, concealed while they were waited for.
             let skipped = first.wrapping_sub(next);
             let mut waited = u64::from(self.waited_run);
-            if skipped as usize <= PRE_ROLL_FRAMES {
-                let lost = skipped.min(self.waited_run) as u64;
+            let mut replay = 0;
+            if !self.played_closed {
+                let buffered = self.frames.last().map_or(0, |(last, _)| last.wrapping_sub(first) + 1);
+                let room = PLAYOUT_MAX_TARGET.saturating_sub(buffered);
+                let (rebuilt, reach) = rebuildable(&mut self.dred, &self.frames[0].1, skipped.min(room), false);
+                self.dred_from = reach.map(|reach| (first, reach));
+                replay = rebuilt;
+                let lost = (skipped - replay).min(self.waited_run) as u64;
                 waited -= lost;
                 self.stats.concealed += lost;
                 self.note_lost(lost);
             }
             self.stats.waited += waited;
-            self.next = Some(first);
+            self.next = Some(first.wrapping_sub(replay));
             self.waited_run = 0;
             self.catch_up_from(self.target());
             return self.produce();
         } else {
-            // A gap: this frame is lost. The next frame's FEC carries a rough copy.
+            // A gap: this frame is lost. Rebuild it from the next frame's FEC copy or from
+            // the DRED of the first frame after the gap; failing both, conceal it.
             self.next = Some(next.wrapping_add(1));
-            self.concealed_run += 1;
             self.note_lost(1);
-            match self.position(next.wrapping_add(1)) {
-                Some(following) => {
+            match self.rebuild(next) {
+                // The sender's own audio, so not a sign it went quiet.
+                Some(rebuilt) => {
                     self.stats.recovered += 1;
-                    self.decoder.decode_float(&self.frames[following].1, &mut self.decoded, true)
+                    self.concealed_run = 0;
+                    rebuilt
                 }
                 None => {
                     self.stats.concealed += 1;
-                    self.decoder.decode_float(&[], &mut self.decoded, false)
+                    self.concealed_run += 1;
+                    self.conceal()
                 }
             }
         };
@@ -448,6 +542,18 @@ mod tests {
         encode(count, 0.3)
     }
 
+    /// The synthetic voice as a sender protecting against `loss` percent codes it, with
+    /// DRED when `dred`. Opus codes FEC copies only for frames it takes for speech.
+    fn speech(seconds: f32, loss: i32, dred: bool) -> Vec<Vec<u8>> {
+        let mut encoder = crate::codec::Encoder::voip().unwrap();
+        encoder.set_bitrate(OPUS_BITRATE).unwrap();
+        encoder.set_voice_signal().unwrap();
+        encoder.set_inband_fec(true).unwrap();
+        encoder.set_packet_loss_perc(loss).unwrap();
+        encoder.set_dred_duration(if dred { DRED_DURATION } else { 0 }).unwrap();
+        crate::fake::speech_like(seconds, 0.03).chunks_exact(FRAME_SAMPLES).map(|frame| encoder.encode_vec_float(frame)).collect()
+    }
+
     fn receiver() -> Receiver {
         Receiver::new(Arc::default()).unwrap()
     }
@@ -505,15 +611,75 @@ mod tests {
     #[test]
     fn recovers_a_lost_frame_from_the_next_ones_fec() {
         let mut receiver = receiver();
-        let encoded = frames(4);
+        let encoded = speech(1.0, 20, false);
+        let lost = (10..encoded.len() - 2).find(|&n| codec::has_fec(&encoded[n + 1])).expect("a frame with an FEC copy");
         let now = Instant::now();
-        for seq in [0, 2, 3] {
-            receiver.insert(seq, encoded[seq as usize].clone(), now);
+        for seq in [lost - 2, lost - 1, lost + 1, lost + 2] {
+            receiver.insert(seq as u32, encoded[seq].clone(), now);
         }
         for _ in 0..4 {
             receiver.produce();
         }
-        assert_eq!((receiver.stats.played, receiver.stats.recovered), (3, 1));
+        assert_eq!((receiver.stats.played, receiver.stats.recovered, receiver.stats.concealed), (3, 1, 0));
+    }
+
+    #[test]
+    fn a_lost_frame_with_no_fec_copy_in_reach_is_rebuilt_from_dred() {
+        let mut receiver = receiver();
+        let encoded = speech(1.0, 20, true);
+        // Two lost in a row: the second's FEC copy arrives, the first has none in reach.
+        let lost = (20..encoded.len() - 3).find(|&n| codec::has_fec(&encoded[n + 2])).expect("a frame with an FEC copy");
+        let now = Instant::now();
+        for seq in [lost - 2, lost - 1, lost + 2, lost + 3] {
+            receiver.insert(seq as u32, encoded[seq].clone(), now);
+        }
+        for _ in 0..5 {
+            receiver.produce();
+        }
+        assert_eq!((receiver.stats.played, receiver.stats.recovered, receiver.stats.concealed), (3, 2, 0));
+    }
+
+    #[test]
+    fn a_burst_concealed_while_waiting_plays_late_from_dred() {
+        let mut receiver = receiver();
+        let encoded = speech(1.0, 20, true);
+        let burst = (20..encoded.len() - 4).find(|&n| codec::has_fec(&encoded[n + 3])).expect("a frame with an FEC copy");
+        let now = Instant::now();
+        receiver.insert(burst as u32 - 2, encoded[burst - 2].clone(), now);
+        receiver.insert(burst as u32 - 1, encoded[burst - 1].clone(), now);
+        for _ in 0..4 {
+            receiver.produce();
+        }
+        assert_eq!(receiver.waited_run, 2, "the burst's first frame is waited for");
+        // Its three frames never come; the next does, and its DRED reaches back over them.
+        receiver.insert(burst as u32 + 3, encoded[burst + 3].clone(), now);
+        for _ in 0..4 {
+            receiver.produce();
+        }
+        assert_eq!(receiver.stats.recovered, 3, "the burst plays, late, rather than being passed over");
+        assert_eq!((receiver.stats.played, receiver.stats.waited, receiver.stats.concealed), (3, 2, 0));
+    }
+
+    #[test]
+    fn bursts_dred_covers_deepen_the_target() {
+        // Three lost in every 25 (a half second): with DRED the burst's frames count as
+        // arriving with the frame after it, up to three frames late; with FEC alone only
+        // the last of them does, one frame late.
+        let target = |dred: bool| {
+            let mut receiver = receiver();
+            let encoded = speech(8.0, 20, dred);
+            let start = Instant::now();
+            for (seq, frame) in encoded.into_iter().enumerate() {
+                if seq % 25 < 22 {
+                    receiver.insert(seq as u32, frame, start + Duration::from_millis(seq as u64 * FRAME_MS as u64));
+                }
+                receiver.produce();
+            }
+            receiver.target()
+        };
+        let (with_fec, with_dred) = (target(false), target(true));
+        assert_eq!(with_fec, PLAYOUT_MIN_TARGET + 1, "FEC alone: the extra frame kept while losing");
+        assert!(with_dred > with_fec, "DRED-covered bursts deepen the target: {with_dred} frames, {with_fec} with FEC alone");
     }
 
     #[test]
@@ -566,19 +732,24 @@ mod tests {
     #[test]
     fn resumes_at_the_new_talk_spurt_after_a_pause() {
         let mut receiver = receiver();
-        let encoded = frames(4);
+        let encoded = speech(1.0, 20, true);
         let now = Instant::now();
         receiver.insert(0, encoded[0].clone(), now);
         receiver.insert(1, encoded[1].clone(), now);
-        for _ in 0..5 {
+        // The talk spurt closes with silence before the pause.
+        for seq in 2..2 + SILENCE_FRAME_COUNT as u32 {
+            receiver.insert(seq, OPUS_SILENCE.to_vec(), now);
+        }
+        for _ in 0..7 {
             receiver.produce();
         }
-        // The sender's clock ran on through the pause; nothing between was sent.
-        receiver.insert(40, encoded[2].clone(), now);
-        receiver.insert(41, encoded[3].clone(), now);
+        // The sender's clock ran on through the pause; nothing between was sent. The new
+        // spurt's DRED reaches back into the pause, which is not played.
+        receiver.insert(40, encoded[40].clone(), now);
+        receiver.insert(41, encoded[41].clone(), now);
         receiver.produce();
-        assert_eq!(receiver.stats.played, 3, "playout jumped to the new spurt");
-        assert_eq!(receiver.stats.concealed, 0, "without concealing the unsent frames");
+        assert_eq!(receiver.stats.played, 6, "playout jumped to the new spurt");
+        assert_eq!((receiver.stats.recovered, receiver.stats.concealed), (0, 0), "without rebuilding or concealing the unsent frames");
     }
 
     #[test]

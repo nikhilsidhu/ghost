@@ -18,9 +18,6 @@ use crate::receiver::PlayoutStats;
 use crate::{AgcMode, AudioControls, InputMode, NoiseSuppressionMode};
 use ghost_wire::voice::Reception;
 
-/// CELT-only fullband 20 ms mono silence; resets the receiver's decoder state cleanly.
-const OPUS_SILENCE: [u8; 3] = [0xF8, 0xFF, 0xFE];
-
 const FRAME_DURATION: Duration = Duration::from_millis(FRAME_MS as u64);
 
 /// The voice diagnostics are worth reading in dev builds, where the launcher keeps logs.
@@ -44,6 +41,15 @@ fn create_encoder() -> Result<Encoder, String> {
 /// step at or below it, none below the first.
 fn opus_loss_pct(reported: u8) -> i32 {
     OPUS_LOSS_STEPS.iter().rev().find(|step| reported >= **step).map_or(0, |step| *step as i32)
+}
+
+/// The DRED duration for the loss Opus protects against: none below heavy loss.
+fn dred_duration(opus_loss: i32) -> i32 {
+    if opus_loss >= i32::from(DRED_LOSS_STEP) {
+        DRED_DURATION
+    } else {
+        0
+    }
 }
 
 /// Turns captured frames into sent ones: echo cancellation, gain, noise suppression,
@@ -205,6 +211,9 @@ impl Transmitter {
         let opus_loss = if protected { opus_loss_pct(controls.expected_loss.load(Ordering::Relaxed)) } else { 0 };
         if opus_loss != self.opus_loss && self.encoder.set_packet_loss_perc(opus_loss).is_ok() {
             self.opus_loss = opus_loss;
+            if let Err(e) = self.encoder.set_dred_duration(dred_duration(opus_loss)) {
+                tracing::warn!("voice: opus dred duration: {e}");
+            }
         }
         // Encode every frame, sent or not, so the encoder's state stays warm.
         let Ok(len) = self.encoder.encode_float(frame, &mut self.encode_buf) else { return };
@@ -450,6 +459,25 @@ mod tests {
         assert!(modes(&mut encoder).iter().all(|m| *m == "celt"), "a clean network gets full-band CELT");
         encoder.set_packet_loss_perc(opus_loss_pct(5)).unwrap();
         assert!(modes(&mut encoder).iter().all(|m| *m != "celt"), "reported loss brings the SILK layer that carries FEC");
+    }
+
+    #[test]
+    fn senders_add_dred_only_under_heavy_loss() {
+        assert_eq!([0, 1, 5, 10, 20].map(dred_duration), [0, 0, 0, DRED_DURATION, DRED_DURATION]);
+        let voice = speech_like(1.6, 0.03);
+        // How far back the last packet's DRED reaches, in frames.
+        let reach = |reported: u8| -> usize {
+            let mut encoder = create_encoder().unwrap();
+            let loss = opus_loss_pct(reported);
+            encoder.set_packet_loss_perc(loss).unwrap();
+            encoder.set_dred_duration(dred_duration(loss)).unwrap();
+            let packet = voice.chunks_exact(FRAME_SAMPLES).map(|f| encoder.encode_vec_float(f)).last().unwrap();
+            crate::codec::Dred::new().unwrap().parse(&packet, SAMPLE_RATE as usize, true).unwrap().back / FRAME_SAMPLES
+        };
+        let (moderate, heavy, heavier) = (reach(5), reach(10), reach(20));
+        assert_eq!(moderate, 0, "no DRED at moderate loss");
+        assert!(heavy >= 3, "heavy loss reaches past the frame FEC rebuilds: {heavy} frames");
+        assert!(heavier >= heavy, "more loss, more DRED: {heavier} frames at 20%, {heavy} at 10%");
     }
 
     #[test]

@@ -18,6 +18,19 @@ pub const OPUS_LOSS_STEPS: [u8; 4] = [1, 5, 10, 20];
 pub const RECEPTION_MIN_FRAMES: u64 = 50;
 /// Room for one encoded frame.
 pub const OPUS_MAX_FRAME_BYTES: usize = 1500;
+/// Reported loss (one of the steps) from which senders add DRED, redundancy that reaches
+/// further back than FEC: below it, at this bitrate, it cost bits and rebuilt nothing.
+pub const DRED_LOSS_STEP: u8 = OPUS_LOSS_STEPS[2];
+/// How much of the recent past each packet's DRED carries, in 10 ms units: as far back
+/// as playout's deepest target reaches, plus the chunk libopus 1.6.1 can leave off.
+pub const DRED_DURATION: i32 = (PLAYOUT_MAX_TARGET * FRAME_MS / 10) as i32 + 2;
+/// libopus 1.6.1 parses DRED a chunk short of what it is asked for; a frame more covers it.
+pub const DRED_PARSE_MARGIN: usize = FRAME_SAMPLES;
+/// Recent loss from which concealment runs Deep PLC: below it, Deep PLC scored worse than
+/// libopus's own concealment at this bitrate.
+pub const DEEP_PLC_LOSS_RATE: f32 = DRED_LOSS_STEP as f32 / 100.0;
+/// Decoder complexity that turns Deep PLC on.
+pub const DEEP_PLC_COMPLEXITY: i32 = 5;
 
 /// nnnoiseless works on 480-sample chunks of i16-range floats.
 pub const DENOISE_FRAME_SIZE: usize = 480;
@@ -45,6 +58,9 @@ pub const DIGITAL_SILENCE: f32 = 1e-6;
 pub const VAD_HANGOVER_FRAMES: u32 = 15;
 /// Silence frames sent when a talk spurt ends, so receivers' decoders reset cleanly.
 pub const SILENCE_FRAME_COUNT: usize = 3;
+/// CELT-only full-band 20 ms mono silence: what closes a talk spurt, so receivers tell a
+/// pause from a loss.
+pub const OPUS_SILENCE: [u8; 3] = [0xF8, 0xFF, 0xFE];
 /// Frames kept while silent and sent at speech onset, so the first syllable is not clipped.
 pub const PRE_ROLL_FRAMES: usize = 3;
 

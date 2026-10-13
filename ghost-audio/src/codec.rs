@@ -1,5 +1,7 @@
 //! libopus, which opusic-sys builds from source at one version on every platform and
-//! links statically, so every device codes and conceals alike. Mono at 48 kHz.
+//! links statically, so every device codes and conceals alike. Mono at 48 kHz. It is
+//! built with its neural redundancy (DRED) and concealment (Deep PLC), which playout
+//! uses under heavy loss.
 
 use std::ffi::{c_int, CStr};
 use std::fmt;
@@ -73,6 +75,12 @@ impl Encoder {
         self.set(ffi::OPUS_SET_PACKET_LOSS_PERC_REQUEST, percent)
     }
 
+    /// Carry this much of the recent past in every packet as DRED, in 10 ms units; 0
+    /// carries none. Its bits come out of the bitrate, more of them the more loss is set.
+    pub fn set_dred_duration(&mut self, units: i32) -> Result<(), OpusError> {
+        self.set(ffi::OPUS_SET_DRED_DURATION_REQUEST, units)
+    }
+
     /// Encode one frame into `packet`; returns the packet's length.
     pub fn encode_float(&mut self, pcm: &[f32], packet: &mut [u8]) -> Result<usize, OpusError> {
         // SAFETY: `pcm` holds pcm.len() mono samples and `packet` has room for packet.len() bytes.
@@ -122,6 +130,111 @@ impl Decoder {
             ffi::opus_decode_float(self.0.as_ptr(), data, packet.len() as i32, pcm.as_mut_ptr(), pcm.len() as c_int, fec as c_int)
         })
     }
+
+    /// From `DEEP_PLC_COMPLEXITY` up, concealment synthesizes lost speech with Deep PLC.
+    pub fn set_complexity(&mut self, complexity: i32) -> Result<(), OpusError> {
+        // SAFETY: OPUS_SET_COMPLEXITY takes a single opus_int32.
+        check(unsafe { ffi::opus_decoder_ctl(self.0.as_ptr(), ffi::OPUS_SET_COMPLEXITY_REQUEST, complexity) }).map(drop)
+    }
+
+    /// Rebuild into `pcm` the audio starting `offset` samples before the packet `dred`
+    /// last parsed. Returns the samples decoded.
+    pub fn decode_dred(&mut self, dred: &Dred, offset: usize, pcm: &mut [f32]) -> Result<usize, OpusError> {
+        // SAFETY: `dred` holds a parsed state, and `pcm` has room for pcm.len() samples.
+        check(unsafe {
+            ffi::opus_decoder_dred_decode_float(self.0.as_ptr(), dred.state.as_ptr(), offset as i32, pcm.as_mut_ptr(), pcm.len() as c_int)
+        })
+    }
+}
+
+/// Whether `packet` carries a copy of the frame before it (in-band FEC). Opus codes the
+/// copy only for frames it took for active speech.
+pub fn has_fec(packet: &[u8]) -> bool {
+    // SAFETY: `packet` points at packet.len() bytes.
+    unsafe { ffi::opus_packet_has_lbrr(packet.as_ptr(), packet.len() as i32) > 0 }
+}
+
+/// How far back one packet's DRED reaches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DredReach {
+    /// Samples before the packet that its DRED covers.
+    pub back: usize,
+    /// Samples just before the packet that it leaves out.
+    pub gap: usize,
+}
+
+impl DredReach {
+    /// Whether the frame starting `offset` samples before the packet can be rebuilt.
+    pub fn covers(&self, offset: usize, frame: usize) -> bool {
+        offset <= self.back && offset >= self.gap + frame
+    }
+}
+
+/// A packet's DRED, parsed for rebuilding the frames lost before it. Its memory is
+/// reserved when made, so parsing never allocates.
+pub struct Dred {
+    decoder: NonNull<ffi::OpusDREDDecoder>,
+    state: NonNull<ffi::OpusDRED>,
+}
+
+// SAFETY: as for `Encoder`.
+unsafe impl Send for Dred {}
+
+impl Dred {
+    pub fn new() -> Result<Self, OpusError> {
+        let mut error = 0;
+        // SAFETY: a valid out pointer.
+        let decoder = unsafe { ffi::opus_dred_decoder_create(&mut error) };
+        check(error)?;
+        let decoder = NonNull::new(decoder).ok_or(OpusError(ffi::OPUS_ALLOC_FAIL))?;
+        // SAFETY: a valid out pointer.
+        let state = unsafe { ffi::opus_dred_alloc(&mut error) };
+        match (check(error), NonNull::new(state)) {
+            (Ok(_), Some(state)) => Ok(Self { decoder, state }),
+            (result, state) => {
+                // SAFETY: made above and not shared.
+                unsafe {
+                    if let Some(state) = state {
+                        ffi::opus_dred_free(state.as_ptr());
+                    }
+                    ffi::opus_dred_decoder_destroy(decoder.as_ptr());
+                }
+                Err(result.err().unwrap_or(OpusError(ffi::OPUS_ALLOC_FAIL)))
+            }
+        }
+    }
+
+    /// Parse `packet`'s DRED as far as `back` samples before it, replacing what was parsed
+    /// before. With `defer`, only find how far it reaches, skipping the costly part that
+    /// decoding needs.
+    pub fn parse(&mut self, packet: &[u8], back: usize, defer: bool) -> Result<DredReach, OpusError> {
+        let mut gap = 0;
+        // SAFETY: both states are ours, `packet` points at packet.len() bytes, and `gap`
+        // is a valid out pointer.
+        let reached = check(unsafe {
+            ffi::opus_dred_parse(
+                self.decoder.as_ptr(),
+                self.state.as_ptr(),
+                packet.as_ptr(),
+                packet.len() as i32,
+                back as i32,
+                SAMPLE_RATE as i32,
+                &mut gap,
+                defer as c_int,
+            )
+        })?;
+        Ok(DredReach { back: reached, gap: gap.max(0) as usize })
+    }
+}
+
+impl Drop for Dred {
+    fn drop(&mut self) {
+        // SAFETY: made in `new` and freed only here.
+        unsafe {
+            ffi::opus_dred_free(self.state.as_ptr());
+            ffi::opus_dred_decoder_destroy(self.decoder.as_ptr());
+        }
+    }
 }
 
 impl Drop for Decoder {
@@ -134,7 +247,7 @@ impl Drop for Decoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::constants::{FRAME_SAMPLES, OPUS_MAX_FRAME_BYTES};
+    use crate::constants::{DRED_DURATION, DRED_PARSE_MARGIN, FRAME_SAMPLES, OPUS_MAX_FRAME_BYTES};
 
     #[test]
     fn every_device_runs_the_same_libopus() {
@@ -155,5 +268,27 @@ mod tests {
 
         let error = encoder.encode_float(&tone[..7], &mut vec![0u8; OPUS_MAX_FRAME_BYTES]).unwrap_err();
         assert_eq!(error.to_string(), "invalid argument");
+    }
+
+    #[test]
+    fn dred_rebuilds_frames_lost_before_a_packet() {
+        let mut encoder = Encoder::voip().unwrap();
+        encoder.set_packet_loss_perc(20).unwrap();
+        encoder.set_dred_duration(DRED_DURATION).unwrap();
+        let voice = crate::fake::speech_like(1.0, 0.03);
+        let packets: Vec<Vec<u8>> = voice.chunks_exact(FRAME_SAMPLES).map(|frame| encoder.encode_vec_float(frame)).collect();
+
+        // Frames 27-29 lost; 30 carries their DRED.
+        let mut dred = Dred::new().unwrap();
+        let reach = dred.parse(&packets[30], 3 * FRAME_SAMPLES + DRED_PARSE_MARGIN, false).unwrap();
+        assert!(reach.covers(3 * FRAME_SAMPLES, FRAME_SAMPLES), "three frames back: {reach:?}");
+        let mut decoder = Decoder::new().unwrap();
+        let mut pcm = vec![0.0f32; FRAME_SAMPLES];
+        for packet in &packets[..27] {
+            decoder.decode_float(packet, &mut pcm, false).unwrap();
+        }
+        assert_eq!(decoder.decode_dred(&dred, 3 * FRAME_SAMPLES, &mut pcm).unwrap(), FRAME_SAMPLES);
+        let (rebuilt, sent) = (crate::dsp::rms(&pcm), crate::dsp::rms(&voice[27 * FRAME_SAMPLES..28 * FRAME_SAMPLES]));
+        assert!(rebuilt > sent * 0.3, "the frame comes back near its level: {rebuilt} for {sent}");
     }
 }

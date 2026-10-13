@@ -111,6 +111,12 @@ impl TargetDelay {
             None => sequence as i64,
             Some((last, last_unwrapped)) => last_unwrapped + sequence.wrapping_sub(last) as i32 as i64,
         };
+        let media = unwrapped as f64 * FRAME_MS as f64;
+        // Each frame counts once: a late original after the copy it was rebuilt from, or
+        // a duplicate, says nothing new.
+        if self.history.iter().any(|&(seen, _)| seen == media) {
+            return;
+        }
         let reordered_by = match self.highest {
             Some((_, highest)) if unwrapped < highest => (highest - unwrapped) as usize,
             _ => 0,
@@ -128,7 +134,6 @@ impl TargetDelay {
         }
         self.reorder.add(reordered_by);
 
-        let media = unwrapped as f64 * FRAME_MS as f64;
         self.history.push_back((media, now));
         while self.history.front().is_some_and(|&(_, at)| now - at > QUANTILE_HISTORY.as_secs_f64() * 1000.0) {
             self.history.pop_front();
@@ -191,6 +196,19 @@ mod tests {
         let resumed = start + Duration::from_secs(5);
         for seq in 250..400u32 {
             policy.arrived(seq, resumed + Duration::from_millis((seq - 250) as u64 * 20));
+        }
+        assert_eq!(policy.target(), PLAYOUT_MIN_TARGET);
+    }
+
+    #[test]
+    fn a_frame_counts_once() {
+        let start = Instant::now();
+        let mut policy = TargetDelay::new();
+        feed(&mut policy, start, 100, |_| 5);
+        // Frame 50 again, a second late: a duplicate, or an original after its rebuilt copy.
+        policy.arrived(50, start + Duration::from_millis(50 * 20 + 1005));
+        for seq in 100..200u32 {
+            policy.arrived(seq, start + Duration::from_millis(seq as u64 * 20 + 5));
         }
         assert_eq!(policy.target(), PLAYOUT_MIN_TARGET);
     }
