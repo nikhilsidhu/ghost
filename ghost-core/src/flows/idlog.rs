@@ -102,7 +102,7 @@ async fn verify_home_head(client: &SharedClient, relay: &RelayClient, account_fp
     verify_extension(&newest, &head, entry_proof.as_ref()).map_err(|e| {
         GhostError::IdentityLog(format!("newest entry is not in the home's current tree: {e}"))
     })?;
-    let mut c = client.lock().await;
+    let c = client.lock().await;
     c.accept_kt_head(&home, &head, prior_proof.as_ref())
 }
 

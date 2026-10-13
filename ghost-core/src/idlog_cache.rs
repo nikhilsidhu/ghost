@@ -1,9 +1,13 @@
+//! Identity logs as this device has checked them: a cache of validated logs that device
+//! checks consult without I/O, the local database behind it, and the key-transparency
+//! heads accepted from relays.
+
 use std::collections::HashMap;
 
-use ghost_wire::short_id;
 use ghost_wire::anchor::{validate_anchored_entry, AnchoredEntry};
 use ghost_wire::idlog::{choose_branch, entry_hash, validate_chain, BranchChoice, LogEntry, LogState};
-use ghost_wire::merkle::Checkpoint;
+use ghost_wire::merkle::{Checkpoint, ConsistencyProof};
+use ghost_wire::{now_millis, short_id};
 
 use crate::error::{GhostError, Result};
 use crate::relay::AnchoredLog;
@@ -120,6 +124,15 @@ impl IdLogCache {
     /// Get the cached LogState for an account, if present.
     pub fn get(&self, account_fp: &[u8; 32]) -> Option<&LogState> {
         self.logs.get(account_fp).map(|log| &log.state)
+    }
+
+    /// The cached state for an account, loaded from the local database when it is not
+    /// in memory yet. `None` if this device never cached it.
+    pub fn get_or_load(&mut self, store: &GhostStore, account_fp: &[u8; 32]) -> Result<Option<&LogState>> {
+        if self.logs.contains_key(account_fp) {
+            return Ok(self.get(account_fp));
+        }
+        self.load_from_store(store, account_fp)
     }
 
     /// Hash of the cached entry at `seq`, if held.
@@ -248,6 +261,41 @@ impl IdLogCache {
         self.logs.insert(*account_fp, CachedLog { state: state.clone(), entry_hashes: entries.iter().map(entry_hash).collect() });
         Ok((state, replaced))
     }
+
+    /// `cache_and_validate`, telling of history it replaced: `own_account`'s is recorded
+    /// for the next account check to report; another account's is only logged.
+    pub fn cache_anchored_log(&mut self, store: &GhostStore, own_account: &[u8; 32], account_fp: &[u8; 32], log: &AnchoredLog) -> Result<LogState> {
+        let (state, replaced) = self.cache_and_validate(store, account_fp, log)?;
+        if let Some(replaced) = replaced {
+            if account_fp == own_account {
+                store.record_replaced_history(&replaced, now_millis())?;
+            } else {
+                tracing::warn!("identity log of {}: cached history from entry {} replaced by a root-signed branch", short_id(account_fp), replaced.from_seq);
+            }
+        }
+        Ok(state)
+    }
+}
+
+/// The last key-transparency head accepted from `relay_vk`, if any.
+pub fn kt_head(store: &GhostStore, relay_vk: &[u8; 32]) -> Result<Option<Checkpoint>> {
+    match store.get_kt_state(relay_vk)? {
+        Some(state) => Checkpoint::from_bytes(&state.checkpoint).map(Some).map_err(|e| GhostError::IdentityLog(format!("stored kt head: {e}"))),
+        None => Ok(None),
+    }
+}
+
+/// Accept a new key-transparency head from `relay_vk`: it must be signed by that relay
+/// and extend the last head accepted from it (`proof` covers the growth). A relay that
+/// shows two clients different trees fails this check on one of them.
+pub fn accept_kt_head(store: &GhostStore, relay_vk: &[u8; 32], head: &Checkpoint, proof: Option<&ConsistencyProof>) -> Result<()> {
+    let vk = ed25519_dalek::VerifyingKey::from_bytes(relay_vk).map_err(|e| GhostError::IdentityLog(format!("bad relay vk: {e}")))?;
+    head.verify(&vk).map_err(|_| GhostError::IdentityLog("kt head signature invalid".into()))?;
+    if let Some(prior) = kt_head(store, relay_vk)? {
+        ghost_wire::merkle::verify_extension(&prior, head, proof)
+            .map_err(|e| GhostError::IdentityLog(format!("kt head does not extend the last one seen ({e}); possible split view")))?;
+    }
+    store.set_kt_state(relay_vk, head.tree_size, &head.root_hash, &head.to_bytes())
 }
 
 /// What replacing the cached chain `held` from `from_seq` took away: the entries past
