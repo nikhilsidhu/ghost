@@ -9,8 +9,8 @@ env:
 
 jobs:
   # Wire, relay, core, media, audio and headless-device tests (unit, integration,
-  # scenarios, voice calls, and the process tests that SIGKILL the relay and a device)
-  # on every desktop platform.
+  # scenarios, and the process tests that SIGKILL the relay and a device) on every
+  # desktop platform; the voice calls on Linux.
   rust:
     name: Rust tests (${{ matrix.os }})
     strategy:
@@ -38,12 +38,26 @@ jobs:
           echo "OPENSSL_DIR=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static-md" >> $env:GITHUB_ENV
       # The keyring tests store device keys in the OS store; on Linux that is the Secret
       # Service, which needs a D-Bus session and an unlocked keyring.
+      # The audio engine's tests and the voice calls pace real-time devices, so they
+      # run one test at a time, as the UI tests do: run beside other tests on a shared
+      # runner's few cores they wake late in bursts, which deepens playout and breaks
+      # their timing. The voice calls run on Linux only; they exercise nothing of the
+      # platform, and the macOS and Windows runners fail their timing even alone.
       - name: Test (Linux)
         if: runner.os == 'Linux'
-        run: dbus-run-session -- sh -c "printf ci | gnome-keyring-daemon --unlock --components=secrets && cargo test --workspace --exclude ghost-app"
+        run: |
+          dbus-run-session -- sh -c "printf ci | gnome-keyring-daemon --unlock --components=secrets \
+            && cargo test --workspace --exclude ghost-app --exclude ghost-audio --exclude ghost-node \
+            && cargo test -p ghost-audio -- --test-threads=1 \
+            && cargo test -p ghost-node --lib --bins --test outages --test process --test scenarios \
+            && cargo test -p ghost-node --test voice -- --test-threads=1"
       - name: Test
         if: runner.os != 'Linux'
-        run: cargo test --workspace --exclude ghost-app
+        shell: bash
+        run: |
+          cargo test --workspace --exclude ghost-app --exclude ghost-audio --exclude ghost-node
+          cargo test -p ghost-audio -- --test-threads=1
+          cargo test -p ghost-node --lib --bins --test outages --test process --test scenarios
 
   # The front end's own tests: types against the generated bindings, then Vitest with
   # Tauri's IPC mocked.
