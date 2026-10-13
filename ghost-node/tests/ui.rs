@@ -115,6 +115,13 @@ impl App {
         Self { driver, _tauri_driver: tauri_driver, log, _dir: dir }
     }
 
+    /// End the WebDriver session. Left to its drop, thirtyfour ends it with a blocking
+    /// call that stalls this test's runtime, and with it the in-process relay the app
+    /// is talking to, until the call times out.
+    async fn close(self) {
+        self.driver.quit().await.expect("the WebDriver session ends");
+    }
+
     /// `eventually`, but a timeout reports what the app was showing instead, and saves
     /// a screenshot into `GHOST_UI_ARTIFACTS` when that is set.
     async fn eventually<T, F, Fut>(&self, what: &str, mut check: F) -> T
@@ -232,7 +239,21 @@ impl App {
         })
         .await;
         icon.click().await.unwrap();
-        self.element_with_text("channel", "general").await.click().await.unwrap();
+        // A click on the channel as the server opens was lost once on CI (not seen
+        // locally), so click it until the channel shows.
+        self.eventually("the general channel open", || async {
+            if self.driver.find(testid("composer")).await.is_ok() {
+                return Some(());
+            }
+            for channel in self.driver.find_all(testid("channel")).await.ok()? {
+                if inner_text(&channel).await.is_some_and(|text| text.contains("general")) {
+                    let _ = channel.click().await;
+                    break;
+                }
+            }
+            None
+        })
+        .await;
     }
 
     async fn say(&self, text: &str) {
@@ -290,6 +311,7 @@ async fn onboard_create_a_server_and_chat() {
     let (_relay, app) = app_with_server().await;
     app.say("hello from the app").await;
     app.element_with_text("message-content", "hello from the app").await;
+    app.close().await;
 }
 
 #[tokio::test]
@@ -305,6 +327,7 @@ async fn a_peer_joins_from_an_invite_and_chats() {
     let mark = bob.device.mark();
     app.say("hi bob").await;
     bob.expect(mark, "the app's reply", message_text("hi bob")).await;
+    app.close().await;
 }
 
 #[tokio::test]
@@ -330,6 +353,7 @@ async fn a_private_channel_for_a_role_reaches_only_that_role() {
     // Bob's view has caught up; Carol's would have too by now.
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert!(!sees_lounge(&carol).await, "carol, without the role, can see the lounge");
+    app.close().await;
 }
 
 #[tokio::test]
@@ -357,6 +381,7 @@ async fn kicking_from_the_member_list() {
 
     bob.expect(mark, "being kicked", kicked_from(server_id)).await;
     app.wait_until_gone("member", "bob").await;
+    app.close().await;
 }
 
 
