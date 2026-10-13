@@ -2,10 +2,10 @@
 //! through: writes queue up and run in order, several to a transaction, each inside a
 //! savepoint of its own so one that fails leaves the others standing, and a batch costs
 //! one commit however many writes it holds. A pool of readers serves everything else
-//! in parallel under WAL, and both run off the async workers, which never block on the
-//! database. The SQL lives in [`sql`] as functions over a connection, so the writer-side
-//! composites in `state` (a commit's validation, append and proposals; a KT anchor) run
-//! several of them inside one job.
+//! in parallel under WAL, each read on one snapshot, and both run off the async workers,
+//! which never block on the database. The SQL lives in [`sql`] as functions over a
+//! connection, so the writer-side composites in `state` (a commit's validation, append
+//! and proposals; a KT anchor) run several of them inside one job.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -201,7 +201,9 @@ impl Storage {
         self.relay_vk
     }
 
-    /// Run `query` on a reader connection, off the async workers.
+    /// Run `query` on a reader connection, off the async workers, in one read
+    /// transaction: a write that commits while it runs is wholly unseen, never seen by
+    /// some of its statements and not others (a log's first entry would read as swept).
     pub async fn read<R, F>(&self, query: F) -> Result<R, RelayError>
     where
         R: Send + 'static,
@@ -210,7 +212,9 @@ impl Storage {
         let readers = self.readers.clone();
         tokio::task::spawn_blocking(move || {
             let conn = readers.pick().lock().unwrap();
-            query(&conn)
+            // Dropped at the end, which rolls back: for a read, only the snapshot ends.
+            let snapshot = conn.unchecked_transaction().map_err(storage_error)?;
+            query(&snapshot)
         })
         .await
         .map_err(|e| RelayError::Storage(format!("read task: {e}")))?
@@ -2305,6 +2309,35 @@ mod tests {
         // The sweep empties the log; the head stays where it was.
         store.sweep_log(crate::util::now_millis() + 3_600_000, 0).await.unwrap();
         assert_eq!(store.log_position(mb).await.unwrap(), LogPosition { first: None, head: 10 });
+    }
+
+    #[tokio::test]
+    async fn a_read_sees_the_store_as_it_was_when_it_began() {
+        let store = Arc::new(Storage::open_ephemeral().unwrap());
+        let mb = test_mailbox();
+        let (began, has_begun) = std::sync::mpsc::channel();
+        let (go_on, wait) = std::sync::mpsc::channel();
+        let reading = tokio::spawn({
+            let store = store.clone();
+            async move {
+                store
+                    .read(move |conn| {
+                        let before = sql::log_position(conn, &mb)?;
+                        began.send(()).unwrap();
+                        wait.recv().unwrap();
+                        Ok((before, sql::log_position(conn, &mb)?))
+                    })
+                    .await
+            }
+        });
+        // The mailbox's first entry commits while the read is under way.
+        tokio::task::spawn_blocking(move || has_begun.recv().unwrap()).await.unwrap();
+        append_blob(&store, mb, APP, 0, b"first").await.unwrap();
+        go_on.send(()).unwrap();
+        let (before, after) = reading.await.unwrap().unwrap();
+        assert_eq!(before, LogPosition { first: None, head: 0 });
+        assert_eq!(after, before, "the entry is unseen to the end of the read, not half seen");
+        assert_eq!(store.log_position(mb).await.unwrap(), LogPosition { first: Some(1), head: 1 });
     }
 
     #[tokio::test]
