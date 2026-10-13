@@ -522,6 +522,9 @@ mod tests {
     /// How strongly the microphone hears the speakers: nearly as loud as they play, as
     /// a laptop's own microphone hears them turned up.
     const LEAK: f32 = 0.9;
+    /// The most the path can delay a frame: the deepest playout target, plus capture,
+    /// coding and the devices' buffers. A busy machine's jitter deepens playout that far.
+    const PATH_FRAMES: usize = PLAYOUT_MAX_TARGET as usize + 4;
 
     /// Play the default chain's own output back to it, through the sealed loopback a mic
     /// test uses, with the speakers heard by the microphone at `leak`. Returns the
@@ -553,7 +556,7 @@ mod tests {
         let voiced: Vec<usize> = speech.chunks_exact(FRAME_SAMPLES).enumerate().filter(|(_, f)| crate::dsp::rms(f) > SPEECH * 0.3).map(|(i, _)| i).collect();
         let audible = voiced
             .iter()
-            .filter(|&&i| (0..10).any(|lag| played.get((i + lag) * FRAME_SAMPLES..(i + lag + 1) * FRAME_SAMPLES).is_some_and(|f| crate::dsp::rms(f) > SPEECH * 0.1)))
+            .filter(|&&i| (0..PATH_FRAMES).any(|lag| played.get((i + lag) * FRAME_SAMPLES..(i + lag + 1) * FRAME_SAMPLES).is_some_and(|f| crate::dsp::rms(f) > SPEECH * 0.1)))
             .count();
         (audible as f32 / voiced.len() as f32, tail(played))
     }
@@ -592,7 +595,7 @@ mod tests {
         let voiced: Vec<usize> = speech.chunks_exact(FRAME_SAMPLES).enumerate().filter(|(_, f)| crate::dsp::rms(f) > 0.003).map(|(i, _)| i).collect();
         let heard = voiced
             .iter()
-            .filter(|&&i| (0..10).any(|lag| played.get((i + lag) * FRAME_SAMPLES..(i + lag + 1) * FRAME_SAMPLES).is_some_and(|f| crate::dsp::rms(f) > 0.001)))
+            .filter(|&&i| (0..PATH_FRAMES).any(|lag| played.get((i + lag) * FRAME_SAMPLES..(i + lag + 1) * FRAME_SAMPLES).is_some_and(|f| crate::dsp::rms(f) > 0.001)))
             .count();
         assert!(heard as f32 > voiced.len() as f32 * 0.9, "only {heard} of {} voiced frames went out", voiced.len());
     }

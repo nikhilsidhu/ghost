@@ -1,13 +1,14 @@
 //! Synthetic devices for tests: capture plays a sine tone that can be changed or
 //! silenced at any time, plus any samples queued to play once, and can hear the
 //! speakers as a laptop's microphone does; playback records what the mixer produced.
-//! Both are paced in real time like hardware. `tone_windows` tells which stretches of a
-//! recording carry a tone, and `speech_like` makes a voice that voice activity
-//! detection takes for speech.
+//! Both are paced in real time on one clock, as duplex hardware is, so a busy machine
+//! that wakes them late stretches time for both alike. `tone_windows` tells which
+//! stretches of a recording carry a tone, and `speech_like` makes a voice that voice
+//! activity detection takes for speech.
 
 use std::collections::VecDeque;
 use std::f32::consts::TAU;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -81,34 +82,18 @@ impl ToneDevices {
 
 impl AudioDevices for ToneDevices {
     fn open(&self, playback: Playback) -> Result<Box<dyn DeviceStreams>, String> {
-        let playing = Arc::new(AtomicBool::new(true));
-        let (still_playing, recording) = (playing.clone(), self.recording.clone());
-        let opened = Instant::now();
-        let recorded_before = self.recorded_len();
-        std::thread::Builder::new()
-            .name("fake-playback".into())
-            .spawn(move || {
-                let mut frame = vec![0.0f32; FRAME_SAMPLES];
-                let mut deadline = opened;
-                while still_playing.load(Ordering::Relaxed) {
-                    deadline += FRAME_DURATION;
-                    std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
-                    playback.fill(&mut frame);
-                    recording.lock().unwrap().extend_from_slice(&frame);
-                }
-            })
-            .map_err(|e| format!("spawn fake playback: {e}"))?;
         Ok(Box::new(ToneStreams {
             tone: self.tone.clone(),
             queued: self.queued.clone(),
             leak: self.leak.clone(),
             recording: self.recording.clone(),
-            recorded_before,
+            recorded_before: self.recorded_len(),
             captured: 0,
             failure: self.failure.clone(),
             phase: 0.0,
-            next_frame: opened + FRAME_DURATION,
-            playing,
+            next_frame: Instant::now() + FRAME_DURATION,
+            playback,
+            played: vec![0.0; FRAME_SAMPLES],
         }))
     }
 }
@@ -126,13 +111,9 @@ struct ToneStreams {
     failure: Arc<Mutex<Option<String>>>,
     phase: f32,
     next_frame: Instant,
-    playing: Arc<AtomicBool>,
-}
-
-impl Drop for ToneStreams {
-    fn drop(&mut self) {
-        self.playing.store(false, Ordering::Relaxed);
-    }
+    /// Played on each capture tick.
+    playback: Playback,
+    played: Vec<f32>,
 }
 
 impl DeviceStreams for ToneStreams {
@@ -167,6 +148,9 @@ impl DeviceStreams for ToneStreams {
             *sample = sample.clamp(-1.0, 1.0);
         }
         self.captured += frame.len();
+        // The speakers play the tick's frame, which the microphone hears on the next.
+        self.playback.fill(&mut self.played);
+        self.recording.lock().unwrap().extend_from_slice(&self.played);
         CaptureRead::Frame
     }
 
