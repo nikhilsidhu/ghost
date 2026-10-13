@@ -324,14 +324,15 @@ impl World {
             self.person(owner)?.device.link_device(&folder, &self.relay_url(&relay)?, label).await.map_err(failed("link the device"))?;
         device.start();
         // Its session enters the private channels the relays list for the account, as the
-        // app's does on start; the link is done once it has every channel the owner's has.
-        let channels: Vec<[u8; 32]> = {
+        // app's does on start, and a member tells it each one's name after. The link is
+        // done once it shows every channel as the owner's does.
+        let channels: Vec<([u8; 32], String)> = {
             let owner_client = self.person(owner)?.device.client.lock().await;
             let store = owner_client.store();
             let servers = store.list_servers().map_err(failed(&format!("list {owner}'s servers")))?;
             let mut channels = Vec::new();
             for server in servers {
-                channels.extend(store.list_channels(&server.server_id).map_err(failed("list channels"))?.into_iter().map(|c| c.channel_id));
+                channels.extend(store.list_channels(&server.server_id).map_err(failed("list channels"))?.into_iter().map(|c| (c.channel_id, c.name)));
             }
             channels
         };
@@ -340,7 +341,7 @@ impl World {
             let (client, channels) = (client.clone(), channels.clone());
             async move {
                 let c = client.lock().await;
-                channels.iter().all(|id| c.store().get_channel(id).is_ok())
+                channels.iter().all(|(id, name)| c.store().get_channel(id).is_ok_and(|channel| channel.name == *name))
             }
         };
         until(&format!("{profile} to enter {owner}'s channels"), entered).await?;
