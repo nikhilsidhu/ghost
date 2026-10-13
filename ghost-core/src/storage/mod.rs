@@ -85,20 +85,20 @@ impl GhostStore {
         &self.conn
     }
 
+    /// For what needs the connection to itself, as OpenMLS's migrations do.
+    pub(crate) fn conn_mut(&mut self) -> &mut Connection {
+        &mut self.conn
+    }
+
     /// Run `f` as one write: all of its statements land, or none if it fails or the
     /// process ends meanwhile. Inside another such write it becomes part of that one.
     pub(crate) fn write_whole<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
         self.begin_whole()?;
-        match f() {
-            Ok(value) => {
-                self.end_whole()?;
-                Ok(value)
-            }
-            Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK TO whole; RELEASE whole");
-                Err(e)
-            }
+        let written = f().and_then(|value| self.end_whole().map(|()| value));
+        if written.is_err() {
+            self.abandon_whole();
         }
+        written
     }
 
     /// Begin a write made of several store calls that must land together, for a caller
@@ -111,6 +111,12 @@ impl GhostStore {
     /// Land what was written since the matching `begin_whole`.
     pub fn end_whole(&self) -> Result<()> {
         self.conn.execute_batch("RELEASE whole").map_err(db("end write"))
+    }
+
+    /// Undo what was written since the matching `begin_whole`, after it failed or its end
+    /// did. Nothing to undo, as when a failed end already rolled it back, is no error.
+    pub fn abandon_whole(&self) {
+        let _ = self.conn.execute_batch("ROLLBACK TO whole; RELEASE whole");
     }
 }
 

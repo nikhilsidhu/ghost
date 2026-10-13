@@ -38,6 +38,8 @@ pub(crate) fn wipe_local_databases() {
         }
     }
     let db = db_path();
+    // Where MLS state was kept before it moved into the database, should the file of an
+    // install not opened since still be there.
     let mls_db = db.with_extension("mls.db");
     for path in [&db, &mls_db] {
         try_remove(path);

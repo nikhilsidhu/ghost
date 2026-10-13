@@ -8,13 +8,13 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 use common::{create_account, create_server, Account};
-use ghost_core::client::{ChannelOpOutcome, ReceiveResult};
+use ghost_core::client::ReceiveResult;
 use ghost_core::deferred::DeferredBlobs;
 use ghost_core::error::GhostError;
 use ghost_core::flows;
 use ghost_core::relay::{RelayClient, RelayEvent};
 use ghost_core::storage::ChannelKind;
-use ghost_core::wire::{decode_metadata, derive_default_channel_id, encode_channel_op, ChannelOpPayload, MetadataPayload, UNNAMED_PRIVATE_CHANNEL};
+use ghost_core::wire::{derive_default_channel_id, encode_channel_op, ChannelOpPayload, UNNAMED_PRIVATE_CHANNEL};
 use ghost_wire::policy::{Role, ServerPolicy, KICK, MANAGE_CHANNELS};
 
 /// How long a mailbox must stay quiet before `drain` stops waiting.
@@ -49,7 +49,7 @@ async fn drain(account: &Account, relay_url: &str, mailboxes: &[[u8; 32]], defer
         }
         let Some(channel_id) = account.client.lock().await.channel_id_for_mailbox(&blob.mailbox_id) else { continue };
         let result = common::receive_like_session(&account.client, &account.relay, &channel_id, &blob).await;
-        let mut c = account.client.lock().await;
+        let c = account.client.lock().await;
         let mut reply = None;
         let outcome = match result {
             Err(GhostError::PolicyBehind { server_mailbox, epoch }) => {
@@ -57,19 +57,16 @@ async fn drain(account: &Account, relay_url: &str, mailboxes: &[[u8; 32]], defer
                 seen.push("deferred".to_string());
                 continue;
             }
-            Ok(ReceiveResult::Message(m)) => match decode_metadata(&m.content) {
-                Ok(MetadataPayload::ChannelOp(op)) if m.message_type == ghost_core::crypto::MessageType::Metadata => {
-                    match c.apply_channel_op(&channel_id, &m.sender_fp, op).unwrap() {
-                        ChannelOpOutcome::Applied => "channel op".to_string(),
-                        ChannelOpOutcome::Ignored => "channel op ignored".to_string(),
-                        ChannelOpOutcome::Reply(out) => {
-                            reply = Some(out);
-                            "info request".to_string()
-                        }
-                    }
+            // Applied by the client as it read it, as the session's is.
+            Ok(ReceiveResult::Metadata(applied)) => match applied.reply {
+                Some(out) => {
+                    reply = Some(out);
+                    "info request".to_string()
                 }
-                _ => format!("message {}", String::from_utf8_lossy(&m.content)),
+                None if applied.channel_changed => "channel op".to_string(),
+                None => "metadata".to_string(),
             },
+            Ok(ReceiveResult::Message(m)) => format!("message {}", String::from_utf8_lossy(&m.content)),
             Ok(ReceiveResult::CommitProcessed) | Ok(ReceiveResult::MembersRemoved(_)) => "commit".to_string(),
             Ok(ReceiveResult::ProposalProcessed) => "proposal".to_string(),
             Ok(ReceiveResult::ChannelAccessLost(_)) => "access lost".to_string(),
@@ -82,7 +79,6 @@ async fn drain(account: &Account, relay_url: &str, mailboxes: &[[u8; 32]], defer
             Ok(ReceiveResult::DeviceRemoved) => "device removed".to_string(),
             Ok(ReceiveResult::Skipped) => "skipped".to_string(),
             Ok(ReceiveResult::Unreadable) => "unreadable".to_string(),
-            Ok(ReceiveResult::Unverified { .. }) => "unverified".to_string(),
             Err(e) => format!("error: {e}"),
         };
         let _ = c.store().set_last_seen_seq(&blob.mailbox_id, blob.seq);

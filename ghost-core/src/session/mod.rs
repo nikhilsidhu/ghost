@@ -22,20 +22,16 @@ use tokio::sync::{mpsc, Mutex};
 use ghost_wire::EnvelopeType;
 use ghost_wire::short_id;
 
-use crate::client::{BlobOrigin, ChannelOpOutcome, ReceiveResult, ServerStateOutcome};
-use crate::crypto::MessageType;
+use crate::client::{BlobOrigin, MetadataApplied, ReceiveResult};
 use crate::deferred::DeferredBlobs;
 use crate::error::GhostError;
 use crate::flows::presence::PresenceInfo;
 use crate::flows::{self, SharedClient};
 use crate::relay::RelayClient;
-use crate::idlog_cache::{CredentialClaim, HeadClaim};
+use crate::idlog_cache::HeadClaim;
 use crate::relay::{Ack, IncomingBlob, RelayEvent};
 use crate::storage::{placeholder_name, Delivery, Member, OnConflict};
-use crate::wire::{
-    decode_metadata, derive_default_channel_id, ApplicationMessage, MetadataPayload, ProvisionPayload, SyncMessageType,
-    SyncReceiveResult,
-};
+use crate::wire::{derive_default_channel_id, ApplicationMessage, ProvisionPayload, SyncMessageType, SyncReceiveResult};
 
 pub use avatars::AVATARS_DIR;
 pub use events::{AccountAlert, ClientEvent, Connectivity, EventSink, OnlineMember, ServerScope, VoiceMember};
@@ -121,7 +117,7 @@ impl DiscoveryLocks {
 /// What a task reports back to the loop when its network work is done.
 enum Report {
     /// A member's identity log was fetched (or could not be) for a blob held on it.
-    MemberFetched { blob: IncomingBlob, held: HeldBlob, fetched: bool },
+    MemberFetched { blob: IncomingBlob, fetched: bool },
     /// The account check ran.
     AccountChecked(AccountCheck),
     /// A while has passed since the home denied the relay's claim that this device is
@@ -150,14 +146,6 @@ enum Rejoin {
     /// device: a rejoin naming this device's server epoch would be refused, so it waits
     /// until the server group reaches `epoch`.
     WaitsForServer { server_mailbox: [u8; 32], epoch: u64 },
-}
-
-/// A blob held while its sender's identity log is fetched, and how it goes on after.
-enum HeldBlob {
-    /// Processed again from the start.
-    Receive,
-    /// Its message was opened, but its sender's credential could not be checked yet.
-    Unverified { message: ApplicationMessage, claim: CredentialClaim, received_at: u64 },
 }
 
 /// What the account check found, for the loop to act on.
@@ -1090,9 +1078,9 @@ impl Runner {
     /// What a task reported back.
     async fn handle_report(&self, report: Report, sync_mailbox: [u8; 32], state: &mut LoopState) {
         match report {
-            Report::MemberFetched { blob, held, fetched } => {
+            Report::MemberFetched { blob, fetched } => {
                 let mailbox_id = blob.mailbox_id;
-                self.resume_blob(blob, held, fetched, state).await;
+                self.resume_blob(blob, fetched, state).await;
                 state.release(mailbox_id);
                 let ready = state.deferred.take_ready(&*self.client.lock().await);
                 state.requeued.extend(ready);
@@ -1196,47 +1184,37 @@ impl Runner {
         };
 
         // A device this client's identity log does not list yet: fetch its account's log
-        // from the server's relay, off the loop, then process a commit again or settle a
-        // message that was held (its key is spent, so it cannot be opened twice).
+        // from the server's relay, off the loop, then process the blob again. A message's
+        // key is still unspent, since its decryption was rolled back with the rest.
         match result {
             Err(GhostError::UnknownDevice { account_fp }) => {
                 tracing::debug!("blob seq={} on {}: from a device of {} this client has not seen; fetching its log", blob.seq, short_id(&mailbox_id), short_id(&account_fp));
-                self.fetch_member_for(blob, server_id, account_fp, HeldBlob::Receive, state);
-            }
-            Ok(ReceiveResult::Unverified { message, claim, received_at }) => {
-                let account_fp = claim.account_fp;
-                tracing::debug!("blob seq={} on {}: held until {}'s log is fetched", blob.seq, short_id(&mailbox_id), short_id(&account_fp));
-                self.fetch_member_for(blob, server_id, account_fp, HeldBlob::Unverified { message, claim, received_at }, state);
+                self.fetch_member_for(blob, server_id, account_fp, state);
             }
             other => self.finish_blob(blob, server_id, group_channel, other, state).await,
         }
     }
 
     /// Hold the blob's mailbox while the sender's account log is fetched.
-    fn fetch_member_for(&self, blob: IncomingBlob, server_id: [u8; 32], account_fp: [u8; 32], held: HeldBlob, state: &mut LoopState) {
+    fn fetch_member_for(&self, blob: IncomingBlob, server_id: [u8; 32], account_fp: [u8; 32], state: &mut LoopState) {
         state.hold(blob.mailbox_id);
         let runner = self.clone();
         self.spawn_reporting(async move {
             let fetched = flows::idlog::refresh_member(&runner.client, &runner.relay, &server_id, &account_fp).await;
-            Report::MemberFetched { blob, held, fetched }
+            Report::MemberFetched { blob, fetched }
         });
     }
 
     /// Go on with a blob whose sender's log was fetched. A sender the log still does not
     /// list is not waited for again: its blob fails like any other.
-    async fn resume_blob(&self, blob: IncomingBlob, held: HeldBlob, fetched: bool, state: &mut LoopState) {
+    async fn resume_blob(&self, blob: IncomingBlob, fetched: bool, state: &mut LoopState) {
         let (server_id, group_channel, result) = {
             let mut c = self.client.lock().await;
             let (Some(cid), Some(sid)) = (c.channel_id_for_mailbox(&blob.mailbox_id), c.server_id_for_mailbox(&blob.mailbox_id)) else {
                 return;
             };
             let origin = BlobOrigin { mailbox_id: blob.mailbox_id, seq: blob.seq };
-            let result = match held {
-                HeldBlob::Receive => c.receive_at(&cid, &blob.payload, blob.received_at, origin),
-                HeldBlob::Unverified { message, claim, received_at } if fetched => c.accept_unverified(message, &claim, received_at, Some(origin)),
-                HeldBlob::Unverified { .. } => Err(GhostError::IdentityLog("the sender's identity log could not be fetched".into())),
-            };
-            (sid, cid, result)
+            (sid, cid, c.receive_at(&cid, &blob.payload, blob.received_at, origin))
         };
         tracing::debug!(
             "blob seq={} on {}: resumed after the sender's log fetch (fetched={fetched}): {}",
@@ -1275,10 +1253,7 @@ impl Runner {
         }
 
         match result {
-            Ok(ReceiveResult::Message(msg)) if msg.message_type == MessageType::Metadata => {
-                self.check_head_claim(server_id, &msg).await;
-                self.apply_metadata(server_id, group_channel, mailbox_id, seq, msg).await;
-            }
+            Ok(ReceiveResult::Metadata(applied)) => self.carry_out_metadata(server_id, applied).await,
             Ok(ReceiveResult::Message(message)) => {
                 self.check_head_claim(server_id, &message).await;
                 self.emit(ClientEvent::Message { message, received_at });
@@ -1340,13 +1315,6 @@ impl Runner {
                 self.set_last_seen(&mailbox_id, seq).await;
             }
             Ok(ReceiveResult::Skipped) => self.set_last_seen(&mailbox_id, seq).await,
-            // A held blob processed again after a fetch that still does not list its sender:
-            // its key is spent, so it stands in, as one that could not be verified.
-            Ok(ReceiveResult::Unverified { .. }) => {
-                tracing::warn!("relay: blob seq={seq} on {}: its sender could not be checked", short_id(&mailbox_id));
-                self.stand_in_for(&blob, group_channel).await;
-                self.set_last_seen(&mailbox_id, seq).await;
-            }
             Err(e) => {
                 tracing::warn!("relay: blob seq={seq} on {} not processed: {e}", short_id(&mailbox_id));
                 self.unprocessed_blob(&blob, group_channel, &e, state).await;
@@ -1638,107 +1606,26 @@ impl Runner {
         }
     }
 
-    async fn apply_metadata(
-        &self,
-        server_id: [u8; 32],
-        group_channel: [u8; 32],
-        mailbox_id: [u8; 32],
-        seq: u64,
-        msg: crate::wire::ApplicationMessage,
-    ) {
-        let mut fetch_avatar = None;
-        let mut own_name_changed = false;
-        // Another device of this account changed the avatar: `Some(None)` took it down.
-        let mut own_avatar = None;
-        let mut server_move = None;
-        let mut reply = None;
-        let mut ask_state_again = false;
-        let in_server_group = group_channel == derive_default_channel_id(&server_id);
-        match decode_metadata(&msg.content) {
-            Ok(payload) => {
-                let mut c = self.client.lock().await;
-                // What the metadata changes and the blob marked seen land together: a
-                // restart replaying a blob whose key is spent would make it a stand-in.
-                stored(c.store().begin_whole(), "metadata write not begun");
-                match payload {
-                    // Who may change channels comes from the server policy, checked in the client.
-                    MetadataPayload::ChannelOp(op) => match c.apply_channel_op(&group_channel, &msg.sender_fp, op) {
-                        Ok(ChannelOpOutcome::Reply(out)) => reply = Some(out),
-                        // A server state as of before this change would undo it.
-                        Ok(ChannelOpOutcome::Applied) if in_server_group => {
-                            stored(c.store().note_server_change(&server_id, seq), "server change not noted");
-                        }
-                        Ok(_) => {}
-                        Err(e) => tracing::warn!("channel op: {e}"),
-                    },
-                    MetadataPayload::RoleNames(names) => match c.apply_role_names(&server_id, &msg.sender_fp, &names) {
-                        Ok(true) => stored(c.store().note_server_change(&server_id, seq), "server change not noted"),
-                        Ok(false) => {}
-                        Err(e) => tracing::warn!("role names: {e}"),
-                    },
-                    // A joiner asks; a member who may manage channels answers, as of the request.
-                    MetadataPayload::ServerStateRequest if in_server_group => match c.server_state_reply(&server_id, seq) {
-                        Ok(answer) => reply = answer,
-                        Err(e) => tracing::warn!("server state not answered: {e}"),
-                    },
-                    MetadataPayload::ServerState(state) if in_server_group => match c.apply_server_state(&server_id, &msg.sender_fp, state) {
-                        Ok(ServerStateOutcome::Stale) => ask_state_again = true,
-                        Ok(_) => {}
-                        Err(e) => tracing::warn!("server state not taken in: {e}"),
-                    },
-                    MetadataPayload::ServerStateRequest | MetadataPayload::ServerState(_) => {}
-                    MetadataPayload::MemberAnnounce { display_name } => {
-                        stored(c.store().update_member_name(&server_id, &msg.sender_fp, &display_name), "member name not kept");
-                        if msg.sender_fp == *c.fingerprint() {
-                            c.set_display_name(display_name);
-                            own_name_changed = true;
-                        }
-                    }
-                    MetadataPayload::AvatarUpdate { avatar_hash, avatar_key } => {
-                        stored(c.store().update_member_avatar(&server_id, &msg.sender_fp, &avatar_hash, &avatar_key), "avatar not kept");
-                        fetch_avatar = Some(avatar_hash);
-                        if msg.sender_fp == *c.fingerprint() {
-                            own_avatar = Some(Some(crate::mls::presence::AvatarRef { hash: avatar_hash, key: avatar_key }));
-                        }
-                    }
-                    MetadataPayload::AvatarClear => {
-                        stored(c.store().clear_member_avatar(&server_id, &msg.sender_fp), "avatar not cleared");
-                        avatars::clear(&self.data_dir, &msg.sender_fp);
-                        self.emit(ClientEvent::AvatarCleared(msg.sender_fp));
-                        if msg.sender_fp == *c.fingerprint() {
-                            own_avatar = Some(None);
-                        }
-                    }
-                    MetadataPayload::ServerMoved(location) => {
-                        // Only the owner may move a server; the record is verified when followed.
-                        if c.server_owner(&server_id).is_ok_and(|owner| owner == msg.sender_fp) {
-                            server_move = Some(location);
-                        }
-                    }
-                }
-                stored(c.store().set_last_seen_seq(&mailbox_id, seq), "last seen seq not kept");
-                stored(c.store().end_whole(), "metadata write not landed");
-            }
-            // Its key is spent: replayed, it could only stand in. A kind of metadata from a
-            // newer app has nothing to change here.
-            Err(e) => {
-                tracing::warn!("decode metadata: {e}");
-                self.set_last_seen(&mailbox_id, seq).await;
-            }
-        }
-        if let Some(out) = reply {
+    /// Do what an applied metadata message left beyond the database: answer, fetch,
+    /// follow, and tell the app.
+    async fn carry_out_metadata(&self, server_id: [u8; 32], applied: MetadataApplied) {
+        if let Some(out) = applied.reply {
             if let Err(e) = self.relay.send(&out.mailbox_id, out.blob) {
                 tracing::warn!("metadata reply not sent: {e}");
             }
         }
-        if ask_state_again {
+        if applied.ask_state_again {
             let session = self.session.clone();
             self.spawn(async move { flows::invite::ask_server_state(&session.client, &session.relay, &server_id).await });
         }
-        if let Some(hash) = fetch_avatar {
-            self.spawn_fetch_avatar(server_id, msg.sender_fp, hash);
+        if let Some(hash) = applied.fetch_avatar {
+            self.spawn_fetch_avatar(server_id, applied.sender, hash);
         }
-        if let Some(location) = server_move {
+        if applied.avatar_cleared {
+            avatars::clear(&self.data_dir, &applied.sender);
+            self.emit(ClientEvent::AvatarCleared(applied.sender));
+        }
+        if let Some(location) = applied.server_move {
             let session = self.session.clone();
             self.spawn(async move {
                 match flows::server::follow_move(&session.client, &session.relay, &server_id, &location).await {
@@ -1748,11 +1635,12 @@ impl Runner {
                 }
             });
         }
-        if own_name_changed {
+        if let Some(name) = applied.own_name {
+            self.client.lock().await.set_display_name(name);
             self.emit(ClientEvent::DisplayNameSynced);
         }
         // This device announces the account's avatar as it is now, not the one it had.
-        if let Some(avatar) = own_avatar {
+        if let Some(avatar) = applied.own_avatar {
             let info = {
                 let mut p = self.presence.lock().await;
                 let changed = p.avatar != avatar;

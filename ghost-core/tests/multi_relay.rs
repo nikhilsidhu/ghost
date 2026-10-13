@@ -699,7 +699,7 @@ async fn accept_p6_revoked_device_cannot_decrypt_after_remaining_devices_commit_
                     Ok(ReceiveResult::ChannelAccessLost(_)) => "channel access lost".into(),
                     Ok(ReceiveResult::Skipped) => "skipped".into(),
                     Ok(ReceiveResult::Unreadable) => "unreadable".into(),
-                    Ok(ReceiveResult::Unverified { .. }) => "unverified".into(),
+                    Ok(ReceiveResult::Metadata(_)) => "metadata".into(),
                     Err(e) => format!("error: {e}"),
                 }));
                 match result {
@@ -934,12 +934,7 @@ async fn accept_p6_server_move_followed_through_announcement() {
 
     // Alice's live connection delivers the announcement; following it moves her.
     let announced = receive_until(&s.alice.client, &s.alice_app, &mut s.alice_events, &s.channel_id, |r| match r {
-        ReceiveResult::Message(m) if m.message_type == MessageType::Metadata => {
-            match ghost_core::wire::decode_metadata(&m.content) {
-                Ok(ghost_core::wire::MetadataPayload::ServerMoved(location)) => Some(location),
-                _ => None,
-            }
-        }
+        ReceiveResult::Metadata(applied) => applied.server_move.clone(),
         _ => None,
     })
     .await

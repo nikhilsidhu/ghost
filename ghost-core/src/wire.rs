@@ -866,11 +866,6 @@ pub enum MetadataPayload {
 
 pub enum InboundMessage {
     Application(ApplicationMessage),
-    /// An application message from a device the receiver's identity log does not list
-    /// yet. Its key is spent by decrypting it, so it cannot be opened again: the caller
-    /// keeps it, refreshes the account's log, and accepts it only if the device then
-    /// shows active.
-    Unverified { msg: ApplicationMessage, claim: CredentialClaim },
     /// A commit was merged: the members it removed (fingerprints) and the account that
     /// made it.
     Commit { removed: Vec<[u8; 32]>, committer: [u8; 32] },
@@ -1018,9 +1013,10 @@ pub(crate) fn validate_sender(
 /// Process an inbound blob that could be an application message or a commit.
 /// Strips the envelope header, then decrypts. App messages are returned;
 /// commits are merged into the group automatically. Every device involved is checked
-/// against the identity logs; a commit naming a device the receiver's log does not
-/// list fails with `UnknownDevice` before merging, so it can be processed again once
-/// the log is fetched.
+/// against the identity logs; a message from, or a commit naming, a device the
+/// receiver's log does not list fails with `UnknownDevice`, a commit before merging,
+/// so it can be processed again once the log is fetched. The caller rolls a message's
+/// decryption back, so its key is still unspent then.
 pub fn open_any(
     group: &mut GhostGroup,
     provider: &GhostProvider,
@@ -1046,14 +1042,8 @@ pub fn open_any(
                 ));
             }
 
-            match validate_sender(group, &credential, &sender, None, devices) {
-                Ok(()) => Ok(InboundMessage::Application(msg)),
-                Err(GhostError::UnknownDevice { .. }) => {
-                    let (_fp, device_vk) = extract_sender_identity(group, &credential, &sender)?;
-                    Ok(InboundMessage::Unverified { msg, claim: claim_of(&credential, &device_vk)? })
-                }
-                Err(e) => Err(e),
-            }
+            validate_sender(group, &credential, &sender, None, devices)?;
+            Ok(InboundMessage::Application(msg))
         }
         ProcessedMessageContent::StagedCommitMessage(staged_commit) => {
             validate_sender(group, &credential, &sender, Some(&staged_commit), devices)?;
@@ -1491,7 +1481,7 @@ mod tests {
     }
 
     #[test]
-    fn a_message_from_an_unlisted_device_is_held_not_accepted() {
+    fn a_message_from_an_unlisted_device_names_its_account() {
         let (provider_a, mut group_a, provider_b, mut group_b, id_a, _id_b) = two_member_group();
 
         let msg = ApplicationMessage::new(
@@ -1503,13 +1493,9 @@ mod tests {
         let unknown = |_: &CredentialClaim| DeviceStatus::Unknown;
         let no_server = |_: &[u8; 32], _: u64| Err(PolicyError::Denied("no server".into()));
         let checks = CommitChecks { devices: &unknown, mailbox: [0u8; 32], received_at: 0, server_at: &no_server };
-        match open_any(&mut group_b, &provider_b, &blob, &checks).unwrap() {
-            InboundMessage::Unverified { msg: held, claim } => {
-                assert_eq!(held.content, b"who am I");
-                assert_eq!(claim.account_fp, id_a.fingerprint);
-                assert_eq!(claim.device_vk, id_a.verifying_key.to_bytes());
-            }
-            _ => panic!("an unlisted device's message was not held"),
+        match open_any(&mut group_b, &provider_b, &blob, &checks) {
+            Err(GhostError::UnknownDevice { account_fp }) => assert_eq!(account_fp, id_a.fingerprint),
+            _ => panic!("an unlisted device's message was accepted"),
         }
     }
 

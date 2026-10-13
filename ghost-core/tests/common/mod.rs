@@ -235,9 +235,9 @@ where
     panic!("gave up polling");
 }
 
-/// Process a blob from a channel's mailbox as the session loop does: a commit naming a
-/// device the client's log does not list yet is processed again after fetching that
-/// account's log, and a held message is settled once the sender's log is fetched.
+/// Process a blob from a channel's mailbox as the session loop does: a message from, or
+/// a commit naming, a device the client's log does not list yet is processed again
+/// after fetching that account's log.
 #[allow(dead_code)]
 pub async fn receive_like_session(
     client: &Shared<GhostClient>,
@@ -245,7 +245,7 @@ pub async fn receive_like_session(
     channel_id: &[u8; 32],
     blob: &ghost_core::relay::IncomingBlob,
 ) -> ghost_core::error::Result<ghost_core::client::ReceiveResult> {
-    use ghost_core::client::{BlobOrigin, ReceiveResult};
+    use ghost_core::client::BlobOrigin;
     use ghost_core::error::GhostError;
     let origin = BlobOrigin { mailbox_id: blob.mailbox_id, seq: blob.seq };
     let first = client.lock().await.receive_at(channel_id, &blob.payload, blob.received_at, origin);
@@ -253,10 +253,6 @@ pub async fn receive_like_session(
         Err(GhostError::UnknownDevice { account_fp }) => {
             fetch_sender_log(client, relay, blob, &account_fp).await;
             client.lock().await.receive_at(channel_id, &blob.payload, blob.received_at, origin)
-        }
-        Ok(ReceiveResult::Unverified { message, claim, received_at }) => {
-            fetch_sender_log(client, relay, blob, &claim.account_fp).await;
-            client.lock().await.accept_unverified(message, &claim, received_at, Some(origin))
         }
         other => other,
     }

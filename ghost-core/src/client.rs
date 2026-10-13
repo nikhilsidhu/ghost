@@ -2,7 +2,6 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use openmls::prelude::LeafNodeIndex;
-use rusqlite::Connection;
 
 use openmls_traits::OpenMlsProvider;
 use crate::account_keys::AccountSeed;
@@ -15,13 +14,15 @@ use crate::mls::group::{GhostExtension, GhostGroup};
 use crate::storage::{Delivery, 
     Channel, ChannelKind, GhostStore, Server, ServerKind, Member, OnConflict, StoredMessage,
 };
+use crate::mls::presence::AvatarRef;
 use crate::wire::{
-    derive_default_channel_id, mls_group_mailbox_id, open, open_any, seal,
-    ApplicationMessage, CommitChecks, InboundMessage, InviteChannel, InviteMember, InvitePayload, Outbound,
+    decode_metadata, derive_default_channel_id, mls_group_mailbox_id, open, open_any, seal,
+    ApplicationMessage, CommitChecks, InboundMessage, InviteChannel, InviteMember, InvitePayload, MetadataPayload, Outbound,
     ProvisionPayload, ServerStatePayload, SyncDump, SyncEntry, SyncReceiveResult, SyncServerMeta,
 };
 use ghost_wire::policy::{CommitAad, PolicyError, RemovedAccount, ServerPolicy, ServerView};
 use ghost_wire::policy_mls;
+use ghost_wire::server_location::ServerLocation;
 use ghost_wire::{now_millis, short_id};
 
 /// Sender key, its sequence number, generation and signature ahead of a sync message's
@@ -40,31 +41,13 @@ fn sync_message(account_fp: &[u8; 32], seq: u64, generation: u32, sealed: &[u8])
     msg
 }
 
-/// Open an encrypted SQLite connection for MLS state, separate from the app DB.
-fn open_mls_connection(mls_db_key: &[u8; 32], app_db_path: &Path) -> Result<Connection> {
-    let mls_path = app_db_path.with_extension("mls.db");
-
-    let conn = Connection::open(&mls_path)
-        .map_err(|e| GhostError::Database(format!("open mls db: {e}")))?;
-
-    conn.pragma_update(None, "key", format!("x'{}'", hex::encode(mls_db_key)))
-        .map_err(|e| GhostError::Database(format!("set mls key: {e}")))?;
-
-    conn.pragma_update(None, "journal_mode", "WAL")
-        .map_err(|e| GhostError::Database(format!("set mls WAL: {e}")))?;
-
-    Ok(conn)
-}
-
 pub enum ReceiveResult {
-    /// A message from a checked device, already stored. Its `kt_head_hash` is the
+    /// A chat message from a checked device, already stored. Its `kt_head_hash` is the
     /// sender's view of its own log head, for the caller to judge with
     /// [`GhostClient::judge_head`].
     Message(ApplicationMessage),
-    /// A message from a device this client's identity log does not list yet, already
-    /// decrypted and not stored. The caller refreshes the sender's log and passes it to
-    /// [`GhostClient::accept_unverified`], which stores it only if the device is active.
-    Unverified { message: ApplicationMessage, claim: CredentialClaim, received_at: u64 },
+    /// A metadata message from a checked device, already applied.
+    Metadata(MetadataApplied),
     CommitProcessed,
     /// The account was removed from the group by a commit `by` an account: no device
     /// of it remains.
@@ -85,6 +68,28 @@ pub enum ReceiveResult {
     Unreadable,
     /// Nothing to do: this device's own message echoed back, or a commit already applied.
     Skipped,
+}
+
+/// What a metadata message leaves for the caller beyond the database, once applied and
+/// its blob marked seen in the write that spent its key.
+pub struct MetadataApplied {
+    pub sender: [u8; 32],
+    /// A channel op took effect here.
+    pub channel_changed: bool,
+    /// An answer to send: a private channel's name, or the server's state.
+    pub reply: Option<Outbound>,
+    /// The server's state came stale: ask for it again.
+    pub ask_state_again: bool,
+    /// The sender's new avatar, to fetch.
+    pub fetch_avatar: Option<[u8; 32]>,
+    /// The sender took its avatar down: its cached image goes.
+    pub avatar_cleared: bool,
+    /// Another device of this account renamed it.
+    pub own_name: Option<String>,
+    /// Another device of this account changed its avatar: `Some(None)` took it down.
+    pub own_avatar: Option<Option<AvatarRef>>,
+    /// The server's owner moved it: the record to follow.
+    pub server_move: Option<ServerLocation>,
 }
 
 /// A freshly created invite. The relay stores `sealed_payload` under `token`; `key`
@@ -137,8 +142,9 @@ pub enum ChannelOpOutcome {
 /// Session-level orchestration: holds identity, MLS state, and local storage.
 pub struct GhostClient {
     identity: Identity,
+    /// OpenMLS's crypto and storage, the storage being the app's database: the store
+    /// lives here, reached through `provider.store()`.
     provider: GhostProvider,
-    store: GhostStore,
     /// Per-channel MLS groups: channel_id → GhostGroup
     channel_groups: HashMap<[u8; 32], GhostGroup>,
     /// mailbox_id → channel_id for O(1) reverse lookup
@@ -167,14 +173,18 @@ struct PendingRejoin {
 }
 
 impl GhostClient {
+    /// Open the device's database at `db_path` under `db_key`. `mls_db_key` opens the file
+    /// MLS state was kept in before it moved into that database, brought in on the first
+    /// open after.
     pub fn open(identity: Identity, db_key: [u8; 32], mls_db_key: [u8; 32], db_path: &Path) -> Result<Self> {
         let store = GhostStore::open(&db_key, db_path)?;
         // Nothing answers for a message handed to a connection of an earlier run: it is
         // sent again. Failing here fails the open rather than leaving it "sending".
         store.reset_in_flight()?;
 
-        let mls_conn = open_mls_connection(&mls_db_key, db_path)?;
-        let provider = GhostProvider::new(mls_conn)?;
+        let provider = GhostProvider::new(store)?;
+        provider.import_mls_file(&db_path.with_extension("mls.db"), &mls_db_key)?;
+        let store = provider.store();
 
         // Reload per-channel MLS groups from previous sessions. A server none of whose
         // groups was ever stored is the leftover of an interrupted join, and goes so the
@@ -213,7 +223,6 @@ impl GhostClient {
         let client = Self {
             identity,
             provider,
-            store,
             channel_groups,
             mailbox_map,
             channel_server,
@@ -233,12 +242,10 @@ impl GhostClient {
     }
 
     pub fn open_in_memory(identity: Identity, db_key: [u8; 32]) -> Result<Self> {
-        let provider = GhostProvider::new_in_memory()?;
-        let store = GhostStore::open_in_memory(&db_key)?;
+        let provider = GhostProvider::new(GhostStore::open_in_memory(&db_key)?)?;
         Ok(Self {
             identity,
             provider,
-            store,
             channel_groups: HashMap::new(),
             mailbox_map: HashMap::new(),
             channel_server: HashMap::new(),
@@ -248,6 +255,43 @@ impl GhostClient {
             pending_rejoins: HashMap::new(),
             names_asked: HashSet::new(),
         })
+    }
+
+    /// Run `step`, which moves channel groups on and writes the rows that go with that,
+    /// as one write of the database both live in: a crash or an error lands none of it.
+    /// After an error the groups of `channels` are put back in memory as storage holds
+    /// them once rolled back, so memory never runs ahead of storage.
+    fn mls_step<T>(&mut self, channels: &[[u8; 32]], step: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        let servers: Vec<([u8; 32], Option<[u8; 32]>)> = channels.iter().map(|channel_id| (*channel_id, self.channel_server.get(channel_id).copied())).collect();
+        self.provider.store().begin_whole()?;
+        let stepped = step(self).and_then(|value| self.provider.store().end_whole().map(|()| value));
+        if stepped.is_err() {
+            self.provider.store().abandon_whole();
+            for (channel_id, server_id) in servers {
+                self.restore_group(&channel_id, server_id);
+            }
+        }
+        stepped
+    }
+
+    /// Put a channel's group in memory back as storage holds it, after a step that
+    /// touched it was rolled back: read back if it was there before the step, forgotten
+    /// if the step made it.
+    fn restore_group(&mut self, channel_id: &[u8; 32], server_id: Option<[u8; 32]>) {
+        if let Some(group) = self.channel_groups.remove(channel_id) {
+            self.mailbox_map.remove(&mls_group_mailbox_id(group.group_id()));
+        }
+        self.channel_server.remove(channel_id);
+        let Some(server_id) = server_id else { return };
+        match GhostGroup::load(&self.provider, &self.identity, &server_id, channel_id) {
+            Ok(Some(group)) => {
+                self.mailbox_map.insert(mls_group_mailbox_id(group.group_id()), *channel_id);
+                self.channel_server.insert(*channel_id, server_id);
+                self.channel_groups.insert(*channel_id, group);
+            }
+            Ok(None) => {}
+            Err(e) => tracing::error!("group of channel {} not read back after a failed step: {e}", short_id(channel_id)),
+        }
     }
 
     /// Get the default channel's MLS group for a server (for server-wide operations).
@@ -266,7 +310,7 @@ impl GhostClient {
         if self.channel_groups.contains_key(channel_id) {
             return *channel_id;
         }
-        match self.store.get_channel(channel_id) {
+        match self.provider.store().get_channel(channel_id) {
             Ok(channel) => derive_default_channel_id(&channel.server_id),
             Err(_) => *channel_id,
         }
@@ -330,7 +374,7 @@ impl GhostClient {
             let members: Vec<openmls::prelude::Member> = group.members().collect();
             return policy_mls::server_view(group.context_extensions(), &members);
         }
-        self.store
+        self.provider.store()
             .server_view_at(&server_id, epoch)
             .map_err(|e| PolicyError::Denied(e.to_string()))?
             .ok_or_else(|| denied("no record of the server group at that epoch"))
@@ -343,7 +387,7 @@ impl GhostClient {
         let members: Vec<openmls::prelude::Member> = group.members().collect();
         let view = policy_mls::server_view(group.context_extensions(), &members)
             .map_err(|e| GhostError::Format(format!("server policy: {e}")))?;
-        self.store.record_server_view(server_id, group.epoch(), &view)
+        self.provider.store().record_server_view(server_id, group.epoch(), &view)
     }
 
     /// Record the server view if `channel_id` is a server's default channel.
@@ -389,7 +433,7 @@ impl GhostClient {
         if server.kind != ServerKind::Dm {
             return server.name.clone();
         }
-        self.store
+        self.provider.store()
             .list_members(&server.server_id)
             .ok()
             .and_then(|members| members.into_iter().find(|m| m.fingerprint != self.identity.fingerprint && m.has_name()))
@@ -405,7 +449,7 @@ impl GhostClient {
     }
 
     pub fn store(&self) -> &GhostStore {
-        &self.store
+        self.provider.store()
     }
 
     /// Note that sync state changed and the relays' snapshots should follow.
@@ -459,11 +503,11 @@ impl GhostClient {
         account_fp: &[u8; 32],
         log: &crate::relay::AnchoredLog,
     ) -> Result<ghost_wire::idlog::LogState> {
-        let (state, replaced) = self.idlog_cache.cache_and_validate(&self.store, account_fp, log)?;
+        let (state, replaced) = self.idlog_cache.cache_and_validate(self.provider.store(), account_fp, log)?;
         if let Some(replaced) = replaced {
             if *account_fp == self.identity.fingerprint {
                 // Told by the next account check, whichever fetch found it.
-                self.store.record_replaced_history(&replaced, now_millis())?;
+                self.provider.store().record_replaced_history(&replaced, now_millis())?;
             } else {
                 tracing::warn!("identity log of {}: cached history from entry {} replaced by a root-signed branch", short_id(account_fp), replaced.from_seq);
             }
@@ -473,7 +517,7 @@ impl GhostClient {
 
     /// Last KT head accepted from this relay, if any.
     pub fn kt_head(&self, relay_vk: &[u8; 32]) -> Result<Option<ghost_wire::merkle::Checkpoint>> {
-        match self.store.get_kt_state(relay_vk)? {
+        match self.provider.store().get_kt_state(relay_vk)? {
             Some(state) => ghost_wire::merkle::Checkpoint::from_bytes(&state.checkpoint)
                 .map(Some)
                 .map_err(|e| GhostError::IdentityLog(format!("stored kt head: {e}"))),
@@ -499,7 +543,7 @@ impl GhostClient {
                 GhostError::IdentityLog(format!("kt head does not extend the last one seen ({e}); possible split view"))
             })?;
         }
-        self.store.set_kt_state(relay_vk, head.tree_size, &head.root_hash, &head.to_bytes())
+        self.provider.store().set_kt_state(relay_vk, head.tree_size, &head.root_hash, &head.to_bytes())
     }
 
     /// The cached identity log state for an account, loading it from the local
@@ -508,7 +552,7 @@ impl GhostClient {
         if let Some(state) = self.idlog_cache.get(account_fp) {
             return Ok(Some(state.clone()));
         }
-        Ok(self.idlog_cache.load_from_store(&self.store, account_fp)?.cloned())
+        Ok(self.idlog_cache.load_from_store(self.provider.store(), account_fp)?.cloned())
     }
 
     /// Validate a chain held locally and cache it, as when a device has just written
@@ -532,13 +576,13 @@ impl GhostClient {
         let fp = self.identity.fingerprint;
         let server_ids: Vec<[u8; 32]> = self.channel_server.values().copied().collect::<std::collections::HashSet<_>>().into_iter().collect();
         for server_id in &server_ids {
-            let _ = self.store.update_member_name(server_id, &fp, &name);
+            let _ = self.provider.store().update_member_name(server_id, &fp, &name);
         }
         self.identity.display_name = name;
     }
 
     pub fn store_account_seed(&self, seed: &AccountSeed) -> Result<()> {
-        self.store.store_account_seed(seed)
+        self.provider.store().store_account_seed(seed)
     }
 
     /// A generation's seed, if held and it is the one the account's log published.
@@ -546,7 +590,7 @@ impl GhostClient {
         let Some(key) = self.own_log().and_then(|log| log.account_keys.iter().find(|k| k.generation == generation)) else {
             return Ok(None);
         };
-        match self.store.account_seed(generation)? {
+        match self.provider.store().account_seed(generation)? {
             Some(seed) if seed.matches(key)? => Ok(Some(seed)),
             _ => Ok(None),
         }
@@ -569,20 +613,20 @@ impl GhostClient {
     }
 
     pub fn sync_get(&self, key: &str) -> Result<Option<(Option<Vec<u8>>, u64)>> {
-        self.store.sync_get(key)
+        self.provider.store().sync_get(key)
     }
 
     pub fn sync_set(&self, key: &str, value: &[u8], ts: u64) -> Result<bool> {
-        self.store.sync_set(key, value, ts)
+        self.provider.store().sync_set(key, value, ts)
     }
 
     pub fn sync_remove(&self, key: &str, ts: u64) -> Result<bool> {
-        self.store.sync_remove(key, ts)
+        self.provider.store().sync_remove(key, ts)
     }
 
     /// This device's state with what it covers, for a snapshot or a provision.
     pub fn sync_dump(&self) -> Result<SyncDump> {
-        Ok(SyncDump { covered: self.store.sync_cursors()?, entries: self.store.sync_dump()? })
+        Ok(SyncDump { covered: self.provider.store().sync_cursors()?, entries: self.provider.store().sync_dump()? })
     }
 
     /// Merge entries other devices wrote by each key's rule, their clocks clamped to what
@@ -591,7 +635,7 @@ impl GhostClient {
         let now = now_millis();
         let clamped: Vec<SyncEntry> =
             entries.iter().map(|(key, value, ts)| (key.clone(), value.clone(), crate::sync::clock::clamp(*ts, now))).collect();
-        self.store.sync_import(&clamped)
+        self.provider.store().sync_import(&clamped)
     }
 
     /// A snapshot included every message of these devices up to these sequence numbers:
@@ -602,26 +646,26 @@ impl GhostClient {
             if *device_vk == own {
                 continue;
             }
-            let mut window = self.store.sync_cursor(device_vk)?;
+            let mut window = self.provider.store().sync_cursor(device_vk)?;
             window.cover_up_to(*high);
-            self.store.set_sync_cursor(device_vk, &window)?;
+            self.provider.store().set_sync_cursor(device_vk, &window)?;
         }
         Ok(())
     }
 
     /// A clock for a write this device makes now, past everything it has seen.
     pub fn sync_tick(&self) -> Result<u64> {
-        let mut clock = crate::sync::clock::HybridClock::new(self.store.sync_clock()?);
+        let mut clock = crate::sync::clock::HybridClock::new(self.provider.store().sync_clock()?);
         let value = clock.tick(now_millis());
-        self.store.set_sync_clock(clock.last())?;
+        self.provider.store().set_sync_clock(clock.last())?;
         Ok(value)
     }
 
     /// Take in a clock another device wrote; returns it clamped as it is stored.
     pub fn sync_observe(&self, clock: u64) -> Result<u64> {
-        let mut hybrid = crate::sync::clock::HybridClock::new(self.store.sync_clock()?);
+        let mut hybrid = crate::sync::clock::HybridClock::new(self.provider.store().sync_clock()?);
         let stored = hybrid.observe(clock, now_millis());
-        self.store.set_sync_clock(hybrid.last())?;
+        self.provider.store().set_sync_clock(hybrid.last())?;
         Ok(stored)
     }
 
@@ -639,7 +683,7 @@ impl GhostClient {
         use ed25519_dalek::Signer;
         let seed = self.sealing_seed()?;
         let sealed = crate::wire::sync_seal(&*seed.sync_key()?, plaintext)?;
-        let seq = self.store.next_sync_seq()?;
+        let seq = self.provider.store().next_sync_seq()?;
         let signature = self.identity.signing_key.sign(&sync_message(&self.identity.fingerprint, seq, seed.generation(), &sealed));
         let header = ghost_wire::encode_envelope(ghost_wire::EnvelopeType::Application, 0);
         let mut blob = Vec::with_capacity(ghost_wire::ENVELOPE_HEADER_SIZE + SYNC_HEADER_LEN + sealed.len());
@@ -677,7 +721,7 @@ impl GhostClient {
         if sender_vk == *self.identity.verifying_key.as_bytes() {
             return Ok(SyncReceiveResult::Seen);
         }
-        let mut window = self.store.sync_cursor(&sender_vk)?;
+        let mut window = self.provider.store().sync_cursor(&sender_vk)?;
         let gap = match window.accept(seq) {
             crate::sync::window::Arrival::Seen => return Ok(SyncReceiveResult::Seen),
             crate::sync::window::Arrival::New { gap } => gap,
@@ -699,16 +743,16 @@ impl GhostClient {
             .account_seed(generation)?
             .ok_or_else(|| GhostError::AccountKeyUnavailable(format!("generation {generation} is not held yet")))?;
         let plaintext = crate::wire::sync_open(&*seed.sync_key()?, sealed)?;
-        self.store.set_sync_cursor(&sender_vk, &window)?;
+        self.provider.store().set_sync_cursor(&sender_vk, &window)?;
         Ok(SyncReceiveResult::Application { plaintext, sender: sender_vk, gap })
     }
 
     /// Export server metadata for provisioning a sibling device (no role check).
     pub fn export_provision_payload(&self, server_id: &[u8; 32]) -> Result<ProvisionPayload> {
         let default_group = self.default_group(server_id)?;
-        let meta = self.store.get_server(server_id)?;
-        let members = self.store.list_members(server_id)?;
-        let channels = self.store.list_channels(server_id)?;
+        let meta = self.provider.store().get_server(server_id)?;
+        let members = self.provider.store().list_members(server_id)?;
+        let channels = self.provider.store().list_channels(server_id)?;
         let mailbox_id = mls_group_mailbox_id(default_group.group_id());
 
         // Private channels are found through the relay's discovery and joined with the
@@ -744,14 +788,14 @@ impl GhostClient {
             channels: invite_channels,
             mailbox_id,
             relay_ref: self.server_relay_ref(server_id)?,
-            role_names: self.store.list_role_names(server_id)?,
+            role_names: self.provider.store().list_role_names(server_id)?,
         })
     }
 
     /// Relay hosting a server, as recorded at join time; `None` means the home relay.
     fn server_relay_ref(&self, server_id: &[u8; 32]) -> Result<Option<ghost_wire::relay_ref::RelayRef>> {
-        match self.store.server_relay(server_id)? {
-            Some(relay_vk) => Ok(self.store.get_relay(&relay_vk)?),
+        match self.provider.store().server_relay(server_id)? {
+            Some(relay_vk) => Ok(self.provider.store().get_relay(&relay_vk)?),
             None => Ok(None),
         }
     }
@@ -759,8 +803,8 @@ impl GhostClient {
     /// Export lightweight server metadata for sync_state (no members).
     pub fn export_server_meta(&self, server_id: &[u8; 32]) -> Result<SyncServerMeta> {
         let default_group = self.default_group(server_id)?;
-        let meta = self.store.get_server(server_id)?;
-        let channels = self.store.list_channels(server_id)?;
+        let meta = self.provider.store().get_server(server_id)?;
+        let channels = self.provider.store().list_channels(server_id)?;
         let mailbox_id = mls_group_mailbox_id(default_group.group_id());
 
         Ok(SyncServerMeta {
@@ -779,8 +823,8 @@ impl GhostClient {
                 })
                 .collect(),
             relay_ref: self.server_relay_ref(server_id)?,
-            role_names: self.store.list_role_names(server_id)?,
-            removal: self.store.server_removal(server_id)?.map(|r| crate::wire::SyncRemoval { by: r.by }),
+            role_names: self.provider.store().list_role_names(server_id)?,
+            removal: self.provider.store().server_removal(server_id)?.map(|r| crate::wire::SyncRemoval { by: r.by }),
         })
     }
 
@@ -802,68 +846,72 @@ impl GhostClient {
         timestamp: u64,
         idempotent: bool,
     ) -> Result<Vec<([u8; 32], Vec<u8>, [u8; 32])>> {
-        // A server this account was removed from is still here, read-only: rejoining it
-        // after being let back in keeps its rows and history.
-        let idempotent = idempotent || self.store.server_removal(&server_id)?.is_some();
-        let on_conflict = if idempotent { OnConflict::Keep } else { OnConflict::Fail };
-        let server = Server { server_id, name: server_name, kind, created_at: timestamp };
-        self.store.insert_server(&server, on_conflict)?;
-
-        for ch in channels {
-            let channel = Channel {
-                channel_id: ch.channel_id, server_id, name: ch.name.clone(),
-                kind: ch.kind, position: ch.position,
-            };
-            self.store.insert_channel(&channel, on_conflict)?;
-        }
-
-        for m in members {
-            let member = Member {
-                server_id, fingerprint: m.fingerprint, display_name: m.display_name.clone(),
-                joined_at: timestamp, avatar_hash: None, avatar_key: None,
-            };
-            self.store.insert_member(&member, on_conflict)?;
-        }
-
-        let self_member = Member {
-            server_id, fingerprint: self.identity.fingerprint,
-            display_name: self.identity.display_name.clone(),
-            joined_at: timestamp, avatar_hash: None, avatar_key: None,
-        };
-        self.store.insert_member(&self_member, on_conflict)?;
-
-        for (role_id, name) in role_names {
-            self.store.set_role_name(&server_id, *role_id, name)?;
-        }
-
-        let mut results = Vec::with_capacity(channels.len());
-        let aad = CommitAad { invite: grant.cloned(), server_epoch: None };
         // Channels without GroupInfo have no MLS group: metadata only.
-        for ch in channels.iter().filter(|ch| !ch.group_info_bytes.is_empty()) {
-            let (ghost_group, commit_bytes) = GhostGroup::join_by_external_commit(
-                &self.provider,
-                &self.identity,
-                &ch.group_info_bytes,
-                &aad,
-            )?;
-            let mailbox_id = mls_group_mailbox_id(ghost_group.group_id());
-            self.store.record_group_join(&ch.channel_id, ghost_group.epoch())?;
-            self.channel_groups.insert(ch.channel_id, ghost_group);
-            self.mailbox_map.insert(mailbox_id, ch.channel_id);
-            self.channel_server.insert(ch.channel_id, server_id);
-            results.push((ch.channel_id, commit_bytes, mailbox_id));
-        }
-        self.record_server_view(&server_id)?;
-        // Members who joined after the payload was made are in the tree; their names come
-        // when they announce, or with the server's state.
-        for fingerprint in self.mls_member_fingerprints(&server_id)? {
-            let member = Member {
-                server_id, fingerprint, display_name: crate::storage::placeholder_name(&fingerprint),
+        let joined: Vec<[u8; 32]> = channels.iter().filter(|ch| !ch.group_info_bytes.is_empty()).map(|ch| ch.channel_id).collect();
+        // The server's rows and every group joined land together, or none of them.
+        self.mls_step(&joined, |c| {
+            // A server this account was removed from is still here, read-only: rejoining it
+            // after being let back in keeps its rows and history.
+            let idempotent = idempotent || c.provider.store().server_removal(&server_id)?.is_some();
+            let on_conflict = if idempotent { OnConflict::Keep } else { OnConflict::Fail };
+            let server = Server { server_id, name: server_name, kind, created_at: timestamp };
+            c.provider.store().insert_server(&server, on_conflict)?;
+
+            for ch in channels {
+                let channel = Channel {
+                    channel_id: ch.channel_id, server_id, name: ch.name.clone(),
+                    kind: ch.kind, position: ch.position,
+                };
+                c.provider.store().insert_channel(&channel, on_conflict)?;
+            }
+
+            for m in members {
+                let member = Member {
+                    server_id, fingerprint: m.fingerprint, display_name: m.display_name.clone(),
+                    joined_at: timestamp, avatar_hash: None, avatar_key: None,
+                };
+                c.provider.store().insert_member(&member, on_conflict)?;
+            }
+
+            let self_member = Member {
+                server_id, fingerprint: c.identity.fingerprint,
+                display_name: c.identity.display_name.clone(),
                 joined_at: timestamp, avatar_hash: None, avatar_key: None,
             };
-            self.store.insert_member(&member, OnConflict::Keep)?;
-        }
-        Ok(results)
+            c.provider.store().insert_member(&self_member, on_conflict)?;
+
+            for (role_id, name) in role_names {
+                c.provider.store().set_role_name(&server_id, *role_id, name)?;
+            }
+
+            let mut results = Vec::with_capacity(channels.len());
+            let aad = CommitAad { invite: grant.cloned(), server_epoch: None };
+            for ch in channels.iter().filter(|ch| !ch.group_info_bytes.is_empty()) {
+                let (ghost_group, commit_bytes) = GhostGroup::join_by_external_commit(
+                    &c.provider,
+                    &c.identity,
+                    &ch.group_info_bytes,
+                    &aad,
+                )?;
+                let mailbox_id = mls_group_mailbox_id(ghost_group.group_id());
+                c.provider.store().record_group_join(&ch.channel_id, ghost_group.epoch())?;
+                c.channel_groups.insert(ch.channel_id, ghost_group);
+                c.mailbox_map.insert(mailbox_id, ch.channel_id);
+                c.channel_server.insert(ch.channel_id, server_id);
+                results.push((ch.channel_id, commit_bytes, mailbox_id));
+            }
+            c.record_server_view(&server_id)?;
+            // Members who joined after the payload was made are in the tree; their names come
+            // when they announce, or with the server's state.
+            for fingerprint in c.mls_member_fingerprints(&server_id)? {
+                let member = Member {
+                    server_id, fingerprint, display_name: crate::storage::placeholder_name(&fingerprint),
+                    joined_at: timestamp, avatar_hash: None, avatar_key: None,
+                };
+                c.provider.store().insert_member(&member, OnConflict::Keep)?;
+            }
+            Ok(results)
+        })
     }
 
     /// Join a server from a provision payload (handles duplicates).
@@ -904,16 +952,6 @@ impl GhostClient {
 
         // The relay is every group's external sender, so it can propose removals in it.
         let relay_vk = self.relay_vk.ok_or_else(|| GhostError::Network("the home relay's key is not known yet; connect to it first".into()))?;
-        let ghost_group =
-            GhostGroup::create(
-                &self.provider,
-                &self.identity,
-                &server_id,
-                &channel_id,
-                Some(&relay_vk),
-                Some(crate::mls::group::GhostExtension::Server(ghost_wire::policy::ServerPolicy::new(self.identity.fingerprint))),
-            )?;
-
         let server = Server { server_id, name: name.to_string(), kind, created_at: timestamp };
         let channel = Channel { channel_id, server_id, name: channel_name.to_string(), kind: ChannelKind::Text, position: 0 };
         let creator = Member {
@@ -924,19 +962,22 @@ impl GhostClient {
             avatar_hash: None,
             avatar_key: None,
         };
-        if let Err(e) = self.store.insert_created_server(&server, &channel, &creator) {
-            let _ = ghost_group.delete(&self.provider);
-            return Err(e);
-        }
-
-        let mailbox_id = mls_group_mailbox_id(ghost_group.group_id());
-        self.channel_groups.insert(channel_id, ghost_group);
-        self.mailbox_map.insert(mailbox_id, channel_id);
-        self.channel_server.insert(channel_id, server_id);
-        if let Err(e) = self.record_server_view(&server_id) {
-            let _ = self.drop_server(&server_id);
-            return Err(e);
-        }
+        // The group, the server's rows and its first view land together, or none of them.
+        self.mls_step(&[channel_id], |c| {
+            let ghost_group = GhostGroup::create(
+                &c.provider,
+                &c.identity,
+                &server_id,
+                &channel_id,
+                Some(&relay_vk),
+                Some(crate::mls::group::GhostExtension::Server(ghost_wire::policy::ServerPolicy::new(c.identity.fingerprint))),
+            )?;
+            c.provider.store().insert_created_server(&server, &channel, &creator)?;
+            c.mailbox_map.insert(mls_group_mailbox_id(ghost_group.group_id()), channel_id);
+            c.channel_groups.insert(channel_id, ghost_group);
+            c.channel_server.insert(channel_id, server_id);
+            c.record_server_view(&server_id)
+        })?;
         Ok(server_id)
     }
 
@@ -952,10 +993,12 @@ impl GhostClient {
     /// current epoch, so the server group's own commit must be merged first.
     pub fn stage_external_sender(&mut self, channel_id: &[u8; 32], relay_vk: &[u8; 32]) -> Result<Vec<u8>> {
         let aad = self.commit_aad(channel_id);
-        let group = self.channel_groups.get_mut(channel_id).ok_or_else(|| {
-            GhostError::ServerNotLoaded(format!("channel {}", short_id(channel_id)))
-        })?;
-        group.set_external_sender(&self.provider, relay_vk, &aad)
+        self.mls_step(&[*channel_id], |c| {
+            let group = c.channel_groups.get_mut(channel_id).ok_or_else(|| {
+                GhostError::ServerNotLoaded(format!("channel {}", short_id(channel_id)))
+            })?;
+            group.set_external_sender(&c.provider, relay_vk, &aad)
+        })
     }
 
     /// Ids of the server's channels that have an MLS group, with their mailboxes; the
@@ -982,10 +1025,6 @@ impl GhostClient {
     ) -> Result<(Outbound, [u8; 32])> {
         self.ready_to_seal(server_id, channel_id)?;
         let group_channel = self.group_channel(channel_id);
-        let group = self.channel_groups.get_mut(&group_channel).ok_or_else(|| {
-            GhostError::ServerNotLoaded(format!("channel {}", short_id(channel_id)))
-        })?;
-
         let kt_head_hash = self
             .idlog_cache
             .get(&self.identity.fingerprint)
@@ -1001,26 +1040,27 @@ impl GhostClient {
             content,
         )?;
 
-        let blob = seal(group, &self.provider, &msg)?;
-        let mailbox_id = mls_group_mailbox_id(group.group_id());
-        let message_id = msg.message_id;
-
-        let now = now_millis();
-
-        self.store.insert_message(&StoredMessage {
-            message_id: msg.message_id,
-            channel_id: msg.channel_id,
-            sender_fp: msg.sender_fp,
-            message_type: msg.message_type as u8,
-            timestamp: msg.timestamp,
-            received_at: now,
-            content: msg.content,
-            expires_at: None,
-            references: msg.references,
-            delivery: Delivery::Pending,
-        })?;
-
-        Ok((Outbound { channel_id: *channel_id, mailbox_id, blob }, message_id))
+        // The sending key the seal spends and the pending row land together.
+        self.mls_step(&[group_channel], |c| {
+            let group = c.channel_groups.get_mut(&group_channel).ok_or_else(|| {
+                GhostError::ServerNotLoaded(format!("channel {}", short_id(channel_id)))
+            })?;
+            let blob = seal(group, &c.provider, &msg)?;
+            let mailbox_id = mls_group_mailbox_id(group.group_id());
+            c.provider.store().insert_message(&StoredMessage {
+                message_id: msg.message_id,
+                channel_id: msg.channel_id,
+                sender_fp: msg.sender_fp,
+                message_type: msg.message_type as u8,
+                timestamp: msg.timestamp,
+                received_at: now_millis(),
+                content: msg.content.clone(),
+                expires_at: None,
+                references: msg.references.clone(),
+                delivery: Delivery::Pending,
+            })?;
+            Ok((Outbound { channel_id: *channel_id, mailbox_id, blob }, msg.message_id))
+        })
     }
 
     /// Whether a message may be sealed in the channel now: the account is still in the
@@ -1042,7 +1082,7 @@ impl GhostClient {
     /// to send it anew, under the same checks as a first send. The message keeps its id,
     /// so a receiver that saw an earlier copy drops this one.
     pub fn reseal_message(&mut self, message_id: &[u8; 32]) -> Result<Outbound> {
-        let stored = self.store.get_message(message_id)?;
+        let stored = self.provider.store().get_message(message_id)?;
         if stored.sender_fp != self.identity.fingerprint {
             return Err(GhostError::PermissionDenied("not a message of this account".into()));
         }
@@ -1064,11 +1104,13 @@ impl GhostClient {
             stored.content,
         )?;
         let group_channel = self.group_channel(&stored.channel_id);
-        let group = self.channel_groups.get_mut(&group_channel).ok_or_else(|| {
-            GhostError::ServerNotLoaded(format!("channel {}", short_id(&stored.channel_id)))
-        })?;
-        let blob = seal(group, &self.provider, &msg)?;
-        Ok(Outbound { channel_id: stored.channel_id, mailbox_id: mls_group_mailbox_id(group.group_id()), blob })
+        self.mls_step(&[group_channel], |c| {
+            let group = c.channel_groups.get_mut(&group_channel).ok_or_else(|| {
+                GhostError::ServerNotLoaded(format!("channel {}", short_id(&stored.channel_id)))
+            })?;
+            let blob = seal(group, &c.provider, &msg)?;
+            Ok(Outbound { channel_id: stored.channel_id, mailbox_id: mls_group_mailbox_id(group.group_id()), blob })
+        })
     }
 
     /// This device's messages the relay has not acknowledged, in the channels carried by
@@ -1076,13 +1118,14 @@ impl GhostClient {
     pub fn pending_messages_for_mailbox(&self, mailbox_id: &[u8; 32]) -> Result<Vec<StoredMessage>> {
         let Some(server_id) = self.server_id_for_mailbox(mailbox_id) else { return Ok(Vec::new()) };
         let channel_ids: Vec<[u8; 32]> = self
-            .store
+            .provider
+            .store()
             .list_channels(&server_id)?
             .iter()
             .map(|c| c.channel_id)
             .filter(|cid| self.mailbox_id_for_channel(cid) == Some(*mailbox_id))
             .collect();
-        self.store.pending_messages(&channel_ids)
+        self.provider.store().pending_messages(&channel_ids)
     }
 
     /// Send a control message (e.g. channel ops). MLS-encrypted but not stored locally.
@@ -1099,27 +1142,23 @@ impl GhostClient {
     /// whatever must stay among the members it admits, such as its name.
     pub fn send_control_in(&mut self, channel_id: &[u8; 32], content: Vec<u8>) -> Result<Outbound> {
         self.ensure_following_channel(channel_id)?;
-        let fingerprint = self.identity.fingerprint;
         let channel_id = *channel_id;
-        let group = self.channel_groups.get_mut(&channel_id).ok_or_else(|| {
-            GhostError::ServerNotLoaded(format!("channel {}", short_id(&channel_id)))
-        })?;
-
-        let now = now_millis();
-
         let msg = ApplicationMessage::new(
             MessageType::Metadata,
             [0u8; 32],
-            fingerprint,
-            now,
+            self.identity.fingerprint,
+            now_millis(),
             [0u8; 32],
             vec![],
             content,
         )?;
-
-        let blob = seal(group, &self.provider, &msg)?;
-        let mailbox_id = mls_group_mailbox_id(group.group_id());
-        Ok(Outbound { channel_id, mailbox_id, blob })
+        self.mls_step(&[channel_id], |c| {
+            let group = c.channel_groups.get_mut(&channel_id).ok_or_else(|| {
+                GhostError::ServerNotLoaded(format!("channel {}", short_id(&channel_id)))
+            })?;
+            let blob = seal(group, &c.provider, &msg)?;
+            Ok(Outbound { channel_id, mailbox_id: mls_group_mailbox_id(group.group_id()), blob })
+        })
     }
 
     /// Decrypt a blob and store the message. Uses relay-stamped arrival time if
@@ -1131,30 +1170,28 @@ impl GhostClient {
         blob: &[u8],
         received_at: Option<u64>,
     ) -> Result<ApplicationMessage> {
-        let cache = &self.idlog_cache;
-        let devices = |claim: &CredentialClaim| cache.status(claim);
-        let group = self.channel_groups.get_mut(channel_id).ok_or_else(|| {
-            GhostError::ServerNotLoaded(format!("channel {}", short_id(channel_id)))
-        })?;
-
-        let msg = open(group, &self.provider, blob, &devices)?;
-
-        let recv_ts = received_at.unwrap_or_else(now_millis);
-
-        self.store.insert_message(&StoredMessage {
-            message_id: msg.message_id,
-            channel_id: msg.channel_id,
-            sender_fp: msg.sender_fp,
-            message_type: msg.message_type as u8,
-            timestamp: msg.timestamp,
-            received_at: recv_ts,
-            content: msg.content.clone(),
-            expires_at: None,
-            references: msg.references.clone(),
-            delivery: Delivery::Delivered,
-        })?;
-
-        Ok(msg)
+        // The key the open spends and the stored message land together.
+        self.mls_step(&[*channel_id], |c| {
+            let cache = &c.idlog_cache;
+            let devices = |claim: &CredentialClaim| cache.status(claim);
+            let group = c.channel_groups.get_mut(channel_id).ok_or_else(|| {
+                GhostError::ServerNotLoaded(format!("channel {}", short_id(channel_id)))
+            })?;
+            let msg = open(group, &c.provider, blob, &devices)?;
+            c.provider.store().insert_message(&StoredMessage {
+                message_id: msg.message_id,
+                channel_id: msg.channel_id,
+                sender_fp: msg.sender_fp,
+                message_type: msg.message_type as u8,
+                timestamp: msg.timestamp,
+                received_at: received_at.unwrap_or_else(now_millis),
+                content: msg.content.clone(),
+                expires_at: None,
+                references: msg.references.clone(),
+                delivery: Delivery::Delivered,
+            })?;
+            Ok(msg)
+        })
     }
 
     fn build_invite_payload(
@@ -1194,7 +1231,7 @@ impl GhostClient {
                 })
                 .collect(),
             channels: invite_channels,
-            role_names: self.store.list_role_names(server_id)?,
+            role_names: self.provider.store().list_role_names(server_id)?,
             grant: grant.clone(),
         })
     }
@@ -1255,7 +1292,7 @@ impl GhostClient {
             &payload.members, &payload.channels, &payload.role_names, Some(&payload.grant), timestamp, false,
         )?;
         // The payload is from when the invite was made: the server's managers tell the rest.
-        self.store.begin_server_state_wait(&payload.server_id)?;
+        self.provider.store().begin_server_state_wait(&payload.server_id)?;
         Ok((payload.server_id, channel_results, payload.grant))
     }
 
@@ -1271,20 +1308,22 @@ impl GhostClient {
             return Ok(None);
         }
         let channels = self
-            .store
+            .provider
+            .store()
             .list_channels(server_id)?
             .into_iter()
             .filter(|c| !self.is_private_channel(&c.channel_id))
             .map(|c| InviteChannel { channel_id: c.channel_id, name: c.name, kind: c.kind, position: c.position, group_info_bytes: Vec::new() })
             .collect();
         let members = self
-            .store
+            .provider
+            .store()
             .list_members(server_id)?
             .into_iter()
             .filter(Member::has_name)
             .map(|m| InviteMember { fingerprint: m.fingerprint, display_name: m.display_name })
             .collect();
-        let state = ServerStatePayload { request_seq, channels, role_names: self.store.list_role_names(server_id)?, members };
+        let state = ServerStatePayload { request_seq, channels, role_names: self.provider.store().list_role_names(server_id)?, members };
         self.send_control(server_id, crate::wire::encode_server_state(&state)).map(Some)
     }
 
@@ -1293,7 +1332,7 @@ impl GhostClient {
     /// roles, and members still unnamed here take the names listed. An answer as of before
     /// a change this device saw would undo it, so it is refused as stale.
     pub fn apply_server_state(&mut self, server_id: &[u8; 32], sender: &[u8; 32], state: ServerStatePayload) -> Result<ServerStateOutcome> {
-        let Some(wait) = self.store.server_state_wait(server_id)? else { return Ok(ServerStateOutcome::Ignored) };
+        let Some(wait) = self.provider.store().server_state_wait(server_id)? else { return Ok(ServerStateOutcome::Ignored) };
         let Some(asked_at) = wait.request_seq else { return Ok(ServerStateOutcome::Ignored) };
         if state.request_seq < asked_at || !self.server_policy(server_id)?.has(sender, ghost_wire::policy::MANAGE_CHANNELS) {
             return Ok(ServerStateOutcome::Ignored);
@@ -1304,20 +1343,20 @@ impl GhostClient {
         let default_channel = derive_default_channel_id(server_id);
         let listed: HashSet<[u8; 32]> = state.channels.iter().map(|c| c.channel_id).collect();
         for c in state.channels.into_iter().filter(|c| !self.is_private_channel(&c.channel_id)) {
-            self.store.upsert_channel(&Channel { channel_id: c.channel_id, server_id: *server_id, name: c.name, kind: c.kind, position: c.position })?;
+            self.provider.store().upsert_channel(&Channel { channel_id: c.channel_id, server_id: *server_id, name: c.name, kind: c.kind, position: c.position })?;
         }
-        for c in self.store.list_channels(server_id)? {
+        for c in self.provider.store().list_channels(server_id)? {
             let gone = !listed.contains(&c.channel_id) && c.channel_id != default_channel && !self.is_private_channel(&c.channel_id);
             if gone {
-                self.store.delete_channel(&c.channel_id)?;
+                self.provider.store().delete_channel(&c.channel_id)?;
             }
         }
         self.apply_role_names(server_id, sender, &state.role_names)?;
-        let unnamed: HashSet<[u8; 32]> = self.store.list_members(server_id)?.into_iter().filter(|m| !m.has_name()).map(|m| m.fingerprint).collect();
+        let unnamed: HashSet<[u8; 32]> = self.provider.store().list_members(server_id)?.into_iter().filter(|m| !m.has_name()).map(|m| m.fingerprint).collect();
         for m in state.members.into_iter().filter(|m| unnamed.contains(&m.fingerprint)) {
-            self.store.update_member_name(server_id, &m.fingerprint, &m.display_name)?;
+            self.provider.store().update_member_name(server_id, &m.fingerprint, &m.display_name)?;
         }
-        self.store.end_server_state_wait(server_id)?;
+        self.provider.store().end_server_state_wait(server_id)?;
         Ok(ServerStateOutcome::Applied)
     }
 
@@ -1327,9 +1366,9 @@ impl GhostClient {
         grant: &ghost_wire::policy::InviteGrant,
         key: &[u8; 32],
     ) -> Result<Vec<u8>> {
-        let meta = self.store.get_server(server_id)?;
-        let members = self.store.list_members(server_id)?;
-        let channels = self.store.list_channels(server_id)?;
+        let meta = self.provider.store().get_server(server_id)?;
+        let members = self.provider.store().list_members(server_id)?;
+        let channels = self.provider.store().list_channels(server_id)?;
         let payload = self.build_invite_payload(server_id, &meta.name, meta.kind, &members, &channels, grant)?;
         crate::crypto::aead::seal(key, &payload.to_bytes(), crate::wire::INVITE_PAYLOAD_CONTEXT)
     }
@@ -1359,27 +1398,23 @@ impl GhostClient {
             return Err(GhostError::Mls("a rejoin of this group is still waiting for the relay".into()));
         }
         let aad = self.commit_aad(channel_id);
-        let old = self
+        let old_id = self
             .channel_groups
-            .remove(channel_id)
+            .get(channel_id)
+            .map(|group| group.group_id().to_vec())
             .ok_or_else(|| GhostError::ServerNotLoaded(format!("channel {}", short_id(channel_id))))?;
-        let rows = self.provider.storage().group_rows(old.group_id())?;
-        // The new group shares the old one's id, so writing it overwrites the old rows.
-        let (new, commit_bytes) = match GhostGroup::join_by_external_commit(&self.provider, &self.identity, group_info_bytes, &aad) {
-            Ok(built) => built,
-            Err(e) => {
-                if let Err(restore) = self.provider.storage().restore_group_rows(old.group_id(), &rows) {
-                    tracing::error!("rejoin of {}: group rows not restored after a failed build: {restore}", short_id(channel_id));
-                }
-                self.channel_groups.insert(*channel_id, old);
-                return Err(e);
-            }
-        };
-        let mailbox_id = mls_group_mailbox_id(new.group_id());
-        self.channel_groups.insert(*channel_id, new);
-        self.mailbox_map.insert(mailbox_id, *channel_id);
+        let rows = self.provider.storage().group_rows(&old_id)?;
+        // The new group shares the old one's id, so writing it overwrites the old rows; a
+        // build that fails leaves them as they were.
+        let (old, commit_bytes, mailbox_id) = self.mls_step(&[*channel_id], |c| {
+            let (new, commit_bytes) = GhostGroup::join_by_external_commit(&c.provider, &c.identity, group_info_bytes, &aad)?;
+            let mailbox_id = mls_group_mailbox_id(new.group_id());
+            let old = c.channel_groups.insert(*channel_id, new).expect("looked up above");
+            c.mailbox_map.insert(mailbox_id, *channel_id);
+            c.record_if_server_group(channel_id)?;
+            Ok((old, commit_bytes, mailbox_id))
+        })?;
         self.pending_rejoins.insert(*channel_id, PendingRejoin { old, rows });
-        self.record_if_server_group(channel_id)?;
         Ok((commit_bytes, mailbox_id))
     }
 
@@ -1392,9 +1427,11 @@ impl GhostClient {
     /// The relay refused the rejoin: the old group is back, in memory and in storage.
     pub fn abandon_rejoin(&mut self, channel_id: &[u8; 32]) -> Result<()> {
         let Some(pending) = self.pending_rejoins.remove(channel_id) else { return Ok(()) };
-        self.provider.storage().restore_group_rows(pending.old.group_id(), &pending.rows)?;
-        self.channel_groups.insert(*channel_id, pending.old);
-        self.record_if_server_group(channel_id)
+        self.mls_step(&[*channel_id], |c| {
+            c.provider.storage().restore_group_rows(pending.old.group_id(), &pending.rows)?;
+            c.channel_groups.insert(*channel_id, pending.old);
+            c.record_if_server_group(channel_id)
+        })
     }
 
     /// Load a channel's group from the MLS storage again, as a restart would.
@@ -1414,7 +1451,7 @@ impl GhostClient {
         use ghost_wire::policy::{authorize_server_commit, CommitSummary, Committer, GrantContext};
         let current = self.server_policy(server_id)?;
         let channel_id = derive_default_channel_id(server_id);
-        let group = self.channel_groups.get_mut(&channel_id).ok_or_else(|| {
+        let group = self.channel_groups.get(&channel_id).ok_or_else(|| {
             GhostError::ServerNotLoaded(short_id(server_id))
         })?;
         let mailbox_id = mls_group_mailbox_id(group.group_id());
@@ -1433,7 +1470,10 @@ impl GhostClient {
         authorize_server_commit(&current, &summary, &ctx).map_err(|e| GhostError::PermissionDenied(e.to_string()))?;
 
         let policy = crate::mls::group::GhostExtension::Server(policy.clone());
-        let blob = group.stage_policy(&self.provider, policy, &CommitAad::default())?;
+        let blob = self.mls_step(&[channel_id], |c| {
+            let group = c.channel_groups.get_mut(&channel_id).ok_or_else(|| GhostError::ServerNotLoaded(short_id(server_id)))?;
+            group.stage_policy(&c.provider, policy, &CommitAad::default())
+        })?;
         Ok(Outbound { channel_id, mailbox_id, blob })
     }
 
@@ -1462,7 +1502,8 @@ impl GhostClient {
         // The relay hosting the server proposes removals in its channels too.
         // The hosting relay is the group's external sender, so it can propose removals.
         let relay_vk = self
-            .store
+            .provider
+            .store()
             .server_relay(server_id)?
             .or(self.relay_vk)
             .ok_or_else(|| GhostError::Network("the server's relay key is not known yet; connect to it first".into()))?;
@@ -1470,25 +1511,28 @@ impl GhostClient {
         let mut channel_id = [0u8; 32];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut channel_id);
         let policy = ChannelPolicy { server_mailbox, channel_id, roles, accounts };
-        let group = GhostGroup::create(
-            &self.provider,
-            &self.identity,
-            server_id,
-            &channel_id,
-            Some(&relay_vk),
-            Some(GhostExtension::Channel(policy)),
-        )?;
-        let group_info = group.export_group_info(&self.provider)?;
-        let mailbox_id = mls_group_mailbox_id(group.group_id());
+        // The group, its row and the sealed announcement land together, or none of them.
+        self.mls_step(&[channel_id], |c| {
+            let group = GhostGroup::create(
+                &c.provider,
+                &c.identity,
+                server_id,
+                &channel_id,
+                Some(&relay_vk),
+                Some(GhostExtension::Channel(policy)),
+            )?;
+            let group_info = group.export_group_info(&c.provider)?;
+            let mailbox_id = mls_group_mailbox_id(group.group_id());
 
-        self.store.insert_channel(&Channel { channel_id, server_id: *server_id, name: name.to_string(), kind, position }, OnConflict::Fail)?;
-        self.channel_groups.insert(channel_id, group);
-        self.mailbox_map.insert(mailbox_id, channel_id);
-        self.channel_server.insert(channel_id, *server_id);
+            c.provider.store().insert_channel(&Channel { channel_id, server_id: *server_id, name: name.to_string(), kind, position }, OnConflict::Fail)?;
+            c.channel_groups.insert(channel_id, group);
+            c.mailbox_map.insert(mailbox_id, channel_id);
+            c.channel_server.insert(channel_id, *server_id);
 
-        let op = crate::wire::ChannelOpPayload::Create { channel_id, name: name.to_string(), kind, position };
-        let announcement = self.send_control_in(&channel_id, crate::wire::encode_channel_op(&op))?;
-        Ok(NewPrivateChannel { channel_id, mailbox_id, group_info, announcement })
+            let op = crate::wire::ChannelOpPayload::Create { channel_id, name: name.to_string(), kind, position };
+            let announcement = c.send_control_in(&channel_id, crate::wire::encode_channel_op(&op))?;
+            Ok(NewPrivateChannel { channel_id, mailbox_id, group_info, announcement })
+        })
     }
 
     /// Join a private channel the relay listed: stage an external commit, then check
@@ -1501,50 +1545,51 @@ impl GhostClient {
     pub fn join_private_channel(&mut self, server_id: &[u8; 32], group_info: &[u8]) -> Result<([u8; 32], [u8; 32], Vec<u8>)> {
         let server_epoch = self.default_group(server_id)?.epoch();
         let aad = CommitAad { invite: None, server_epoch: Some(server_epoch) };
-        let (group, commit) = GhostGroup::join_by_external_commit(&self.provider, &self.identity, group_info, &aad)?;
+        // A group refused below, or rows not kept, leave nothing behind: the step rolls
+        // the staged group's rows back. The channel is in no map until the end.
+        self.mls_step(&[], |c| {
+            let (group, commit) = GhostGroup::join_by_external_commit(&c.provider, &c.identity, group_info, &aad)?;
+            let refuse = |why: &str| Err(GhostError::PermissionDenied(format!("not joining listed channel: {why}")));
+            let Some(policy) = group.channel_policy()? else {
+                return refuse("it is not a private channel");
+            };
+            if group.group_id() != crate::wire::derive_mls_group_id(server_id, &policy.channel_id) {
+                return refuse("its group does not belong to this server");
+            }
+            let server_group = c.default_group(server_id)?;
+            if mls_group_mailbox_id(server_group.group_id()) != policy.server_mailbox {
+                return refuse("it names another server");
+            }
+            let members: Vec<openmls::prelude::Member> = server_group.members().collect();
+            let view = policy_mls::server_view(server_group.context_extensions(), &members)
+                .map_err(|e| GhostError::Format(format!("server policy: {e}")))?;
+            if !policy.admits(&c.identity.fingerprint, &view) {
+                return refuse("its policy does not admit this account");
+            }
 
-        let refuse = |group: GhostGroup, provider: &GhostProvider, why: &str| {
-            let _ = group.delete(provider);
-            Err(GhostError::PermissionDenied(format!("not joining listed channel: {why}")))
-        };
-        let Some(policy) = group.channel_policy()? else {
-            return refuse(group, &self.provider, "it is not a private channel");
-        };
-        if group.group_id() != crate::wire::derive_mls_group_id(server_id, &policy.channel_id) {
-            return refuse(group, &self.provider, "its group does not belong to this server");
-        }
-        let server_group = self.default_group(server_id)?;
-        if mls_group_mailbox_id(server_group.group_id()) != policy.server_mailbox {
-            return refuse(group, &self.provider, "it names another server");
-        }
-        let members: Vec<openmls::prelude::Member> = server_group.members().collect();
-        let view = policy_mls::server_view(server_group.context_extensions(), &members)
-            .map_err(|e| GhostError::Format(format!("server policy: {e}")))?;
-        if !policy.admits(&self.identity.fingerprint, &view) {
-            return refuse(group, &self.provider, "its policy does not admit this account");
-        }
-
-        let channel_id = policy.channel_id;
-        let mailbox_id = mls_group_mailbox_id(group.group_id());
-        self.store.insert_channel(&Channel {
-            channel_id,
-            server_id: *server_id,
-            name: crate::wire::UNNAMED_PRIVATE_CHANNEL.to_string(),
-            kind: ChannelKind::Text,
-            position: 0,
-        }, OnConflict::Keep)?;
-        self.store.record_group_join(&channel_id, group.epoch())?;
-        self.channel_groups.insert(channel_id, group);
-        self.mailbox_map.insert(mailbox_id, channel_id);
-        self.channel_server.insert(channel_id, *server_id);
-        Ok((channel_id, mailbox_id, commit))
+            let channel_id = policy.channel_id;
+            let mailbox_id = mls_group_mailbox_id(group.group_id());
+            c.provider.store().insert_channel(&Channel {
+                channel_id,
+                server_id: *server_id,
+                name: crate::wire::UNNAMED_PRIVATE_CHANNEL.to_string(),
+                kind: ChannelKind::Text,
+                position: 0,
+            }, OnConflict::Keep)?;
+            c.provider.store().record_group_join(&channel_id, group.epoch())?;
+            c.channel_groups.insert(channel_id, group);
+            c.mailbox_map.insert(mailbox_id, channel_id);
+            c.channel_server.insert(channel_id, *server_id);
+            Ok((channel_id, mailbox_id, commit))
+        })
     }
 
     /// The server's private channels this device holds without a name and has not asked
     /// about in this run.
     pub fn unasked_unnamed_channels(&self, server_id: &[u8; 32]) -> Result<Vec<[u8; 32]>> {
         Ok(self
-            .store
+            .provider
+            .store()
             .list_channels(server_id)?
             .into_iter()
             .filter(|ch| ch.name == crate::wire::UNNAMED_PRIVATE_CHANNEL && self.is_private_channel(&ch.channel_id))
@@ -1568,7 +1613,7 @@ impl GhostClient {
     /// Answer a newly joined device's request for a private channel's name and kind,
     /// inside the channel's group. `None` when this device does not know them either.
     pub fn channel_info_reply(&mut self, channel_id: &[u8; 32]) -> Result<Option<Outbound>> {
-        let channel = self.store.get_channel(channel_id)?;
+        let channel = self.provider.store().get_channel(channel_id)?;
         if !self.is_private_channel(channel_id) || channel.name == crate::wire::UNNAMED_PRIVATE_CHANNEL {
             return Ok(None);
         }
@@ -1613,15 +1658,15 @@ impl GhostClient {
             return match op {
                 ChannelOpPayload::Create { channel_id, name, kind, position } => {
                     // Any member may tell a device that has no name yet; renaming needs the permission.
-                    let unnamed = self.store.get_channel(&channel_id)?.name == crate::wire::UNNAMED_PRIVATE_CHANNEL;
+                    let unnamed = self.provider.store().get_channel(&channel_id)?.name == crate::wire::UNNAMED_PRIVATE_CHANNEL;
                     if !unnamed && !may_manage {
                         return Ok(ChannelOpOutcome::Ignored);
                     }
-                    self.store.upsert_channel(&Channel { channel_id, server_id, name, kind, position })?;
+                    self.provider.store().upsert_channel(&Channel { channel_id, server_id, name, kind, position })?;
                     Ok(ChannelOpOutcome::Applied)
                 }
                 ChannelOpPayload::Rename { channel_id, name } if may_manage => {
-                    self.store.rename_channel(&channel_id, &name)?;
+                    self.provider.store().rename_channel(&channel_id, &name)?;
                     Ok(ChannelOpOutcome::Applied)
                 }
                 ChannelOpPayload::Delete { channel_id } if may_manage => {
@@ -1641,19 +1686,19 @@ impl GhostClient {
         }
         match op {
             ChannelOpPayload::Create { channel_id, name, kind, position } => {
-                self.store.insert_channel(&Channel { channel_id, server_id, name, kind, position }, OnConflict::Keep)?;
+                self.provider.store().insert_channel(&Channel { channel_id, server_id, name, kind, position }, OnConflict::Keep)?;
             }
             ChannelOpPayload::Reorder { positions } => {
                 // Private channels take their place through their own groups.
                 let public: Vec<([u8; 32], i32)> = positions.into_iter().filter(|(channel_id, _)| !self.is_private_channel(channel_id)).collect();
-                self.store.set_channel_positions(&server_id, &public)?;
+                self.provider.store().set_channel_positions(&server_id, &public)?;
             }
             // Private channels are renamed and deleted only inside their own group.
             ChannelOpPayload::Rename { channel_id, name } if !self.is_private_channel(&channel_id) => {
-                self.store.rename_channel(&channel_id, &name)?;
+                self.provider.store().rename_channel(&channel_id, &name)?;
             }
             ChannelOpPayload::Delete { channel_id } if !self.is_private_channel(&channel_id) => {
-                self.store.delete_channel(&channel_id)?;
+                self.provider.store().delete_channel(&channel_id)?;
             }
             _ => return Ok(ChannelOpOutcome::Ignored),
         }
@@ -1667,7 +1712,7 @@ impl GhostClient {
             return Ok(false);
         }
         for (role_id, name) in names {
-            self.store.set_role_name(server_id, *role_id, name)?;
+            self.provider.store().set_role_name(server_id, *role_id, name)?;
         }
         Ok(true)
     }
@@ -1689,19 +1734,23 @@ impl GhostClient {
         let server_id = *self.channel_server.get(channel_id).ok_or_else(|| GhostError::ServerNotLoaded(format!("channel {}", short_id(channel_id))))?;
         let group = self.channel_groups.get(channel_id).ok_or_else(|| GhostError::ServerNotLoaded(format!("channel {}", short_id(channel_id))))?;
         let mailbox_id = mls_group_mailbox_id(group.group_id());
-        self.store.record_deleted_channel(&mailbox_id, &server_id, owed)?;
-        self.drop_private_channel(channel_id)?;
+        self.mls_step(&[*channel_id], |c| {
+            c.provider.store().record_deleted_channel(&mailbox_id, &server_id, owed)?;
+            c.drop_private_channel(channel_id)
+        })?;
         Ok(mailbox_id)
     }
 
+    /// Forget a private channel: its group and its row go together.
     pub fn drop_private_channel(&mut self, channel_id: &[u8; 32]) -> Result<()> {
-        if let Some(group) = self.channel_groups.remove(channel_id) {
-            self.mailbox_map.remove(&mls_group_mailbox_id(group.group_id()));
-            let _ = group.delete(&self.provider);
-        }
-        self.channel_server.remove(channel_id);
-        let _ = self.store.delete_channel(channel_id);
-        Ok(())
+        self.mls_step(&[*channel_id], |c| {
+            if let Some(group) = c.channel_groups.remove(channel_id) {
+                c.mailbox_map.remove(&mls_group_mailbox_id(group.group_id()));
+                group.delete(&c.provider)?;
+            }
+            c.channel_server.remove(channel_id);
+            c.provider.store().delete_channel(channel_id)
+        })
     }
 
     /// The policy of a private channel, or `None` for a public one.
@@ -1728,10 +1777,11 @@ impl GhostClient {
             return Err(GhostError::PermissionDenied("changing a channel's access needs the manage channels permission".into()));
         }
         let aad = self.commit_aad(channel_id);
-        let group = self.channel_groups.get_mut(channel_id).expect("policy read above");
-        let blob = group.stage_policy(&self.provider, crate::mls::group::GhostExtension::Channel(policy.clone()), &aad)?;
-        let mailbox_id = mls_group_mailbox_id(group.group_id());
-        Ok(Outbound { channel_id: *channel_id, mailbox_id, blob })
+        self.mls_step(&[*channel_id], |c| {
+            let group = c.channel_groups.get_mut(channel_id).expect("policy read above");
+            let blob = group.stage_policy(&c.provider, crate::mls::group::GhostExtension::Channel(policy.clone()), &aad)?;
+            Ok(Outbound { channel_id: *channel_id, mailbox_id: mls_group_mailbox_id(group.group_id()), blob })
+        })
     }
 
     /// Leaves of a private channel's group whose accounts its policy no longer admits
@@ -1762,17 +1812,17 @@ impl GhostClient {
 
     /// The name `account` goes by in the server: a member's, else a former member's.
     pub fn member_name(&self, server_id: &[u8; 32], account: &[u8; 32]) -> Option<String> {
-        let members = self.store.list_members(server_id).ok()?;
+        let members = self.provider.store().list_members(server_id).ok()?;
         match members.into_iter().find(|m| m.fingerprint == *account) {
             Some(member) => Some(member.display_name),
-            None => self.store.former_member_name(server_id, account).ok().flatten(),
+            None => self.provider.store().former_member_name(server_id, account).ok().flatten(),
         }
     }
 
     /// When, and by whom when known, this account was removed from a server it still
     /// shows read-only.
     pub fn removed_from(&self, server_id: &[u8; 32]) -> Result<Option<crate::storage::ServerRemoval>> {
-        self.store.server_removal(server_id)
+        self.provider.store().server_removal(server_id)
     }
 
     /// Fail with `RemovedFromServer` once this account was removed from the server, so
@@ -1786,13 +1836,13 @@ impl GhostClient {
 
     /// Why this device stopped following the server, if it did.
     pub fn halt(&self, server_id: &[u8; 32]) -> Result<Option<crate::storage::ServerHalt>> {
-        self.store.server_halt(server_id)
+        self.provider.store().server_halt(server_id)
     }
 
     /// Fail while the server is halted: its relay accepted a change the rules forbid, and
     /// nothing goes there until the person accepts the relay's state or leaves.
     pub fn ensure_following(&self, server_id: &[u8; 32]) -> Result<()> {
-        match self.store.server_halt(server_id)? {
+        match self.provider.store().server_halt(server_id)? {
             Some(halt) => Err(GhostError::PolicyRefused(format!("{}; the server is read-only until you accept the relay's state or leave", halt.reason))),
             None => Ok(()),
         }
@@ -1809,7 +1859,7 @@ impl GhostClient {
     /// Forget a server this account was removed from, or stopped following, with its
     /// history. A server this device is still in is left through its group, not here.
     pub fn forget_server(&mut self, server_id: &[u8; 32]) -> Result<()> {
-        if self.removed_from(server_id)?.is_none() && self.store.server_halt(server_id)?.is_none() {
+        if self.removed_from(server_id)?.is_none() && self.provider.store().server_halt(server_id)?.is_none() {
             return Err(GhostError::PermissionDenied("only a server you were removed from or stopped following can be forgotten".into()));
         }
         self.drop_server(server_id)
@@ -1824,16 +1874,17 @@ impl GhostClient {
     /// of the server, which go with it.
     fn drop_server(&mut self, server_id: &[u8; 32]) -> Result<()> {
         let channels: Vec<[u8; 32]> = self.channel_server.iter().filter(|(_, s)| *s == server_id).map(|(c, _)| *c).collect();
-        for channel_id in channels {
-            if let Some(group) = self.channel_groups.remove(&channel_id) {
-                if let Err(e) = group.delete(&self.provider) {
-                    tracing::warn!("group of channel {} not deleted: {e}", short_id(&channel_id));
+        // Every group's rows and the server's go together, or all stay.
+        self.mls_step(&channels, |c| {
+            for channel_id in &channels {
+                if let Some(group) = c.channel_groups.remove(channel_id) {
+                    c.mailbox_map.remove(&mls_group_mailbox_id(group.group_id()));
+                    group.delete(&c.provider)?;
                 }
+                c.channel_server.remove(channel_id);
             }
-            self.channel_server.remove(&channel_id);
-        }
-        self.mailbox_map.retain(|_, channel_id| self.channel_groups.contains_key(channel_id));
-        self.store.delete_server(server_id)
+            c.provider.store().delete_server(server_id)
+        })
     }
 
     /// Accounts the server keeps from rejoining, with the name each had here when known.
@@ -1842,7 +1893,7 @@ impl GhostClient {
         removed
             .entries
             .into_iter()
-            .map(|entry| Ok((entry, self.store.former_member_name(server_id, &entry.account)?)))
+            .map(|entry| Ok((entry, self.provider.store().former_member_name(server_id, &entry.account)?)))
             .collect()
     }
 
@@ -1854,7 +1905,7 @@ impl GhostClient {
             return Err(GhostError::PermissionDenied("letting someone back in needs the kick permission".into()));
         }
         let channel_id = derive_default_channel_id(server_id);
-        let group = self.channel_groups.get_mut(&channel_id).ok_or_else(|| GhostError::ServerNotLoaded(short_id(server_id)))?;
+        let group = self.channel_groups.get(&channel_id).ok_or_else(|| GhostError::ServerNotLoaded(short_id(server_id)))?;
         let removed = group.removed_accounts()?.unwrap_or_default();
         if !removed.contains(account) {
             return Err(GhostError::PermissionDenied("that account is not kept out of this server".into()));
@@ -1864,9 +1915,18 @@ impl GhostClient {
         if pruned != policy {
             updates.push(GhostExtension::Server(pruned));
         }
-        let blob = group.stage_change(&self.provider, &[], &updates, &CommitAad::default())?;
-        let mailbox_id = mls_group_mailbox_id(group.group_id());
-        Ok(Outbound { channel_id, mailbox_id, blob })
+        self.stage_server_change(server_id, &[], &updates)
+    }
+
+    /// Stage, in the server's group, one commit removing `removed` leaves and putting
+    /// `updates` in place of its extensions of the same types.
+    fn stage_server_change(&mut self, server_id: &[u8; 32], removed: &[LeafNodeIndex], updates: &[GhostExtension]) -> Result<Outbound> {
+        let channel_id = derive_default_channel_id(server_id);
+        self.mls_step(&[channel_id], |c| {
+            let group = c.channel_groups.get_mut(&channel_id).ok_or_else(|| GhostError::ServerNotLoaded(short_id(server_id)))?;
+            let blob = group.stage_change(&c.provider, removed, updates, &CommitAad::default())?;
+            Ok(Outbound { channel_id, mailbox_id: mls_group_mailbox_id(group.group_id()), blob })
+        })
     }
 
     /// Remove a member from the server group: needs the kick permission and a rank above
@@ -1888,7 +1948,7 @@ impl GhostClient {
         }
 
         let channel_id = derive_default_channel_id(server_id);
-        let group = self.channel_groups.get_mut(&channel_id).ok_or_else(|| {
+        let group = self.channel_groups.get(&channel_id).ok_or_else(|| {
             GhostError::ServerNotLoaded(short_id(server_id))
         })?;
         let leaf_indices: Vec<_> = group
@@ -1907,9 +1967,7 @@ impl GhostClient {
         if pruned != policy {
             updates.push(GhostExtension::Server(pruned));
         }
-        let blob = group.stage_change(&self.provider, &leaf_indices, &updates, &CommitAad::default())?;
-        let mailbox_id = mls_group_mailbox_id(group.group_id());
-        Ok(Outbound { channel_id, mailbox_id, blob })
+        self.stage_server_change(server_id, &leaf_indices, &updates)
     }
 
     /// Remove a specific device's leaf from all channel MLS groups by its verifying key.
@@ -1923,11 +1981,9 @@ impl GhostClient {
             if leaf_indices.is_empty() {
                 continue;
             }
-            let aad = self.commit_aad(&cid);
-            let Some(group) = self.channel_groups.get_mut(&cid) else { continue };
-            if let Ok(commit_blob) = group.remove_members(&self.provider, &leaf_indices, &aad) {
-                let mailbox_id = mls_group_mailbox_id(group.group_id());
-                outbound.push(Outbound { channel_id: cid, mailbox_id, blob: commit_blob });
+            if let Ok(blob) = self.remove_channel_members(&cid, &leaf_indices) {
+                let mailbox_id = self.mailbox_id_for_channel(&cid).expect("the group staged the commit");
+                outbound.push(Outbound { channel_id: cid, mailbox_id, blob });
             }
         }
         outbound
@@ -1955,27 +2011,34 @@ impl GhostClient {
         members: &[LeafNodeIndex],
     ) -> Result<Vec<u8>> {
         let aad = self.commit_aad(channel_id);
-        let group = self.channel_groups.get_mut(channel_id).ok_or_else(|| {
-            GhostError::ServerNotLoaded(format!("channel {}", short_id(channel_id)))
-        })?;
-        group.remove_members(&self.provider, members, &aad)
+        self.mls_step(&[*channel_id], |c| {
+            let group = c.channel_groups.get_mut(channel_id).ok_or_else(|| {
+                GhostError::ServerNotLoaded(format!("channel {}", short_id(channel_id)))
+            })?;
+            group.remove_members(&c.provider, members, &aad)
+        })
     }
 
-    /// Merge a pending commit for a channel's MLS group after the relay accepted it.
+    /// Merge a pending commit for a channel's MLS group after the relay accepted it,
+    /// together with the server view it makes.
     pub fn merge_pending_commit_for_channel(&mut self, channel_id: &[u8; 32]) -> Result<()> {
-        let group = self.channel_groups.get_mut(channel_id).ok_or_else(|| {
-            GhostError::ServerNotLoaded(format!("channel {}", short_id(channel_id)))
-        })?;
-        group.merge_pending_commit(&self.provider)?;
-        self.record_if_server_group(channel_id)
+        self.mls_step(&[*channel_id], |c| {
+            let group = c.channel_groups.get_mut(channel_id).ok_or_else(|| {
+                GhostError::ServerNotLoaded(format!("channel {}", short_id(channel_id)))
+            })?;
+            group.merge_pending_commit(&c.provider)?;
+            c.record_if_server_group(channel_id)
+        })
     }
 
     /// Discard a pending commit for a channel's MLS group after the relay rejected it.
     pub fn clear_pending_commit_for_channel(&mut self, channel_id: &[u8; 32]) -> Result<()> {
-        let group = self.channel_groups.get_mut(channel_id).ok_or_else(|| {
-            GhostError::ServerNotLoaded(format!("channel {}", short_id(channel_id)))
-        })?;
-        group.clear_pending_commit(&self.provider)
+        self.mls_step(&[*channel_id], |c| {
+            let group = c.channel_groups.get_mut(channel_id).ok_or_else(|| {
+                GhostError::ServerNotLoaded(format!("channel {}", short_id(channel_id)))
+            })?;
+            group.clear_pending_commit(&c.provider)
+        })
     }
 
     /// Convenience: clear pending commit using server_id (operates on default channel).
@@ -2219,7 +2282,21 @@ impl GhostClient {
         if envelope_type == ghost_wire::EnvelopeType::Commit && current_epoch.is_some_and(|e| envelope_epoch < e) {
             return Ok(ReceiveResult::Skipped);
         }
+        // Opening the blob spends its key or merges its commit, and what it carried is
+        // kept: one write, or none if it fails or the process ends meanwhile.
+        self.mls_step(&[*channel_id], |c| c.open_and_keep(channel_id, blob, (envelope_type, envelope_epoch), current_epoch, received_at, origin))
+    }
 
+    /// The step of `receive_from` that opens the blob and keeps what it carried.
+    fn open_and_keep(
+        &mut self,
+        channel_id: &[u8; 32],
+        blob: &[u8],
+        (envelope_type, envelope_epoch): (ghost_wire::EnvelopeType, u64),
+        current_epoch: Option<u64>,
+        received_at: Option<u64>,
+        origin: Option<BlobOrigin>,
+    ) -> Result<ReceiveResult> {
         // Out of the map while it is processed, so a private channel's commit can be
         // judged against its server group's state.
         let mut group = self.channel_groups.remove(channel_id).ok_or_else(|| {
@@ -2246,7 +2323,7 @@ impl GhostClient {
             Err(GhostError::Mls(_))
                 if envelope_type == ghost_wire::EnvelopeType::Application && current_epoch.is_some_and(|e| envelope_epoch < e) =>
             {
-                let joined = self.store.joined_epoch(channel_id)?;
+                let joined = self.provider.store().joined_epoch(channel_id)?;
                 if envelope_epoch < joined {
                     tracing::debug!("message sealed at epoch {envelope_epoch}, before this device joined at {joined}; not for it");
                     return Ok(ReceiveResult::Skipped);
@@ -2258,8 +2335,10 @@ impl GhostClient {
 
         let received_at = received_at.unwrap_or_else(now_millis);
         match inbound {
+            InboundMessage::Application(msg) if msg.message_type == MessageType::Metadata => {
+                Ok(ReceiveResult::Metadata(self.apply_metadata(channel_id, &msg, origin.as_ref())?))
+            }
             InboundMessage::Application(msg) => self.store_received(msg, received_at, origin),
-            InboundMessage::Unverified { msg, claim } => Ok(ReceiveResult::Unverified { message: msg, claim, received_at }),
             InboundMessage::Commit { removed, committer } => {
                 self.record_if_server_group(channel_id)?;
                 let group = self.channel_groups.get(channel_id).ok_or_else(|| {
@@ -2311,25 +2390,117 @@ impl GhostClient {
         }
     }
 
-    /// Store a message from a device this client checked against its identity log.
-    /// Control messages (Metadata) aren't chat and are not stored.
+    /// Store a chat message from a device this client checked against its identity log.
     fn store_received(&mut self, msg: ApplicationMessage, received_at: u64, origin: Option<BlobOrigin>) -> Result<ReceiveResult> {
-        if msg.message_type != MessageType::Metadata {
-            let seen = origin.as_ref().map(|o| (&o.mailbox_id, o.seq));
-            self.store.insert_message_seen(&StoredMessage {
-                message_id: msg.message_id,
-                channel_id: msg.channel_id,
-                sender_fp: msg.sender_fp,
-                message_type: msg.message_type as u8,
-                timestamp: msg.timestamp,
-                received_at,
-                content: msg.content.clone(),
-                expires_at: None,
-                references: msg.references.clone(),
-                delivery: Delivery::Delivered,
-            }, seen)?;
-        }
+        let seen = origin.as_ref().map(|o| (&o.mailbox_id, o.seq));
+        self.provider.store().insert_message_seen(&StoredMessage {
+            message_id: msg.message_id,
+            channel_id: msg.channel_id,
+            sender_fp: msg.sender_fp,
+            message_type: msg.message_type as u8,
+            timestamp: msg.timestamp,
+            received_at,
+            content: msg.content.clone(),
+            expires_at: None,
+            references: msg.references.clone(),
+            delivery: Delivery::Delivered,
+        }, seen)?;
         Ok(ReceiveResult::Message(msg))
+    }
+
+    /// Apply a metadata message from a checked device, carried by `group_channel`'s
+    /// group, and mark its blob seen. What a sender may not do, or does not fit where it
+    /// arrived, is ignored; a kind from a newer app changes nothing here. A server change
+    /// and a state answer need the blob's place in its mailbox, `origin`.
+    fn apply_metadata(&mut self, group_channel: &[u8; 32], msg: &ApplicationMessage, origin: Option<&BlobOrigin>) -> Result<MetadataApplied> {
+        let server_id = *self
+            .channel_server
+            .get(group_channel)
+            .ok_or_else(|| GhostError::ServerNotLoaded(format!("channel {}", short_id(group_channel))))?;
+        let in_server_group = *group_channel == derive_default_channel_id(&server_id);
+        let seq = origin.map(|o| o.seq);
+        let sender = msg.sender_fp;
+        let own = sender == self.identity.fingerprint;
+        let mut applied = MetadataApplied {
+            sender,
+            channel_changed: false,
+            reply: None,
+            ask_state_again: false,
+            fetch_avatar: None,
+            avatar_cleared: false,
+            own_name: None,
+            own_avatar: None,
+            server_move: None,
+        };
+        match decode_metadata(&msg.content) {
+            Ok(MetadataPayload::ChannelOp(op)) => match self.apply_channel_op(group_channel, &sender, op) {
+                Ok(ChannelOpOutcome::Reply(out)) => applied.reply = Some(out),
+                Ok(ChannelOpOutcome::Applied) => {
+                    applied.channel_changed = true;
+                    // A server state as of before this change would undo it.
+                    if let (true, Some(seq)) = (in_server_group, seq) {
+                        self.provider.store().note_server_change(&server_id, seq)?;
+                    }
+                }
+                Ok(ChannelOpOutcome::Ignored) => {}
+                Err(e) => tracing::warn!("channel op: {e}"),
+            },
+            Ok(MetadataPayload::RoleNames(names)) => match self.apply_role_names(&server_id, &sender, &names) {
+                Ok(true) => {
+                    if let Some(seq) = seq {
+                        self.provider.store().note_server_change(&server_id, seq)?;
+                    }
+                }
+                Ok(false) => {}
+                Err(e) => tracing::warn!("role names: {e}"),
+            },
+            // A joiner asks; a member who may manage channels answers, as of the request.
+            Ok(MetadataPayload::ServerStateRequest) => {
+                if let (true, Some(seq)) = (in_server_group, seq) {
+                    match self.server_state_reply(&server_id, seq) {
+                        Ok(answer) => applied.reply = answer,
+                        Err(e) => tracing::warn!("server state not answered: {e}"),
+                    }
+                }
+            }
+            Ok(MetadataPayload::ServerState(state)) if in_server_group => match self.apply_server_state(&server_id, &sender, state) {
+                Ok(ServerStateOutcome::Stale) => applied.ask_state_again = true,
+                Ok(_) => {}
+                Err(e) => tracing::warn!("server state not taken in: {e}"),
+            },
+            Ok(MetadataPayload::ServerState(_)) => {}
+            Ok(MetadataPayload::MemberAnnounce { display_name }) => {
+                self.provider.store().update_member_name(&server_id, &sender, &display_name)?;
+                if own {
+                    applied.own_name = Some(display_name);
+                }
+            }
+            Ok(MetadataPayload::AvatarUpdate { avatar_hash, avatar_key }) => {
+                self.provider.store().update_member_avatar(&server_id, &sender, &avatar_hash, &avatar_key)?;
+                applied.fetch_avatar = Some(avatar_hash);
+                if own {
+                    applied.own_avatar = Some(Some(AvatarRef { hash: avatar_hash, key: avatar_key }));
+                }
+            }
+            Ok(MetadataPayload::AvatarClear) => {
+                self.provider.store().clear_member_avatar(&server_id, &sender)?;
+                applied.avatar_cleared = true;
+                if own {
+                    applied.own_avatar = Some(None);
+                }
+            }
+            // Only the owner may move a server; the record is verified when followed.
+            Ok(MetadataPayload::ServerMoved(location)) => {
+                if self.server_owner(&server_id).is_ok_and(|owner| owner == sender) {
+                    applied.server_move = Some(location);
+                }
+            }
+            Err(e) => tracing::warn!("decode metadata: {e}"),
+        }
+        if let Some(origin) = origin {
+            self.provider.store().set_last_seen_seq(&origin.mailbox_id, origin.seq)?;
+        }
+        Ok(applied)
     }
 
     /// Judge the head a message's sender claims for its own identity log against the
@@ -2370,7 +2541,7 @@ impl GhostClient {
             references: Vec::new(),
             content: Vec::new(),
         };
-        self.store.insert_message(&StoredMessage {
+        self.provider.store().insert_message(&StoredMessage {
             message_id,
             channel_id: *group_channel,
             sender_fp: message.sender_fp,
@@ -2385,19 +2556,6 @@ impl GhostClient {
         Ok(message)
     }
 
-    /// Settle a message held as [`ReceiveResult::Unverified`] once the sender's log has
-    /// been refreshed: stored if the device is now listed active, refused otherwise.
-    pub fn accept_unverified(&mut self, message: ApplicationMessage, claim: &CredentialClaim, received_at: u64, origin: Option<BlobOrigin>) -> Result<ReceiveResult> {
-        match self.idlog_cache.status(claim) {
-            DeviceStatus::Active => self.store_received(message, received_at, origin),
-            DeviceStatus::Unknown => Err(GhostError::IdentityLog("the sender's device is not in its account's identity log".into())),
-            DeviceStatus::Revoked => Err(GhostError::SenderRefused("sender device has been revoked".into())),
-            DeviceStatus::Contradicted => Err(GhostError::SenderRefused(
-                "sender's credential names a different identity log entry than its account's log holds; possible fork".into(),
-            )),
-        }
-    }
-
     /// Commit the pending proposals of a channel's group that this device may commit
     /// (relay removals of revoked or excluded devices). `None` when there are none.
     #[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
@@ -2407,14 +2565,15 @@ impl GhostClient {
     ) -> Result<Option<Outbound>> {
         let aad = self.commit_aad(channel_id);
         let excluded = self.excluded_leaves(channel_id)?;
-        let group = self.channel_groups.get_mut(channel_id).ok_or_else(|| {
-            GhostError::ServerNotLoaded(format!("channel {}", short_id(channel_id)))
-        })?;
-        let Some(commit) = group.commit_pending_proposals(&self.provider, &self.idlog_cache, &excluded, &aad)? else {
-            return Ok(None);
-        };
-        let mailbox_id = mls_group_mailbox_id(group.group_id());
-        Ok(Some(Outbound { channel_id: *channel_id, mailbox_id, blob: commit }))
+        self.mls_step(&[*channel_id], |c| {
+            let group = c.channel_groups.get_mut(channel_id).ok_or_else(|| {
+                GhostError::ServerNotLoaded(format!("channel {}", short_id(channel_id)))
+            })?;
+            let Some(commit) = group.commit_pending_proposals(&c.provider, &c.idlog_cache, &excluded, &aad)? else {
+                return Ok(None);
+            };
+            Ok(Some(Outbound { channel_id: *channel_id, mailbox_id: mls_group_mailbox_id(group.group_id()), blob: commit }))
+        })
     }
 
     /// Whether a channel's group holds queued proposals this device may yet commit, once
@@ -2669,6 +2828,63 @@ mod tests {
         assert_eq!(c2.receive_blob(&channel_id, &out.blob, None).unwrap().content, b"moved on");
         let (out, _) = c2.send_message(&server_id, &channel_id, b"with you".to_vec(), vec![], 2003).unwrap();
         assert_eq!(c1.receive_blob(&channel_id, &out.blob, None).unwrap().content, b"with you");
+    }
+
+    /// Reading a message spends its key, and keeping it is part of the same write: a
+    /// message that could not be kept leaves its key unspent, in storage as in memory,
+    /// so the same blob reads once keeping works again.
+    #[test]
+    fn a_message_that_could_not_be_kept_reads_again() {
+        let (mut c1, mut c2, server_id) = setup_two_clients();
+        let channel_id = derive_default_channel_id(&server_id);
+        let (out, _) = c1.send_message(&server_id, &channel_id, b"kept at last".to_vec(), vec![], 2000).unwrap();
+
+        let refuse = "CREATE TRIGGER refuse_messages BEFORE INSERT ON messages BEGIN SELECT RAISE(ABORT, 'the disk is full'); END;";
+        c2.store().conn().execute_batch(refuse).unwrap();
+        assert!(c2.receive_any(&channel_id, &out.blob, Some(3000)).is_err());
+        c2.store().conn().execute_batch("DROP TRIGGER refuse_messages").unwrap();
+        assert!(matches!(c2.receive_any(&channel_id, &out.blob, Some(3000)).unwrap(), ReceiveResult::Message(ref m) if m.content == b"kept at last"));
+
+        // The group as storage holds it, as a restart reads it, goes on reading.
+        c2.reload_group(&channel_id);
+        let (out, _) = c1.send_message(&server_id, &channel_id, b"and after".to_vec(), vec![], 2001).unwrap();
+        assert!(matches!(c2.receive_any(&channel_id, &out.blob, Some(3001)).unwrap(), ReceiveResult::Message(ref m) if m.content == b"and after"));
+    }
+
+    /// What a metadata message changes lands in the write that spends its key: a change
+    /// that could not be kept leaves the key unspent, and applies when read again.
+    #[test]
+    fn a_metadata_change_that_could_not_be_kept_applies_when_read_again() {
+        let (mut c1, mut c2, server_id) = setup_two_clients();
+        let channel_id = derive_default_channel_id(&server_id);
+        let out = c1.send_control(&server_id, crate::wire::encode_member_announce("Alicia")).unwrap();
+        let alice = c1.identity.fingerprint;
+
+        let refuse = "CREATE TRIGGER refuse_names BEFORE UPDATE ON members BEGIN SELECT RAISE(ABORT, 'the disk is full'); END;";
+        c2.store().conn().execute_batch(refuse).unwrap();
+        assert!(c2.receive_any(&channel_id, &out.blob, Some(3000)).is_err());
+        c2.store().conn().execute_batch("DROP TRIGGER refuse_names").unwrap();
+        assert!(matches!(c2.receive_any(&channel_id, &out.blob, Some(3000)).unwrap(), ReceiveResult::Metadata(ref m) if m.sender == alice));
+        assert_eq!(c2.store().get_member(&server_id, &alice).unwrap().display_name, "Alicia");
+    }
+
+    /// A message from a device this client's log does not list yet fails with
+    /// `UnknownDevice` and spends nothing: once the log lists the device, the same blob
+    /// reads, as the session reads it again after fetching the sender's log.
+    #[test]
+    fn a_message_from_an_unlisted_device_reads_once_its_log_lists_it() {
+        let mut c1 = test_client([0x01; 32]);
+        let mut c2 = test_client([0x02; 32]);
+        register_identity_in_cache(&mut c1, &Identity::from_seed([0x02; 32]).unwrap());
+        let server_id = c1.create_server("test", ServerKind::Server, 1000).unwrap();
+        join_through_invite(&mut c1, &mut c2, &server_id);
+        let channel_id = derive_default_channel_id(&server_id);
+        let (out, _) = c1.send_message(&server_id, &channel_id, b"who sent this".to_vec(), vec![], 2000).unwrap();
+
+        let sender = c1.identity.fingerprint;
+        assert!(matches!(c2.receive_any(&channel_id, &out.blob, Some(3000)), Err(GhostError::UnknownDevice { account_fp }) if account_fp == sender));
+        register_identity_in_cache(&mut c2, &Identity::from_seed([0x01; 32]).unwrap());
+        assert!(matches!(c2.receive_any(&channel_id, &out.blob, Some(3000)).unwrap(), ReceiveResult::Message(ref m) if m.content == b"who sent this"));
     }
 
     #[test]

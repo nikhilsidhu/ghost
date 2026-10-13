@@ -1,6 +1,10 @@
-//! The OpenMLS provider: the crypto backend and the SQLite storage every group lives in.
-//! The storage is this module's own type over the connection, so the connection stays
-//! reachable for what OpenMLS itself has no call for: putting a group back as it was.
+//! The OpenMLS provider: the crypto backend and the storage every group lives in, which
+//! is the app's own database, so a step that moves a group on commits together with the
+//! rows that go with it. The storage is this module's own type over that database, so
+//! the connection stays reachable for what OpenMLS itself has no call for: putting a
+//! group back as it was.
+
+use std::path::Path;
 
 use openmls_rust_crypto::RustCrypto;
 use openmls_sqlite_storage::{Codec, SqliteStorageProvider};
@@ -12,6 +16,13 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 
 use crate::error::{GhostError, Result};
+use crate::storage::GhostStore;
+
+/// Set once a device's MLS file from before its state moved into the app's database
+/// has been brought in, so a file left behind is never read over newer state.
+const CONFIG_MLS_FILE_IMPORTED: &str = "mls_file_imported";
+/// OpenMLS's own record of its migrations, which each database keeps for itself.
+const MLS_MIGRATIONS_TABLE: &str = "openmls_sqlite_storage_migrations";
 
 #[derive(Default)]
 pub struct JsonCodec;
@@ -43,14 +54,14 @@ struct TableRows {
     rows: Vec<Vec<Value>>,
 }
 
-/// OpenMLS storage in SQLite, with the connection kept at hand.
+/// OpenMLS storage in the app's database, whose store it holds.
 pub struct GhostStorage {
-    conn: Connection,
+    store: GhostStore,
 }
 
 impl GhostStorage {
     fn view(&self) -> SqliteStorageProvider<JsonCodec, &Connection> {
-        SqliteStorageProvider::new(&self.conn)
+        SqliteStorageProvider::new(self.store.conn())
     }
 
     fn db(context: &'static str) -> impl Fn(rusqlite::Error) -> GhostError {
@@ -67,7 +78,7 @@ impl GhostStorage {
         let key = Self::group_key(group_id)?;
         let mut tables = Vec::new();
         for table in GROUP_TABLES {
-            let mut stmt = self.conn.prepare(&format!("SELECT * FROM {table} WHERE group_id = ?1")).map_err(Self::db("read group rows"))?;
+            let mut stmt = self.store.conn().prepare(&format!("SELECT * FROM {table} WHERE group_id = ?1")).map_err(Self::db("read group rows"))?;
             let columns: Vec<String> = stmt.column_names().iter().map(|c| c.to_string()).collect();
             let rows = stmt
                 .query_map([key.as_slice()], |row| (0..columns.len()).map(|i| row.get::<_, Value>(i)).collect::<rusqlite::Result<Vec<Value>>>())
@@ -79,19 +90,21 @@ impl GhostStorage {
         Ok(GroupRows { tables })
     }
 
-    /// Make the storage hold exactly `rows` for the group again.
+    /// Make the storage hold exactly `rows` for the group again, as one write.
     pub fn restore_group_rows(&self, group_id: &[u8], rows: &GroupRows) -> Result<()> {
         let key = Self::group_key(group_id)?;
-        let tx = self.conn.unchecked_transaction().map_err(Self::db("restore group rows"))?;
-        for table in &rows.tables {
-            tx.execute(&format!("DELETE FROM {} WHERE group_id = ?1", table.table), [key.as_slice()]).map_err(Self::db("restore group rows"))?;
-            let placeholders: Vec<String> = (1..=table.columns.len()).map(|i| format!("?{i}")).collect();
-            let sql = format!("INSERT INTO {} ({}) VALUES ({})", table.table, table.columns.join(", "), placeholders.join(", "));
-            for row in &table.rows {
-                tx.execute(&sql, rusqlite::params_from_iter(row.iter())).map_err(Self::db("restore group rows"))?;
+        let conn = self.store.conn();
+        self.store.write_whole(|| {
+            for table in &rows.tables {
+                conn.execute(&format!("DELETE FROM {} WHERE group_id = ?1", table.table), [key.as_slice()]).map_err(Self::db("restore group rows"))?;
+                let placeholders: Vec<String> = (1..=table.columns.len()).map(|i| format!("?{i}")).collect();
+                let sql = format!("INSERT INTO {} ({}) VALUES ({})", table.table, table.columns.join(", "), placeholders.join(", "));
+                for row in &table.rows {
+                    conn.execute(&sql, rusqlite::params_from_iter(row.iter())).map_err(Self::db("restore group rows"))?;
+                }
             }
-        }
-        tx.commit().map_err(Self::db("restore group rows"))
+            Ok(())
+        })
     }
 
     /// Drop the rows of `rows` the storage still holds unchanged: what an old copy of a
@@ -99,15 +112,17 @@ impl GhostStorage {
     /// the new copy overwrote differs and stays; the group data table is left alone,
     /// since the new copy rewrites every row of it.
     pub fn delete_rows_still_held(&self, rows: &GroupRows) -> Result<()> {
-        let tx = self.conn.unchecked_transaction().map_err(Self::db("drop old group rows"))?;
-        for table in rows.tables.iter().filter(|t| t.table != "openmls_group_data") {
-            let conditions: Vec<String> = table.columns.iter().enumerate().map(|(i, c)| format!("{c} IS ?{}", i + 1)).collect();
-            let sql = format!("DELETE FROM {} WHERE {}", table.table, conditions.join(" AND "));
-            for row in &table.rows {
-                tx.execute(&sql, rusqlite::params_from_iter(row.iter())).map_err(Self::db("drop old group rows"))?;
+        let conn = self.store.conn();
+        self.store.write_whole(|| {
+            for table in rows.tables.iter().filter(|t| t.table != "openmls_group_data") {
+                let conditions: Vec<String> = table.columns.iter().enumerate().map(|(i, c)| format!("{c} IS ?{}", i + 1)).collect();
+                let sql = format!("DELETE FROM {} WHERE {}", table.table, conditions.join(" AND "));
+                for row in &table.rows {
+                    conn.execute(&sql, rusqlite::params_from_iter(row.iter())).map_err(Self::db("drop old group rows"))?;
+                }
             }
-        }
-        tx.commit().map_err(Self::db("drop old group rows"))
+            Ok(())
+        })
     }
 }
 
@@ -611,27 +626,79 @@ impl StorageProvider<CURRENT_VERSION> for GhostStorage {
     }
 }
 
-/// Holds the OpenMLS crypto backend and persistent SQLite storage.
+/// The OpenMLS crypto backend, and its storage in the app's database.
 pub struct GhostProvider {
     crypto: RustCrypto,
     storage: GhostStorage,
 }
 
 impl GhostProvider {
-    /// Create a provider backed by a persistent SQLite connection (already opened/encrypted).
-    pub fn new(mut conn: Connection) -> Result<Self> {
-        SqliteStorageProvider::<JsonCodec, &mut Connection>::new(&mut conn)
-            .run_migrations()
-            .map_err(|e| GhostError::Database(format!("mls migrations: {e}")))?;
-        Ok(Self { crypto: RustCrypto::default(), storage: GhostStorage { conn } })
+    /// The provider over the app's database, with OpenMLS's tables brought up to date
+    /// in it.
+    pub fn new(mut store: GhostStore) -> Result<Self> {
+        migrate(store.conn_mut())?;
+        Ok(Self { crypto: RustCrypto::default(), storage: GhostStorage { store } })
     }
 
-    /// Create a provider backed by an in-memory SQLite database (for testing).
+    /// A provider over a fresh in-memory database, for tests.
     pub fn new_in_memory() -> Result<Self> {
-        let conn = Connection::open_in_memory()
-            .map_err(|e| GhostError::Database(format!("mls in-memory: {e}")))?;
-        Self::new(conn)
+        Self::new(GhostStore::open_in_memory(&[0; 32])?)
     }
+
+    /// The app's database, as the store the rest of the client reads and writes.
+    pub fn store(&self) -> &GhostStore {
+        &self.storage.store
+    }
+
+    /// Bring in the MLS state a device kept in a file of its own, at `path` under `key`,
+    /// before that state moved into the app's database: once, in one write that also
+    /// marks it done; the file is removed after.
+    pub fn import_mls_file(&self, path: &Path, key: &[u8; 32]) -> Result<()> {
+        let store = self.store();
+        let failed = |context: &'static str| move |e: rusqlite::Error| GhostError::Database(format!("mls file import: {context}: {e}"));
+        let raw_key = format!("x'{}'", hex::encode(key));
+        if path.exists() && store.get_config_blob(CONFIG_MLS_FILE_IMPORTED)?.is_none() {
+            // Its schema brought up to date first, so its tables match the database's.
+            {
+                let mut file = Connection::open(path).map_err(failed("open"))?;
+                file.pragma_update(None, "key", &raw_key).map_err(failed("key"))?;
+                migrate(&mut file)?;
+            }
+            let conn = store.conn();
+            conn.execute("ATTACH DATABASE ?1 AS mls_file KEY ?2", rusqlite::params![path.to_string_lossy(), raw_key]).map_err(failed("attach"))?;
+            let copied = store.write_whole(|| {
+                let tables: Vec<String> = conn
+                    .prepare("SELECT name FROM mls_file.sqlite_master WHERE type = 'table' AND name LIKE 'openmls%' AND name != ?1")
+                    .and_then(|mut stmt| stmt.query_map([MLS_MIGRATIONS_TABLE], |row| row.get(0))?.collect())
+                    .map_err(failed("list tables"))?;
+                for table in tables {
+                    conn.execute(&format!("INSERT INTO main.{table} SELECT * FROM mls_file.{table}"), []).map_err(failed("copy"))?;
+                }
+                store.set_config_blob(CONFIG_MLS_FILE_IMPORTED, &[1])
+            });
+            let detached = conn.execute("DETACH DATABASE mls_file", []).map_err(failed("detach"));
+            copied?;
+            detached?;
+        }
+        // Brought in, now or by an earlier open: nothing in the file is needed any more.
+        for suffix in ["", "-wal", "-shm"] {
+            let mut file = path.as_os_str().to_owned();
+            file.push(suffix);
+            if let Err(e) = std::fs::remove_file(&file) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!("mls file {} not removed: {e}", Path::new(&file).display());
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Bring OpenMLS's tables in `conn` up to date.
+fn migrate(conn: &mut Connection) -> Result<()> {
+    SqliteStorageProvider::<JsonCodec, &mut Connection>::new(conn)
+        .run_migrations()
+        .map_err(|e| GhostError::Database(format!("mls migrations: {e}")))
 }
 
 impl OpenMlsProvider for GhostProvider {
@@ -649,5 +716,69 @@ impl OpenMlsProvider for GhostProvider {
 
     fn storage(&self) -> &Self::StorageProvider {
         &self.storage
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::identity::Identity;
+    use crate::mls::group::{test_group, GhostGroup};
+    use ghost_wire::policy::CommitAad;
+
+    const KEY: [u8; 32] = [7; 32];
+    const MLS_KEY: [u8; 32] = [9; 32];
+
+    /// A database file at `path`, as the client opens one.
+    fn provider_at(path: &Path) -> GhostProvider {
+        GhostProvider::new(GhostStore::open(&KEY, path).unwrap()).unwrap()
+    }
+
+    /// The MLS file a device kept before its state moved into the app's database: the
+    /// OpenMLS tables of `provider`'s database, alone in a file under their own key.
+    fn write_mls_file(provider: &GhostProvider, path: &Path) {
+        let conn = provider.store().conn();
+        conn.execute("ATTACH DATABASE ?1 AS old KEY ?2", rusqlite::params![path.to_string_lossy(), format!("x'{}'", hex::encode(MLS_KEY))]).unwrap();
+        let tables: Vec<String> = conn
+            .prepare("SELECT name FROM main.sqlite_master WHERE type = 'table' AND name LIKE 'openmls%'")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        for table in tables {
+            conn.execute(&format!("CREATE TABLE old.{table} AS SELECT * FROM main.{table}"), []).unwrap();
+        }
+        conn.execute("DETACH DATABASE old", []).unwrap();
+    }
+
+    #[test]
+    fn an_mls_file_is_brought_in_once_and_never_over_newer_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = Identity::from_seed([0x01; 32]).unwrap();
+        let (server_id, channel_id) = ([0x42; 32], crate::wire::derive_default_channel_id(&[0x42; 32]));
+        let mls_file = dir.path().join("app.mls.db");
+        let stale_copy = dir.path().join("stale.mls.db");
+        {
+            let elsewhere = provider_at(&dir.path().join("before.db"));
+            test_group(&elsewhere, &identity, None);
+            write_mls_file(&elsewhere, &mls_file);
+            write_mls_file(&elsewhere, &stale_copy);
+        }
+
+        let provider = provider_at(&dir.path().join("app.db"));
+        provider.import_mls_file(&mls_file, &MLS_KEY).unwrap();
+        assert!(!mls_file.exists(), "the file goes once its state is in");
+        let mut group = GhostGroup::load(&provider, &identity, &server_id, &channel_id).unwrap().expect("the group came in");
+        assert_eq!(group.epoch(), 0);
+
+        // The group moves on; a copy of the file left behind must not take it back.
+        group.stage_change(&provider, &[], &[], &CommitAad::default()).unwrap();
+        group.merge_pending_commit(&provider).unwrap();
+        std::fs::rename(&stale_copy, &mls_file).unwrap();
+        provider.import_mls_file(&mls_file, &MLS_KEY).unwrap();
+        assert!(!mls_file.exists());
+        let group = GhostGroup::load(&provider, &identity, &server_id, &channel_id).unwrap().unwrap();
+        assert_eq!(group.epoch(), 1, "the newer state stands");
     }
 }
