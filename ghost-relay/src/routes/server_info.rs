@@ -23,26 +23,22 @@ pub async fn put(
     if !state.may_initialize(&id, &auth.account_fp) {
         // Members keep the published GroupInfo current after their commits, so other
         // devices can join by external commit; they cannot change the group state.
-        if !state.group_info_matches_state(&id, &body)? {
-            return Err(crate::error::RelayError::Forbidden(
-                "members may only publish GroupInfo for the relay's current group state".into(),
-            ));
-        }
-        state.storage.put_server_info(id, body.to_vec()).await?;
+        state.publish_group_info(id, body.to_vec()).await?;
         return Ok(StatusCode::NO_CONTENT);
     }
-    // Initialize/update the PublicGroup from the uploaded GroupInfo. A policy refusal
-    // rejects the upload; other failures are non-fatal, since pre-upgrade groups may
-    // have non-standard GroupInfo. An upload from a device behind on the group's
-    // epochs is dropped, keeping the newer GroupInfo joiners need.
+    // Initialize/update the PublicGroup from the uploaded GroupInfo, which is stored
+    // with it. A policy refusal rejects the upload; other failures are non-fatal, since
+    // pre-upgrade groups may have non-standard GroupInfo, which is then stored alone. An
+    // upload from a device behind on the group's epochs is dropped, keeping the newer
+    // GroupInfo joiners need.
     match state.init_public_group(id, body.to_vec(), auth.account_fp).await {
         Err(e @ crate::error::RelayError::Forbidden(_)) => return Err(e),
-        Err(e) => tracing::warn!("PublicGroup init skipped for {mailbox_id}: {e}"),
-        Ok(false) => return Ok(StatusCode::NO_CONTENT),
-        Ok(true) => {}
+        Err(e) => {
+            tracing::warn!("PublicGroup init skipped for {mailbox_id}: {e}");
+            state.storage.put_server_info(id, body.to_vec()).await?;
+        }
+        Ok(_) => {}
     }
-    state.storage.put_server_info(id, body.to_vec()).await?;
-
     Ok(StatusCode::NO_CONTENT)
 }
 

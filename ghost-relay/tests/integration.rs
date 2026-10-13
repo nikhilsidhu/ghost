@@ -11,6 +11,7 @@ use serde_json::Value;
 use tokio::net::UdpSocket;
 use tokio_tungstenite::tungstenite::Message;
 
+use openmls::prelude::tls_codec::Deserialize as _;
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
@@ -1869,6 +1870,21 @@ impl MlsTestIdentity {
         };
         Self { account_fp: *account_fp, signer, credential }
     }
+
+    /// The identity of `auth`'s device: its leaf signed with the device key, as a Ghost
+    /// device's is, so the relay can tell which devices are in a group.
+    fn of_device(auth: &TestAuth) -> Self {
+        let signer = SignatureKeyPair::from_raw(
+            SignatureScheme::ED25519,
+            auth.device_key.to_bytes().to_vec(),
+            auth.device_key.verifying_key().to_bytes().to_vec(),
+        );
+        let credential = CredentialWithKey {
+            credential: Credential::new(CredentialType::Basic, auth.account_fp.to_vec()),
+            signature_key: SignaturePublicKey::from(signer.public().to_vec()),
+        };
+        Self { account_fp: auth.account_fp, signer, credential }
+    }
 }
 
 /// The leaf capabilities a Ghost device advertises: a group may carry only the context
@@ -1901,16 +1917,23 @@ fn create_test_mls_group(
     identity: &MlsTestIdentity,
     relay_vk: &[u8; 32],
 ) -> (MlsGroup, [u8; 32]) {
+    let policy = ghost_wire::policy::ServerPolicy::new(identity.account_fp);
+    let extension = Extension::Unknown(ghost_wire::policy::SERVER_POLICY_EXTENSION, UnknownExtension(policy.to_bytes()));
+    create_test_group_with(provider, identity, relay_vk, extension)
+}
+
+/// A group with the relay as external sender and `policy` in its context.
+fn create_test_group_with(
+    provider: &OpenMlsRustCrypto,
+    identity: &MlsTestIdentity,
+    relay_vk: &[u8; 32],
+    policy: Extension,
+) -> (MlsGroup, [u8; 32]) {
     let external_sender = ExternalSender::new(
         SignaturePublicKey::from(relay_vk.to_vec()),
         Credential::new(CredentialType::Basic, b"ghost-relay".to_vec()),
     );
-    let policy = ghost_wire::policy::ServerPolicy::new(identity.account_fp);
-    let extensions = Extensions::from_vec(vec![
-        Extension::ExternalSenders(vec![external_sender]),
-        Extension::Unknown(ghost_wire::policy::SERVER_POLICY_EXTENSION, UnknownExtension(policy.to_bytes())),
-    ])
-    .unwrap();
+    let extensions = Extensions::from_vec(vec![Extension::ExternalSenders(vec![external_sender]), policy]).unwrap();
     let config = MlsGroupCreateConfig::builder()
         .use_ratchet_tree_extension(true)
         .max_past_epochs(1)
@@ -2152,6 +2175,104 @@ async fn an_owner_behind_on_epochs_does_not_replace_the_newer_group_info() {
     assert_eq!(served.as_ref(), current.as_slice(), "joiners must get the epoch the relay validates against");
 }
 
+/// Alice's server with Bob and Carol in it and a private channel of hers listing both,
+/// each account's leaf on its device key; the channel's group is built but not yet on
+/// the relay.
+struct ChannelFixture {
+    base: String,
+    state: state::AppState,
+    provider: OpenMlsRustCrypto,
+    alice: TestAuth,
+    alice_id: MlsTestIdentity,
+    bob: TestAuth,
+    carol: TestAuth,
+    server_mailbox: [u8; 32],
+    /// The server group's epoch, which every commit to the channel must name.
+    server_epoch: u64,
+    channel: MlsGroup,
+    channel_mailbox: [u8; 32],
+}
+
+async fn channel_fixture() -> ChannelFixture {
+    let (base, state) = start_server_with_state(test_config()).await;
+    let (alice, bob, carol) = (TestAuth::generate(), TestAuth::generate(), TestAuth::generate());
+    for auth in [&alice, &bob, &carol] {
+        auth.register(&base).await;
+    }
+    let relay_vk = fetch_relay_vk(&base).await;
+    let provider = OpenMlsRustCrypto::default();
+    let alice_id = MlsTestIdentity::of_device(&alice);
+    let (mut server, server_mailbox) = create_test_mls_group(&provider, &alice_id, &relay_vk);
+    upload_group_info(&base, &alice, &server_mailbox, &export_group_info_bytes(&server, &provider, &alice_id.signer)).await;
+    let url = mailbox_url(&base, &server_mailbox);
+    for member in [&bob, &carol] {
+        let add = add_member_commit(&mut server, &provider, &alice_id.signer, &member.account_fp);
+        let resp = alice.sign("POST", &url, add, reqwest::Client::new().post(&url)).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+    let policy = ghost_wire::policy::ChannelPolicy { server_mailbox, channel_id: [0xC1; 32], roles: Vec::new(), accounts: vec![bob.account_fp, carol.account_fp] };
+    let extension = Extension::Unknown(ghost_wire::policy::CHANNEL_POLICY_EXTENSION, UnknownExtension(policy.to_bytes()));
+    let (channel, channel_mailbox) = create_test_group_with(&provider, &alice_id, &relay_vk, extension);
+    let server_epoch = server.epoch().as_u64();
+    ChannelFixture { base, state, provider, alice, alice_id, bob, carol, server_mailbox, server_epoch, channel, channel_mailbox }
+}
+
+/// The accounts told to look for channels since the last call, sorted.
+fn told(rx: &mut tokio::sync::broadcast::Receiver<[u8; 32]>) -> Vec<[u8; 32]> {
+    let mut accounts = Vec::new();
+    while let Ok(account) = rx.try_recv() {
+        accounts.push(account);
+    }
+    accounts.sort();
+    accounts
+}
+
+#[tokio::test]
+async fn a_private_channel_is_listed_by_the_time_its_accounts_are_told_of_it() {
+    let f = channel_fixture().await;
+    let group_info = export_group_info_bytes(&f.channel, &f.provider, &f.alice_id.signer);
+    let mut rx = f.state.subscribe(f.server_mailbox, |mailbox| mailbox.channels_tx.subscribe());
+    assert!(f.state.init_public_group(f.channel_mailbox, group_info.clone(), f.alice.account_fp).await.unwrap());
+    // Alice's only device made it, so only Bob and Carol have a device to bring in.
+    let mut waiting = vec![f.bob.account_fp, f.carol.account_fp];
+    waiting.sort();
+    assert_eq!(told(&mut rx), waiting);
+
+    // Told, their devices look for the channel at once, and must find it.
+    let client = reqwest::Client::new();
+    let url = format!("{}/servers/{}/channels", f.base, URL_SAFE_NO_PAD.encode(f.server_mailbox));
+    let resp = f.bob.sign("GET", &url, Vec::new(), client.get(&url)).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let listing = ghost_wire::policy::AdmittedChannels::from_bytes(&resp.bytes().await.unwrap()).unwrap();
+    assert_eq!(listing.0, vec![(f.channel_mailbox, group_info)]);
+}
+
+#[tokio::test]
+async fn a_private_channel_is_told_again_once_its_group_info_catches_up_with_a_commit() {
+    let f = channel_fixture().await;
+    upload_group_info(&f.base, &f.alice, &f.channel_mailbox, &export_group_info_bytes(&f.channel, &f.provider, &f.alice_id.signer)).await;
+    let mut rx = f.state.subscribe(f.server_mailbox, |mailbox| mailbox.channels_tx.subscribe());
+
+    // Bob gets in first; a join Carol built on the same GroupInfo would now be refused.
+    let published = export_group_info_bytes(&f.channel, &f.provider, &f.alice_id.signer);
+    let (bob_provider, bob_id) = (OpenMlsRustCrypto::default(), MlsTestIdentity::of_device(&f.bob));
+    let aad = ghost_wire::policy::CommitAad { invite: None, server_epoch: Some(f.server_epoch) }.to_bytes();
+    let (bob_channel, join) = external_join_commit(&bob_provider, &bob_id, &published, aad);
+    let url = mailbox_url(&f.base, &f.channel_mailbox);
+    let resp = f.bob.sign("POST", &url, join, reqwest::Client::new().post(&url)).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert_eq!(told(&mut rx), Vec::<[u8; 32]>::new(), "the stored GroupInfo is behind the join: nothing to join on yet");
+
+    // A member (not the owner) publishes the GroupInfo of the new epoch: Carol, still
+    // outside, is told; Bob, now in, is not.
+    let current = export_group_info_bytes(&bob_channel, &bob_provider, &bob_id.signer);
+    upload_group_info(&f.base, &f.bob, &f.channel_mailbox, &current).await;
+    assert_eq!(told(&mut rx), vec![f.carol.account_fp]);
+    // The same GroupInfo again changes nothing a joiner could act on.
+    upload_group_info(&f.base, &f.bob, &f.channel_mailbox, &current).await;
+    assert_eq!(told(&mut rx), Vec::<[u8; 32]>::new());
+}
+
 #[tokio::test]
 async fn an_accounts_sync_mailbox_admits_its_devices_alone_and_takes_no_mls() {
     let (base, st) = start_server_with_state(test_config()).await;
@@ -2288,6 +2409,37 @@ fn add_member_commit(group: &mut MlsGroup, provider: &OpenMlsRustCrypto, signer:
         .build(Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519, provider, &joiner.signer, joiner.credential.clone())
         .unwrap();
     commit_change(group, provider, signer, Change::Add(Box::new(key_package.key_package().clone())))
+}
+
+/// `joiner` joining the group `group_info` describes by external commit, naming `aad`,
+/// as a Ghost device does. Returns the joiner's group and the wrapped commit.
+fn external_join_commit(provider: &OpenMlsRustCrypto, joiner: &MlsTestIdentity, group_info: &[u8], aad: Vec<u8>) -> (MlsGroup, Vec<u8>) {
+    let MlsMessageBodyIn::GroupInfo(info) = MlsMessageIn::tls_deserialize_exact(group_info).unwrap().extract() else {
+        panic!("not a GroupInfo");
+    };
+    let epoch = info.epoch().as_u64();
+    let config = MlsGroupJoinConfig::builder()
+        .use_ratchet_tree_extension(true)
+        .wire_format_policy(MIXED_PLAINTEXT_WIRE_FORMAT_POLICY)
+        .build();
+    let leaf = LeafNodeParameters::builder()
+        .with_credential_with_key(joiner.credential.clone())
+        .with_capabilities(ghost_capabilities())
+        .build();
+    let (group, bundle) = MlsGroup::external_commit_builder()
+        .with_config(config)
+        .with_aad(aad)
+        .build_group(provider, info, joiner.credential.clone())
+        .unwrap()
+        .leaf_node_parameters(leaf)
+        .load_psks(provider.storage())
+        .unwrap()
+        .build(provider.rand(), provider.crypto(), &joiner.signer, |_| true)
+        .unwrap()
+        .finalize(provider)
+        .unwrap();
+    let commit = bundle.into_commit().to_bytes().unwrap();
+    (group, envelope(ghost_wire::EnvelopeType::Commit, epoch, &commit))
 }
 
 /// A commit removing every leaf of `account_fp` from `group`, merged locally and wrapped.

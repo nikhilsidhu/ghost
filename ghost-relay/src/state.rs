@@ -79,8 +79,8 @@ impl Inner {
     }
 
     /// Tell live connections what a writer job committed: new log entries to their
-    /// subscribers, departures to the accounts they concern, and channel changes to
-    /// the accounts the channels admit.
+    /// subscribers, departures to the accounts they concern, and private channels that
+    /// became joinable to the accounts waiting on them.
     pub(crate) fn announce(&self, committed: Committed) {
         let mailboxes = self.mailboxes.read().unwrap();
         for entry in &committed.appended {
@@ -91,16 +91,11 @@ impl Inner {
         for departure in committed.departed {
             let _ = self.departure_tx.send(departure);
         }
-        if committed.channels_to_signal.is_empty() {
-            return;
-        }
-        // Only the accounts a private channel admits are told to look for channels, on
-        // their connections to its server's mailbox, so it stays hidden from everyone else.
-        let groups = self.groups.read().unwrap();
-        for channel_mailbox in committed.channels_to_signal {
-            let Some((server_mailbox, admitted)) = groups.admitted_accounts(&channel_mailbox) else { continue };
-            if let Some(mailbox) = mailboxes.get(&server_mailbox) {
-                for account in admitted {
+        // Only accounts a private channel admits are told to look for channels, on their
+        // connections to its server's mailbox, so it stays hidden from everyone else.
+        for joinable in committed.joinable {
+            if let Some(mailbox) = mailboxes.get(&joinable.server_mailbox) {
+                for account in joinable.accounts {
                     let _ = mailbox.channels_tx.send(account);
                 }
             }

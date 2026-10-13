@@ -45,6 +45,34 @@ pub fn member_accounts(pg: &PublicGroup) -> Vec<[u8; 32]> {
     policy_mls::member_accounts(&members)
 }
 
+/// The epoch a stored GroupInfo describes.
+fn group_info_epoch(group_info_bytes: &[u8]) -> Option<GroupEpoch> {
+    match MlsMessageIn::tls_deserialize_exact(group_info_bytes).ok()?.extract() {
+        MlsMessageBodyIn::GroupInfo(info) => Some(info.epoch()),
+        _ => None,
+    }
+}
+
+/// Whom to tell that a private channel became joinable, now that its stored GroupInfo
+/// describes `pg`: the accounts it admits with an active device that has no leaf in it.
+/// `None` for a server group, when the GroupInfo stored before already described this
+/// epoch, or when nobody waits.
+fn became_joinable(conn: &Connection, groups: &GroupTable, pg: &PublicGroup, stored_before: Option<&[u8]>) -> Result<Option<Joinable>, RelayError> {
+    let Some(channel) = channel_policy_of(pg) else { return Ok(None) };
+    if stored_before.and_then(group_info_epoch) == Some(pg.group_context().epoch()) {
+        return Ok(None);
+    }
+    let leaves: Vec<Vec<u8>> = pg.members().map(|member| member.signature_key).collect();
+    let mut accounts = Vec::new();
+    for account in groups.admitted_by(&channel) {
+        let devices = sql::active_device_keys(conn, &account)?;
+        if devices.iter().any(|device| !leaves.iter().any(|leaf| leaf.as_slice() == device.as_slice())) {
+            accounts.push(account);
+        }
+    }
+    Ok((!accounts.is_empty()).then_some(Joinable { server_mailbox: channel.server_mailbox, accounts }))
+}
+
 impl GroupTable {
     pub fn get(&self, mailbox_id: &[u8; 32]) -> Option<&PublicGroup> {
         self.groups.get(mailbox_id)
@@ -100,13 +128,11 @@ impl GroupTable {
         policy_mls::server_policy(pg.group_context().extensions(), &members).ok().map(|policy| policy.owner)
     }
 
-    /// The server mailbox a private channel group belongs to, and the accounts its
-    /// policy admits now.
-    pub fn admitted_accounts(&self, channel_mailbox: &[u8; 32]) -> Option<([u8; 32], Vec<[u8; 32]>)> {
-        let channel = channel_policy_of(self.groups.get(channel_mailbox)?)?;
-        let view = self.server_view(&channel.server_mailbox).ok()?;
-        let admitted = view.members.iter().filter(|account| channel.admits(account, &view)).copied().collect();
-        Some((channel.server_mailbox, admitted))
+    /// The accounts a private channel's policy admits now; none while its server group
+    /// is not here.
+    pub fn admitted_by(&self, channel: &ChannelPolicy) -> Vec<[u8; 32]> {
+        let Ok(view) = self.server_view(&channel.server_mailbox) else { return Vec::new() };
+        view.members.iter().filter(|account| channel.admits(account, &view)).copied().collect()
     }
 
     /// Leaves to propose removing after a commit to `mailbox_id`: in that group if it
@@ -196,9 +222,17 @@ pub struct Committed {
     /// In log order per mailbox: the blob itself and the proposals made because of it.
     pub appended: Vec<NewEntry>,
     pub departed: Vec<Departure>,
-    /// Private channel groups whose admitted accounts should look for channels: just
-    /// created, or admitting more accounts than before.
-    pub channels_to_signal: Vec<[u8; 32]>,
+    /// Private channels that just became joinable, with whom to tell.
+    pub joinable: Vec<Joinable>,
+}
+
+/// A private channel whose stored GroupInfo now describes its group as the relay holds
+/// it, so a device can join at the group's epoch: just made, or caught up with a commit
+/// a join may have lost to, or that admitted more accounts. The accounts it admits with
+/// an active device outside it are told, on their connections to its server's mailbox.
+pub struct Joinable {
+    pub server_mailbox: [u8; 32],
+    pub accounts: Vec<[u8; 32]>,
 }
 
 /// What merging a commit changed beyond the group state itself.
@@ -208,9 +242,6 @@ struct CommitEffects {
     exclusions: Vec<([u8; 32], Vec<LeafNodeIndex>)>,
     /// Accounts the commit removed from the group entirely.
     departed: Vec<[u8; 32]>,
-    /// The commit changed a private channel group's policy, so whom it admits may
-    /// have grown.
-    channel_policy_changed: bool,
 }
 
 /// Parse an envelope's MLS payload into the message the public group processes.
@@ -307,7 +338,7 @@ impl Inner {
                 .iter()
                 .map(|account_fp| Departure { mailbox_id: *mailbox_id, account_fp: *account_fp, seq: appended.seq })
                 .collect(),
-            channels_to_signal: effects.channel_policy_changed.then_some(*mailbox_id).into_iter().collect(),
+            ..Committed::default()
         };
         // Proposed after the commit is sequenced, so they target the epoch it created.
         for (channel_mailbox, leaves) in effects.exclusions {
@@ -366,7 +397,6 @@ impl Inner {
         mailbox_id: &[u8; 32],
         staged_commit: StagedCommit,
     ) -> Result<CommitEffects, RelayError> {
-        let policy_before = groups.get(mailbox_id).and_then(channel_policy_of);
         let pg = groups.get_mut(mailbox_id).expect("looked up above");
         let before = member_accounts(pg);
         let merged = pg
@@ -384,12 +414,7 @@ impl Inner {
             }
         };
         let departed = before.into_iter().filter(|fp| !members.contains(fp)).collect();
-        let policy_after = groups.get(mailbox_id).and_then(channel_policy_of);
-        Ok(CommitEffects {
-            exclusions: groups.channel_exclusions(mailbox_id),
-            departed,
-            channel_policy_changed: policy_before.is_some() && policy_before != policy_after,
-        })
+        Ok(CommitEffects { exclusions: groups.channel_exclusions(mailbox_id), departed })
     }
 
     /// Decide a commit under the group's policy, with the same rules every member's
@@ -544,23 +569,38 @@ impl Inner {
         Ok(pg)
     }
 
-    /// Whether a GroupInfo faithfully describes the group state this relay already
-    /// validated: signed by a member and carrying exactly the current group context.
-    /// Lets any member refresh the published GroupInfo after a commit without being
-    /// able to change what the relay believes the group is.
-    pub fn group_info_matches_state(&self, mailbox_id: &[u8; 32], group_info_bytes: &[u8]) -> Result<bool, RelayError> {
+    /// Store a member's GroupInfo, which must describe the group state this relay
+    /// already validated: signed by a member and carrying exactly the current group
+    /// context, else `Forbidden`. Lets any member refresh the published GroupInfo after
+    /// a commit without being able to change what the relay believes the group is. One
+    /// that makes a private channel joinable again is told to whoever waits on it.
+    pub async fn publish_group_info(self: &Arc<Self>, mailbox_id: [u8; 32], group_info_bytes: Vec<u8>) -> Result<(), RelayError> {
         let scratch = openmls_rust_crypto::MemoryStorage::default();
-        let pg = self.public_group_from_info(&scratch, group_info_bytes)?;
-        let groups = self.groups.read().unwrap();
-        Ok(groups
-            .get(mailbox_id)
-            .is_some_and(|existing| existing.group_context() == pg.group_context()))
+        let described = self.public_group_from_info(&scratch, &group_info_bytes)?.group_context().clone();
+        let inner = self.clone();
+        let committed = self
+            .storage
+            .write(move |conn| {
+                let groups = inner.groups.read().unwrap();
+                let Some(pg) = groups.get(&mailbox_id).filter(|pg| *pg.group_context() == described) else {
+                    return Err(RelayError::Forbidden("members may only publish GroupInfo for the relay's current group state".into()));
+                };
+                let stored_before = sql::get_server_info(conn, &mailbox_id)?;
+                sql::put_server_info(conn, &mailbox_id, &group_info_bytes)?;
+                let joinable = became_joinable(conn, &groups, pg, stored_before.as_deref())?;
+                Ok(Committed { joinable: joinable.into_iter().collect(), ..Committed::default() })
+            })
+            .await?;
+        self.announce(committed);
+        Ok(())
     }
 
-    /// Build the group state from an uploaded GroupInfo. Refuses (`Forbidden`) a group
-    /// with malformed policies, or a private channel group uploaded by someone who may
-    /// not manage the server's channels: creating one is how a channel comes to exist.
-    /// Returns false, leaving the state alone, when the relay holds a later epoch.
+    /// Build the group state from an uploaded GroupInfo, stored with it, so a private
+    /// channel is joinable by the time its admitted accounts are told of it. Refuses
+    /// (`Forbidden`) a group with malformed policies, or a private channel group uploaded
+    /// by someone who may not manage the server's channels: creating one is how a channel
+    /// comes to exist. Returns false, leaving the state alone, when the relay holds a
+    /// later epoch.
     pub async fn init_public_group(
         self: &Arc<Self>,
         mailbox_id: [u8; 32],
@@ -588,6 +628,7 @@ impl Inner {
         uploader: &[u8; 32],
     ) -> Result<Option<Committed>, RelayError> {
         let mut groups = self.groups.write().unwrap();
+        let stored_before = sql::get_server_info(conn, mailbox_id)?;
         // Built straight into the store, under a savepoint of its own: a refused or
         // stale upload must not leave its components in place of the held group's.
         conn.execute_batch("SAVEPOINT group_info").map_err(|e| RelayError::Storage(e.to_string()))?;
@@ -597,16 +638,14 @@ impl Inner {
             .map_err(|e| RelayError::Storage(e.to_string()))?;
         let Some(pg) = built? else { return Ok(None) };
 
-        let is_channel = channel_policy_of(&pg).is_some();
+        let joinable = became_joinable(conn, &groups, &pg, stored_before.as_deref())?;
         groups.insert(*mailbox_id, pg);
-        Ok(Some(Committed {
-            channels_to_signal: is_channel.then_some(*mailbox_id).into_iter().collect(),
-            ..Committed::default()
-        }))
+        Ok(Some(Committed { joinable: joinable.into_iter().collect(), ..Committed::default() }))
     }
 
     /// Check an uploaded GroupInfo and write the group it describes, with its
-    /// membership and the epoch its next commit must carry. `None` for a stale upload.
+    /// membership, the epoch its next commit must carry and the GroupInfo itself for
+    /// joiners. `None` for a stale upload.
     fn build_public_group(
         &self,
         conn: &Connection,
@@ -643,6 +682,7 @@ impl Inner {
         // The next commit must be at the group's epoch, even if this relay never saw
         // the earlier ones (the group moved here).
         sql::raise_mailbox_epoch(conn, mailbox_id, new_epoch)?;
+        sql::put_server_info(conn, mailbox_id, group_info_bytes)?;
         Ok(Some(pg))
     }
 

@@ -1605,6 +1605,18 @@ pub(crate) mod sql {
         owner.map(|fp| fp.try_into().map_err(|_| RelayError::Storage("sync mailbox owner is not 32 bytes".into()))).transpose()
     }
 
+    /// The account's devices that are not revoked, as this relay knows its log.
+    pub(crate) fn active_device_keys(conn: &Connection, account_fp: &[u8; 32]) -> Result<Vec<[u8; 32]>, RelayError> {
+        let rows: Vec<Vec<u8>> = conn
+            .prepare_cached("SELECT device_vk FROM device_keys WHERE account_fp = ?1 AND active = 1")
+            .map_err(storage_error)?
+            .query_map(params![account_fp.as_slice()], |row| row.get(0))
+            .map_err(storage_error)?
+            .collect::<Result<_, _>>()
+            .map_err(storage_error)?;
+        rows.into_iter().map(|vk| vk.try_into().map_err(|_| RelayError::Storage("corrupt device_vk in device_keys".into()))).collect()
+    }
+
     /// The `active` column of the device's row: 1 while it is active, 0 once revoked,
     /// `None` when the held log never listed it.
     fn device_active(conn: &Connection, account_fp: &[u8; 32], device_vk: &[u8; 32]) -> Result<Option<i64>, RelayError> {
