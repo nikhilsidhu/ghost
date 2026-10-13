@@ -182,6 +182,9 @@ async fn voice_connection(socket: WebSocket, mailbox_id: [u8; 32], room_id: [u8;
     // the slot was taken over or claimed back elsewhere.
     let mut held: Option<(u32, [u8; 32])> = None;
     let mut event_rx: Option<Events> = None;
+    // The close the relay ends the connection with, if it does: sent once the slot is
+    // released.
+    let mut closing: Option<axum::extract::ws::CloseFrame> = None;
 
     // Track which peer slots this connection knows about
     let mut known_slots: HashSet<u32> = HashSet::new();
@@ -340,10 +343,7 @@ async fn voice_connection(socket: WebSocket, mailbox_id: [u8; 32], room_id: [u8;
                     Ok(VoiceEvent::Replaced { slot_id: sid }) if slot_id == Some(sid) => {
                         // The joining device's admission already gave the slot up.
                         held = None;
-                        let _ = sink.send(Message::Close(Some(axum::extract::ws::CloseFrame {
-                            code: ghost_wire::WS_CLOSE_VOICE_REPLACED,
-                            reason: "joined from another device".into(),
-                        }))).await;
+                        closing = Some(axum::extract::ws::CloseFrame { code: ghost_wire::WS_CLOSE_VOICE_REPLACED, reason: "joined from another device".into() });
                         break;
                     }
                     Ok(VoiceEvent::Resumed { slot_id: sid, conn_id: holder }) if slot_id == Some(sid) && holder != conn_id => {
@@ -421,7 +421,7 @@ async fn voice_connection(socket: WebSocket, mailbox_id: [u8; 32], room_id: [u8;
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 };
                 if revoked {
-                    let _ = sink.send(Message::Close(Some(super::ws::revoked_close(&state, &auth).await))).await;
+                    closing = Some(super::ws::revoked_close(&state, &auth).await);
                     break;
                 }
             }
@@ -434,10 +434,7 @@ async fn voice_connection(socket: WebSocket, mailbox_id: [u8; 32], room_id: [u8;
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 };
                 if removed {
-                    let _ = sink.send(Message::Close(Some(axum::extract::ws::CloseFrame {
-                        code: ghost_wire::WS_CLOSE_REMOVED,
-                        reason: "removed from the group".into(),
-                    }))).await;
+                    closing = Some(super::ws::removed_close());
                     break;
                 }
             }
@@ -454,6 +451,9 @@ async fn voice_connection(socket: WebSocket, mailbox_id: [u8; 32], room_id: [u8;
 
     if let Some((sid, _)) = held {
         release(&state, room_id, sid, conn_id).await;
+    }
+    if let Some(frame) = closing {
+        super::ws::close_with(&mut sink, &mut stream, frame).await;
     }
 }
 

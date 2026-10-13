@@ -7,7 +7,7 @@ use axum::extract::{Path, State};
 use axum::response::{IntoResponse, Response};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
-use futures_util::stream::SplitSink;
+use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use tokio::sync::broadcast;
@@ -17,7 +17,7 @@ use ghost_wire::presence::{OnlineStateMsg, PresenceSender, VoiceStateMsg};
 use ghost_wire::{short_id, WS_ERROR_PREFIX, WS_SIGNAL_CHANNELS, WS_SIGNAL_GAP};
 
 use crate::auth::DeviceAuth;
-use crate::constants::{MAX_PRESENCE_BLOB_SIZE, WS_CATCHUP_PAGE, WS_MISSED_PONGS};
+use crate::constants::{MAX_PRESENCE_BLOB_SIZE, WS_CATCHUP_PAGE, WS_CLOSE_WAIT_SECS, WS_MISSED_PONGS};
 use crate::mailbox::{Frame, Mailbox, OnlinePresence, VoicePresence};
 use crate::state::AppState;
 use crate::util::{decode_mailbox_id, now_millis};
@@ -25,6 +25,7 @@ use crate::util::{decode_mailbox_id, now_millis};
 const HANDSHAKE_TIMEOUT_SECS: u64 = 5;
 
 type Sink = SplitSink<WebSocket, Message>;
+type Stream = SplitStream<WebSocket>;
 
 /// A voice state announcement as a client sends it; the relay adds who sent it.
 #[derive(Deserialize)]
@@ -122,7 +123,7 @@ async fn ws_connection(socket: WebSocket, mailbox_id: [u8; 32], state: AppState,
         Ok(Some(Ok(Message::Binary(data)))) if data.len() == 8 => u64::from_be_bytes(data[..8].try_into().unwrap()),
         _ => {
             let close = axum::extract::ws::CloseFrame { code: axum::extract::ws::close_code::PROTOCOL, reason: "no resume point sent".into() };
-            let _ = sink.send(Message::Close(Some(close))).await;
+            close_with(&mut sink, &mut stream, close).await;
             return;
         }
     };
@@ -161,12 +162,12 @@ async fn ws_connection(socket: WebSocket, mailbox_id: [u8; 32], state: AppState,
         }
     } else if let Err(stop) = catch_up(&state, mailbox_id, &mut cursor, &mut sink).await {
         if matches!(stop, Stop::Removed) {
-            close_removed(&mut sink).await;
+            close_with(&mut sink, &mut stream, removed_close()).await;
         }
         return;
     }
     if cursor.read_limit.is_some() {
-        close_removed(&mut sink).await;
+        close_with(&mut sink, &mut stream, removed_close()).await;
         return;
     }
     if sink.send(Message::text(ghost_wire::WS_SIGNAL_CAUGHT_UP)).await.is_err() {
@@ -185,6 +186,9 @@ async fn ws_connection(socket: WebSocket, mailbox_id: [u8; 32], state: AppState,
     // not come back to this mailbox: its presence goes at once. Anything else may be a
     // blip, which the grace rides out.
     let mut withdraw_at_once = false;
+    // The close the relay ends the connection with, if it does: sent once the presence is
+    // withdrawn.
+    let mut closing: Option<axum::extract::ws::CloseFrame> = None;
     let mut revoke_rx = state.revocation_tx.subscribe();
     let mut departure_rx = state.departure_tx.subscribe();
     let mut readmission_rx = state.readmission_tx.subscribe();
@@ -233,7 +237,7 @@ async fn ws_connection(socket: WebSocket, mailbox_id: [u8; 32], state: AppState,
                 match delivered {
                     Ok(()) => {}
                     Err(Stop::Removed) => {
-                        close_removed(&mut sink).await;
+                        closing = Some(removed_close());
                         withdraw_at_once = true;
                         break;
                     }
@@ -247,7 +251,7 @@ async fn ws_connection(socket: WebSocket, mailbox_id: [u8; 32], state: AppState,
                         // not have reached yet, then close.
                         cursor.read_limit = Some(d.seq);
                         if cursor.last_seen >= d.seq {
-                            close_removed(&mut sink).await;
+                            closing = Some(removed_close());
                             withdraw_at_once = true;
                             break;
                         }
@@ -308,7 +312,7 @@ async fn ws_connection(socket: WebSocket, mailbox_id: [u8; 32], state: AppState,
                     Err(RecvError::Closed) => break,
                 };
                 if revoked {
-                    let _ = sink.send(Message::Close(Some(revoked_close(&state, &auth).await))).await;
+                    closing = Some(revoked_close(&state, &auth).await);
                     withdraw_at_once = true;
                     break;
                 }
@@ -322,12 +326,7 @@ async fn ws_connection(socket: WebSocket, mailbox_id: [u8; 32], state: AppState,
                 // Admitted when it connected is not admitted now: the device learns why
                 // from the refusal its reconnect gets.
                 if recheck && !still_admitted(&state, &auth).await {
-                    let _ = sink.send(Message::Close(Some(
-                        axum::extract::ws::CloseFrame {
-                            code: ghost_wire::WS_CLOSE_ADMISSION_CHANGED,
-                            reason: "no longer admitted".into(),
-                        },
-                    ))).await;
+                    closing = Some(axum::extract::ws::CloseFrame { code: ghost_wire::WS_CLOSE_ADMISSION_CHANGED, reason: "no longer admitted".into() });
                     withdraw_at_once = true;
                     break;
                 }
@@ -350,6 +349,32 @@ async fn ws_connection(socket: WebSocket, mailbox_id: [u8; 32], state: AppState,
     }
 
     withdraw_presence(&state, mailbox_id, conn_id, withdraw_at_once);
+    if let Some(frame) = closing {
+        close_with(&mut sink, &mut stream, frame).await;
+    }
+}
+
+/// Send `frame`, then wait for the device's own close before the socket goes, so none
+/// of the device's data is left unread: a socket closed with data unread is reset, and
+/// the device sees the reset in place of the reason (on Windows, every time). A device
+/// that does not answer within `WS_CLOSE_WAIT_SECS` is not waited for longer.
+pub(crate) async fn close_with(sink: &mut Sink, stream: &mut Stream, frame: axum::extract::ws::CloseFrame) {
+    if sink.send(Message::Close(Some(frame))).await.is_err() {
+        return;
+    }
+    let answered = async {
+        while let Some(Ok(message)) = stream.next().await {
+            if matches!(message, Message::Close(_)) {
+                break;
+            }
+        }
+    };
+    let _ = tokio::time::timeout(Duration::from_secs(WS_CLOSE_WAIT_SECS), answered).await;
+}
+
+/// The close for an account removed from the group.
+pub(crate) fn removed_close() -> axum::extract::ws::CloseFrame {
+    axum::extract::ws::CloseFrame { code: ghost_wire::WS_CLOSE_REMOVED, reason: "removed from the group".into() }
 }
 
 /// The close for a device the account's log revoked; its reason says what revoked it,
@@ -561,13 +586,4 @@ fn withdraw_now(state: &AppState, mailbox_id: &[u8; 32], conn_id: u64) {
     for entry in gone {
         let _ = mailbox.presence_tx.send((conn_id, online_announcement(None, entry.from)));
     }
-}
-
-async fn close_removed(sink: &mut Sink) {
-    let _ = sink
-        .send(Message::Close(Some(axum::extract::ws::CloseFrame {
-            code: ghost_wire::WS_CLOSE_REMOVED,
-            reason: "removed from the group".into(),
-        })))
-        .await;
 }

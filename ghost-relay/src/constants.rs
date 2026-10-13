@@ -7,6 +7,9 @@ pub const WORKER_INTERVAL_SECS: u64 = 60;
 pub const DEFAULT_WS_PING_SECS: u64 = 15;
 /// Pings in a row a connection may leave unanswered before it is dead.
 pub const WS_MISSED_PONGS: u32 = 2;
+/// How long a connection the relay closes waits for the device to answer the close frame
+/// before the socket goes anyway.
+pub const WS_CLOSE_WAIT_SECS: u64 = 2;
 /// Seconds a device's presence outlives a connection that ended without a close frame,
 /// so a blip shows nothing and a device that comes back replaces itself silently.
 pub const DEFAULT_PRESENCE_GRACE_SECS: u64 = 30;
