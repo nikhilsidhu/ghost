@@ -554,16 +554,17 @@ mod tests {
     /// coding and the devices' buffers. A busy machine's jitter deepens playout that far.
     const PATH_FRAMES: usize = PLAYOUT_MAX_TARGET as usize + 4;
 
-    /// Play the default chain's own output back to it, through the sealed loopback a mic
-    /// test uses, with the speakers heard by the microphone at `leak`. Returns the
-    /// speech and what played.
-    fn call_with_speakers(leak: f32, echo_cancellation: bool) -> (Vec<f32>, Vec<f32>) {
+    /// Play the chain's own output back to it, through the sealed loopback a mic test
+    /// uses, with the speakers heard by the microphone at `leak` and the microphone
+    /// opened by `input_mode`. Returns the speech and what played.
+    fn call_with_speakers(leak: f32, echo_cancellation: bool, input_mode: InputMode) -> (Vec<f32>, Vec<f32>) {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let _enter = runtime.enter();
         let devices = ToneDevices::new();
         devices.set_leak(leak);
         let audio = VoiceAudio::new(devices.clone());
         audio.set_echo_cancellation(echo_cancellation);
+        audio.set_input_mode(input_mode);
         let speech = speech_like(SPEECH_SECONDS, SPEECH);
         devices.play(&speech);
         let (events, _events) = mpsc::unbounded_channel();
@@ -591,7 +592,7 @@ mod tests {
 
     #[test]
     fn speech_comes_through_the_default_chain() {
-        let (speech, played) = call_with_speakers(0.0, true);
+        let (speech, played) = call_with_speakers(0.0, true, InputMode::VoiceActivity);
         let (share, tail) = heard(&speech, &played);
         assert!(share > 0.9, "only {:.0}% of speech heard", share * 100.0);
         assert!(tail < SILENT, "silence after the speech, got RMS {tail}");
@@ -599,7 +600,7 @@ mod tests {
 
     #[test]
     fn speakers_the_microphone_hears_do_not_feed_back() {
-        let (speech, played) = call_with_speakers(LEAK, true);
+        let (speech, played) = call_with_speakers(LEAK, true, InputMode::VoiceActivity);
         let (share, tail) = heard(&speech, &played);
         assert!(share > 0.7, "only {:.0}% of speech heard", share * 100.0);
         assert!(tail < SILENT, "the echo rang on after the speech: RMS {tail}");
@@ -630,8 +631,10 @@ mod tests {
 
     #[test]
     fn without_echo_cancellation_the_same_speakers_feed_back() {
-        // What the test above guards against: the loop sustains itself.
-        let (_, played) = call_with_speakers(LEAK, false);
+        // What the test above guards against: the loop sustains itself. The microphone
+        // stays open, so only the canceller could end the loop: voice activity closing a
+        // talk spurt after a frame a busy machine concealed is not what is measured.
+        let (_, played) = call_with_speakers(LEAK, false, InputMode::Continuous);
         let level = tail(&played);
         assert!(level > SILENT, "the echo died out on its own: RMS {level}");
     }
