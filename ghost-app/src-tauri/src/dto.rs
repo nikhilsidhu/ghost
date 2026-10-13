@@ -432,14 +432,31 @@ pub struct InviteDto {
     pub expires_at: u64,
 }
 
+/// A device chosen for calls.
+#[derive(Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS), ts(rename = "ChosenDevice"))]
+pub struct ChosenDeviceDto {
+    /// Its id; none for a device chosen before devices had ids that has not been seen
+    /// since.
+    pub id: Option<String>,
+    /// Its name, to show while it is not connected.
+    pub name: String,
+}
+
+impl From<&crate::audio::ChosenDevice> for ChosenDeviceDto {
+    fn from(chosen: &crate::audio::ChosenDevice) -> Self {
+        Self { id: chosen.id.clone(), name: chosen.name.clone() }
+    }
+}
+
 #[derive(Serialize)]
 #[cfg_attr(test, derive(ts_rs::TS), ts(rename = "Config"))]
 pub struct ConfigDto {
     pub display_name: Option<String>,
     /// The relay this device connects to, which is the account's home.
     pub relay_url: String,
-    pub input_device: Option<String>,
-    pub output_device: Option<String>,
+    pub input_device: Option<ChosenDeviceDto>,
+    pub output_device: Option<ChosenDeviceDto>,
     pub noise_suppression: NoiseSuppressionDto,
     pub agc: AgcDto,
     pub input_mode: InputModeDto,

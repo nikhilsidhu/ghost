@@ -154,7 +154,7 @@ impl DeviceStreams for ToneStreams {
         CaptureRead::Frame
     }
 
-    fn input_name(&self) -> String {
+    fn input_id(&self) -> String {
         "tone".into()
     }
 }

@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::audio::{device_id, find_by_name, ChosenDevice, Direction};
 use crate::dto::{AgcDto, InputModeDto, NoiseSuppressionDto, OnlineStatusDto};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -19,8 +20,10 @@ pub struct KeybindConfig {
 pub struct GhostConfig {
     pub display_name: Option<String>,
     pub relay_url: Option<String>,
-    pub input_device: Option<String>,
-    pub output_device: Option<String>,
+    /// The microphone calls use; none follows the system default.
+    pub input_device: Option<ChosenDevice>,
+    /// The speakers calls use; none follows the system default.
+    pub output_device: Option<ChosenDevice>,
     pub noise_suppression: Option<NoiseSuppressionDto>,
     pub agc: Option<AgcDto>,
     pub input_mode: Option<InputModeDto>,
@@ -29,8 +32,11 @@ pub struct GhostConfig {
     /// Whether echo cancellation runs; on unless turned off. Whether it is needed
     /// depends on this device's speakers, so it is not synced.
     pub echo_cancellation: Option<bool>,
-    /// The gain the volume normalizer settled on, by microphone name, so a call starts
-    /// at the right loudness instead of finding it again.
+    /// The gain the volume normalizer settled on, by microphone id, so a call starts at
+    /// the right loudness instead of finding it again.
+    pub learned_gains: Option<BTreeMap<String, f32>>,
+    /// Gains learned before microphones had ids, by name; each moves to `learned_gains`
+    /// once its microphone is seen.
     pub input_gains: Option<BTreeMap<String, f32>>,
     pub keybinds: Option<KeybindConfig>,
     /// Whether going idle mutes a call; on unless turned off.
@@ -82,9 +88,48 @@ impl GhostConfig {
             input_device: self.input_device.take(),
             output_device: self.output_device.take(),
             echo_cancellation: self.echo_cancellation.take(),
+            learned_gains: self.learned_gains.take(),
             input_gains: self.input_gains.take(),
             ..Self::default()
         };
+    }
+
+    /// Whether anything is still saved by device name, from before devices had ids.
+    pub fn has_device_names(&self) -> bool {
+        let named = |chosen: &Option<ChosenDevice>| chosen.as_ref().is_some_and(|chosen| chosen.id.is_none());
+        named(&self.input_device) || named(&self.output_device) || self.input_gains.is_some()
+    }
+
+    /// Give what was saved by device name, before devices had ids, the ids of the devices
+    /// of those names connected now; the rest keeps its name until its device is seen.
+    /// Whether anything changed.
+    pub fn identify_devices(&mut self, host: &cpal::Host) -> bool {
+        let mut changed = false;
+        for (chosen, direction) in [(&mut self.input_device, Direction::Input), (&mut self.output_device, Direction::Output)] {
+            let Some(chosen) = chosen.as_mut().filter(|chosen| chosen.id.is_none()) else { continue };
+            if let Some(id) = find_by_name(host, &chosen.name, direction).as_ref().and_then(device_id) {
+                chosen.id = Some(id);
+                changed = true;
+            }
+        }
+        if let Some(named) = self.input_gains.take() {
+            let mut unseen = BTreeMap::new();
+            for (name, gain) in named {
+                match find_by_name(host, &name, Direction::Input).as_ref().and_then(device_id) {
+                    Some(id) => {
+                        // A gain learned under the id already is the newer.
+                        self.learned_gains.get_or_insert_with(Default::default).entry(id).or_insert(gain);
+                        changed = true;
+                    }
+                    None => {
+                        unseen.insert(name, gain);
+                    }
+                }
+            }
+            changed |= unseen.is_empty();
+            self.input_gains = (!unseen.is_empty()).then_some(unseen);
+        }
+        changed
     }
 
     pub fn device_choice(&self) -> crate::audio::DeviceChoice {
@@ -99,7 +144,7 @@ impl GhostConfig {
         audio.set_input_gain(self.input_gain());
         audio.set_input_mode(self.input_mode().into());
         audio.set_echo_cancellation(self.echo_cancellation());
-        audio.set_learned_gains(self.input_gains.iter().flatten().map(|(input, gain)| (input.clone(), *gain)).collect());
+        audio.set_learned_gains(self.learned_gains.iter().flatten().map(|(input, gain)| (input.clone(), *gain)).collect());
     }
 
     pub fn load(path: &Path) -> Self {

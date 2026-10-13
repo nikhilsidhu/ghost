@@ -282,6 +282,20 @@ pub fn initialize() -> SetupResult {
 
     let cfg_path = config::config_path(&dir);
     let mut cfg = GhostConfig::load(&cfg_path);
+    // Devices chosen, and gains learned, before devices had ids take the ids of the
+    // devices of their names connected now. On a thread of its own, so the audio
+    // system's per-thread state (COM on Windows) is not set up on the main thread.
+    if cfg.has_device_names() {
+        match std::thread::scope(|s| s.spawn(|| cfg.identify_devices(&cpal::default_host())).join()) {
+            Ok(true) => {
+                if let Err(e) = cfg.save(&cfg_path) {
+                    tracing::warn!("device ids not saved to the config: {e}");
+                }
+            }
+            Ok(false) => {}
+            Err(_) => tracing::warn!("the audio devices could not be asked for their ids"),
+        }
+    }
 
     // Without an account the client runs a provisional identity in memory, so the app
     // has something to show its setup screens against; creation, linking or recovery
@@ -379,15 +393,15 @@ pub fn initialize() -> SetupResult {
     }
 }
 
-/// Keep in the config each gain the volume normalizer settles on, by microphone, so the
-/// next start begins at the right loudness.
+/// Keep in the config each gain the volume normalizer settles on, by microphone id, so
+/// the next start begins at the right loudness.
 fn keep_learned_gains(state: &AppState) {
     let (config, config_path) = (state.config.clone(), state.config_path.clone());
     state.audio.on_gain_learned(move |input, gain_db| {
         let (config, config_path, input) = (config.clone(), config_path.clone(), input.to_string());
         tauri::async_runtime::spawn(async move {
             let mut cfg = config.lock().await;
-            cfg.input_gains.get_or_insert_with(Default::default).insert(input, gain_db);
+            cfg.learned_gains.get_or_insert_with(Default::default).insert(input, gain_db);
             if let Err(e) = cfg.save(&config_path) {
                 tracing::warn!("learned microphone gain not saved: {e}");
             }

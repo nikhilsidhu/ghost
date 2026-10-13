@@ -30,8 +30,9 @@ pub trait AudioDevices: Send + Sync + 'static {
 pub trait DeviceStreams {
     /// Wait up to `timeout` for the next frame of capture, `FRAME_SAMPLES` long.
     fn read_frame(&mut self, frame: &mut [f32], timeout: Duration) -> CaptureRead;
-    /// The microphone capture comes from, by name: what its learned volume is kept under.
-    fn input_name(&self) -> String;
+    /// The microphone capture comes from, by an id that stays the same across restarts:
+    /// what its learned volume is kept under.
+    fn input_id(&self) -> String;
 }
 
 pub enum CaptureRead {

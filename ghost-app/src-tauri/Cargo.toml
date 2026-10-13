@@ -24,7 +24,9 @@ url = "2"
 toml = "0.8"
 # Not used directly: enables TLS for ghost-core's WebSocket connections (wss relays).
 tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
-cpal = "0.15"
+# The PulseAudio host on Linux, which lists the sound server's own devices by name (ALSA
+# shows only its plugins); pure Rust, unlike the PipeWire host.
+cpal = { version = "0.18", features = ["pulseaudio"] }
 rubato = "0.16"
 ringbuf = "0.4"
 tauri-plugin-global-shortcut = "2"
@@ -36,6 +38,17 @@ zeroize = "1.8.2"
 objc2-app-kit = { version = "0.3", features = ["NSColor", "NSWindow"] }
 objc2-core-foundation = "0.3"
 coreaudio-sys = { version = "0.2", default-features = false, features = ["core_audio"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# The audio endpoint notifications; the version cpal already brings. `implement` expands
+# to paths in windows-core, so it is a dependency of its own.
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Media_Audio", "Win32_System_Com"] }
+windows-core = "0.62"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# The sound server's device events, and which of its sources are monitors; the version
+# cpal already brings.
+pulseaudio = "0.3"
 
 [features]
 # The profiler window and the timings behind it, for debug builds only (main.rs refuses

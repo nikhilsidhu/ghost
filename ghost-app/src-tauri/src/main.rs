@@ -18,6 +18,8 @@ mod devtools;
 mod dto;
 mod error;
 mod idle_task;
+#[cfg(target_os = "linux")]
+mod pulse;
 mod relay_task;
 mod setup;
 mod state;

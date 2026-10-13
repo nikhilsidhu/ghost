@@ -5,9 +5,33 @@ import { settingsOpen, settingsCategory, setSettingsCategory, setIsPttMode } fro
 import { setInputMode as setKeybindInputMode } from "../../lib/keybinds";
 import { SettingGroup, SettingSelect, SettingSegmented, SettingSlider, SettingToggle } from "./controls";
 import { cn } from "../../lib/cn";
-import type { Agc, Config, InputMode, NoiseSuppression } from "../../lib/types";
+import type { Agc, AudioDevice, ChosenDevice, Config, InputMode, NoiseSuppression } from "../../lib/types";
 
 const VAD_DEBOUNCE_MS = 200;
+/** The option that follows the system default. Device ids never take this value. */
+const DEFAULT_DEVICE = "default";
+/** The option standing for a chosen device that is not connected. */
+const NOT_CONNECTED = "not-connected";
+
+/** Which option shows `chosen`, among the devices connected. */
+function deviceValue(connected: AudioDevice[], chosen: ChosenDevice | null): string {
+  if (!chosen) return DEFAULT_DEVICE;
+  // A device chosen before devices had ids is known by name until it is seen again.
+  const found = connected.find((d) => (chosen.id ? d.id === chosen.id : d.name === chosen.name));
+  return found?.id ?? NOT_CONNECTED;
+}
+
+/** The system default, the devices connected, and the chosen one if it is not. */
+function deviceOptions(connected: AudioDevice[], defaultName: string | null, chosen: ChosenDevice | null) {
+  const options = [
+    { value: DEFAULT_DEVICE, label: defaultName ? `default (${defaultName})` : "default" },
+    ...connected.map((d) => ({ value: d.id, label: d.name })),
+  ];
+  if (chosen && deviceValue(connected, chosen) === NOT_CONNECTED) {
+    options.push({ value: NOT_CONNECTED, label: `${chosen.name} (not connected)` });
+  }
+  return options;
+}
 
 export default function AudiovisualSettings() {
   const [micTesting, setMicTesting] = createSignal(false);
@@ -16,10 +40,12 @@ export default function AudiovisualSettings() {
   const [micTestFailure, setMicTestFailure] = createSignal<string | null>(null);
   const [tonePlaying, setTonePlaying] = createSignal(false);
 
-  const [inputDevices, setInputDevices] = createSignal<{ value: string; label: string }[]>([]);
-  const [outputDevices, setOutputDevices] = createSignal<{ value: string; label: string }[]>([]);
-  const [selectedInput, setSelectedInput] = createSignal("default");
-  const [selectedOutput, setSelectedOutput] = createSignal("default");
+  const [inputs, setInputs] = createSignal<AudioDevice[]>([]);
+  const [outputs, setOutputs] = createSignal<AudioDevice[]>([]);
+  const [defaultInput, setDefaultInput] = createSignal<string | null>(null);
+  const [defaultOutput, setDefaultOutput] = createSignal<string | null>(null);
+  const [chosenInput, setChosenInput] = createSignal<ChosenDevice | null>(null);
+  const [chosenOutput, setChosenOutput] = createSignal<ChosenDevice | null>(null);
   const [selectedNs, setSelectedNs] = createSignal<NoiseSuppression>("nnnoiseless");
   const [selectedAgc, setSelectedAgc] = createSignal<Agc>("auto");
   const [echoCancellation, setEchoCancellationLocal] = createSignal(true);
@@ -33,8 +59,8 @@ export default function AudiovisualSettings() {
   let gainTimer: ReturnType<typeof setTimeout> | null = null;
 
   const showConfig = (config: Config) => {
-    setSelectedInput(config.input_device ?? "default");
-    setSelectedOutput(config.output_device ?? "default");
+    setChosenInput(config.input_device);
+    setChosenOutput(config.output_device);
     setSelectedNs(config.noise_suppression);
     setSelectedAgc(config.agc);
     setEchoCancellationLocal(config.echo_cancellation);
@@ -53,18 +79,10 @@ export default function AudiovisualSettings() {
   onMount(async () => {
     const [devices, config, keybinds] = await Promise.all([listAudioDevices(), getConfig(), getKeybinds()]);
 
-    const defaultInLabel = devices.default_input ? `default (${devices.default_input})` : "default";
-    const defaultOutLabel = devices.default_output ? `default (${devices.default_output})` : "default";
-
-    setInputDevices([
-      { value: "default", label: defaultInLabel },
-      ...devices.inputs.map((name) => ({ value: name, label: name })),
-    ]);
-    setOutputDevices([
-      { value: "default", label: defaultOutLabel },
-      ...devices.outputs.map((name) => ({ value: name, label: name })),
-    ]);
-
+    setInputs(devices.inputs);
+    setOutputs(devices.outputs);
+    setDefaultInput(devices.default_input);
+    setDefaultOutput(devices.default_output);
     showConfig(config);
     setPttKeyBound(!!keybinds.push_to_talk);
   });
@@ -124,13 +142,17 @@ export default function AudiovisualSettings() {
   ));
 
   const handleInputChange = async (v: string) => {
-    setSelectedInput(v);
-    await setInputDevice(v === "default" ? null : v);
+    if (v === NOT_CONNECTED) return;
+    const device = inputs().find((d) => d.id === v) ?? null;
+    setChosenInput(device);
+    await setInputDevice(device);
   };
 
   const handleOutputChange = async (v: string) => {
-    setSelectedOutput(v);
-    await setOutputDevice(v === "default" ? null : v);
+    if (v === NOT_CONNECTED) return;
+    const device = outputs().find((d) => d.id === v) ?? null;
+    setChosenOutput(device);
+    await setOutputDevice(device);
   };
 
   const handleNsChange = async (v: NoiseSuppression) => {
@@ -168,15 +190,15 @@ export default function AudiovisualSettings() {
         <SettingSelect
           label="input device"
           description="microphone used for voice chat"
-          value={selectedInput()}
-          options={inputDevices()}
+          value={deviceValue(inputs(), chosenInput())}
+          options={deviceOptions(inputs(), defaultInput(), chosenInput())}
           onChange={handleInputChange}
         />
         <SettingSelect
           label="output device"
           description="speakers used for voice chat"
-          value={selectedOutput()}
-          options={outputDevices()}
+          value={deviceValue(outputs(), chosenOutput())}
+          options={deviceOptions(outputs(), defaultOutput(), chosenOutput())}
           onChange={handleOutputChange}
         />
       </SettingGroup>

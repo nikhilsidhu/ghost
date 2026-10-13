@@ -6,7 +6,7 @@ use cpal::traits::{DeviceTrait, StreamTrait};
 use ghost_audio::{TrackEvent, TrackIo, VoiceAudio};
 use tauri::{AppHandle, Emitter};
 
-use crate::audio::{open_output, pick_format, resolve_device};
+use crate::audio::{open_output, pick_format, resolve_device, ChosenDevice, Direction};
 
 /// The mic test running now, by its number; 0 when none runs. A test stopped and one
 /// started right after never mix: the first's thread sees it is no longer current.
@@ -78,7 +78,7 @@ pub fn stop_mic_test() {
     MIC_TEST.store(0, Ordering::SeqCst);
 }
 
-pub fn play_test_tone(output_device_name: Option<String>) -> Result<(), String> {
+pub fn play_test_tone(output: Option<ChosenDevice>) -> Result<(), String> {
     if TONE_PLAYING.swap(true, Ordering::SeqCst) {
         return Ok(());
     }
@@ -86,7 +86,7 @@ pub fn play_test_tone(output_device_name: Option<String>) -> Result<(), String> 
     std::thread::Builder::new()
         .name("test-tone".into())
         .spawn(move || {
-            if let Err(e) = run_test_tone(output_device_name) {
+            if let Err(e) = run_test_tone(output) {
                 tracing::warn!("test tone error: {e}");
             }
             TONE_PLAYING.store(false, Ordering::SeqCst);
@@ -96,13 +96,13 @@ pub fn play_test_tone(output_device_name: Option<String>) -> Result<(), String> 
     Ok(())
 }
 
-fn run_test_tone(output_device_name: Option<String>) -> Result<(), String> {
+fn run_test_tone(output: Option<ChosenDevice>) -> Result<(), String> {
     let host = cpal::default_host();
 
-    let device = resolve_device(&host, &output_device_name, "output")?;
+    let device = resolve_device(&host, output.as_ref(), Direction::Output)?;
     let format = pick_format(device.supported_output_configs().map_err(|e| format!("output configs: {e}"))?)?;
 
-    let phase_inc = TONE_FREQ / format.config.sample_rate.0 as f32;
+    let phase_inc = TONE_FREQ / format.config.sample_rate as f32;
     let mut phase = 0.0f32;
     let stream = open_output(
         &device,

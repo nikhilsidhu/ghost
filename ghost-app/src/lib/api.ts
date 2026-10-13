@@ -1,6 +1,6 @@
 import { invoke } from "./invoke";
 import type {
-  Identity, Server, Channel, Member, Message, Invite, Config, AudioDevices, KeybindConfig, Device, ServerRoles, ServerPolicy,
+  Identity, Server, Channel, Member, Message, Invite, Config, AudioDevice, AudioDevices, KeybindConfig, Device, ServerRoles, ServerPolicy,
   ChannelAccess, KeptOut, ChannelKind, NoiseSuppression, Agc, InputMode, OnlineStatus, LiveState, ProfileReach,
 } from "./types";
 
@@ -137,10 +137,10 @@ export const setVoiceDeafened = (deafened: boolean) =>
 
 // Audio devices
 export const listAudioDevices = () => invoke<AudioDevices>("list_audio_devices");
-export const setInputDevice = (name: string | null) =>
-  invoke<void>("set_input_device", { name });
-export const setOutputDevice = (name: string | null) =>
-  invoke<void>("set_output_device", { name });
+export const setInputDevice = (device: AudioDevice | null) =>
+  invoke<void>("set_input_device", { device });
+export const setOutputDevice = (device: AudioDevice | null) =>
+  invoke<void>("set_output_device", { device });
 
 // Voice processing
 export const setNoiseSuppression = (mode: NoiseSuppression) =>

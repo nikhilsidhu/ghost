@@ -350,7 +350,7 @@ pub(crate) fn run(
     let TrackIo { sender, mut received, events } = io;
     let (playback, mut link) = Playback::new(controls.clone());
     let mut streams = devices.open(playback)?;
-    let mut transmitter = Transmitter::new(sender.clone(), processing_for(&controls, streams.input_name()))?;
+    let mut transmitter = Transmitter::new(sender.clone(), processing_for(&controls, streams.input_id()))?;
     let mut frame = vec![0.0f32; FRAME_SAMPLES];
 
     let (mut ticks, mut frames_received, mut capture_empty) = (0u32, 0u32, 0u32);
@@ -382,12 +382,12 @@ pub(crate) fn run(
                 CaptureRead::Restarted => {
                     tracing::info!("voice: audio devices reopened");
                     transmitter.denoise_primed = false;
-                    switch_input(&controls, &mut transmitter.processing, streams.input_name());
+                    switch_input(&controls, &mut transmitter.processing, streams.input_id());
                 }
                 CaptureRead::Substituted(notice) => {
                     tracing::warn!("voice: {notice}");
                     transmitter.denoise_primed = false;
-                    switch_input(&controls, &mut transmitter.processing, streams.input_name());
+                    switch_input(&controls, &mut transmitter.processing, streams.input_id());
                     let _ = events.send(TrackEvent::Notice(notice));
                 }
                 CaptureRead::Failed(e) => {

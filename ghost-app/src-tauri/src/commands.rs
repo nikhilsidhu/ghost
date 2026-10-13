@@ -14,11 +14,12 @@ use ghost_core::identity::Identity;
 use ghost_core::relay::{RelayClient, RelayInfo};
 use ghost_core::storage::ServerKind;
 
+use crate::audio::ChosenDevice;
 use crate::constants::{DEFAULT_PAGE_SIZE, INPUT_GAIN_MAX};
 use crate::config::KeybindConfig;
 use crate::dto::{
     setting_name, AccountPhaseDto, AccountStatusDto, AgcDto, AssignmentDto, ChannelAccessDto, ChannelDto, ChannelKindDto,
-    ConfigDto, DeviceDto, IdentityDto, InputModeDto, InviteDto, KeptOutDto, KeybindConfigDto, MemberDto, MessageDto,
+    ChosenDeviceDto, ConfigDto, DeviceDto, IdentityDto, InputModeDto, InviteDto, KeptOutDto, KeybindConfigDto, MemberDto, MessageDto,
     NoiseSuppressionDto, OnlineStatusDto, PairingStageDto, PairingStatusDto, PolicyDto, ProfileReachDto, RecoveryOutcomeDto,
     RecoveryOutcomeKindDto, RevokeOutcomeDto, RevokeOutcomeKindDto, RoleDto, ServerDto, ServerRolesDto, SnapshotRestoreDto,
     DeviceListDto, KeyCheckDto, UnfinishedOutcomeDto, UnfinishedOutcomeKindDto,
@@ -619,8 +620,8 @@ pub async fn get_config(state: State<'_, AppState>) -> CommandResult<ConfigDto> 
     Ok(ConfigDto {
         display_name: cfg.display_name.clone(),
         relay_url,
-        input_device: cfg.input_device.clone(),
-        output_device: cfg.output_device.clone(),
+        input_device: cfg.input_device.as_ref().map(ChosenDeviceDto::from),
+        output_device: cfg.output_device.as_ref().map(ChosenDeviceDto::from),
         noise_suppression: cfg.noise_suppression(),
         agc: cfg.agc(),
         input_mode: cfg.input_mode(),
@@ -830,50 +831,57 @@ pub async fn play_test_tone(state: State<'_, AppState>) -> CommandResult<()> {
 #[tauri::command]
 #[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn list_audio_devices() -> CommandResult<AudioDevicesDto> {
-    use cpal::traits::{DeviceTrait, HostTrait};
-    let host = cpal::default_host();
-
-    let default_in = host.default_input_device().and_then(|d| d.name().ok());
-    let default_out = host.default_output_device().and_then(|d| d.name().ok());
-
-    let mut inputs = Vec::new();
-    if let Ok(devices) = host.input_devices() {
-        for d in devices {
-            if let Ok(name) = d.name() {
-                inputs.push(name);
-            }
+    // Asking the devices waits on the system's audio service.
+    tauri::async_runtime::spawn_blocking(|| {
+        use cpal::traits::HostTrait;
+        use crate::audio::{device_id, device_name, microphones};
+        let host = cpal::default_host();
+        let listed = |device: cpal::Device| Some(AudioDeviceDto { id: device_id(&device)?, name: device_name(&device)? });
+        AudioDevicesDto {
+            inputs: microphones(&host).into_iter().filter_map(listed).collect(),
+            outputs: host.output_devices().into_iter().flatten().filter_map(listed).collect(),
+            default_input: host.default_input_device().as_ref().and_then(device_name),
+            default_output: host.default_output_device().as_ref().and_then(device_name),
         }
-    }
+    })
+    .await
+    .map_err(|e| CommandError::internal(format!("listing audio devices: {e}")))
+}
 
-    let mut outputs = Vec::new();
-    if let Ok(devices) = host.output_devices() {
-        for d in devices {
-            if let Ok(name) = d.name() {
-                outputs.push(name);
-            }
-        }
-    }
+/// An audio device the settings offer.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS), ts(rename = "AudioDevice"))]
+pub struct AudioDeviceDto {
+    /// cpal's id, which stays the same across restarts and reconnections.
+    pub id: String,
+    pub name: String,
+}
 
-    Ok(AudioDevicesDto { inputs, outputs, default_input: default_in, default_output: default_out })
+impl From<AudioDeviceDto> for ChosenDevice {
+    fn from(device: AudioDeviceDto) -> Self {
+        Self { id: Some(device.id), name: device.name }
+    }
 }
 
 #[derive(serde::Serialize)]
 #[cfg_attr(test, derive(ts_rs::TS), ts(rename = "AudioDevices"))]
 pub struct AudioDevicesDto {
-    pub inputs: Vec<String>,
-    pub outputs: Vec<String>,
+    pub inputs: Vec<AudioDeviceDto>,
+    pub outputs: Vec<AudioDeviceDto>,
+    /// The system default input's name.
     pub default_input: Option<String>,
+    /// The system default output's name.
     pub default_output: Option<String>,
 }
 
 #[tauri::command]
 #[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn set_input_device(
-    name: Option<String>,
+    device: Option<AudioDeviceDto>,
     state: State<'_, AppState>,
 ) -> CommandResult<()> {
     let mut cfg = state.config.lock().await;
-    cfg.input_device = name;
+    cfg.input_device = device.map(ChosenDevice::from);
     cfg.save(&state.config_path)?;
     // A call or mic test running now switches to it.
     state.devices.choose(cfg.device_choice());
@@ -883,11 +891,11 @@ pub async fn set_input_device(
 #[tauri::command]
 #[cfg_attr(feature = "devtools", tracing::instrument(skip_all))]
 pub async fn set_output_device(
-    name: Option<String>,
+    device: Option<AudioDeviceDto>,
     state: State<'_, AppState>,
 ) -> CommandResult<()> {
     let mut cfg = state.config.lock().await;
-    cfg.output_device = name;
+    cfg.output_device = device.map(ChosenDevice::from);
     cfg.save(&state.config_path)?;
     // A call or mic test running now switches to it.
     state.devices.choose(cfg.device_choice());

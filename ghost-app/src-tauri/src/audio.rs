@@ -1,16 +1,17 @@
 //! The real audio devices behind voice calls: cpal capture and playback, opened in each
 //! device's own channel layout and sample format and converted to and from the engine's
-//! 48 kHz mono, and reopened when the default device changes, when the user chooses
-//! other devices, and when a device goes away. A chosen device that is not there gives
-//! way to the system default, and the call is told.
+//! 48 kHz mono, and reopened when the default device changes, when devices come or go,
+//! when the user chooses other devices, and when a stream must be built again. Devices
+//! are chosen by cpal's id, which stays the same across restarts. A chosen device that
+//! is not there gives way to the system default, and the call is told.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{BufferSize, FromSample, Sample, SampleFormat, SampleRate, SizedSample, StreamConfig, SupportedBufferSize};
+use cpal::{BufferSize, DeviceId, ErrorKind, FromSample, Sample, SampleFormat, SizedSample, StreamConfig, SupportedBufferSize};
 use ghost_audio::constants::{FRAME_MS, FRAME_SAMPLES, SAMPLE_RATE};
 use ghost_audio::{AudioDevices, CaptureRead, DeviceStreams, Playback};
 use ringbuf::{traits::*, HeapRb};
@@ -122,7 +123,7 @@ impl std::fmt::Display for DeviceFormat {
             BufferSize::Fixed(frames) => format!("{frames}-frame buffer"),
             BufferSize::Default => "default buffer".into(),
         };
-        write!(f, "{} Hz, {} ch, {}, {buffer}", self.config.sample_rate.0, self.config.channels, self.sample_format)
+        write!(f, "{} Hz, {} ch, {}, {buffer}", self.config.sample_rate, self.config.channels, self.sample_format)
     }
 }
 
@@ -130,7 +131,7 @@ impl std::fmt::Display for DeviceFormat {
 /// 48 kHz first, then the best sample format, then the fewest channels. A 10 ms buffer
 /// where the device allows one, else its own.
 pub fn pick_format(configs: impl Iterator<Item = cpal::SupportedStreamConfigRange>) -> Result<DeviceFormat, String> {
-    let rate = |range: &cpal::SupportedStreamConfigRange| SAMPLE_RATE.clamp(range.min_sample_rate().0, range.max_sample_rate().0);
+    let rate = |range: &cpal::SupportedStreamConfigRange| SAMPLE_RATE.clamp(range.min_sample_rate(), range.max_sample_rate());
     let best = configs
         .filter(|range| range.channels() > 0)
         .filter_map(|range| {
@@ -140,7 +141,7 @@ pub fn pick_format(configs: impl Iterator<Item = cpal::SupportedStreamConfigRang
         .min_by_key(|(rank, _)| *rank)
         .map(|(_, range)| range)
         .ok_or("the device offers no format Ghost can use")?;
-    let supported = best.with_sample_rate(SampleRate(rate(&best)));
+    let supported = best.with_sample_rate(rate(&best));
     let buffer_size = match supported.buffer_size() {
         SupportedBufferSize::Range { min, max } if (*min..=*max).contains(&DEVICE_BUFFER_SAMPLES) => BufferSize::Fixed(DEVICE_BUFFER_SAMPLES),
         _ => BufferSize::Default,
@@ -171,7 +172,7 @@ fn build_input<T>(
     device: &cpal::Device,
     format: &DeviceFormat,
     mut take: impl FnMut(&[f32]) + Send + 'static,
-    on_error: impl FnMut(cpal::StreamError) + Send + 'static,
+    on_error: impl FnMut(cpal::Error) + Send + 'static,
 ) -> Result<cpal::Stream, String>
 where
     T: SizedSample,
@@ -181,7 +182,7 @@ where
     let mut mono = Vec::with_capacity(CALLBACK_ROOM);
     device
         .build_input_stream(
-            &format.config,
+            format.config,
             move |data: &[T], _: &cpal::InputCallbackInfo| {
                 downmix(data, channels, &mut mono);
                 take(&mono);
@@ -196,13 +197,13 @@ fn build_output<T: SizedSample + FromSample<f32>>(
     device: &cpal::Device,
     format: &DeviceFormat,
     mut render: impl FnMut(&mut [f32]) + Send + 'static,
-    on_error: impl FnMut(cpal::StreamError) + Send + 'static,
+    on_error: impl FnMut(cpal::Error) + Send + 'static,
 ) -> Result<cpal::Stream, String> {
     let channels = format.config.channels as usize;
     let mut mono = Vec::with_capacity(CALLBACK_ROOM);
     device
         .build_output_stream(
-            &format.config,
+            format.config,
             move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
                 mono.resize(data.len() / channels, 0.0);
                 render(&mut mono);
@@ -219,7 +220,7 @@ fn open_input(
     device: &cpal::Device,
     format: &DeviceFormat,
     take: impl FnMut(&[f32]) + Send + 'static,
-    on_error: impl FnMut(cpal::StreamError) + Send + 'static,
+    on_error: impl FnMut(cpal::Error) + Send + 'static,
 ) -> Result<cpal::Stream, String> {
     for_sample_format!(format.sample_format, T => build_input::<T>(device, format, take, on_error))
 }
@@ -229,41 +230,128 @@ pub fn open_output(
     device: &cpal::Device,
     format: &DeviceFormat,
     render: impl FnMut(&mut [f32]) + Send + 'static,
-    on_error: impl FnMut(cpal::StreamError) + Send + 'static,
+    on_error: impl FnMut(cpal::Error) + Send + 'static,
 ) -> Result<cpal::Stream, String> {
     for_sample_format!(format.sample_format, T => build_output::<T>(device, format, render, on_error))
 }
 
-fn find_device_by_name(
-    mut devices: impl Iterator<Item = cpal::Device>,
-    name: &str,
-) -> Option<cpal::Device> {
-    devices.find(|d| d.name().ok().as_deref() == Some(name))
+/// Which way a device carries sound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    Input,
+    Output,
 }
 
-pub fn resolve_device(
-    host: &cpal::Host,
-    name: &Option<String>,
-    direction: &str,
-) -> Result<cpal::Device, String> {
-    match name {
-        Some(name) => {
-            let devices = if direction == "input" {
-                host.input_devices().map_err(|e| format!("{direction} devices: {e}"))?
-            } else {
-                host.output_devices().map_err(|e| format!("{direction} devices: {e}"))?
-            };
-            find_device_by_name(devices, name)
-                .ok_or_else(|| format!("{direction} device '{name}' not found"))
+impl std::fmt::Display for Direction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Direction::Input => "input",
+            Direction::Output => "output",
+        })
+    }
+}
+
+/// A device the user chose: by cpal's id, which stays the same across restarts and
+/// reconnections, with its name to show while it is not connected. A choice saved by
+/// name alone, before ids, has no id until the device is next seen.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(from = "SavedDevice")]
+pub struct ChosenDevice {
+    pub id: Option<String>,
+    pub name: String,
+}
+
+/// A chosen device as the config holds it: both, or a bare name from before ids.
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum SavedDevice {
+    Chosen { id: Option<String>, name: String },
+    Named(String),
+}
+
+impl From<SavedDevice> for ChosenDevice {
+    fn from(saved: SavedDevice) -> Self {
+        match saved {
+            SavedDevice::Chosen { id, name } => Self { id, name },
+            SavedDevice::Named(name) => Self { id: None, name },
         }
-        None => {
-            if direction == "input" {
-                host.default_input_device()
-            } else {
-                host.default_output_device()
-            }
-            .ok_or_else(|| format!("no {direction} device"))
+    }
+}
+
+/// A device's name, as the user knows it.
+pub fn device_name(device: &cpal::Device) -> Option<String> {
+    device.description().ok().map(|description| description.name().to_string())
+}
+
+/// A device's id, as the config keeps it.
+pub fn device_id(device: &cpal::Device) -> Option<String> {
+    device.id().ok().map(|id| id.to_string())
+}
+
+/// A sound server's monitor sources, by backend id: inputs that play back what a sink
+/// plays, so one capturing a call would send it back into itself. Only PulseAudio has them.
+#[cfg(target_os = "linux")]
+fn monitor_sources(host: &cpal::Host) -> HashSet<String> {
+    if host.id() != cpal::HostId::PulseAudio {
+        return HashSet::new();
+    }
+    crate::pulse::monitor_sources().unwrap_or_else(|e| {
+        tracing::warn!("monitor sources not told apart: {e}");
+        HashSet::new()
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn monitor_sources(_: &cpal::Host) -> HashSet<String> {
+    HashSet::new()
+}
+
+fn is_monitor(monitors: &HashSet<String>, device: &cpal::Device) -> bool {
+    !monitors.is_empty() && device.id().is_ok_and(|id| monitors.contains(id.id()))
+}
+
+/// The microphones to offer: every input but the monitors.
+pub fn microphones(host: &cpal::Host) -> Vec<cpal::Device> {
+    let monitors = monitor_sources(host);
+    host.input_devices().into_iter().flatten().filter(|device| !is_monitor(&monitors, device)).collect()
+}
+
+/// The `direction` device called `name`: how a choice saved before ids is found.
+pub fn find_by_name(host: &cpal::Host, name: &str, direction: Direction) -> Option<cpal::Device> {
+    host.devices().ok()?.filter(|device| device_name(device).as_deref() == Some(name)).find(|device| match direction {
+        Direction::Input => device.supports_input(),
+        Direction::Output => device.supports_output(),
+    })
+}
+
+/// The device `chosen` names, or the system default for `direction` when none is chosen.
+pub fn resolve_device(host: &cpal::Host, chosen: Option<&ChosenDevice>, direction: Direction) -> Result<cpal::Device, String> {
+    let Some(chosen) = chosen else {
+        let default = match direction {
+            Direction::Input => host.default_input_device(),
+            Direction::Output => host.default_output_device(),
+        };
+        let default = default.ok_or_else(|| format!("no {direction} device"))?;
+        // Without a microphone, a sound server's default input is a monitor of its output.
+        if direction == Direction::Input && is_monitor(&monitor_sources(host), &default) {
+            return Err("no microphone: the default input only plays back the output".into());
         }
+        return Ok(default);
+    };
+    let found = match &chosen.id {
+        Some(id) => id.parse::<DeviceId>().ok().and_then(|id| host.device_by_id(&id)),
+        None => find_by_name(host, &chosen.name, direction),
+    };
+    found.ok_or_else(|| format!("{direction} device \"{}\" is not connected", chosen.name))
+}
+
+/// The device to open for `direction`: the chosen one, or the system default when it is
+/// not there, with the notice to give.
+fn resolve_or_default(host: &cpal::Host, chosen: Option<&ChosenDevice>, direction: Direction) -> Result<(cpal::Device, Option<String>), String> {
+    match resolve_device(host, chosen, direction) {
+        Ok(device) => Ok((device, None)),
+        Err(e) if chosen.is_some() => Ok((resolve_device(host, None, direction)?, Some(format!("{e}; using the system default instead")))),
+        Err(e) => Err(e),
     }
 }
 
@@ -291,8 +379,8 @@ impl Settle {
 /// Which devices calls use; `None` follows the system default.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DeviceChoice {
-    pub input: Option<String>,
-    pub output: Option<String>,
+    pub input: Option<ChosenDevice>,
+    pub output: Option<ChosenDevice>,
 }
 
 /// The machine's audio devices, as the user chose them. A new choice reaches a call
@@ -319,7 +407,7 @@ impl AudioDevices for CpalDevices {
     fn open(&self, playback: Playback) -> Result<Box<dyn DeviceStreams>, String> {
         let seen_choice = self.choices.load(Ordering::Relaxed);
         let choice = self.choice.lock().unwrap().clone();
-        let watcher = DeviceWatcher::new().map_err(|e| format!("device watcher: {e}"))?;
+        let watcher = DeviceWatcher::new();
         let host = cpal::default_host();
         let (streams, notice) = open_or_default(&host, &choice, playback.clone())?;
         let capture = Capture::new(streams.input_rate)?;
@@ -335,20 +423,65 @@ impl AudioDevices for CpalDevices {
             notice,
             losses: VecDeque::new(),
             settle: Settle::default(),
+            must_rebuild: false,
         }))
     }
 }
 
-/// Open the chosen devices; when they are not available, the system default's instead,
-/// with the notice to give.
+/// Open the chosen devices, each giving way to the system default when it is not there;
+/// when they fail to open, the system default's instead. With the notice to give.
 fn open_or_default(host: &cpal::Host, choice: &DeviceChoice, playback: Playback) -> Result<(OpenStreams, Option<String>), String> {
     match OpenStreams::open(host, choice, playback.clone()) {
-        Ok(streams) => Ok((streams, None)),
+        Ok(opened) => Ok(opened),
         Err(e) if *choice != DeviceChoice::default() => {
-            let streams = OpenStreams::open(host, &DeviceChoice::default(), playback)?;
+            let (streams, _) = OpenStreams::open(host, &DeviceChoice::default(), playback)?;
             Ok((streams, Some(format!("{e}; using the system default instead"))))
         }
         Err(e) => Err(e),
+    }
+}
+
+/// What the streams' error callbacks said, for the audio thread to act on.
+#[derive(Default)]
+struct StreamHealth {
+    /// A device went away.
+    lost: AtomicBool,
+    /// A stream must be built again: its device changed under it (its sample rate, or
+    /// the default it followed, moved on) or its sound server went away.
+    invalidated: AtomicBool,
+    /// A stream on a default device moved to the new default by itself.
+    rerouted: AtomicBool,
+}
+
+impl StreamHealth {
+    fn note(&self, what: &str, err: cpal::Error) {
+        if err.kind() == ErrorKind::Xrun {
+            // A glitch the device recovers from by itself; frequent under load.
+            tracing::debug!("voice {what}: {err}");
+            return;
+        }
+        tracing::warn!("voice {what} error: {err}");
+        let flag = match err.kind() {
+            ErrorKind::DeviceNotAvailable => &self.lost,
+            ErrorKind::StreamInvalidated => &self.invalidated,
+            ErrorKind::DeviceChanged => &self.rerouted,
+            _ => return,
+        };
+        flag.store(true, Ordering::Relaxed);
+    }
+}
+
+/// A device a call has open: by id, to tell whether it is still the one to use, and by
+/// name, for the log.
+struct OpenDevice {
+    id: String,
+    name: String,
+}
+
+impl OpenDevice {
+    fn of(device: &cpal::Device) -> Result<Self, String> {
+        let id = device.id().map_err(|e| format!("device id: {e}"))?.to_string();
+        Ok(Self { id, name: device_name(device).unwrap_or_default() })
     }
 }
 
@@ -357,28 +490,25 @@ struct OpenStreams {
     _capture: cpal::Stream,
     _playback: cpal::Stream,
     capture_cons: ringbuf::HeapCons<f32>,
-    input_name: String,
-    output_name: String,
+    input: OpenDevice,
+    output: OpenDevice,
     input_rate: u32,
-    /// Set by either stream when its device goes away.
-    device_lost: Arc<AtomicBool>,
+    health: Arc<StreamHealth>,
 }
 
 impl OpenStreams {
-    fn open(host: &cpal::Host, choice: &DeviceChoice, playback: Playback) -> Result<Self, String> {
-        let device_lost = Arc::new(AtomicBool::new(false));
-        let lost_by = |what: &'static str| {
-            let device_lost = device_lost.clone();
-            move |err: cpal::StreamError| {
-                tracing::warn!("voice {what} error: {err}");
-                if matches!(err, cpal::StreamError::DeviceNotAvailable) {
-                    device_lost.store(true, Ordering::Relaxed);
-                }
-            }
+    /// Open the chosen devices, each giving way to the system default when it is not
+    /// there, with the notice to give then.
+    fn open(host: &cpal::Host, choice: &DeviceChoice, playback: Playback) -> Result<(Self, Option<String>), String> {
+        let health = Arc::new(StreamHealth::default());
+        let report = |what: &'static str| {
+            let health = health.clone();
+            move |err: cpal::Error| health.note(what, err)
         };
-        let input_device = resolve_device(host, &choice.input, "input")?;
+        let (input_device, input_notice) = resolve_or_default(host, choice.input.as_ref(), Direction::Input)?;
+        let input = OpenDevice::of(&input_device)?;
         let input_format = pick_format(input_device.supported_input_configs().map_err(|e| format!("input configs: {e}"))?)?;
-        let input_rate = input_format.config.sample_rate.0;
+        let input_rate = input_format.config.sample_rate;
 
         let (mut capture_prod, capture_cons) = HeapRb::<f32>::new(RING_CAPACITY).split();
         let capture_stream = open_input(
@@ -387,12 +517,13 @@ impl OpenStreams {
             move |mono| {
                 capture_prod.push_slice(mono);
             },
-            lost_by("capture"),
+            report("capture"),
         )?;
 
-        let output_device = resolve_device(host, &choice.output, "output")?;
+        let (output_device, output_notice) = resolve_or_default(host, choice.output.as_ref(), Direction::Output)?;
+        let output = OpenDevice::of(&output_device)?;
         let output_format = pick_format(output_device.supported_output_configs().map_err(|e| format!("output configs: {e}"))?)?;
-        let output_rate = output_format.config.sample_rate.0;
+        let output_rate = output_format.config.sample_rate;
 
         // The output hardware clock drives the mixer; at other rates than 48 kHz, whole
         // engine frames are converted and the remainder kept for the next callback.
@@ -417,21 +548,25 @@ impl OpenStreams {
                     residual.drain(..out.len());
                 }
             },
-            lost_by("playback"),
+            report("playback"),
         )?;
 
         capture_stream.play().map_err(|e| format!("start capture: {e}"))?;
         playback_stream.play().map_err(|e| format!("start playback: {e}"))?;
 
-        let (input_name, output_name) = (input_device.name().unwrap_or_default(), output_device.name().unwrap_or_default());
-        tracing::info!("voice: capture \"{input_name}\" ({input_format}), playback \"{output_name}\" ({output_format})");
+        tracing::info!("voice: capture \"{}\" ({input_format}), playback \"{}\" ({output_format})", input.name, output.name);
 
-        Ok(Self { _capture: capture_stream, _playback: playback_stream, capture_cons, input_name, output_name, input_rate, device_lost })
+        let notice = match (input_notice, output_notice) {
+            (Some(input), Some(output)) => Some(format!("{input}; {output}")),
+            (input, output) => input.or(output),
+        };
+        let streams = Self { _capture: capture_stream, _playback: playback_stream, capture_cons, input, output, input_rate, health };
+        Ok((streams, notice))
     }
 
-    /// The devices open, by name.
+    /// The devices open, by id.
     fn devices(&self) -> (Option<String>, Option<String>) {
-        (Some(self.input_name.clone()), Some(self.output_name.clone()))
+        (Some(self.input.id.clone()), Some(self.output.id.clone()))
     }
 }
 
@@ -465,10 +600,10 @@ impl Capture {
     }
 }
 
-/// The devices `choice` resolves to now, by name: what a reopen would open.
+/// The devices `choice` resolves to now, by id: what a reopen would open.
 fn wanted_devices(host: &cpal::Host, choice: &DeviceChoice) -> (Option<String>, Option<String>) {
-    let name = |chosen: &Option<String>, direction| resolve_device(host, chosen, direction).ok().and_then(|device| device.name().ok());
-    (name(&choice.input, "input"), name(&choice.output, "output"))
+    let id = |chosen: &Option<ChosenDevice>, direction| resolve_or_default(host, chosen.as_ref(), direction).ok().and_then(|(device, _)| device_id(&device));
+    (id(&choice.input, Direction::Input), id(&choice.output, Direction::Output))
 }
 
 struct CpalStreams {
@@ -485,14 +620,20 @@ struct CpalStreams {
     notice: Option<String>,
     /// When devices were lost lately, oldest first.
     losses: VecDeque<Instant>,
-    /// Default-device changes waiting to settle.
+    /// Device changes waiting to settle.
     settle: Settle,
+    /// A stream said it must be built again; done once the changes settle.
+    must_rebuild: bool,
 }
 
 impl CpalStreams {
     /// Open the devices again, on the choice as it is now.
     fn reopen(&mut self) -> CaptureRead {
         let choice = self.choice.lock().unwrap().clone();
+        // A host of its own: the last one's connection to a sound server that restarted
+        // is gone.
+        self.host = cpal::default_host();
+        self.must_rebuild = false;
         let reopened = open_or_default(&self.host, &choice, self.playback.clone())
             .and_then(|(streams, notice)| Ok((Capture::new(streams.input_rate)?, streams, notice)));
         match reopened {
@@ -514,7 +655,7 @@ impl DeviceStreams for CpalStreams {
         // A device went away under the streams, or capture stopped coming: reopen, unless
         // devices keep going.
         let stalled = self.capture.heard_at.elapsed() >= CAPTURE_STALL;
-        if self.streams.device_lost.load(Ordering::Relaxed) || stalled {
+        if self.streams.health.lost.load(Ordering::Relaxed) || stalled {
             let now = Instant::now();
             self.losses.retain(|at| now.duration_since(*at) < DEVICE_LOSS_WINDOW);
             if self.losses.len() >= DEVICE_LOSS_LIMIT {
@@ -531,12 +672,26 @@ impl DeviceStreams for CpalStreams {
             tracing::info!("voice: other audio devices chosen, switching");
             return self.reopen();
         }
-        // The OS says a default device changed: once the changes settle, reopen if the
-        // devices to use are not the ones open (a headset changing mode keeps its name).
+        // Devices changed: the system says a default moved on or a device came or went,
+        // or a stream was moved or must be built again. Once the changes settle, reopen
+        // if a stream must be built again or the devices to use are not the ones open (a
+        // headset changing mode keeps its id).
+        let now = Instant::now();
         while self.watcher.try_recv().is_some() {
-            self.settle.notice(Instant::now());
+            self.settle.notice(now);
         }
-        if self.settle.settled(Instant::now()) {
+        if self.streams.health.invalidated.swap(false, Ordering::Relaxed) {
+            self.must_rebuild = true;
+            self.settle.notice(now);
+        }
+        if self.streams.health.rerouted.swap(false, Ordering::Relaxed) {
+            self.settle.notice(now);
+        }
+        if self.settle.settled(now) {
+            if self.must_rebuild {
+                tracing::info!("voice: an audio stream must be built again, reopening");
+                return self.reopen();
+            }
             let choice = self.choice.lock().unwrap().clone();
             if wanted_devices(&self.host, &choice) != self.streams.devices() {
                 tracing::info!("voice: audio device changed, switching");
@@ -568,8 +723,8 @@ impl DeviceStreams for CpalStreams {
         }
     }
 
-    fn input_name(&self) -> String {
-        self.streams.input_name.clone()
+    fn input_id(&self) -> String {
+        self.streams.input.id.clone()
     }
 }
 
@@ -581,7 +736,33 @@ mod tests {
     const ANY_BUFFER: SupportedBufferSize = SupportedBufferSize::Range { min: 64, max: 4096 };
 
     fn range(channels: u16, rates: (u32, u32), sample_format: SampleFormat, buffer: SupportedBufferSize) -> SupportedStreamConfigRange {
-        SupportedStreamConfigRange::new(channels, SampleRate(rates.0), SampleRate(rates.1), buffer, sample_format)
+        SupportedStreamConfigRange::new(channels, rates.0, rates.1, buffer, sample_format)
+    }
+
+    #[test]
+    fn a_device_chosen_before_ids_is_read_back_by_name() {
+        #[derive(serde::Deserialize)]
+        struct Saved {
+            device: ChosenDevice,
+        }
+        let named: Saved = toml::from_str("device = \"MacBook Pro Microphone\"").unwrap();
+        assert_eq!(named.device, ChosenDevice { id: None, name: "MacBook Pro Microphone".into() });
+        let chosen: Saved = toml::from_str("[device]\nid = \"coreaudio:BuiltInMicrophoneDevice\"\nname = \"MacBook Pro Microphone\"").unwrap();
+        assert_eq!(chosen.device.id.as_deref(), Some("coreaudio:BuiltInMicrophoneDevice"));
+    }
+
+    #[test]
+    fn a_stream_to_build_again_is_told_apart_from_a_lost_device() {
+        let health = StreamHealth::default();
+        health.note("capture", ErrorKind::Xrun.into());
+        health.note("capture", ErrorKind::BackendError.into());
+        assert!(!health.lost.load(Ordering::Relaxed) && !health.invalidated.load(Ordering::Relaxed) && !health.rerouted.load(Ordering::Relaxed));
+        health.note("playback", ErrorKind::StreamInvalidated.into());
+        assert!(health.invalidated.load(Ordering::Relaxed) && !health.lost.load(Ordering::Relaxed));
+        health.note("playback", ErrorKind::DeviceChanged.into());
+        assert!(health.rerouted.load(Ordering::Relaxed));
+        health.note("capture", ErrorKind::DeviceNotAvailable.into());
+        assert!(health.lost.load(Ordering::Relaxed));
     }
 
     #[test]
@@ -601,7 +782,7 @@ mod tests {
         // A MacBook's speakers list no mono configuration.
         let format = pick_format([range(2, (44_100, 96_000), SampleFormat::F32, ANY_BUFFER)].into_iter()).unwrap();
         assert_eq!(format.config.channels, 2);
-        assert_eq!(format.config.sample_rate.0, SAMPLE_RATE);
+        assert_eq!(format.config.sample_rate, SAMPLE_RATE);
         assert_eq!(format.config.buffer_size, BufferSize::Fixed(DEVICE_BUFFER_SAMPLES));
     }
 
@@ -623,7 +804,7 @@ mod tests {
     #[test]
     fn a_device_without_48k_opens_at_its_nearest_rate_and_its_own_buffer() {
         let format = pick_format([range(2, (88_200, 192_000), SampleFormat::I32, SupportedBufferSize::Unknown)].into_iter()).unwrap();
-        assert_eq!(format.config.sample_rate.0, 88_200);
+        assert_eq!(format.config.sample_rate, 88_200);
         assert_eq!(format.config.buffer_size, BufferSize::Default);
     }
 
