@@ -219,10 +219,12 @@ pub async fn create_private(
 
 /// Join every private channel of the server that the relay lists for this account
 /// and this device is not yet in, nor knows was deleted, then ask the name of every one
-/// still unnamed. Run at start, after server group commits (a role may have been
-/// granted) and when a linked device announces a change. First, deletions this device
-/// owes the relay are tried again. A channel whose join the relay refuses is skipped and
-/// tried again next time. Returns the channels joined.
+/// still unnamed. Run whenever the connection to the server's mailbox has caught up (at
+/// start and after a dropped connection), after server group commits (a role may have
+/// been granted), when the relay says a channel became joinable and when a linked device
+/// announces a change. First, deletions this device owes the relay are tried again. A
+/// channel whose join the relay refuses (another join or commit got in first) is skipped;
+/// the relay says when it is joinable again. Returns the channels joined.
 pub async fn join_admitted(client: &SharedClient, relay: &RelayClient, server_id: &[u8; 32]) -> Result<Vec<[u8; 32]>> {
     finish_channel_deletions(client, relay, server_id).await;
     let server_mailbox = client.lock().await.server_mailbox(server_id)?;

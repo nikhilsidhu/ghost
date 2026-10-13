@@ -15,7 +15,7 @@ use ghost_core::flows::recovery::SnapshotRestore;
 use ghost_wire::RevocationCause;
 use ghost_core::storage::ChannelKind;
 use ghost_core::wire::derive_default_channel_id;
-use ghost_wire::policy::Role;
+use ghost_wire::policy::{Role, MANAGE_CHANNELS};
 use ghost_core::session::{AccountAlert, ClientEvent};
 use ghost_core::voice::VoiceEvent;
 use ghost_node::Device;
@@ -242,6 +242,70 @@ async fn private_channels_are_joined_named_and_left_by_the_running_loops() {
     policy.assignments.retain(|(account, _)| *account != bob_fp);
     flows::roles::set_server_policy(&a.client, &a.relay, &server_id, &policy).await.unwrap();
     eventually(EVENT_WAIT, "Bob to lose the channel", async || b.client.lock().await.store().get_channel(&channel_id).is_err()).await;
+}
+
+/// Members a new channel admits are told of it together, so all their joins but the
+/// first lose to an earlier one; each is told again once any member's GroupInfo makes
+/// the channel joinable at the epoch the winner made. The server's owner is away, so
+/// nothing waits on her device.
+#[tokio::test]
+async fn members_a_new_channel_admits_together_all_get_in_with_the_owner_away() {
+    let relay = start_relay().await;
+    let mut alice = Peer::new(&relay.url(), "alice").await;
+    let bob = Peer::new(&relay.url(), "bob").await;
+    let carol = Peer::new(&relay.url(), "carol").await;
+    let dave = Peer::new(&relay.url(), "dave").await;
+    let server_id = alice.device.create_server("club").await.unwrap();
+    for member in [&bob, &carol, &dave] {
+        invite_into(&alice, member, &server_id).await;
+    }
+    let (b, c, d) = (&bob.device, &carol.device, &dave.device);
+
+    // Bob manages channels; Carol and Dave hold the role his channel is for.
+    let a = &alice.device;
+    let mut policy = a.client.lock().await.server_policy(&server_id).unwrap();
+    policy.roles.push(Role { id: 1, permissions: MANAGE_CHANNELS });
+    policy.roles.push(Role { id: 2, permissions: 0 });
+    policy.assignments.push((b.fingerprint().await, vec![1]));
+    policy.assignments.push((c.fingerprint().await, vec![2]));
+    policy.assignments.push((d.fingerprint().await, vec![2]));
+    flows::roles::set_server_policy(&a.client, &a.relay, &server_id, &policy).await.unwrap();
+    for member in [b, c, d] {
+        caught_up(member, a, &server_id).await;
+    }
+    alice.device.stop().await;
+
+    let channel_id = flows::channels::create_private(&b.client, &b.relay, &b.relay, &server_id, "staff", ChannelKind::Text, vec![2], vec![])
+        .await
+        .unwrap();
+    eventually(EVENT_WAIT, "Carol and Dave to enter the channel", async || {
+        c.client.lock().await.store().get_channel(&channel_id).is_ok() && d.client.lock().await.store().get_channel(&channel_id).is_ok()
+    })
+    .await;
+}
+
+/// The relay tells only live connections that a channel can be joined; a device whose
+/// connection was down then looks again once it is back.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_channel_made_while_a_member_was_disconnected_is_joined_once_it_is_back() {
+    let relay = support::start_switched_relay().await;
+    let alice = Peer::new(&relay.url(), "alice").await;
+    let bob = Peer::new(&relay.url(), "bob").await;
+    let server_id = alice.device.create_server("club").await.unwrap();
+    invite_into(&alice, &bob, &server_id).await;
+    let (a, b) = (&alice.device, &bob.device);
+    let mut policy = a.client.lock().await.server_policy(&server_id).unwrap();
+    policy.roles.push(Role { id: 1, permissions: 0 });
+    policy.assignments.push((b.fingerprint().await, vec![1]));
+    flows::roles::set_server_policy(&a.client, &a.relay, &server_id, &policy).await.unwrap();
+    caught_up(b, a, &server_id).await;
+
+    // The channel reaches the relay while every connection is down, so nobody hears of it.
+    relay.go_down();
+    let created = a.client.lock().await.create_private_channel(&server_id, "staff", ChannelKind::Text, 1, vec![1], vec![]).unwrap();
+    assert!(relay.relay.state.init_public_group(created.mailbox_id, created.group_info, a.fingerprint().await).await.unwrap());
+    relay.come_back();
+    eventually(EVENT_WAIT, "Bob to enter the channel", async || b.client.lock().await.store().get_channel(&created.channel_id).is_ok()).await;
 }
 
 async fn channel_name(device: &Device, channel_id: &[u8; 32]) -> Option<String> {
@@ -642,7 +706,8 @@ async fn a_name_change_a_server_missed_reaches_it_once_it_is_back() {
         bob.device.client.lock().await.store().get_member(&server_id, &alice_fp).is_ok_and(|m| m.display_name == "Alicia")
     })
     .await;
-    assert!(alice.device.client.lock().await.store().profile_owed(&server_id).unwrap().is_empty(), "the name is still owed");
+    // Told first, then marked told: the mark may come a moment after Bob has it.
+    eventually(EVENT_WAIT, "alice's name no longer owed", async || alice.device.client.lock().await.store().profile_owed(&server_id).unwrap().is_empty()).await;
 }
 
 /// The avatar's key rides in presence, so a member who joins after the avatar was
@@ -734,7 +799,8 @@ async fn an_avatar_a_relay_missed_is_put_once_it_is_back() {
     bob.expect(mark, "alice's avatar", |e| matches!(e, ClientEvent::AvatarUpdated(fp) if *fp == alice_fp).then_some(())).await;
     let cached = std::fs::read(ghost_core::session::avatars::cache_path(bob.device.data_dir(), &alice_fp)).unwrap();
     assert_eq!(cached, image);
-    assert!(alice.device.client.lock().await.store().profile_owed(&server_id).unwrap().is_empty());
+    // Told first, then marked told: the mark may come a moment after Bob has it.
+    eventually(EVENT_WAIT, "alice's avatar no longer owed", async || alice.device.client.lock().await.store().profile_owed(&server_id).unwrap().is_empty()).await;
 }
 
 /// A device coming back reports that it is catching up on what it missed, then that it

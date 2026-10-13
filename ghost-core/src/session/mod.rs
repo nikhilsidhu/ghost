@@ -885,19 +885,6 @@ impl Runner {
             flows::server::publish_unpublished(&session.client, &session.relay).await;
         });
 
-        // Join the private channels each server's relay lists for this account (granted
-        // while this device was away).
-        let runner = self.clone();
-        self.spawn(async move {
-            let servers: Vec<[u8; 32]> = {
-                let c = runner.client.lock().await;
-                c.store().list_servers().map(|list| list.into_iter().map(|s| s.server_id).collect()).unwrap_or_default()
-            };
-            for server_id in servers {
-                runner.spawn_join_private_channels(server_id);
-            }
-        });
-
         sync_mailbox
     }
 
@@ -1034,6 +1021,12 @@ impl Runner {
             RelayEvent::CaughtUp { mailbox_id, relay_url } => {
                 if state.catching_up.remove(&(mailbox_id, relay_url)) {
                     self.emit(ClientEvent::RelayConnectivity(state.connectivity(sync_mailbox, &self.relay.base_url())));
+                }
+                // Up to date with a server's group, at start or after a dropped connection:
+                // its private channels granted, or told of, while away are joined now.
+                let server_id = self.client.lock().await.server_id_for_server_mailbox(&mailbox_id);
+                if let Some(server_id) = server_id {
+                    self.spawn_join_private_channels(server_id);
                 }
             }
             RelayEvent::ConnectionState { mailbox_id, relay_url, connected } => {
